@@ -1,0 +1,10 @@
+target remote :1234
+
+nm -n dist/kernel.elf | grep long_mode_start
+
+gdb kernel.bin
+
+b 0x000000000
+
+source trace_fast.py
+trace_fast

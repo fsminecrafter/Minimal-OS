@@ -1,0 +1,24 @@
+{
+    "files.associations": {
+        "stddef.h": "c",
+        "print.h": "c",
+        "commandhandler.h": "c",
+        "keyboardhandler.h": "c",
+        "compare": "c",
+        "sleep.h": "c",
+        "stdint.h": "c",
+        "pit.h": "c",
+        "allocator.h": "c",
+        "keyboard.h": "c",
+        "rtc.h": "c",
+        "multiboot2parse.h": "c",
+        "proc.h": "c",
+        "scheduler.h": "c",
+        "stdbool.h": "c",
+        "functional": "c",
+        "startuproutine.h": "c",
+        "gpu.h": "c",
+        "mmio.h": "c",
+        "pci.h": "c"
+    }
+}

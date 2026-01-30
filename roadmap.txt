@@ -1,0 +1,13 @@
+ROADMAP
+
+X = Done
+C = Come back later
+
+Panic screen [X]
+simple audio [C]
+allocator [X]
+startupRoutine [X]
+Processes and ProcessManager [X]
+GRAPHICS!!! []
+
+now lets create the GPU driver/c code i want to able to write a pixel to the screen and also initializing the screen with a resolution

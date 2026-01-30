@@ -59,32 +59,28 @@ char* strchr(const char* s, int c) {
     return NULL;
 }
 
-__attribute__((optimize("O2")))
 void* memset(void* s, int c, size_t n) {
     unsigned char* p = (unsigned char*)s;
     unsigned char byte = (unsigned char)c;
     
-    // Use rep stosq for maximum performance on x86-64
-    if (n >= 8 && ((uintptr_t)p & 7) == 0 && byte == 0) {
-        // Aligned and zeroing - use rep stosq
+    // For zeroing aligned memory, use 64-bit writes
+    if (byte == 0 && n >= 8 && ((uintptr_t)p & 7) == 0) {
+        uint64_t* p64 = (uint64_t*)p;
         size_t qwords = n / 8;
-        size_t bytes_written = qwords * 8;
         
-        __asm__ volatile(
-            "rep stosq"
-            : "+D"(p), "+c"(qwords)
-            : "a"(0ULL)
-            : "memory"
-        );
+        // Simple loop with 64-bit writes
+        for (size_t i = 0; i < qwords; i++) {
+            p64[i] = 0;
+        }
         
-        // p now points past the last qword written
-        // Adjust remaining byte count
-        n -= bytes_written;
+        // Handle remaining bytes
+        p = (unsigned char*)(p64 + qwords);
+        n = n & 7;
     }
     
-    // Handle remaining bytes or non-zero patterns
-    while (n--) {
-        *p++ = byte;
+    // Byte-by-byte for remaining or non-aligned
+    for (size_t i = 0; i < n; i++) {
+        p[i] = byte;
     }
     
     return s;

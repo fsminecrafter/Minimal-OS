@@ -22,5 +22,10 @@ sudo apt install -y \
   wget \
   curl
 
+
+Build GCC
+
+Build Binutils
+
 ;;;
 

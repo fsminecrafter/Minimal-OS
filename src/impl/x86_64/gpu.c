@@ -222,53 +222,79 @@ void gpu_clear(gpu_device_t* gpu, uint32_t color) {
 void gpu_test_write(gpu_device_t* gpu) {
     if (!gpu || !gpu->fb) return;
 
-    serial_write_str("gpu_test_write: drawing test pattern...\n");
+    serial_write_str("gpu_test_write: drawing color gradient...\n");
 
-    // Draw a large colored rectangle pattern to make it visible
-    // Top-left quarter: Red
-    for (uint32_t y = 0; y < gpu->height / 2; y++) {
-        for (uint32_t x = 0; x < gpu->width / 2; x++) {
-            gpu_put_pixel(gpu, x, y, 0xFFFF0000); // Red
-        }
-    }
-    serial_write_str("Red quarter drawn\n");
-
-    // Top-right quarter: Green
-    for (uint32_t y = 0; y < gpu->height / 2; y++) {
-        for (uint32_t x = gpu->width / 2; x < gpu->width; x++) {
-            gpu_put_pixel(gpu, x, y, 0xFF00FF00); // Green
-        }
-    }
-    serial_write_str("Green quarter drawn\n");
-
-    // Bottom-left quarter: Blue
-    for (uint32_t y = gpu->height / 2; y < gpu->height; y++) {
-        for (uint32_t x = 0; x < gpu->width / 2; x++) {
-            gpu_put_pixel(gpu, x, y, 0xFF0000FF); // Blue
-        }
-    }
-    serial_write_str("Blue quarter drawn\n");
-
-    // Bottom-right quarter: Yellow
-    for (uint32_t y = gpu->height / 2; y < gpu->height; y++) {
-        for (uint32_t x = gpu->width / 2; x < gpu->width; x++) {
-            gpu_put_pixel(gpu, x, y, 0xFFFFFF00); // Yellow
-        }
-    }
-    serial_write_str("Yellow quarter drawn\n");
-
-    // Draw a white border around the screen
-    for (uint32_t x = 0; x < gpu->width; x++) {
-        gpu_put_pixel(gpu, x, 0, 0xFFFFFFFF); // Top border
-        gpu_put_pixel(gpu, x, gpu->height - 1, 0xFFFFFFFF); // Bottom border
-    }
+    // Create a smooth color gradient
+    // Horizontal gradient: Red -> Yellow -> Green -> Cyan -> Blue -> Magenta -> Red
+    // Vertical gradient: Bright at top -> Dark at bottom
+    
     for (uint32_t y = 0; y < gpu->height; y++) {
-        gpu_put_pixel(gpu, 0, y, 0xFFFFFFFF); // Left border
-        gpu_put_pixel(gpu, gpu->width - 1, y, 0xFFFFFFFF); // Right border
+        volatile uint32_t* row = (volatile uint32_t*)((uintptr_t)gpu->fb + y * gpu->pitch);
+        
+        // Vertical brightness factor (0.0 to 1.0)
+        uint32_t brightness = (255 * (gpu->height - y)) / gpu->height;
+        
+        for (uint32_t x = 0; x < gpu->width; x++) {
+            // Horizontal hue cycle (0 to 6 across width)
+            uint32_t hue_section = (x * 6) / gpu->width;
+            uint32_t hue_fraction = ((x * 6 * 255) / gpu->width) % 255;
+            
+            uint32_t r, g, b;
+            
+            // RGB color wheel
+            switch (hue_section) {
+                case 0: // Red -> Yellow
+                    r = 255;
+                    g = hue_fraction;
+                    b = 0;
+                    break;
+                case 1: // Yellow -> Green
+                    r = 255 - hue_fraction;
+                    g = 255;
+                    b = 0;
+                    break;
+                case 2: // Green -> Cyan
+                    r = 0;
+                    g = 255;
+                    b = hue_fraction;
+                    break;
+                case 3: // Cyan -> Blue
+                    r = 0;
+                    g = 255 - hue_fraction;
+                    b = 255;
+                    break;
+                case 4: // Blue -> Magenta
+                    r = hue_fraction;
+                    g = 0;
+                    b = 255;
+                    break;
+                default: // Magenta -> Red
+                    r = 255;
+                    g = 0;
+                    b = 255 - hue_fraction;
+                    break;
+            }
+            
+            // Apply vertical brightness
+            r = (r * brightness) / 255;
+            g = (g * brightness) / 255;
+            b = (b * brightness) / 255;
+            
+            // Pack into ARGB format (0xAARRGGBB)
+            row[x] = 0xFF000000 | (r << 16) | (g << 8) | b;
+        }
+        
+        // Progress indicator every 100 rows
+        if (y % 100 == 0) {
+            serial_write_str("  Row ");
+            serial_write_dec(y);
+            serial_write_str("/");
+            serial_write_dec(gpu->height);
+            serial_write_str("\n");
+        }
     }
-    serial_write_str("White border drawn\n");
 
-    serial_write_str("gpu_test_write: done\n");
+    serial_write_str("gpu_test_write: gradient complete\n");
 }
 
 void gpu_test(gpu_device_t* gpu, pci_device_t* pci_dev, uint32_t width, uint32_t height) {

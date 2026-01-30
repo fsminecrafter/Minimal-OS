@@ -2,12 +2,24 @@ ROADMAP
 
 X = Done
 C = Come back later
+N = New plans
+
+V 0.4.00
 
 Panic screen [X]
 simple audio [C]
 allocator [X]
 startupRoutine [X]
 Processes and ProcessManager [X]
-GRAPHICS!!! []
+GRAPHICS!!! [X] 🥳🥳🥳
 
-now lets create the GPU driver/c code i want to able to write a pixel to the screen and also initializing the screen with a resolution
+V 0.4.03
+
+Time Scheduler []
+Graphics handler (display.h) []
+Time handler (time.h) []
+
+Displaying and reading images []
+Fonts []
+
+File system !!! []

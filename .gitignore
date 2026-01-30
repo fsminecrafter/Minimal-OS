@@ -1,0 +1,7 @@
+# Kernel binaries
+kernel.iso
+kernel.bin
+
+# Building files
+
+*.o

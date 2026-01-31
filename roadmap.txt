@@ -15,6 +15,7 @@ GRAPHICS!!! [X] 🥳🥳🥳
 
 V 0.4.03
 
+Better allocator []
 Time Scheduler []
 Graphics handler (display.h) []
 Time handler (time.h) []

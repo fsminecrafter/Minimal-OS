@@ -3,6 +3,7 @@
 #include "x86_64/proc.h"
 #include "x86_64/scheduler.h"
 #include "x86_64/allocator.h"
+#include "time.h"
 #include "panic.h"
 
 extern uint64_t pml4_phys_addr;
@@ -34,6 +35,11 @@ process_t* proc_create(const char* file_name, void (*entry_point)()) {
 
 	proc->pid = get_next_pid();
 	proc->state = PROCESS_READY;
+	
+	// Initialize timing fields
+	proc->wake_time_ms = 0;
+	proc->cpu_time_ms = 0;
+	proc->creation_time_ms = time_get_uptime_ms();
 
 	// === BEGIN name construction ===
 	char* p = proc->name;

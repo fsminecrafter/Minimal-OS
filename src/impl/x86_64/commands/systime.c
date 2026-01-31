@@ -5,7 +5,7 @@
 #include "bool.h"
 
 void cmd_systime(int argc, const char** argv) {
-    print_uint64_dec(currentsystemtime_sec(0));
+    time_print_datetime(true);
     print_str("\n");
 }
 

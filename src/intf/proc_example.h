@@ -1,3 +1,3 @@
 #pragma once
 
-void proc_test();
+void proc_test_sleep();

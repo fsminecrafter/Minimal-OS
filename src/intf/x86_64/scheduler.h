@@ -1,12 +1,25 @@
-#pragma once
+#ifndef SCHEDULER_H
+#define SCHEDULER_H
 
-#include "proc.h"
+#include <stdint.h>
+#include "x86_64/proc.h"
 
+// Current process
 extern process_t* current_process;
 
-void scheduler_init();
-void scheduler_tick(); // Call from PIT
-void schedule();       // Switch to next process
-void context_switch(process_t* current, process_t* next);
-void ready(); //Ready process state
-void currentstate();
+// Scheduling functions
+void schedule(void);
+void scheduler_tick(void);
+void ready(void);
+
+// Sleep/wake functions
+void sleep(uint64_t milliseconds);
+
+// Statistics
+void scheduler_get_stats(uint64_t* switches, uint64_t* idle);
+void scheduler_print_stats(void);
+
+// Debug
+void currentstate(void);
+
+#endif // SCHEDULER_H

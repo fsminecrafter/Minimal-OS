@@ -30,6 +30,7 @@ void kernel_main(uint64_t mb2_info_addr) {
     //allocator_init((void*)0x300000, 1024);
     startroutine(total_ram_bytes);
     test_gpu();
+    proc_test_sleep();
 
     while(1);
 }

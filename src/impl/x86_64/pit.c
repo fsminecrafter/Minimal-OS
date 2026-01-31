@@ -4,6 +4,7 @@
 #include "x86_64/interupthandler.h"
 #include "x86_64/idt.h"
 #include "x86_64/scheduler.h"
+#include "time.h"
 #include "panic.h"
 
 // PIT ports
@@ -16,8 +17,12 @@
 #define PIT_MODE_RATE_GENERATOR 0x04
 
 static volatile uint64_t pit_ticks = 0;
+static uint32_t pit_frequency = 100;  // Default 100Hz
 
 void pit_init(uint32_t frequency) {
+    // Store frequency for time calculations
+    pit_frequency = frequency;
+    
     // Calculate divisor for PIT input frequency (1.193182 MHz)
     uint16_t divisor = 1193182 / frequency;
 
@@ -35,7 +40,13 @@ void pit_init(uint32_t frequency) {
 
 void pit_irq_handler() {
     pit_ticks++;
+    
+    // Update system time
+    time_tick(pit_frequency);
+    
+    // Run scheduler
     scheduler_tick();
+    
     // Send End Of Interrupt (EOI) to PIC master for IRQ0
     pic_eoi_master();
 }

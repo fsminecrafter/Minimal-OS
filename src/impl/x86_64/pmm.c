@@ -71,14 +71,30 @@ void* alloc_page_zeroed(void) {
         PANIC("Cannot zero page - would destroy stack!");
     }
     
+    // Check if page is in critical kernel region
+    // This range includes IDT, GDT, and other kernel structures
+    if (page_start >= 0x10a000 && page_start < 0x400000) {
+        serial_write_str("WARNING: Page ");
+        serial_write_hex(page_start);
+        serial_write_str(" is in critical kernel region!\n");
+        serial_write_str("This might be fragile - consider adjusting PMM base\n");
+    }
+    
     page_pool_used++;
     
-    serial_write_str("alloc_page_zeroed: about to call memset\n");
+    serial_write_str("alloc_page_zeroed: about to call memset (interrupts will be disabled)\n");
 
+    // CRITICAL FIX: Disable interrupts during memset!
+    // If timer interrupt fires while we're zeroing page tables or other
+    // critical structures, it can cause corruption and hangs
+    __asm__ volatile("cli");  // Disable interrupts
+    
     // Zero the page using memset
     memset(page, 0, PAGE_SIZE);
     
-    serial_write_str("alloc_page_zeroed: memset returned\n");
+    __asm__ volatile("sti");  // Re-enable interrupts
+    
+    serial_write_str("alloc_page_zeroed: memset returned (interrupts re-enabled)\n");
     serial_write_str("alloc_page_zeroed: DONE\n");
 
     return page;

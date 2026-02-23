@@ -14,9 +14,9 @@
 #include "x86_64/gpu.h"
 #include "x86_64/gdt.h"
 #include "x86_64/tss.h"
+#include "time.h"
 
-#define HEAP_START 0x300000  // 3 MiB
-#define HEAP_SIZE  (total_ram_bytes - HEAP_START)
+#define HEAP_START 0x400000  // 4 MiB - should be above kernel and reserved areas
 
 void print_pic_masks() {
     uint8_t master_mask = port_inb(0x21);
@@ -30,10 +30,15 @@ void print_pic_masks() {
 }
 
 void startroutine(uint64_t total_ram_bytes) {
+    uint64_t uintheapsize = total_ram_bytes - HEAP_START;
     print_set_color(PRINT_COLOR_WHITE, PRINT_COLOR_BLACK);
     print_str("Startup Routine\n");
+    print_str("init rtc\n");
+    rtc_init();
+    print_str("Time subsystem init\n");
+    time_init();
     print_str("init pit: ");
-    pit_init(1000);
+    pit_init(100);
     setup_kernel_interrupts();
     idt_set_handler_pit(pit_irq_handler);
     print_set_color(PRINT_COLOR_GREEN, PRINT_COLOR_BLACK);
@@ -55,8 +60,8 @@ void startroutine(uint64_t total_ram_bytes) {
     while (pit_get_ticks() < 5) {
         asm volatile("hlt");
     }
-    allocator_init((void*)HEAP_START, HEAP_SIZE);
-    pmm_init((void*)0x100000, 0x4000000);
+    allocator_init((void*)HEAP_START, uintheapsize);
+    pmm_init((void*)0x1000000, 0x4000000);  // Start at 16MB instead
     print_str("PIT working!\n");
     print_str("Init serial\n");
     serial_init();
@@ -66,7 +71,5 @@ void startroutine(uint64_t total_ram_bytes) {
     print_str("Enumerating PCI devices\n");
     pci_enumerate_all();
     print_pci_devices();
-    
-
     print_str("Startup routine Done.\n");
 }

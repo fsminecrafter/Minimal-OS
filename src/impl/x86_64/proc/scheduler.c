@@ -7,6 +7,9 @@
 #include "string.h"
 #include "x86_64/allocator.h"
 #include "serial.h"
+#include "bool.h"
+
+bool scheduler_on = false;
 
 // The currently running process
 process_t* current_process = NULL;
@@ -27,7 +30,10 @@ void ready() {
         current_process->state = PROCESS_READY;
 }
 
-// Put current process to sleep for specified milliseconds
+void schedulerInit() {
+    scheduler_on = true;
+}
+
 void sleep(uint64_t milliseconds) {
     if (!current_process) return;
     
@@ -39,14 +45,19 @@ void sleep(uint64_t milliseconds) {
     serial_write_str(current_process->name);
     serial_write_str(" sleeping for ");
     serial_write_dec(milliseconds);
-    serial_write_str("ms (wake at ");
-    serial_write_dec(wake_time);
-    serial_write_str(")\n");
+    serial_write_str("ms\n");
     
-    // Trigger scheduler to switch to another process
+    // Mark as waiting and switch to another process
     schedule();
+    
+    // When we return here, this process has been woken up and rescheduled
+    // The state was changed to READY/RUNNING by wake_sleeping_processes()
+    // Just return - we're done sleeping!
+    
+    serial_write_str("Process ");
+    serial_write_str(current_process->name);
+    serial_write_str(" woke up\n");
 }
-
 // Wake up sleeping processes whose time has come
 static void wake_sleeping_processes() {
     uint64_t current_time = time_get_uptime_ms();
@@ -158,8 +169,7 @@ void schedule() {
         current_process = find_next_ready_process();
         if (!current_process) {
             serial_write_str("No processes to schedule\n");
-            idle_cycles++;
-            return;
+            PANIC("No processes to schedule, but scheduler called");
         }
         current_process->state = PROCESS_RUNNING;
         
@@ -212,6 +222,10 @@ static const int TICKS_PER_SCHEDULE = 10;  // Schedule every 10 ticks
 
 // Timer-based scheduler trigger (called from PIT)
 void scheduler_tick() {
+    if (!scheduler_on) {
+        return; // Prevent re-entrancy
+    }
+
     if (!current_process) {
         schedule();
         return;

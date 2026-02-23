@@ -5,12 +5,15 @@
 #include "x86_64/startuproutine.h"
 #include "x86_64/allocator.h"
 #include "proc_example.h"
+#include "x86_64/proc.h"
 #include "panic.h"
 #include "keyboard.h"
 #include "keyboardhandler.h"
 #include "x86_64/scheduler.h"
 #include "x86_64/pci.h"
 #include "x86_64/gpu.h"
+#include "time.h"
+#include "x86_64/memoryscanner.h"
 
 void kernel_main(uint64_t mb2_info_addr) {
     multiboot2_info_t* mb_info = (multiboot2_info_t*)mb2_info_addr;
@@ -29,8 +32,14 @@ void kernel_main(uint64_t mb2_info_addr) {
     //init allocator only beyond - 0x300000
     //allocator_init((void*)0x300000, 1024);
     startroutine(total_ram_bytes);
+    //verify_memory_initialization((void*)0x400000, (void*)total_ram_bytes);
+
+    memory_scanner_init();
+    memory_scan_full();
+
     test_gpu();
     proc_test_sleep();
+    schedulerInit();
 
     while(1);
 }

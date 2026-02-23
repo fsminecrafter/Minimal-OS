@@ -35,3 +35,4 @@ void pci_enumerate_bus(uint8_t bus);
 void pci_enumerate_all();
 void print_pci_devices(); //Prints in the serial COM1 output
 uint32_t pci_read_data(void);
+void test_gpu();

@@ -11,6 +11,7 @@ extern process_t* current_process;
 void schedule(void);
 void scheduler_tick(void);
 void ready(void);
+void schedulerInit();
 
 // Sleep/wake functions
 void sleep(uint64_t milliseconds);
@@ -21,5 +22,6 @@ void scheduler_print_stats(void);
 
 // Debug
 void currentstate(void);
+
 
 #endif // SCHEDULER_H

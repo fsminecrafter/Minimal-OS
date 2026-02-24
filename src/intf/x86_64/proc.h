@@ -26,7 +26,7 @@ typedef struct process {
     uint64_t regs[9];                  // RAX, RBX, RCX, RDX, RSI, RDI, RSP, RIP, RFLAGS
     
     // Memory management
-    uint64_t* pml4;                    // Page table
+    uint64_t pml4;                    // Page table
     uint64_t* kernel_stack;            // Kernel stack pointer
     
     // Timing
@@ -48,7 +48,7 @@ process_t** get_procs(size_t* count);
 uint64_t get_next_pid(void);
 
 // Kernel page table
-uint64_t* get_kernel_pml4(void);
+uint64_t get_kernel_pml4(void);
 
 // Helper functions (from string.h but needed here)
 void hex_to_str(uint64_t value, char* out);

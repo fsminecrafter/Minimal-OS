@@ -15,12 +15,14 @@ GRAPHICS!!! [X] 🥳🥳🥳
 
 V 0.4.03
 
-Better allocator []
-Time Scheduler []
+Better allocator [X]
+Time Scheduler [X]
+Improved scheduler and proc [X]
 Graphics handler (display.h) []
 Time handler (time.h) []
 
 Displaying and reading images []
 Fonts []
 
+System calls !! []
 File system !!! []

@@ -16,9 +16,11 @@ static uint64_t pid_counter = 1;
 uint64_t get_next_pid() {
     return pid_counter++;
 }
-uint64_t* get_kernel_pml4(void) {
-    return (uint64_t*)pml4_phys_addr; 
+
+uint64_t get_kernel_pml4(void) {
+    return pml4_phys_addr;  // Return the VALUE, not cast to pointer!
 }
+
 void memset_p(void* dest, uint8_t val, uint64_t len) { //changed memset to memset_p to make compiler STAY SILENT
     uint8_t* ptr = dest;
     for (uint64_t i = 0; i < len; i++) {
@@ -89,7 +91,7 @@ process_t* proc_create(const char* file_name, void (*entry_point)()) {
 	// === END name construction ===
 
 	// Remaining setup
-	proc->pml4 = get_kernel_pml4();
+	proc->pml4 = (uint64_t)get_kernel_pml4();
 	if (!proc->pml4) {
 		PANIC("Failed to get PML4 for new process");
 	}
@@ -100,9 +102,15 @@ process_t* proc_create(const char* file_name, void (*entry_point)()) {
 	}
 	proc->kernel_stack = (uint64_t*)((uint8_t*)stack + STACK_SIZE);
 
-    proc->regs[6] = (uint64_t)proc->kernel_stack;  // RSP
-    proc->regs[7] = (uint64_t)entry_point;         // RIP
-    proc->regs[8] = 0x202;                         // RFLAGS
+	// Zero all registers first
+	for (int i = 0; i < 9; i++) {
+		proc->regs[i] = 0;
+	}
+
+	// Then set the important ones
+	proc->regs[6] = (uint64_t)proc->kernel_stack;  // RSP
+	proc->regs[7] = (uint64_t)entry_point;         // RIP
+	proc->regs[8] = 0x202;                         // RFLAGS (IF=1, reserved bit 1)
 
 	proc->next = proc_list_head;
 	proc_list_head = proc;

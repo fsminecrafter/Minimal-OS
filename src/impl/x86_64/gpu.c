@@ -3,6 +3,7 @@
 #include "x86_64/mmio.h"
 #include "panic.h"
 #include "x86_64/port.h"
+#include "graphics.h"
 
 #define GPU_FB_BAR_INDEX 0
 #define GPU_REG_BAR_INDEX 2
@@ -301,6 +302,7 @@ void gpu_test(gpu_device_t* gpu, pci_device_t* pci_dev, uint32_t width, uint32_t
     serial_write_str("gpu_test: starting GPU test...\n");
     gpu_init(gpu, pci_dev, width, height);
     serial_write_str("gpu_test: GPU initialized, writing test pixels...\n");
+    graphics_safety_mode = true; // Enable safety mode for testing
     gpu_test_write(gpu);
     serial_write_str("gpu_test: done\n");
 }

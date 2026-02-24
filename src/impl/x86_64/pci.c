@@ -17,17 +17,6 @@
 uint32_t pci_read_config_dword(uint8_t bus, uint8_t device, uint8_t function, uint8_t offset);
 void pci_write_config_dword(uint8_t bus, uint8_t device, uint8_t function, uint8_t offset, uint32_t value);
 
-// --- Inline I/O port functions ---
-static inline void port_outl(uint16_t port, uint32_t val) {
-    __asm__ volatile ("outl %0, %1" : : "a"(val), "Nd"(port));
-}
-
-static inline uint32_t port_inl(uint16_t port) {
-    uint32_t ret;
-    __asm__ volatile ("inl %1, %0" : "=a"(ret) : "Nd"(port));
-    return ret;
-}
-
 // Align helpers
 static uintptr_t align_down(uintptr_t addr, uintptr_t align) {
     return addr & ~(align - 1);
@@ -71,24 +60,6 @@ void pci_write_config_dword(uint8_t bus, uint8_t device, uint8_t function, uint8
 }
 
 // --- pci_read_data already replaced by port_inl above; can remove redundant functions ---
-
-// Helper to get BAR size
-static size_t pci_get_bar_size(const pci_device_t* dev, int bar_num) {
-    if (bar_num < 0 || bar_num >= PCI_NUM_BARS) return 0;
-
-    uint8_t offset = 0x10 + bar_num * 4;
-    uint32_t original = pci_read_config_dword(dev->bus, dev->device, dev->function, offset);
-    pci_write_config_dword(dev->bus, dev->device, dev->function, offset, 0xFFFFFFFF);
-    uint32_t size_mask = pci_read_config_dword(dev->bus, dev->device, dev->function, offset);
-    pci_write_config_dword(dev->bus, dev->device, dev->function, offset, original);
-
-    if (size_mask == 0 || size_mask == 0xFFFFFFFF) return 0;
-
-    size_mask &= ~0xF; // clear lower nibble (flags)
-    size_t size = (~size_mask) + 1;
-
-    return size;
-}
 
 uint32_t pci_read_data(void) {
     uint32_t ret;

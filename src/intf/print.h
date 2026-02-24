@@ -34,3 +34,4 @@ void print_str_at(const char* str, int col, int row);
 void print_char_at(char character, int col, int row);
 void print_int_at(int64_t value, int col, int row);
 void print_int(int64_t value);
+void print_hex64_at(uint64_t value, int col, int row);

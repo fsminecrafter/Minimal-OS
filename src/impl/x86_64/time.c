@@ -3,6 +3,7 @@
 #include "x86_64/pit.h"
 #include "print.h"
 #include "serial.h"
+#include "string.h"
 #include <stdint.h>
 #include <stdbool.h>
 

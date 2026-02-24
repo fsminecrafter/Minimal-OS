@@ -13,7 +13,7 @@ startupRoutine [X]
 Processes and ProcessManager [X]
 GRAPHICS!!! [X] 🥳🥳🥳
 
-V 0.4.03
+V 0.4.04
 
 Better allocator [X]
 Time Scheduler [X]

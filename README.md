@@ -20,7 +20,7 @@ Last synced 2026 - Feb 24 - 14:52
 * Processes and ProcessManager [X]
 * GRAPHICS!!! [X] 🥳🥳🥳
 
-#### V 0.4.03
+#### V 0.4.04
 
 * Better allocator [X]
 * Time Scheduler [X]

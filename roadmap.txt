@@ -18,11 +18,11 @@ V 0.4.04
 Better allocator [X]
 Time Scheduler [X]
 Improved scheduler and proc [X]
-Graphics handler (display.h) []
-Time handler (time.h) []
+Graphics handler (display.h) [X]
+Time handler (time.h) [X]
 
-Displaying and reading images []
-Fonts []
+Displaying and reading images [X] !limited support!
+Fonts [X] !also a little limited for now!
 
 System calls !! []
 File system !!! []

@@ -5,6 +5,7 @@
 #include "print.h"
 #include "panic.h"
 #include "bool.h"
+#include "graphics.h"
 
 // Process that prints a message every second
 void heartbeat_process() {
@@ -18,6 +19,8 @@ void heartbeat_process() {
         print_str("\n");
         print_set_color(PRINT_COLOR_WHITE, PRINT_COLOR_BLACK);
         
+        graphics_fill_circle(100 + (counter % 500), 100, 20, 255, 0, 0);
+
         // Sleep for 1 second (1000ms)
         sleep(1000);
     }

@@ -32,7 +32,7 @@ void graphics_complete_demo(gpu_device_t* gpu) {
     // Setup
     graphics_set_gpu(gpu);
     graphics_init();
-    graphics_safety_mode = false;  // Use clamping
+    graphics_safety_mode = true;  // Use panic
     
     uint32_t width = graphics_get_width();
     uint32_t height = graphics_get_height();
@@ -248,10 +248,17 @@ void graphics_complete_demo(gpu_device_t* gpu) {
     
     serial_write_str("Step 21: Info box done\n");
     
+    //Logo
+    serial_write_str("Step 22: Drawing image\n");
+    bmp_image_t logo_data;
+    graphics_load_bmp(&logo_data,logo_bmp, logo_bmp_len);
+    graphics_draw_image(&logo_data, 800, 175);
+    graphics_write_text("BMP IMAGE\n", 670, 35, 255, 255, 0);
+
     // ============================================
     // FINAL BORDER
     // ============================================
-    serial_write_str("Step 22: Drawing border\n");
+    serial_write_str("Step 23: Drawing border\n");
     
     // Screen border
     graphics_write_rectangle(0, 0, width - 1, height - 1, 128, 128, 255);

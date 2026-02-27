@@ -128,8 +128,6 @@ static process_t* find_next_ready_process() {
 
 // Main scheduling function
 void schedule() {
-    // Wake up any sleeping processes whose time has come
-    wake_sleeping_processes();
     
     // Clean up ZOMBIE or TERMINATED processes
     process_t* prev = NULL;
@@ -225,6 +223,8 @@ void scheduler_tick() {
     if (!scheduler_on) {
         return; // Prevent re-entrancy
     }
+
+    wake_sleeping_processes(); 
 
     if (!current_process) {
         schedule();

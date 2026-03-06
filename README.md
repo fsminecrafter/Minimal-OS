@@ -5,7 +5,7 @@ find roadmap in roadmap.txt or below (might be old or un-synced!)
 
 ## ROADMAP
 
-Last synced 2026 - Feb 25 - 11:28
+Last synced 2026 - Mar 6 - 18:24
 
 #### X = Done
 #### C = Come back later
@@ -31,5 +31,7 @@ Last synced 2026 - Feb 25 - 11:28
 * Displaying and reading images [X] !limited support!
 * Fonts [X] !also a little limited for now!
 
+* Keyboard []
+* Simple Audio ! []
 * System calls !! []
 * File system !!! []

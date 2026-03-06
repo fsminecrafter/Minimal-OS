@@ -24,5 +24,6 @@ Time handler (time.h) [X]
 Displaying and reading images [X] !limited support!
 Fonts [X] !also a little limited for now!
 
+Simple Audio ! []
 System calls !! []
 File system !!! []

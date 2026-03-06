@@ -1,199 +1,212 @@
-#include <stdint.h>
-#include "x86_64/proc.h"
+#include "prochandler.h"
 #include "x86_64/scheduler.h"
-#include "time.h"
 #include "serial.h"
-#include "panic.h"
 
-// Simple test process entry point
-void test_process_entry(void) {
-    serial_write_str("\n\n");
-    serial_write_str("========================================\n");
-    serial_write_str("   PROCESS ENTRY POINT TEST\n");
-    serial_write_str("========================================\n");
-    serial_write_str("SUCCESS! The process started!\n");
-    
-    if (current_process) {
-        serial_write_str("Process name: ");
-        serial_write_str(current_process->name);
-        serial_write_str("\n");
-    }
-    serial_write_str("========================================\n\n");
-    
-    int counter = 0;
+// Example process functions
+void example_worker(void) {
+    int count = 0;
     while (1) {
-        serial_write_str("[TEST] Counter = ");
-        serial_write_dec(counter++);
+        serial_write_str("[WORKER] Working... ");
+        serial_write_dec(count++);
         serial_write_str("\n");
-        sleep(500);
-    }
-}
-
-// Process that prints a message every second
-void heartbeat_process(void) {
-    int counter = 0;
-    
-    serial_write_str("\n[HEARTBEAT] Process started!\n");
-    
-    while (1) {
-        counter++;
-        serial_write_str("[HEARTBEAT] Alive, counter = ");
-        serial_write_dec(counter);
-        serial_write_str("\n");
-        
         sleep(1000);
     }
 }
 
-// Process that counts rapidly then sleeps
-void counter_process(void) {
-    int iteration = 0;
-    
-    serial_write_str("\n[COUNTER] Process started!\n");
-    
+void example_monitor(void) {
+    int checks = 0;
     while (1) {
-        iteration++;
-        
-        serial_write_str("[COUNTER] Iteration ");
-        serial_write_dec(iteration);
-        serial_write_str(" - Counting...\n");
-        
-        volatile int count = 0;
-        for (int i = 0; i < 1000000; i++) {
-            count++;
-        }
-        
-        serial_write_str("[COUNTER] Done, sleeping\n");
+        serial_write_str("[MONITOR] System check #");
+        serial_write_dec(checks++);
+        serial_write_str("\n");
         sleep(2000);
     }
 }
 
-// Process that displays system info
-void sysinfo_process(void) {
-    serial_write_str("\n[SYSINFO] Process started!\n");
-    
+void example_logger(void) {
     while (1) {
-        serial_write_str("\n=== System Information ===\n");
-        
-        char uptime_str[32];
-        time_format_uptime(uptime_str, sizeof(uptime_str));
-        serial_write_str("Uptime: ");
-        serial_write_str(uptime_str);
-        serial_write_str("\n");
-        
-        scheduler_print_stats();
-        serial_write_str("==========================\n\n");
-        
-        sleep(5000);
-    }
-}
-
-// Quick blinker process
-void blinker_process(void) {
-    int state = 0;
-    
-    serial_write_str("\n[BLINKER] Process started!\n");
-    
-    while (1) {
-        serial_write_str(state ? "*" : ".");
-        state = !state;
+        serial_write_str("[LOGGER] ");
+        serial_write_str(getCurrentProcessName());
+        serial_write_str(" is running\n");
         sleep(500);
     }
 }
 
-// Main test - simple single process
-void proc_test_sleep(void) {
-    serial_write_str("\n\n");
-    serial_write_str("############################################\n");
-    serial_write_str("#  STARTING PROCESS TEST\n");
-    serial_write_str("############################################\n\n");
+// Example: Basic usage
+void prochandler_example_basic(void) {
+    serial_write_str("\n=== Process Handler Example ===\n\n");
     
-    serial_write_str("Creating test process...\n");
+    // Create processes
+    process_t* worker = createProcess("worker", example_worker);
+    process_t* monitor = createProcess("monitor", example_monitor);
+    process_t* logger = createProcess("logger", example_logger);
     
-    process_t* proc_test = proc_create("test", test_process_entry);
-    if (!proc_test) {
-        PANIC("Cannot start test process");
-        return;
-    }
+    // List all processes
+    listAllProcesses();
     
-    serial_write_str("Test process created: ");
-    serial_write_str(proc_test->name);
+    // Get some info
+    serial_write_str("Total processes: ");
+    serial_write_dec(getProcessCount());
     serial_write_str("\n");
     
-    // Set as current and running
-    current_process = proc_test;
-    current_process->state = PROCESS_RUNNING;
-    
-    serial_write_str("Jumping to process...\n\n");
-    
-    // Jump to the process manually (correct assembly syntax)
-    __asm__ volatile(
-        "mov %0, %%rsp\n\t"       // Set stack pointer
-        "push %1\n\t"              // Push RFLAGS
-        "popfq\n\t"                // Restore RFLAGS  
-        "jmp *%2\n\t"              // Jump to entry point
-        : /* no outputs */
-        : "r"(proc_test->regs[6]),  // RSP
-          "r"(proc_test->regs[8]),  // RFLAGS
-          "r"(proc_test->regs[7])   // RIP
-        : "memory"
-    );
-    
-    // Should never reach here
-    PANIC("Returned from process!");
+    serial_write_str("Ready processes: ");
+    serial_write_dec(getProcessCountByState(PROCESS_READY));
+    serial_write_str("\n\n");
 }
 
-// Alternative: Multiple processes with scheduler
-void proc_test_all(void) {
+// Example: Process control
+void prochandler_example_control(void) {
+    serial_write_str("\n=== Process Control Example ===\n\n");
+    
+    // Create a process
+    process_t* worker = createProcess("worker", example_worker);
+    
+    serial_write_str("Worker PID: ");
+    serial_write_dec(worker->pid);
+    serial_write_str("\n\n");
+    
+    // Let it run for a bit...
+    serial_write_str("Letting worker run for 3 seconds...\n");
+    sleep(3000);
+    
+    // Pause it
+    serial_write_str("\nPausing worker...\n");
+    pauseProcess(worker->pid);
+    
+    sleep(2000);
+    
+    // Unpause it
+    serial_write_str("\nUnpausing worker...\n");
+    unpauseProcess(worker->pid);
+    
+    sleep(2000);
+    
+    // Kill it
+    serial_write_str("\nKilling worker...\n");
+    killProcess(worker->pid);
+    
+    listAllProcesses();
+}
+
+// Example: Finding processes
+void prochandler_example_find(void) {
+    serial_write_str("\n=== Process Lookup Example ===\n\n");
+    
+    // Create some processes
+    createProcess("worker1", example_worker);
+    createProcess("worker2", example_worker);
+    createProcess("monitor", example_monitor);
+    
+    // Find by name
+    process_t* proc = findProcessByName("monitor");
+    if (proc) {
+        serial_write_str("Found process by name:\n");
+        printProcessInfo(proc);
+    }
+    
+    // Find by PID
+    process_t* proc2 = findProcessByPID(2);
+    if (proc2) {
+        serial_write_str("\nFound process by PID 2:\n");
+        printProcessInfo(proc2);
+    }
+    
+    // Pause by name
+    serial_write_str("\nPausing 'worker1'...\n");
+    pauseProcessByName("worker1");
+    
+    listAllProcesses();
+}
+
+// Example: Advanced - Dynamic process management
+void prochandler_example_advanced(void) {
+    serial_write_str("\n=== Advanced Process Management ===\n\n");
+    
+    // Start with some base processes
+    createProcess("system_monitor", example_monitor);
+    createProcess("logger", example_logger);
+    
+    // Dynamically create and manage workers
+    for (int i = 0; i < 5; i++) {
+        char name[32];
+        // Simulate sprintf: "worker_N"
+        name[0] = 'w'; name[1] = 'o'; name[2] = 'r'; name[3] = 'k';
+        name[4] = 'e'; name[5] = 'r'; name[6] = '_';
+        name[7] = '0' + i;
+        name[8] = '\0';
+        
+        createProcess(name, example_worker);
+    }
+    
+    listAllProcesses();
+    
+    serial_write_str("\nRunning with all workers...\n");
+    sleep(2000);
+    
+    // Pause odd-numbered workers
+    serial_write_str("\nPausing odd-numbered workers...\n");
+    for (int i = 1; i < 5; i += 2) {
+        pauseProcess(i + 3);  // Workers start at PID 3
+    }
+    
+    listAllProcesses();
+    sleep(2000);
+    
+    // Unpause and kill
+    serial_write_str("\nUnpausing and killing all workers...\n");
+    for (int i = 0; i < 5; i++) {
+        uint64_t pid = i + 3;
+        unpauseProcess(pid);
+        killProcess(pid);
+    }
+    
+    listAllProcesses();
+}
+
+// Example: Real-world usage - Process monitoring
+void process_monitor_task(void) {
+    while (1) {
+        serial_write_str("\n");
+        serial_write_str("=== PROCESS MONITOR ===\n");
+        serial_write_str("Current: ");
+        serial_write_str(getCurrentProcessName());
+        serial_write_str(" (PID ");
+        serial_write_dec(getCurrentPID());
+        serial_write_str(")\n");
+        
+        serial_write_str("Total: ");
+        serial_write_dec(getProcessCount());
+        serial_write_str(" processes\n");
+        
+        serial_write_str("  Ready: ");
+        serial_write_dec(getProcessCountByState(PROCESS_READY));
+        serial_write_str("\n  Running: ");
+        serial_write_dec(getProcessCountByState(PROCESS_RUNNING));
+        serial_write_str("\n  Waiting: ");
+        serial_write_dec(getProcessCountByState(PROCESS_WAITING));
+        serial_write_str("\n  Paused: ");
+        serial_write_dec(getProcessCountByState(PROCESS_PAUSED));
+        serial_write_str("\n=======================\n");
+        
+        sleep(5000);  // Monitor every 5 seconds
+    }
+}
+
+// Main demo that creates a monitoring system
+void prochandler_demo_full(void) {
     serial_write_str("\n\n");
     serial_write_str("############################################\n");
-    serial_write_str("#  STARTING MULTI-PROCESS TEST\n");
+    serial_write_str("#  PROCESS HANDLER FULL DEMO\n");
     serial_write_str("############################################\n\n");
     
-    // Create all processes
-    process_t* proc_heartbeat = proc_create("heartbeat", heartbeat_process);
-    if (!proc_heartbeat) {
-        PANIC("Cannot start heartbeat");
-        return;
-    }
+    // Create system processes
+    createProcess("monitor", process_monitor_task);
+    createProcess("worker", example_worker);
+    createProcess("logger", example_logger);
     
-    process_t* proc_counter = proc_create("counter", counter_process);
-    if (!proc_counter) {
-        PANIC("Cannot start counter");
-        return;
-    }
+    serial_write_str("System processes created.\n\n");
+    listAllProcesses();
     
-    process_t* proc_sysinfo = proc_create("sysinfo", sysinfo_process);
-    if (!proc_sysinfo) {
-        PANIC("Cannot start sysinfo");
-        return;
-    }
-    
-    process_t* proc_blinker = proc_create("blinker", blinker_process);
-    if (!proc_blinker) {
-        PANIC("Cannot start blinker");
-        return;
-    }
-    
-    serial_write_str("All processes created:\n");
-    serial_write_str("  - heartbeat\n");
-    serial_write_str("  - counter\n");
-    serial_write_str("  - sysinfo\n");
-    serial_write_str("  - blinker\n\n");
-    
-    // Set first as running
-    current_process = proc_heartbeat;
-    current_process->state = PROCESS_RUNNING;
-    
-    // Others ready
-    proc_counter->state = PROCESS_READY;
-    proc_sysinfo->state = PROCESS_READY;
-    proc_blinker->state = PROCESS_READY;
-    
-    serial_write_str("Starting scheduler...\n\n");
+    serial_write_str("\nStarting scheduler...\n\n");
     schedulerInit();
-    
-    // Jump to first process
-    serial_write_str("Jumping to heartbeat process...\n\n");
-
 }

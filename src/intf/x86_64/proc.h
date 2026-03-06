@@ -12,6 +12,7 @@ typedef enum {
     PROCESS_READY = 0,      // Ready to run
     PROCESS_RUNNING,        // Currently executing
     PROCESS_WAITING,        // Waiting (sleeping or blocked)
+    PROCESS_PAUSED,         // Paused (won't be scheduled)
     PROCESS_ZOMBIE,         // Finished but not cleaned up
     PROCESS_TERMINATED      // Fully terminated
 } process_state_t;
@@ -23,10 +24,10 @@ typedef struct process {
     process_state_t state;             // Current state
     
     // Register state (for context switching)
-    uint64_t regs[9];                  // RAX, RBX, RCX, RDX, RSI, RDI, RSP, RIP, RFLAGS
+    uint64_t regs[9];                  // RBX, RBP, R12-R15, RSP, RIP, RFLAGS
     
     // Memory management
-    uint64_t pml4;                    // Page table
+    uint64_t pml4;                     // Page table (physical address)
     uint64_t* kernel_stack;            // Kernel stack pointer
     
     // Timing
@@ -37,6 +38,9 @@ typedef struct process {
     // Linked list
     struct process* next;              // Next process in list
 } process_t;
+
+// Global process list head (defined in proc.c)
+extern process_t* proc_list_head;
 
 // Process management functions
 process_t* proc_create(const char* file_name, void (*entry_point)());

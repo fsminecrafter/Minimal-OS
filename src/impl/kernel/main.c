@@ -38,7 +38,7 @@ void kernel_main(uint64_t mb2_info_addr) {
     //memory_scan_full();
 
     test_gpu();
-    proc_test_all();
+    prochandler_example_advanced();
     schedulerInit();
     verify_process_offsets();
 

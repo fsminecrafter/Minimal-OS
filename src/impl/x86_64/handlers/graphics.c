@@ -180,20 +180,42 @@ void graphics_free_image(bmp_image_t* image) {
 }
 
 void graphics_terminal_putchar(char c, uint32_t col, uint32_t row, color_t fg, color_t bg) {
-    if (c < 32 || c > 126) c = '?';  // Replace unprintable chars
-    
-    uint32_t char_index = c - 32;
+    if (c < 32 || c > 126)
+        c = '?';
+
+    uint32_t char_index = (uint8_t)c;
+
     uint32_t px = col * g_terminal.char_width;
     uint32_t py = row * g_terminal.char_height;
-    
-    // Draw character from builtin font
+
     for (uint32_t y = 0; y < 8 && y < g_terminal.char_height; y++) {
         uint8_t row_data = font8x8_basic[char_index][y];
+
         for (uint32_t x = 0; x < 8 && x < g_terminal.char_width; x++) {
-            bool pixel_set = (row_data & (1 << (7 - x))) != 0;
+            bool pixel_set = (row_data & (1 << x)) != 0;
+
             color_t color = pixel_set ? fg : bg;
+
             graphics_write_pixel_c(px + x, py + y, color);
         }
+    }
+}
+
+void terminalUpdateCursor() {
+    serial_write_dec(g_terminal.cursor_visible);
+
+    uint32_t px = g_terminal.cursor_x * g_terminal.char_width;
+    uint32_t py = g_terminal.cursor_y * g_terminal.char_height;
+
+    uint32_t cursor_y = py + g_terminal.char_height - 2;
+
+    for (uint32_t x = 0; x < g_terminal.char_width; x++) {
+        color_t color = g_terminal.cursor_visible ? 
+                        g_terminal.fg_color : 
+                        g_terminal.bg_color;
+
+        graphics_write_pixel_c(px + x, cursor_y, color);
+        graphics_write_pixel_c(px + x, cursor_y + 1, color);
     }
 }
 
@@ -206,27 +228,42 @@ void graphics_set_resolution(uint32_t cols, uint32_t rows) {
         PANIC("graphics: GPU not initialized");
         return;
     }
-    
+
+    // Fixed font size
+    g_terminal.char_width = 8;
+    g_terminal.char_height = 8;
+
+    // Maximum characters that fit
+    uint32_t max_cols = g_gpu->width / g_terminal.char_width;
+    uint32_t max_rows = g_gpu->height / g_terminal.char_height;
+
+    // Clamp requested size
+    if (cols > max_cols)
+        cols = max_cols;
+
+    if (rows > max_rows)
+        rows = max_rows;
+
     g_terminal.cols = cols;
     g_terminal.rows = rows;
+
     g_terminal.cursor_x = 0;
     g_terminal.cursor_y = 0;
-    g_terminal.char_width = g_gpu->width / cols;
-    g_terminal.char_height = g_gpu->height / rows;
+
     g_terminal.fg_color = COLOR_WHITE;
     g_terminal.bg_color = COLOR_BLACK;
     g_terminal.cursor_visible = true;
-    
+
     serial_write_str("Terminal resolution set to ");
     serial_write_dec(cols);
     serial_write_str("x");
     serial_write_dec(rows);
-    serial_write_str(" (");
-    serial_write_dec(g_terminal.char_width);
+    serial_write_str(" (8x8 pixels per char, max ");
+    serial_write_dec(max_cols);
     serial_write_str("x");
-    serial_write_dec(g_terminal.char_height);
-    serial_write_str(" pixels per char)\n");
-    
+    serial_write_dec(max_rows);
+    serial_write_str(")\n");
+
     graphics_terminal_clear();
 }
 

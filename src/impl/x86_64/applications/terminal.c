@@ -1,1 +1,54 @@
 #include "graphics.h"
+#include "prochandler.h"
+#include "x86_64/gpu.h"
+#include "panic.h"
+#include "applications/terminal.h"
+#include "x86_64/scheduler.h"
+#include "serial.h"
+#include "string.h"
+
+gpu_device_t g_gpu;
+
+void cursorupdater(void) {
+    terminal_t* terminal = graphics_get_terminal();
+
+    serial_write_str("Cursor updater process started\n");
+
+    while (1) {
+        serial_write_str("Updating cursor...\n");
+
+        terminalUpdateCursor();
+
+        terminal->cursor_visible = !terminal->cursor_visible;
+
+        sleep(500);
+    }
+}
+
+void terminal_program_entry() {
+    g_gpu = *getSystemGPU();
+    if (!g_gpu.fb) {
+        panic("Failed to initialize GPU", __FILE__, __LINE__, NULL);
+    }
+
+    uint32_t width = graphics_get_width();
+    uint32_t height = graphics_get_height();
+
+    int16_t cols = width / 8;
+    int16_t rows = height / 8;
+
+    terminal_t* terminal = graphics_get_terminal();
+
+    process_t* cursor_process = createProcess("cursorupdater", cursorupdater);
+    listAllProcesses();
+
+    graphics_clear(0, 0, 0); // Clear to black
+    graphics_set_resolution(cols, rows); // Set terminal mode
+    graphics_terminal_set_color(COLOR_WHITE, COLOR_BLACK); // White text
+    graphics_write_textr("Welcome to the Minimal OS Terminal!\n"); 
+    for (int i = 0; i < rows; i++) {
+        graphics_write_textr("Testing...\n");
+    }
+    terminal->cursor_x = 0;
+    terminal->cursor_y = 0;
+}

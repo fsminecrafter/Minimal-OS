@@ -184,7 +184,7 @@ void graphics_terminal_set_cursor(uint32_t x, uint32_t y);
 void graphics_terminal_get_cursor(uint32_t* x, uint32_t* y);
 void graphics_terminal_set_color(color_t fg, color_t bg);
 void graphics_terminal_scroll(void);
-
+void terminalUpdateCursor();
 // Built-in bitmap font (8x16 default)
 void graphics_terminal_putchar(char c, uint32_t col, uint32_t row, color_t fg, color_t bg);
 

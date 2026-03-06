@@ -1,9 +1,29 @@
 #include "x86_64/scheduler.h"
 #include "x86_64/proc.h"
+#include "x86_64/gpu.h"
 #include "serial.h"
 #include "panic.h"
-#include "prochandler.h"
-#include <stdbool.h>
+
+// ===========================================
+// GPU DEVICE ACCESS
+// ===========================================
+
+static gpu_device_t* g_system_gpu = NULL;
+
+void setSystemGPU(gpu_device_t* gpu) {
+    g_system_gpu = gpu;
+    if (gpu) {
+        serial_write_str("[PROC] System GPU set: ");
+        serial_write_dec(gpu->width);
+        serial_write_str("x");
+        serial_write_dec(gpu->height);
+        serial_write_str("\n");
+    }
+}
+
+gpu_device_t* getSystemGPU(void) {
+    return g_system_gpu;
+}
 
 // ===========================================
 // PROCESS CREATION
@@ -316,6 +336,20 @@ int getProcessCountByState(process_state_t state) {
         }
     }
     return count;
+}
+
+void getprocslist(process_t** buffer, size_t max_procs) {
+    size_t count = 0;
+    for (process_t* proc = proc_list_head; proc != NULL && count < max_procs; proc = proc->next) {
+        buffer[count++] = proc;
+    }
+}
+
+void getprocslistNames(const char** buffer, size_t max_procs) {
+    size_t count = 0;
+    for (process_t* proc = proc_list_head; proc != NULL && count < max_procs; proc = proc->next) {
+        buffer[count++] = proc->name;
+    }
 }
 
 // ===========================================

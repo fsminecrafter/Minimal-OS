@@ -14,6 +14,11 @@
 #include "x86_64/gpu.h"
 #include "time.h"
 #include "x86_64/memoryscanner.h"
+#include "string.h"
+
+void busy(void) {
+    for (volatile int i = 0; i < 100000000; i++);
+}
 
 void kernel_main(uint64_t mb2_info_addr) {
     multiboot2_info_t* mb_info = (multiboot2_info_t*)mb2_info_addr;
@@ -38,9 +43,12 @@ void kernel_main(uint64_t mb2_info_addr) {
     //memory_scan_full();
 
     test_gpu();
-    prochandler_example_advanced();
+    char *proc_list[32];
+    getprocslistNames(proc_list, 32);
+    serial_write_str(proc_list[0]);
+    terminal_program_entry();
+    createProcess("busy", busy);
     schedulerInit();
-    verify_process_offsets();
 
     while(1);
 }

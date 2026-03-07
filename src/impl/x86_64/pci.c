@@ -7,12 +7,16 @@
 #include "x86_64/port.h"
 #include "x86_64/allocator.h"
 #include "graphics.h"
+#include "print.h"
+#include "string.h"
 
 #define MMIO_PAGE_SIZE  0x200000ULL  // 2 MiB
 #define MMIO_VA_ALIGN   MMIO_PAGE_SIZE
 #define PCI_CONFIG_ADDRESS 0xCF8
 #define PCI_CONFIG_DATA    0xCFC
 #define PAGE_SIZE 0x1000
+
+bool printtodisplay = true;
 
 // --- Function prototypes for pci config access ---
 uint32_t pci_read_config_dword(uint8_t bus, uint8_t device, uint8_t function, uint8_t offset);
@@ -111,10 +115,19 @@ uint16_t pci_config_read_word(uint8_t bus, uint8_t device, uint8_t function, uin
 
 void pci_enumerate_all() {
     serial_write_str("Enumerating PCI devices starting from bus 0...\n");
+    if (printtodisplay) {
+        print_clear();
+        print_str("Enumerating PCI devices starting from bus 0...\n");
+    }
     pci_enumerate_bus(0);
 }
 
 void pci_enumerate_bus(uint8_t bus) {
+    if (printtodisplay == true) {
+        print_str("Enumerating bus:");
+        print_uint64_dec(bus);
+        print_str("\n");
+    }
     serial_write_str("Enumerating bus: ");
     serial_write_dec(bus);
     serial_write_str("\n");
@@ -130,6 +143,9 @@ void pci_enumerate_bus(uint8_t bus) {
 
             if (pci_device_count >= MAX_PCI_DEVICES) {
                 serial_write_str("PCI device array full\n");
+                if (printtodisplay) {
+                    print_str("PCI device array full!\n");
+                }
                 return;
             }
 
@@ -216,13 +232,29 @@ void initializeGraphicsDevice() {
 
     if (!gpu_pci) {
         serial_write_str("No GPU device found.\n");
-        return;
+        
     }
-
     gpu_initialize_g(&gpu, gpu_pci, 1080, 720);
 }
 
 void print_pci_devices() {
+    if (printtodisplay) {
+        for (int i = 0; i < pci_device_count; i++) {
+            pci_device_t* dev = &pci_devices[i];
+            print_str("PCI Device found: ");
+            print_uint64_hex(dev->bus);
+            print_str(':');
+            print_uint64_hex(dev->device);
+            print_str(':');
+            print_uint64_hex(dev->function);
+            print_str(" Vendor: ");
+            print_uint64_hex(dev->vendor_id);
+            print_str(" Device: ");
+            print_uint64_hex(dev->device_id);
+            print_str("\n");
+        }
+        print_uint64_dec(pci_device_count);   
+    }
     for (int i = 0; i < pci_device_count; i++) {
         pci_device_t* dev = &pci_devices[i];
         serial_write_str("PCI Device found: ");

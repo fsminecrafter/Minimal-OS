@@ -27,17 +27,31 @@ static char* get_str_buffer(void) {
     char* buf = time_str_bufs[time_str_idx++ % 4];
     return buf;
 }
-/*
-static void // write_rtc_if_needed(void) {
-    // (Not called during normal tick updates)
-    rtc_write_year(current_datetime.year);
-    rtc_write_month(current_datetime.month);
-    rtc_write_day(current_datetime.day);
-    rtc_write_hours(current_datetime.hour);
-    rtc_write_minutes(current_datetime.minute);
-    rtc_write_seconds(current_datetime.second);
+
+static void write_rtc_if_needed(void) {
+
+    datetime_t rtc_now;
+
+    rtc_get_datetime(&rtc_now);
+
+    if (rtc_now.second != current_datetime.second)
+        rtc_write_seconds(current_datetime.second);
+
+    if (rtc_now.minute != current_datetime.minute)
+        rtc_write_minutes(current_datetime.minute);
+
+    if (rtc_now.hour != current_datetime.hour)
+        rtc_write_hours(current_datetime.hour);
+
+    if (rtc_now.day != current_datetime.day)
+        rtc_write_day(current_datetime.day);
+
+    if (rtc_now.month != current_datetime.month)
+        rtc_write_month(current_datetime.month);
+
+    if (rtc_now.year != current_datetime.year)
+        rtc_write_year(current_datetime.year);
 }
-*/
 // ===========================================
 // INITIALIZATION & UPDATES
 // ===========================================
@@ -424,47 +438,47 @@ const char* time_get_weekday_name_short(uint8_t day) {
 void time_set_datetime(const datetime_t* dt) {
     if (time_validate_datetime(dt)) {
         current_datetime = *dt;
-        // write_rtc_if_needed();
+        write_rtc_if_needed();
     }
 }
 
 void time_set_year(uint16_t year) {
     current_datetime.year = year;
-    // write_rtc_if_needed();
+    write_rtc_if_needed();
 }
 
 void time_set_month(uint8_t month) {
     if (month >= 1 && month <= 12) {
         current_datetime.month = month;
-        // write_rtc_if_needed();
+        write_rtc_if_needed();
     }
 }
 
 void time_set_day(uint8_t day) {
     if (day >= 1 && day <= 31) {
         current_datetime.day = day;
-        // write_rtc_if_needed();
+        write_rtc_if_needed();
     }
 }
 
 void time_set_hour(uint8_t hour) {
     if (hour < 24) {
         current_datetime.hour = hour;
-        // write_rtc_if_needed();
+        write_rtc_if_needed();
     }
 }
 
 void time_set_minute(uint8_t minute) {
     if (minute < 60) {
         current_datetime.minute = minute;
-        // write_rtc_if_needed();
+        write_rtc_if_needed();
     }
 }
 
 void time_set_second(uint8_t second) {
     if (second < 60) {
         current_datetime.second = second;
-        // write_rtc_if_needed();
+        write_rtc_if_needed();
     }
 }
 
@@ -472,14 +486,14 @@ void time_set_date(uint16_t year, uint8_t month, uint8_t day) {
     current_datetime.year = year;
     current_datetime.month = month;
     current_datetime.day = day;
-    // write_rtc_if_needed();
+    write_rtc_if_needed();
 }
 
 void time_set_time(uint8_t hour, uint8_t minute, uint8_t second) {
     current_datetime.hour = hour;
     current_datetime.minute = minute;
     current_datetime.second = second;
-    // write_rtc_if_needed();
+    write_rtc_if_needed();
 }
 
 // Parse "YYYY-MM-DD HH:MM:SS"
@@ -513,7 +527,7 @@ bool time_set_from_str(const char* datetime_str) {
                               (datetime_str[18] - '0');
     
     if (time_validate_datetime(&current_datetime)) {
-        // write_rtc_if_needed();
+        write_rtc_if_needed();
         return true;
     }
     

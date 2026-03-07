@@ -46,6 +46,17 @@ void kernel_main(uint64_t mb2_info_addr) {
     char *proc_list[32];
     getprocslistNames(proc_list, 32);
     serial_write_str(proc_list[0]);
+
+    datetime_t dt;
+
+    dt.year = 2025;
+    dt.month = 5;
+    dt.day = 7;
+    dt.hour = 15;
+    dt.minute = 45;
+    dt.second = 30;
+
+    time_set_datetime(&dt);
     terminal_program_entry();
     createProcess("busy", busy);
     schedulerInit();

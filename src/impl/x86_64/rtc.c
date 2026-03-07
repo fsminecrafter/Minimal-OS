@@ -1,54 +1,7 @@
 #include "x86_64/rtc.h"
 #include "x86_64/port.h"
+#include "time.h"
 #include <stdint.h>
-
-#define CMOS_ADDRESS 0x70
-#define CMOS_DATA    0x71
-
-// CMOS registers
-#define RTC_SECONDS       0x00
-#define RTC_MINUTES       0x02
-#define RTC_HOURS         0x04
-#define RTC_DAY           0x07
-#define RTC_MONTH         0x08
-#define RTC_YEAR          0x09
-#define RTC_CENTURY       0x32
-#define RTC_STATUS_A      0x0A
-#define RTC_STATUS_B      0x0B
-
-// Read from CMOS register
-static uint8_t cmos_read(uint8_t reg) {
-    port_outb(CMOS_ADDRESS, reg);
-    return port_inb(CMOS_DATA);
-}
-
-// Check if RTC is updating
-static int rtc_is_updating() {
-    port_outb(CMOS_ADDRESS, RTC_STATUS_A);
-    return (port_inb(CMOS_DATA) & 0x80);
-}
-
-// Convert BCD to binary if needed
-static uint8_t bcd_to_binary(uint8_t bcd) {
-    return ((bcd & 0xF0) >> 4) * 10 + (bcd & 0x0F);
-}
-
-// Read RTC value with BCD conversion check
-static uint8_t rtc_read_reg(uint8_t reg) {
-    // Wait for update to complete
-    while (rtc_is_updating());
-    
-    uint8_t value = cmos_read(reg);
-    
-    // Check if RTC is in BCD mode
-    uint8_t status_b = cmos_read(RTC_STATUS_B);
-    if (!(status_b & 0x04)) {
-        // BCD mode - convert to binary
-        value = bcd_to_binary(value);
-    }
-    
-    return value;
-}
 
 uint8_t rtc_seconds() {
     return rtc_read_reg(RTC_SECONDS);
@@ -56,6 +9,15 @@ uint8_t rtc_seconds() {
 
 uint8_t rtc_minutes() {
     return rtc_read_reg(RTC_MINUTES);
+}
+
+void rtc_get_datetime(datetime_t* dt) {
+    dt->second = rtc_seconds();
+    dt->minute = rtc_minutes();
+    dt->hour   = rtc_hours();
+    dt->day    = rtc_day();
+    dt->month  = rtc_month();
+    dt->year   = rtc_year();
 }
 
 uint8_t rtc_hours() {
@@ -118,4 +80,33 @@ void rtc_init() {
     // Write back
     port_outb(CMOS_ADDRESS, 0x8B);
     port_outb(CMOS_DATA, status_b);
+}
+
+void rtc_write_seconds(uint8_t s) {
+    rtc_write_reg(RTC_SECONDS, s);
+}
+
+void rtc_write_minutes(uint8_t m) {
+    rtc_write_reg(RTC_MINUTES, m);
+}
+
+void rtc_write_hours(uint8_t h) {
+    rtc_write_reg(RTC_HOURS, h);
+}
+
+void rtc_write_day(uint8_t d) {
+    rtc_write_reg(RTC_DAY, d);
+}
+
+void rtc_write_month(uint8_t m) {
+    rtc_write_reg(RTC_MONTH, m);
+}
+
+void rtc_write_year(uint16_t year) {
+
+    uint8_t yr = year % 100;
+    uint8_t century = year / 100;
+
+    rtc_write_reg(RTC_YEAR, yr);
+    rtc_write_reg(RTC_CENTURY, century);
 }

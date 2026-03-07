@@ -48,19 +48,11 @@ void terminal_program_entry() {
     graphics_terminal_set_color(COLOR_WHITE, COLOR_BLACK); // White text
     graphics_write_textr("Welcome to the Minimal OS Terminal!\n"); 
 
-    uint64_t uptime_ms = time_get_uptime_ms();
-    string_t uptime_ms_str = str_from_uint(uptime_ms);
-
     graphics_write_textr("System Date: ");
 
     const char* data = datetime_str_readable();
     graphics_write_textr(data);
     graphics_write_textr("\n");
-    graphics_write_textr("System Uptime: ");
-    time_format_uptime(uptime_ms_str.data, uptime_ms_str.capacity);
-    graphics_write_textr(uptime_ms_str.data);
-    graphics_write_textr("\n");
 
-    terminal->cursor_x = 0;
-    terminal->cursor_y = 0;
+    graphics_write_textr("Computer@local: ");
 }

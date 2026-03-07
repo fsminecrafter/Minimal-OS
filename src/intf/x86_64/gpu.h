@@ -16,3 +16,4 @@ bool gpu_init(gpu_device_t* gpu, pci_device_t* pci_dev, uint32_t width, uint32_t
 void gpu_put_pixel(gpu_device_t* gpu, uint32_t x, uint32_t y, uint32_t color);
 void gpu_clear(gpu_device_t* gpu, uint32_t color);
 void gpu_test(gpu_device_t* gpu, pci_device_t* pci_dev, uint32_t width, uint32_t height);
+void gpu_initialize_g(gpu_device_t* gpu, pci_device_t* pci_dev, uint32_t width, uint32_t height);

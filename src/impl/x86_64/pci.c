@@ -6,6 +6,7 @@
 #include "x86_64/mmio.h"
 #include "x86_64/port.h"
 #include "x86_64/allocator.h"
+#include "graphics.h"
 
 #define MMIO_PAGE_SIZE  0x200000ULL  // 2 MiB
 #define MMIO_VA_ALIGN   MMIO_PAGE_SIZE
@@ -202,6 +203,23 @@ void test_gpu() {
     // (Assuming you have some timer/delay function)
     // delay(2000);
     // gpu_clear(&gpu, 0x0000FF00);
+}
+
+void initializeGraphicsDevice() {
+    pci_device_t* gpu_pci = NULL;
+    for (int i = 0; i < pci_device_count; i++) {
+        if (pci_devices[i].class_code == 0x03) {
+            gpu_pci = &pci_devices[i];
+            break;
+        }
+    }
+
+    if (!gpu_pci) {
+        serial_write_str("No GPU device found.\n");
+        return;
+    }
+
+    gpu_initialize_g(&gpu, gpu_pci, 1080, 720);
 }
 
 void print_pci_devices() {

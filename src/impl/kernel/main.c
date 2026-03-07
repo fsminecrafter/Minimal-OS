@@ -42,7 +42,7 @@ void kernel_main(uint64_t mb2_info_addr) {
     //memory_scanner_init();
     //memory_scan_full();
 
-    test_gpu();
+    initializeGraphicsDevice();
     char *proc_list[32];
     getprocslistNames(proc_list, 32);
     serial_write_str(proc_list[0]);

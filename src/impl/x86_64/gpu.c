@@ -308,3 +308,15 @@ void gpu_test(gpu_device_t* gpu, pci_device_t* pci_dev, uint32_t width, uint32_t
     graphics_complete_demo(gpu);
     serial_write_str("gpu_test: done\n");
 }
+
+void gpu_initialize_g(gpu_device_t* gpu, pci_device_t* pci_dev, uint32_t width, uint32_t height) {
+    serial_write_str("gpu_init: starting GPU...\n");
+    gpu_init(gpu, pci_dev, width, height);
+    serial_write_str("gpu_init: GPU initialized, writing test pixels...\n");
+    graphics_safety_mode = true; // Enable safety mode for testing
+    gpu_test_write(gpu);
+    gpu_clear(gpu, 0x00000000);
+    graphics_set_gpu(gpu);
+    graphics_init();
+    serial_write_str("gpu_init: done\n");
+}

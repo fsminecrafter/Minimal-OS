@@ -1,5 +1,5 @@
 #include <stddef.h>
-#include "bool.h"
+#include <stdbool.h>
 #include "keyboard.h"
 #include "x86_64/idt.h"
 #include "x86_64/ps2.h"

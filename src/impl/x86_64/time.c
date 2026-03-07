@@ -1,11 +1,12 @@
+#include <stdint.h>
+#include <stdbool.h>
+
 #include "time.h"
 #include "x86_64/rtc.h"
 #include "x86_64/pit.h"
 #include "print.h"
 #include "serial.h"
 #include "string.h"
-#include <stdint.h>
-#include <stdbool.h>
 
 // System uptime tracking
 static uint64_t system_uptime_ms = 0;

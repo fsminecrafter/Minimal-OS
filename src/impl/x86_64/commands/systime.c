@@ -1,8 +1,8 @@
+#include <stdbool.h>
 #include "print.h"
 #include "x86_64/commandhandler.h"
 #include "x86_64/commandreg.h"
 #include "time.h"
-#include "bool.h"
 
 void cmd_systime(int argc, const char** argv) {
     time_print_datetime(true);

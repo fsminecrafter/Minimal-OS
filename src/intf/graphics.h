@@ -4,6 +4,8 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#include "x86_64/gpu.h"
+
 // Color structure for convenience
 typedef struct {
     uint8_t r;
@@ -125,6 +127,9 @@ typedef struct {
     bool loaded;
     void* font_data;  // Internal font data
 } font_t;
+
+//Sets the current active gpu
+void graphics_set_gpu(gpu_device_t* gpu);
 
 // Set current font (loads TTF if not already loaded)
 bool graphics_set_font(const char* font_path, uint32_t size, font_style_t style);

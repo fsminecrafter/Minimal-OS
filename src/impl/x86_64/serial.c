@@ -1,6 +1,6 @@
 #include "serial.h"
 #include <stdint.h>
-#include "bool.h"
+#include <stdbool.h>
 
 bool enabled = true;
 bool initialized = false;

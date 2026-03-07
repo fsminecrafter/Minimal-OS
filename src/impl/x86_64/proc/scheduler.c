@@ -1,5 +1,6 @@
 #include <stdint.h>
 #include <stddef.h>
+#include <stdbool.h>
 #include "x86_64/proc.h"
 #include "time.h"
 #include "panic.h"
@@ -7,7 +8,6 @@
 #include "string.h"
 #include "x86_64/allocator.h"
 #include "serial.h"
-#include "bool.h"
 
 bool scheduler_on = false;
 
@@ -34,30 +34,6 @@ void schedulerInit() {
     scheduler_on = true;
 }
 
-void sleep(uint64_t milliseconds) {
-    if (!current_process) return;
-    
-    uint64_t wake_time = time_get_uptime_ms() + milliseconds;
-    current_process->wake_time_ms = wake_time;
-    current_process->state = PROCESS_WAITING;
-    
-    serial_write_str("Process ");
-    serial_write_str(current_process->name);
-    serial_write_str(" sleeping for ");
-    serial_write_dec(milliseconds);
-    serial_write_str("ms\n");
-    
-    // Mark as waiting and switch to another process
-    schedule();
-    
-    // When we return here, this process has been woken up and rescheduled
-    // The state was changed to READY/RUNNING by wake_sleeping_processes()
-    // Just return - we're done sleeping!
-    
-    serial_write_str("Process ");
-    serial_write_str(current_process->name);
-    serial_write_str(" woke up\n");
-}
 // Wake up sleeping processes whose time has come
 static void wake_sleeping_processes() {
     uint64_t current_time = time_get_uptime_ms();
@@ -213,6 +189,31 @@ void schedule() {
     serial_write_str("\n");
     
     context_switch(old, next);
+}
+
+void sleep(uint64_t milliseconds) {
+    if (!current_process) return;
+    
+    uint64_t wake_time = time_get_uptime_ms() + milliseconds;
+    current_process->wake_time_ms = wake_time;
+    current_process->state = PROCESS_WAITING;
+    
+    serial_write_str("Process ");
+    serial_write_str(current_process->name);
+    serial_write_str(" sleeping for ");
+    serial_write_dec(milliseconds);
+    serial_write_str("ms\n");
+    
+    // Mark as waiting and switch to another process
+    schedule();
+    
+    // When we return here, this process has been woken up and rescheduled
+    // The state was changed to READY/RUNNING by wake_sleeping_processes()
+    // Just return - we're done sleeping!
+    
+    serial_write_str("Process ");
+    serial_write_str(current_process->name);
+    serial_write_str(" woke up\n");
 }
 
 static int tick_counter = 0;

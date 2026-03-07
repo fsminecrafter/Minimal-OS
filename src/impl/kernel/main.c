@@ -15,9 +15,15 @@
 #include "time.h"
 #include "x86_64/memoryscanner.h"
 #include "string.h"
+#include "prochandler.h"
+
+
+//Applications
+
+#include "applications/terminal.h"
 
 void busy(void) {
-    for (volatile int i = 0; i < 100000000; i++);
+    for (volatile int i = 0; i < 100; i++);
 }
 
 void kernel_main(uint64_t mb2_info_addr) {

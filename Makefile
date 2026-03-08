@@ -37,16 +37,20 @@ clean:
 
 .PHONY: run
 run: build-x86_64
+	qemu-system-x86_64 -cdrom dist/x86_64/kernel.iso -m 1024M -boot d -serial stdio -audiodev pa,id=speaker -machine pcspk-audiodev=speaker -usb -device usb-kbd
+
+.PHONY: run-ps2
+run: build-x86_64
 	qemu-system-x86_64 -cdrom dist/x86_64/kernel.iso -m 1024M -boot d -serial stdio -audiodev pa,id=speaker -machine pcspk-audiodev=speaker
 
 .PHONY: run-int
 run-int: build-x86_64
-	qemu-system-x86_64 -cdrom dist/x86_64/kernel.iso -m 1024M -boot d -serial stdio -d int -audiodev pa,id=speaker -machine pcspk-audiodev=speaker
+	qemu-system-x86_64 -cdrom dist/x86_64/kernel.iso -m 1024M -boot d -serial stdio -d int -audiodev pa,id=speaker -machine pcspk-audiodev=speaker -usb -device usb-kbd
 
 .PHONY: run-de
 run-de: build-x86_64
-	qemu-system-x86_64 -cdrom dist/x86_64/kernel.iso -m 1024M -boot d -d guest_errors,int,cpu_reset,unimp -D qemu.log --no-reboot -serial stdio -audiodev pa,id=speaker -machine pcspk-audiodev=speaker
+	qemu-system-x86_64 -cdrom dist/x86_64/kernel.iso -m 1024M -boot d -d guest_errors,int,cpu_reset,unimp -D qemu.log --no-reboot -serial stdio -audiodev pa,id=speaker -machine pcspk-audiodev=speaker -usb -device usb-kbd
 
 .PHONY: run-dex
 run-dex: build-x86_64
-	qemu-system-x86_64 -cdrom dist/x86_64/kernel.iso -m 1024M -boot d -d guest_errors,int,cpu_reset,unimp -D qemu.log --no-reboot -serial stdio -S -s
+	qemu-system-x86_64 -cdrom dist/x86_64/kernel.iso -m 1024M -boot d -d guest_errors,int,cpu_reset,unimp -D qemu.log --no-reboot -serial stdio -S -s -usb -device usb-kbd

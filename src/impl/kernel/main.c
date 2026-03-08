@@ -17,7 +17,6 @@
 #include "string.h"
 #include "prochandler.h"
 
-
 //Applications
 
 #include "applications/terminal.h"

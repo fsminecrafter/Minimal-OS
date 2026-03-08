@@ -346,13 +346,13 @@ void graphics_write_textr(const char* text) {
         text++;
     }
 }
-/*
+
 void graphics_write_textr_dec(int64_t value) {
     char buffer[32];
     int_to_str(value, buffer);
     graphics_write_textr(buffer);
 }
-*/
+
 void graphics_write_textr_udec(uint64_t value) {
     char buffer[32];
     uint_to_str(value, buffer);

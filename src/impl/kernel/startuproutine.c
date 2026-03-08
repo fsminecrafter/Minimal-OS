@@ -39,7 +39,9 @@ void startroutine(uint64_t total_ram_bytes) {
     time_init();
     print_str("init pit: ");
     pit_init(100);
+    print_str("Setting up kernel ints\n");
     setup_kernel_interrupts();
+    print_str("Setting IDT handler\n");
     idt_set_handler_pit(pit_irq_handler);
     print_set_color(PRINT_COLOR_GREEN, PRINT_COLOR_BLACK);
     if (pit_get_ticks == 0) {

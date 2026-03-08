@@ -4,29 +4,199 @@
 #include "panic.h"
 #include "applications/terminal.h"
 #include "x86_64/scheduler.h"
+#include "keyboard/ps2keyboardbridge.h"
+#include "keyboard/usbkeyboard.h"
+#include "x86_64/commandhandler.h"  // For command system
 #include "serial.h"
 #include "string.h"
 #include "time.h"
 
+// ===========================================
+// TERMINAL STATE
+// ===========================================
+
 gpu_device_t g_gpu;
+terminal_t* terminal;
+
+#define INPUT_BUFFER_SIZE 256
+static char input_buffer[INPUT_BUFFER_SIZE];
+static uint16_t input_pos = 0;
+static bool command_ready = false;
+
+// ===========================================
+// TERMINAL RENDERING
+// ===========================================
 
 void cursorupdater(void) {
-    terminal_t* terminal = graphics_get_terminal();
-
     serial_write_str("Cursor updater process started\n");
 
     while (1) {
-        serial_write_str("Updating cursor...\n");
-
         terminalUpdateCursor();
-
         terminal->cursor_visible = !terminal->cursor_visible;
-
         sleep(500);
     }
 }
 
-void terminal_program_entry() {
+void terminalPrompt(void) {
+    graphics_write_textr("Computer@local:~$ ");
+}
+
+// ===========================================
+// KEYBOARD CALLBACK (FIXED!)
+// ===========================================
+
+void terminal_keyboard_callback(uint8_t scancode, char character, bool pressed) {
+    if (!pressed) return;  // Only handle key presses
+    
+    // Debug log
+    serial_write_str("Key: scancode=0x");
+    serial_write_hex(scancode);
+    serial_write_str(" char=0x");
+    serial_write_hex((uint8_t)character);
+    serial_write_str(" (");
+    if (character >= 32 && character <= 126) {
+        graphics_write_textr_char(character);
+    } else {
+        serial_write_str("non-printable");
+    }
+    serial_write_str(")\n");
+    
+    // Handle special keys
+    switch (scancode) {
+        case USB_KEY_ENTER:
+            // Submit command
+            graphics_write_textr("\n");
+            input_buffer[input_pos] = '\0';
+            command_ready = true;
+            serial_write_str("ENTER pressed, command ready: '");
+            serial_write_str(input_buffer);
+            serial_write_str("'\n");
+            break;
+            
+        case USB_KEY_BACKSPACE:
+            // Delete last character
+            if (input_pos > 0) {
+                input_pos--;
+                input_buffer[input_pos] = '\0';
+                
+                // Move cursor back, write space, move back again
+                if (terminal->cursor_x > 0) {
+                    terminal->cursor_x--;
+                    graphics_write_textr_char(' ');
+                    terminal->cursor_x--;
+                }
+            }
+            break;
+            
+        case USB_KEY_TAB:
+            // Tab - insert 4 spaces
+            for (int i = 0; i < 4 && input_pos < INPUT_BUFFER_SIZE - 1; i++) {
+                input_buffer[input_pos++] = ' ';
+                graphics_write_textr_char(' ');
+            }
+            break;
+            
+        case USB_KEY_ESCAPE:
+            // Clear input
+            input_pos = 0;
+            input_buffer[0] = '\0';
+            graphics_write_textr("^C\n");
+            terminalPrompt();
+            break;
+            
+        case USB_KEY_UP:
+        case USB_KEY_DOWN:
+        case USB_KEY_LEFT:
+        case USB_KEY_RIGHT:
+        case USB_KEY_HOME:
+        case USB_KEY_END:
+        case USB_KEY_PAGEUP:
+        case USB_KEY_PAGEDOWN:
+        case USB_KEY_INSERT:
+        case USB_KEY_DELETE:
+        case USB_KEY_F1:
+        case USB_KEY_F2:
+        case USB_KEY_F3:
+        case USB_KEY_F4:
+        case USB_KEY_F5:
+        case USB_KEY_F6:
+        case USB_KEY_F7:
+        case USB_KEY_F8:
+        case USB_KEY_F9:
+        case USB_KEY_F10:
+        case USB_KEY_F11:
+        case USB_KEY_F12:
+        case USB_KEY_CAPSLOCK:
+        case USB_KEY_NUMLOCK:
+        case USB_KEY_SCROLLLOCK:
+        case USB_KEY_PRINTSCREEN:
+        case USB_KEY_PAUSE:
+            // Ignore these special keys
+            break;
+            
+        default:
+            // Only print VALID printable ASCII characters
+            if (character >= 32 && character <= 126) {
+                if (input_pos < INPUT_BUFFER_SIZE - 1) {
+                    input_buffer[input_pos++] = character;
+                    graphics_write_textr_char(character);
+                }
+            } else if (character != 0) {
+                // Non-ASCII character - log but don't display
+                serial_write_str("WARNING: Non-ASCII character received: 0x");
+                serial_write_hex((uint8_t)character);
+                serial_write_str("\n");
+            }
+            break;
+    }
+}
+
+// ===========================================
+// COMMAND PROCESSING (USING YOUR COMMAND SYSTEM)
+// ===========================================
+
+void terminal_process_command(const char* cmd) {
+    // Trim leading/trailing spaces
+    while (*cmd == ' ') cmd++;
+    if (*cmd == '\0') {
+        terminalPrompt();
+        return;
+    }
+    
+    serial_write_str("Processing command: '");
+    serial_write_str(cmd);
+    serial_write_str("'\n");
+    
+    // Use your existing command system
+    command_execute(cmd);
+    
+    terminalPrompt();
+}
+
+// ===========================================
+// TERMINAL UPDATE LOOP
+// ===========================================
+
+void terminal_update(void) {
+    // Update keyboard (for key repeat)
+    usb_keyboard_update();
+    
+    // Process pending command
+    if (command_ready) {
+        terminal_process_command(input_buffer);
+        input_pos = 0;
+        input_buffer[0] = '\0';
+        command_ready = false;
+    }
+}
+
+// ===========================================
+// TERMINAL INITIALIZATION
+// ===========================================
+
+void terminal_program_entry(void) {
+    serial_write_str("=== TERMINAL STARTING ===\n");
+    
     g_gpu = *getSystemGPU();
     if (!g_gpu.fb) {
         panic("Failed to initialize GPU", __FILE__, __LINE__, NULL);
@@ -38,21 +208,51 @@ void terminal_program_entry() {
     int16_t cols = width / 8;
     int16_t rows = height / 8;
 
-    terminal_t* terminal = graphics_get_terminal();
+    terminal = graphics_get_terminal();
 
+    // Clear screen and setup
+    graphics_clear(0, 0, 0);
+    graphics_set_resolution(cols, rows);
+    graphics_terminal_set_color(COLOR_WHITE, COLOR_BLACK);
+    
+    // Initialize command system
+    serial_write_str("Terminal: Initializing command system...\n");
+    commandhandler_init();
+    
+    // Initialize keyboard input
+    serial_write_str("Terminal: Initializing keyboard input...\n");
+    ps2_usb_bridge_init();
+    
+    // Register keyboard callback
+    usb_keyboard_set_callback(terminal_keyboard_callback);
+    
+    // Start cursor updater process
+    serial_write_str("Terminal: Starting cursor process...\n");
     process_t* cursor_process = createProcess("cursorupdater", cursorupdater);
-    listAllProcesses();
-
-    graphics_clear(0, 0, 0); // Clear to black
-    graphics_set_resolution(cols, rows); // Set terminal mode
-    graphics_terminal_set_color(COLOR_WHITE, COLOR_BLACK); // White text
-    graphics_write_textr("Welcome to the Minimal OS Terminal!\n"); 
-
-    graphics_write_textr("System Date: ");
-
-    const char* data = datetime_str_readable();
-    graphics_write_textr(data);
+    
+    // Display welcome message
+    graphics_write_textr("----------------------------------------\n");
+    graphics_write_textr("  Welcome to MinimalOS Terminal!\n");
+    graphics_write_textr("----------------------------------------\n\n");
+    
+    graphics_write_textr("System: ");
+    graphics_write_textr(datetime_str_readable());
     graphics_write_textr("\n");
-
-    graphics_write_textr("Computer@local: ");
+    
+    graphics_write_textr("Uptime: ");
+    graphics_write_textr(uptime_str_human());
+    graphics_write_textr("\n\n");
+    
+    graphics_write_textr("Keyboard: PS/2 (ready for input!)\n");
+    graphics_write_textr("Type a command and press Enter.\n\n");
+    
+    terminalPrompt();
+    
+    serial_write_str("=== TERMINAL READY ===\n");
+    
+    // Main terminal loop
+    while (1) {
+        terminal_update();
+        sleep(10);  // Update every 10ms
+    }
 }

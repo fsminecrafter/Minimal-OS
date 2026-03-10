@@ -107,4 +107,23 @@ static void rtc_write_reg(uint8_t reg, uint8_t value) {
     }
 }
 
+// Alternative inline version
+static inline void port_io_wait(void) {
+    port_outb(0x80, 0);  // Write to unused port
+}
+
+// ===========================================
+// HELPER MACROS
+// ===========================================
+
+// Read-modify-write helpers
+#define PORT_SET_BIT(port, bit) \
+    port_outb(port, port_inb(port) | (1 << (bit)))
+
+#define PORT_CLEAR_BIT(port, bit) \
+    port_outb(port, port_inb(port) & ~(1 << (bit)))
+
+#define PORT_TOGGLE_BIT(port, bit) \
+    port_outb(port, port_inb(port) ^ (1 << (bit)))
+
 #endif // PORT_H

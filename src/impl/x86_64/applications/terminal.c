@@ -4,9 +4,9 @@
 #include "panic.h"
 #include "applications/terminal.h"
 #include "x86_64/scheduler.h"
-#include "keyboard/ps2keyboardbridge.h"
 #include "keyboard/usbkeyboard.h"
-#include "x86_64/commandhandler.h"  // For command system
+#include "usb/usb_stack.h"
+#include "x86_64/commandhandler.h"
 #include "serial.h"
 #include "string.h"
 #include "time.h"
@@ -42,24 +42,23 @@ void terminalPrompt(void) {
 }
 
 // ===========================================
-// KEYBOARD CALLBACK (FIXED!)
+// KEYBOARD CALLBACK
 // ===========================================
 
 void terminal_keyboard_callback(uint8_t scancode, char character, bool pressed) {
     if (!pressed) return;  // Only handle key presses
     
     // Debug log
-    serial_write_str("Key: scancode=0x");
+    serial_write_str("Terminal: Key scancode=0x");
     serial_write_hex(scancode);
-    serial_write_str(" char=0x");
-    serial_write_hex((uint8_t)character);
-    serial_write_str(" (");
+    serial_write_str(" char='");
     if (character >= 32 && character <= 126) {
-        graphics_write_textr_char(character);
+        serial_write_str(character);
     } else {
-        serial_write_str("non-printable");
+        serial_write_str("0x");
+        serial_write_hex((uint8_t)character);
     }
-    serial_write_str(")\n");
+    serial_write_str("'\n");
     
     // Handle special keys
     switch (scancode) {
@@ -68,7 +67,7 @@ void terminal_keyboard_callback(uint8_t scancode, char character, bool pressed) 
             graphics_write_textr("\n");
             input_buffer[input_pos] = '\0';
             command_ready = true;
-            serial_write_str("ENTER pressed, command ready: '");
+            serial_write_str("Terminal: Command ready: '");
             serial_write_str(input_buffer);
             serial_write_str("'\n");
             break;
@@ -143,7 +142,7 @@ void terminal_keyboard_callback(uint8_t scancode, char character, bool pressed) 
                 }
             } else if (character != 0) {
                 // Non-ASCII character - log but don't display
-                serial_write_str("WARNING: Non-ASCII character received: 0x");
+                serial_write_str("Terminal: WARNING - Non-ASCII character 0x");
                 serial_write_hex((uint8_t)character);
                 serial_write_str("\n");
             }
@@ -152,7 +151,7 @@ void terminal_keyboard_callback(uint8_t scancode, char character, bool pressed) 
 }
 
 // ===========================================
-// COMMAND PROCESSING (USING YOUR COMMAND SYSTEM)
+// COMMAND PROCESSING
 // ===========================================
 
 void terminal_process_command(const char* cmd) {
@@ -163,11 +162,11 @@ void terminal_process_command(const char* cmd) {
         return;
     }
     
-    serial_write_str("Processing command: '");
+    serial_write_str("Terminal: Processing command: '");
     serial_write_str(cmd);
     serial_write_str("'\n");
     
-    // Use your existing command system
+    // Use existing command system
     command_execute(cmd);
     
     terminalPrompt();
@@ -188,6 +187,45 @@ void terminal_update(void) {
         input_buffer[0] = '\0';
         command_ready = false;
     }
+}
+
+// ===========================================
+// KEYBOARD INITIALIZATION
+// ===========================================
+
+void terminal_init_keyboard(void) {
+    serial_write_str("Terminal: Initializing keyboard...\n");
+    
+    // Initialize USB keyboard driver
+    usb_keyboard_init();
+    
+    // Load Swedish keyboard layout
+    extern const keyboard_layout_t usb_layout_se_qwerty;
+    usb_keyboard_load_layout(&usb_layout_se_qwerty);
+    
+    // Register our callback
+    usb_keyboard_set_callback(terminal_keyboard_callback);
+    
+    // Check what keyboard we have
+    usb_device_t* usb_kbd = usb_get_keyboard();
+    
+    if (usb_kbd && usb_is_configured(usb_kbd)) {
+        serial_write_str("Terminal: USB keyboard detected!\n");
+        graphics_write_textr("Keyboard: USB (");
+        graphics_write_textr(usb_get_speed_string(usb_kbd));
+        graphics_write_textr(")\n");
+    } else {
+        serial_write_str("Terminal: PS/2 keyboard (or no keyboard)\n");
+        graphics_write_textr("Keyboard: PS/2 fallback\n");
+        
+        // Initialize PS/2 bridge if available
+        #ifdef HAVE_PS2_KEYBOARD
+        extern void ps2_usb_bridge_init(void);
+        ps2_usb_bridge_init();
+        #endif
+    }
+    
+    serial_write_str("Terminal: Keyboard ready!\n");
 }
 
 // ===========================================
@@ -219,21 +257,17 @@ void terminal_program_entry(void) {
     serial_write_str("Terminal: Initializing command system...\n");
     commandhandler_init();
     
-    // Initialize keyboard input
-    serial_write_str("Terminal: Initializing keyboard input...\n");
-    ps2_usb_bridge_init();
-    
-    // Register keyboard callback
-    usb_keyboard_set_callback(terminal_keyboard_callback);
+    // Initialize keyboard
+    terminal_init_keyboard();
     
     // Start cursor updater process
     serial_write_str("Terminal: Starting cursor process...\n");
     process_t* cursor_process = createProcess("cursorupdater", cursorupdater);
     
     // Display welcome message
-    graphics_write_textr("----------------------------------------\n");
+    graphics_write_textr("========================================\n");
     graphics_write_textr("  Welcome to MinimalOS Terminal!\n");
-    graphics_write_textr("----------------------------------------\n\n");
+    graphics_write_textr("========================================\n\n");
     
     graphics_write_textr("System: ");
     graphics_write_textr(datetime_str_readable());
@@ -243,8 +277,9 @@ void terminal_program_entry(void) {
     graphics_write_textr(uptime_str_human());
     graphics_write_textr("\n\n");
     
-    graphics_write_textr("Keyboard: PS/2 (ready for input!)\n");
-    graphics_write_textr("Type a command and press Enter.\n\n");
+    // Keyboard status was already printed by terminal_init_keyboard()
+    graphics_write_textr("Type a command and press Enter.\n");
+    graphics_write_textr("Type 'help' for available commands.\n\n");
     
     terminalPrompt();
     

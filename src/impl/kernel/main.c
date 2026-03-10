@@ -16,10 +16,16 @@
 #include "x86_64/memoryscanner.h"
 #include "string.h"
 #include "prochandler.h"
+#include "usb/uhci.h"
+#include "x86_64/globaldatatable.h"
+
+#include "keyboard/unifiedkeyboardbridge.h"
 
 //Applications
 
 #include "applications/terminal.h"
+#include "keyboard/swedishKeyboard.h"
+#include "keyboard/usKeyboard.h"
 
 void busy(void) {
     for (volatile int i = 0; i < 100; i++);
@@ -46,6 +52,16 @@ void kernel_main(uint64_t mb2_info_addr) {
 
     //memory_scanner_init();
     //memory_scan_full();
+
+    pci_enumerate_all();
+    
+    if (usb_init()) {
+        serial_write_str("USB keyboard available!\n");
+    } else {
+        serial_write_str("Falling back to PS/2\n");
+    }
+    
+    terminal_init_keyboard();
 
     initializeGraphicsDevice();
     char *proc_list[32];

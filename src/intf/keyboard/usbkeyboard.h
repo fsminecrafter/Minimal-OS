@@ -316,4 +316,8 @@ char usb_keyboard_to_ascii(uint8_t scancode);
 // LED control (for keyboard LEDs)
 void usb_keyboard_set_leds(bool caps, bool num, bool scroll);
 
+// Call this in main loop or timer interrupt
+// Handles key repeat functionality
+void usb_keyboard_update(void);
+
 #endif // USB_KEYBOARD_H

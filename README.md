@@ -31,6 +31,7 @@ Last synced 2026 - Mar 6 - 18:24
 * Displaying and reading images [X] !limited support!
 * Fonts [X] !also a little limited for now!
 
+* USB 1.1 [X]
 * Keyboard []
 * Simple Audio ! []
 * System calls !! []

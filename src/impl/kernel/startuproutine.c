@@ -70,6 +70,7 @@ void startroutine(uint64_t total_ram_bytes) {
     print_str("Init MMIO subsystem\n");
     extern void mmio_init(void);
     mmio_init();
+    
     print_str("Enumerating PCI devices\n");
     pci_enumerate_all();
     print_pci_devices();

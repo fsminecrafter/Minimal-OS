@@ -43,6 +43,9 @@ void pit_irq_handler() {
     
     // Update system time
     time_tick(pit_frequency);
+
+    // Usb poll
+    usb_poll();
     
     // Run scheduler
     scheduler_tick();

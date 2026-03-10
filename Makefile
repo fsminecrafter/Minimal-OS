@@ -40,7 +40,7 @@ run: build-x86_64
 	qemu-system-x86_64 -cdrom dist/x86_64/kernel.iso -m 1024M -boot d -serial stdio -audiodev pa,id=speaker -machine pcspk-audiodev=speaker -usb -device usb-kbd
 
 .PHONY: run-ps2
-run: build-x86_64
+run-ps2: build-x86_64
 	qemu-system-x86_64 -cdrom dist/x86_64/kernel.iso -m 1024M -boot d -serial stdio -audiodev pa,id=speaker -machine pcspk-audiodev=speaker
 
 .PHONY: run-int

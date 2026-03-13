@@ -53,7 +53,10 @@ void terminal_keyboard_callback(uint8_t scancode, char character, bool pressed) 
     serial_write_hex(scancode);
     serial_write_str(" char='");
     if (character >= 32 && character <= 126) {
-        serial_write_str(character);
+        char buf[2];
+        buf[0] = character;
+        buf[1] = 0;
+        serial_write_str(buf);
     } else {
         serial_write_str("0x");
         serial_write_hex((uint8_t)character);
@@ -178,7 +181,6 @@ void terminal_process_command(const char* cmd) {
 
 void terminal_update(void) {
     // Update keyboard (for key repeat)
-    usb_keyboard_update();
     
     // Process pending command
     if (command_ready) {
@@ -196,6 +198,8 @@ void terminal_update(void) {
 void terminal_init_keyboard(void) {
     serial_write_str("Terminal: Initializing keyboard...\n");
     
+    commandhandler_init();
+
     // Initialize USB keyboard driver
     usb_keyboard_init();
     

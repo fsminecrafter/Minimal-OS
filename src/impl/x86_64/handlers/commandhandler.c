@@ -6,7 +6,7 @@
 extern void (*__start_command_ctors)(void);
 extern void (*__stop_command_ctors)(void);
 
-#define MAX_COMMANDS 32
+#define MAX_COMMANDS 4096
 
 static struct CommandEntry commands[MAX_COMMANDS];
 static int command_count = 0;

@@ -60,7 +60,6 @@ void kernel_main(uint64_t mb2_info_addr) {
     } else {
         serial_write_str("Falling back to PS/2\n");
     }
-    
     terminal_init_keyboard();
 
     initializeGraphicsDevice();

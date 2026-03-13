@@ -8,6 +8,7 @@
 #include "serial.h"
 #include "string.h"
 #include "time.h"
+#include <stdbool.h>
 
 // ===========================================
 // EXTERNAL DEPENDENCIES
@@ -16,6 +17,19 @@
 // Forward declarations from pci.c
 extern uint32_t pci_read_config_dword(uint8_t bus, uint8_t device, uint8_t function, uint8_t offset);
 extern void pci_write_config_dword(uint8_t bus, uint8_t device, uint8_t function, uint8_t offset, uint32_t value);
+
+static uint64_t g_last_poll_time[8] = {0};
+
+static uint32_t g_interrupt_attempts = 0;
+static uint32_t g_interrupt_successes = 0;
+static uint32_t g_interrupt_naks = 0;
+static uint32_t g_interrupt_timeouts = 0;
+static uint32_t g_interrupt_errors = 0;
+static uint32_t g_interrupt_polls;
+static uint8_t g_endpoint_toggles[128] = {0};
+static uint8_t keyboard_int_buffer[8];
+static uint8_t keyboard_toggle = 0;
+static bool keyboard_is_low_speed = false;
 
 // ===========================================
 // UHCI REGISTERS AND CONSTANTS
@@ -122,6 +136,8 @@ typedef struct {
     uint32_t reserved[2];
 } __attribute__((packed, aligned(16))) uhci_qh_t;
 
+
+static uhci_td_t* keyboard_int_td = NULL;
 // ===========================================
 // GLOBAL USB STATE
 // ===========================================
@@ -776,6 +792,10 @@ bool usb_init(void) {
                     
                     // Enumerate devices on ports
                     usb_enumerate_devices();
+                    usb_device_t* kbd = usb_get_keyboard();
+                    if (kbd) {
+                        uhci_keyboard_interrupt_init(kbd);
+                    }
                     
                     return true;
                 }
@@ -798,23 +818,56 @@ bool usb_init(void) {
 // ===========================================
 // INTERRUPT TRANSFERS
 // ===========================================
-
-bool uhci_interrupt_transfer(uint8_t dev_addr, uint8_t endpoint, 
-                             void* buffer, uint16_t length, bool low_speed) {
-    // Allocate TD for interrupt transfer
+/*
+bool uhci_interrupt_transfer(uint8_t dev_addr, uint8_t endpoint, void* buffer, uint16_t length, bool low_speed) {
+    g_interrupt_attempts++;
+    
+    // Calculate toggle key and get current toggle
+    uint8_t toggle_key = (dev_addr << 4) | (endpoint & 0xF);
+    uint8_t toggle = g_endpoint_toggles[toggle_key];
+    
+    // Debug first few attempts
+    if (g_interrupt_attempts <= 5) {
+        serial_write_str("USB: Interrupt #");
+        serial_write_dec(g_interrupt_attempts);
+        serial_write_str(" dev=");
+        serial_write_dec(dev_addr);
+        serial_write_str(" ep=");
+        serial_write_dec(endpoint);
+        serial_write_str(" toggle=");
+        serial_write_dec(toggle);
+        serial_write_str("\n");
+    }
+    
+    // Allocate TD
     uhci_td_t* td = uhci_alloc_td();
     if (!td) {
+        serial_write_str("USB: Failed to allocate TD!\n");
         return false;
     }
     
-    // Setup interrupt IN transfer
-    uhci_setup_td(td, USB_PID_IN, dev_addr, endpoint, low_speed, buffer, length, true);
+    // Setup TD with correct toggle
+    td->status = UHCI_TD_ACTIVE | (3 << 27);
+    if (low_speed) {
+        td->status |= UHCI_TD_LS;
+    }
+    td->status |= UHCI_TD_SPD;
+    
+    td->token = (USB_PID_IN & 0xFF) |
+               ((dev_addr & 0x7F) << 8) |
+               ((endpoint & 0xF) << 15) |
+               (toggle << 19) |
+               (((length - 1) & 0x7FF) << 21);
+    
+    td->buffer_ptr = (uint32_t)(uintptr_t)buffer;
+    td->buffer_virt = buffer;
+    td->link_ptr = 0x1;
     
     // Add to interrupt queue
-    interrupt_qh->element_ptr = ((uint32_t)(uintptr_t)td);
+    interrupt_qh->element_ptr = ((uint32_t)(uintptr_t)td) & ~0xF;
     
-    // Wait for completion (with short timeout for polling)
-    uint32_t timeout = 100;  // 100ms timeout
+    // Wait for completion
+    uint32_t timeout = 20;
     while (timeout > 0) {
         if (!(td->status & UHCI_TD_ACTIVE)) {
             break;
@@ -824,36 +877,273 @@ bool uhci_interrupt_transfer(uint8_t dev_addr, uint8_t endpoint,
     }
     
     // Clear queue
-    interrupt_qh->element_ptr = 1;
+    interrupt_qh->element_ptr = 0x1;
+    
+    // Check result
+    uint32_t status = td->status;
     
     if (timeout == 0) {
-        // Timeout - might be NAK (no data available)
+        g_interrupt_timeouts++;
+        if (g_interrupt_timeouts <= 5) {
+            serial_write_str("USB: Interrupt timeout #");
+            serial_write_dec(g_interrupt_timeouts);
+            serial_write_str(" status=0x");
+            serial_write_hex(status);
+            serial_write_str("\n");
+        }
         return false;
     }
     
-    // Check for errors (ignore NAK)
-    if (td->status & (UHCI_TD_STALLED | UHCI_TD_DBERR | UHCI_TD_BABBLE | UHCI_TD_CRCTIMEOUT | UHCI_TD_BITSTUFF)) {
+    // Check for NAK (normal - no data)
+    if (status & UHCI_TD_NAK) {
+        g_interrupt_naks++;
         return false;
     }
     
-    // Success - data received
+    // Check for errors
+    if (status & (UHCI_TD_STALLED | UHCI_TD_DBERR | UHCI_TD_BABBLE | 
+                  UHCI_TD_CRCTIMEOUT | UHCI_TD_BITSTUFF)) {
+        g_interrupt_errors++;
+        if (g_interrupt_errors <= 10) {
+            serial_write_str("USB: Interrupt ERROR #");
+            serial_write_dec(g_interrupt_errors);
+            serial_write_str(" status=0x");
+            serial_write_hex(status);
+            if (status & UHCI_TD_STALLED) serial_write_str(" STALL");
+            if (status & UHCI_TD_DBERR) serial_write_str(" DBERR");
+            if (status & UHCI_TD_BABBLE) serial_write_str(" BABBLE");
+            if (status & UHCI_TD_CRCTIMEOUT) serial_write_str(" CRC/TIMEOUT");
+            if (status & UHCI_TD_BITSTUFF) serial_write_str(" BITSTUFF");
+            serial_write_str("\n");
+        }
+        return false;
+    }
+    
+    // Success!
+    g_interrupt_successes++;
+    g_endpoint_toggles[toggle_key] = toggle ^ 1;  // Flip toggle
+    
     return true;
 }
-
+*/
 // ===========================================
 // KEYBOARD POLLING
 // ===========================================
 
+void uhci_keyboard_interrupt_init(usb_device_t* dev) {
+    serial_write_str("UHCI: Setting up persistent keyboard interrupt TD\n");
+    
+    keyboard_int_td = uhci_alloc_td();
+    if (!keyboard_int_td) {
+        serial_write_str("UHCI: CRITICAL - Failed to allocate keyboard TD!\n");
+        return;
+    }
+
+    // Clear report buffer
+    memset(keyboard_int_buffer, 0, sizeof(keyboard_int_buffer));
+
+    uint16_t max_packet = dev->keyboard_max_packet_size;
+    if (max_packet == 0 || max_packet > 8) {
+        max_packet = 8;
+    }
+
+    keyboard_is_low_speed = dev->low_speed;
+
+    uint32_t td_phys = ((uint32_t)(uintptr_t)keyboard_int_td) & ~0xF;
+
+    // ============================
+    // STATUS
+    // ============================
+    keyboard_int_td->status =
+        UHCI_TD_ACTIVE |
+        UHCI_TD_IOC |
+        UHCI_TD_SPD |
+        (3 << 27) |
+        0x7FF;                // reset actual length
+
+    if (keyboard_is_low_speed) {
+        keyboard_int_td->status |= UHCI_TD_LS;
+    }
+
+    // ============================
+    // TOKEN
+    // ============================
+    keyboard_int_td->token =
+        (USB_PID_IN & 0xFF) |
+        ((dev->address & 0x7F) << 8) |
+        ((dev->keyboard_endpoint & 0xF) << 15) |
+        (0 << 20) |                       // DATA0 toggle
+        (((max_packet - 1) & 0x7FF) << 21);
+
+    // ============================
+    // BUFFER
+    // ============================
+    keyboard_int_td->buffer_ptr = (uint32_t)(uintptr_t)keyboard_int_buffer;
+    keyboard_int_td->buffer_virt = keyboard_int_buffer;
+
+    // ============================
+    // CRITICAL FIX: TD LOOP
+    // ============================
+    keyboard_int_td->link_ptr = td_phys;   // loop to itself
+
+    // Attach TD to interrupt queue
+    interrupt_qh->element_ptr = td_phys;
+
+    keyboard_toggle = 0;
+
+    serial_write_str("UHCI: Keyboard TD installed\n");
+    serial_write_str("  Device addr: ");
+    serial_write_dec(dev->address);
+    serial_write_str("\n  Endpoint: ");
+    serial_write_dec(dev->keyboard_endpoint);
+    serial_write_str("\n  Max packet: ");
+    serial_write_dec(max_packet);
+    serial_write_str("\n  TD phys: 0x");
+    serial_write_hex(td_phys);
+    serial_write_str("\n");
+}
+
+// Reactivate keyboard TD for next transfer
+void uhci_keyboard_interrupt_reactivate(void)
+{
+    if (!keyboard_int_td) return;
+
+    memset(keyboard_int_buffer, 0, 8);
+
+    uint32_t token = keyboard_int_td->token;
+
+    token &= ~(1 << 20);
+    token |= (keyboard_toggle << 20);
+
+    keyboard_int_td->token = token;
+
+    uint32_t status =
+        UHCI_TD_ACTIVE |
+        UHCI_TD_IOC |
+        UHCI_TD_SPD |
+        (3 << 27) |
+        0x7FF;              // <-- REQUIRED (reset actual length)
+
+    if (keyboard_is_low_speed)
+        status |= UHCI_TD_LS;
+
+    keyboard_int_td->status = status;
+}
+
+bool uhci_keyboard_interrupt_poll(uint8_t* buffer, uint16_t length) {
+    static uint32_t poll_count = 0;
+    poll_count++;
+    
+    if (!keyboard_int_td) {
+        return false;
+    }
+    
+    g_interrupt_polls++;
+    uint32_t status = keyboard_int_td->status;
+    
+    // Debug EVERY poll for first 20, then every 100
+    if (poll_count <= 20 || (poll_count % 100) == 0) {
+        serial_write_str("UHCI: Poll #");
+        serial_write_dec(poll_count);
+        serial_write_str(" TD status=0x");
+        serial_write_hex(status);
+        
+        if (status & UHCI_TD_ACTIVE) {
+            serial_write_str(" [ACTIVE - waiting]");
+        } else {
+            serial_write_str(" [COMPLETE");
+            if (status & UHCI_TD_NAK) serial_write_str(" NAK");
+            if (status & UHCI_TD_STALLED) serial_write_str(" STALL");
+            if (status & UHCI_TD_DBERR) serial_write_str(" DBERR");
+            if (status & UHCI_TD_BABBLE) serial_write_str(" BABBLE");
+            if (status & UHCI_TD_CRCTIMEOUT) serial_write_str(" CRC");
+            if (status & UHCI_TD_BITSTUFF) serial_write_str(" BITSTUFF");
+            serial_write_str("]");
+        }
+        serial_write_str("\n");
+    }
+    
+    // Check if TD is still active
+    if (status & UHCI_TD_ACTIVE) {
+        // Still active - no data yet
+        return false;
+    }
+    
+    // TD completed! Check for NAK
+    if (status & UHCI_TD_NAK) {
+        g_interrupt_naks++;
+        uhci_keyboard_interrupt_reactivate();
+        return false;
+    }
+    
+    // Check for other errors
+    if (status & (UHCI_TD_STALLED | UHCI_TD_DBERR | UHCI_TD_BABBLE | 
+                  UHCI_TD_CRCTIMEOUT | UHCI_TD_BITSTUFF)) {
+        g_interrupt_errors++;
+        if (g_interrupt_errors <= 10) {
+            serial_write_str("UHCI: Keyboard error #");
+            serial_write_dec(g_interrupt_errors);
+            serial_write_str(": 0x");
+            serial_write_hex(status);
+            serial_write_str("\n");
+        }
+        uhci_keyboard_interrupt_reactivate();
+        return false;
+    }
+    
+    // Success! Copy data
+    g_interrupt_successes++;
+    for (int i = 0; i < length && i < 8; i++) {
+        buffer[i] = keyboard_int_buffer[i];
+    }
+    
+    // Flip toggle and reactivate
+    keyboard_toggle ^= 1;
+    uhci_keyboard_interrupt_reactivate();
+    
+    return true;
+}
+
+ 
 void usb_poll_keyboard(usb_device_t* dev) {
     static uint8_t report_buffer[8];
     
-    // Try to read HID report from keyboard
-    if (uhci_interrupt_transfer(dev->address, dev->keyboard_endpoint, 
-                                report_buffer, 8, false)) {
-        // Got data - process it
+    // Poll the persistent TD
+    if (uhci_keyboard_interrupt_poll(report_buffer, 8)) {
+        g_interrupt_successes++;
+        
+        // Debug: print report
+        serial_write_str("USB: HID #");
+        serial_write_dec(g_interrupt_successes);
+        serial_write_str(": ");
+        for (int i = 0; i < 8; i++) {
+            if (report_buffer[i] < 0x10) serial_write_str("0");
+            serial_write_hex(report_buffer[i]);
+            serial_write_str(" ");
+        }
+        serial_write_str("\n");
+        
+        // ALWAYS process the report - don't filter!
+        // The keyboard driver handles key transitions internally
         usb_hid_keyboard_report_t* report = (usb_hid_keyboard_report_t*)report_buffer;
         usb_keyboard_process_report(report);
     }
+    
+    // Print stats every 500 polls
+    if ((g_interrupt_polls % 500) == 0 && g_interrupt_polls > 0) {
+        serial_write_str("USB: Stats - polls=");
+        serial_write_dec(g_interrupt_polls);
+        serial_write_str(" success=");
+        serial_write_dec(g_interrupt_successes);
+        serial_write_str(" NAKs=");
+        serial_write_dec(g_interrupt_naks);
+        serial_write_str("\n");
+    }
+}
+ 
+// Call this ONCE after keyboard enumeration
+void usb_init_keyboard_polling(usb_device_t* dev) {
+    uhci_keyboard_interrupt_init(dev);
 }
 
 // ===========================================
@@ -1164,17 +1454,33 @@ bool usb_keyboard_init_device(usb_device_t* dev) {
 // ===========================================
 // USB POLLING
 // ===========================================
-
 void usb_poll(void) {
+    static bool first_poll = true;
+    
     if (!g_usb_initialized) return;
     
-    // Poll keyboard devices
+    if (first_poll) {
+        serial_write_str("USB: Starting keyboard polling...\n");
+        first_poll = false;
+    }
+    
+    uint64_t now = time_get_uptime_ms();
+    
     for (uint8_t i = 0; i < g_usb_hc.num_devices; i++) {
         usb_device_t* dev = &g_usb_hc.devices[i];
         
-        if (dev->is_keyboard) {
-            usb_poll_keyboard(dev);
+        if (!dev->is_keyboard || dev->state != USB_DEVICE_STATE_CONFIGURED) {
+            continue;
         }
+        
+        // Poll at keyboard's interval (10ms)
+        uint64_t elapsed = now - dev->last_poll_time;
+        if (elapsed < dev->keyboard_interval) {
+            continue;
+        }
+        
+        dev->last_poll_time = now;
+        usb_poll_keyboard(dev);
     }
 }
 

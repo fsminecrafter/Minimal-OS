@@ -1112,25 +1112,20 @@ void usb_poll_keyboard(usb_device_t* dev) {
     if (uhci_keyboard_interrupt_poll(report_buffer, 8)) {
         g_interrupt_successes++;
         
-        // Debug: print report
-        serial_write_str("USB: HID #");
-        serial_write_dec(g_interrupt_successes);
-        serial_write_str(": ");
-        for (int i = 0; i < 8; i++) {
-            if (report_buffer[i] < 0x10) serial_write_str("0");
-            serial_write_hex(report_buffer[i]);
-            serial_write_str(" ");
+        // Debug every 10th successful report to reduce spam
+        if ((g_interrupt_successes % 10) == 1) {
+            serial_write_str("USB: HID reports received: ");
+            serial_write_dec(g_interrupt_successes);
+            serial_write_str("\n");
         }
-        serial_write_str("\n");
         
-        // ALWAYS process the report - don't filter!
-        // The keyboard driver handles key transitions internally
+        // ALWAYS process - don't filter duplicates!
         usb_hid_keyboard_report_t* report = (usb_hid_keyboard_report_t*)report_buffer;
         usb_keyboard_process_report(report);
     }
     
-    // Print stats every 500 polls
-    if ((g_interrupt_polls % 500) == 0 && g_interrupt_polls > 0) {
+    // Print detailed stats less frequently
+    if ((g_interrupt_polls % 1000) == 0 && g_interrupt_polls > 0) {
         serial_write_str("USB: Stats - polls=");
         serial_write_dec(g_interrupt_polls);
         serial_write_str(" success=");
@@ -1460,27 +1455,18 @@ void usb_poll(void) {
     if (!g_usb_initialized) return;
     
     if (first_poll) {
-        serial_write_str("USB: Starting keyboard polling...\n");
+        serial_write_str("USB: Polling started\n");
         first_poll = false;
     }
     
-    uint64_t now = time_get_uptime_ms();
-    
+    // Poll ALL devices every time
+    // Don't skip polls based on timing - let the hardware handle it
     for (uint8_t i = 0; i < g_usb_hc.num_devices; i++) {
         usb_device_t* dev = &g_usb_hc.devices[i];
         
-        if (!dev->is_keyboard || dev->state != USB_DEVICE_STATE_CONFIGURED) {
-            continue;
+        if (dev->is_keyboard && dev->state == USB_DEVICE_STATE_CONFIGURED) {
+            usb_poll_keyboard(dev);
         }
-        
-        // Poll at keyboard's interval (10ms)
-        uint64_t elapsed = now - dev->last_poll_time;
-        if (elapsed < dev->keyboard_interval) {
-            continue;
-        }
-        
-        dev->last_poll_time = now;
-        usb_poll_keyboard(dev);
     }
 }
 

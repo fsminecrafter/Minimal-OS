@@ -1,12 +1,16 @@
 #include <stdbool.h>
 #include "print.h"
+#include "graphics.h"
 #include "x86_64/commandhandler.h"
 #include "x86_64/commandreg.h"
 #include "time.h"
+#include "string.h"
 
 void cmd_systime(int argc, const char** argv) {
-    time_print_datetime(true);
-    print_str("\n");
+    string_t uptime;
+    time_format_uptime(uptime.data, uptime.capacity);
+    graphics_write_textr(uptime.data);
+    graphics_write_textr("\n");
 }
 
 void register_systime(void) {

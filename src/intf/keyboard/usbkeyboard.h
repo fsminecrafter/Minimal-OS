@@ -227,6 +227,7 @@ typedef struct {
 
     uint64_t last_key_press_time_ms;
     uint64_t next_repeat_time_ms;
+    uint64_t last_repeat_number;
     
 } usb_keyboard_state_t;
 

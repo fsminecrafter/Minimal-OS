@@ -559,3 +559,31 @@ const char* str_int_array(const int64_t* array, size_t count) {
     str_from_int_array(&s, array, count);
     return s.data;
 }
+
+void itoa(int value, char* str, int base) {
+    char* ptr = str;
+    char* ptr1 = str;
+    char tmp_char;
+    int tmp_value;
+
+    if (value == 0) {
+        str[0] = '0';
+        str[1] = '\0';
+        return;
+    }
+
+    while (value != 0) {
+        tmp_value = value % base;
+        *ptr++ = (tmp_value < 10) ? (tmp_value + '0') : (tmp_value - 10 + 'a');
+        value /= base;
+    }
+
+    *ptr-- = '\0';
+
+    // Reverse string
+    while (ptr1 < ptr) {
+        tmp_char = *ptr;
+        *ptr-- = *ptr1;
+        *ptr1++ = tmp_char;
+    }
+}

@@ -58,28 +58,30 @@ static void usb_keyboard_handle_key_release(uint8_t scancode);
 void usb_keyboard_init(void) {
     serial_write_str("USB Keyboard: Initializing...\n");
     
-    // Clear state
     memset(&g_keyboard_state, 0, sizeof(usb_keyboard_state_t));
     
-    // Set defaults
     g_keyboard_state.caps_lock = false;
-    g_keyboard_state.num_lock = true;   // Num lock on by default
+    g_keyboard_state.num_lock = true;
     g_keyboard_state.scroll_lock = false;
-    g_keyboard_state.repeat_delay_ms = 500;  // 500ms before repeat
-    g_keyboard_state.repeat_rate_ms = 33;    // ~30 chars/sec
     
-    // No layout loaded yet
+    // SLOWER, MORE REASONABLE repeat settings:
+    g_keyboard_state.repeat_delay_ms = 600;   // 600ms before repeat (was 500ms)
+    g_keyboard_state.repeat_rate_ms = 80;     // 80ms between repeats (was 33ms)
+                                               // = ~12 chars/sec (was 30/sec)
+    
     g_keyboard_state.layout = NULL;
     
     serial_write_str("USB Keyboard: Ready (no layout loaded)\n");
 }
-
 // ===========================================
 // REPORT PROCESSING
 // ===========================================
 
 void usb_keyboard_process_report(const usb_hid_keyboard_report_t* report) {
     if (!report) return;
+
+    g_keyboard_state.previous_report = g_keyboard_state.current_report;
+    g_keyboard_state.current_report = *report;
     
     uint8_t mods = report->modifiers;
 
@@ -126,9 +128,6 @@ void usb_keyboard_process_report(const usb_hid_keyboard_report_t* report) {
         }
     }
 
-    // Save current as previous
-    g_keyboard_state.previous_report = g_keyboard_state.current_report;
-    g_keyboard_state.current_report = *report;
 }
 
 static void usb_keyboard_handle_key_press(uint8_t scancode, uint8_t modifiers) {
@@ -162,12 +161,18 @@ static void usb_keyboard_handle_key_press(uint8_t scancode, uint8_t modifiers) {
     char character = usb_keyboard_translate(scancode, modifiers);
     
     uint64_t now = time_get_uptime_ms();
-
+ 
+    // Store key info for repeat
     g_keyboard_state.last_key = scancode;
-    g_keyboard_state.last_key_press_time_ms = now;
-    g_keyboard_state.next_repeat_time_ms = now + g_keyboard_state.repeat_delay_ms;
+    g_keyboard_state.last_key_time_ms = now;
+    g_keyboard_state.last_repeat_number = 0;  // ← RESET repeat counter!
     
-    // Call user callback
+    // Don't call callback for modifier-only keys
+    if (usb_keyboard_is_modifier(scancode)) {
+        return;
+    }
+    
+    // Call user callback for the press
     if (g_user_callback) {
         g_user_callback(scancode, character, true);
     }
@@ -177,8 +182,13 @@ static void usb_keyboard_handle_key_release(uint8_t scancode) {
     // Clear last key if this was it
     if (g_keyboard_state.last_key == scancode) {
         g_keyboard_state.last_key = 0;
-        g_keyboard_state.last_key_press_time_ms = 0;
-        g_keyboard_state.next_repeat_time_ms = 0;
+        g_keyboard_state.last_key_time_ms = 0;
+        g_keyboard_state.last_repeat_number = 0;
+    }
+    
+    // Don't call callback for modifier releases
+    if (usb_keyboard_is_modifier(scancode)) {
+        return;
     }
     
     // Call user callback
@@ -404,25 +414,47 @@ void usb_keyboard_set_leds(bool caps, bool num, bool scroll) {
 // ===========================================
 
 void usb_keyboard_update(void) {
-    if (usb_keyboard_is_modifier(g_keyboard_state.last_key))
+    // No key held? Nothing to do
+    if (g_keyboard_state.last_key == 0) {
         return;
-    if (g_keyboard_state.last_key == 0)
-        return;
-
-    uint64_t now = time_get_uptime_ms();
-
-    if (now < g_keyboard_state.next_repeat_time_ms)
-        return;
-
-    char character = usb_keyboard_translate(
-        g_keyboard_state.last_key,
-        g_keyboard_state.current_report.modifiers
-    );
-
-    if (g_user_callback) {
-        g_user_callback(g_keyboard_state.last_key, character, true);
     }
 
-    // schedule next repeat
-    g_keyboard_state.next_repeat_time_ms += g_keyboard_state.repeat_rate_ms;
+    if (!usb_keyboard_is_pressed(g_keyboard_state.last_key)) {
+        g_keyboard_state.last_key = 0;
+        return;
+    }
+    
+    // Don't repeat modifiers
+    if (usb_keyboard_is_modifier(g_keyboard_state.last_key)) {
+        return;
+    }
+    
+    uint64_t now = time_get_uptime_ms();
+    uint64_t key_held_time = now - g_keyboard_state.last_key_time_ms;
+    
+    // Not held long enough to start repeating?
+    if (key_held_time < g_keyboard_state.repeat_delay_ms) {
+        return;
+    }
+    
+    // Time since we started repeating
+    uint64_t repeat_time = key_held_time - g_keyboard_state.repeat_delay_ms;
+    
+    // Calculate which repeat number we should be on
+    uint64_t repeat_number = repeat_time / g_keyboard_state.repeat_rate_ms;
+    
+    // Store the last repeat we sent in the state struct
+    // (You'll need to add this field to usb_keyboard_state_t)
+    if (repeat_number > g_keyboard_state.last_repeat_number) {
+        char character = usb_keyboard_translate(
+            g_keyboard_state.last_key,
+            g_keyboard_state.current_report.modifiers
+        );
+        
+        if (g_user_callback) {
+            g_user_callback(g_keyboard_state.last_key, character, true);
+        }
+        
+        g_keyboard_state.last_repeat_number = repeat_number;
+    }
 }

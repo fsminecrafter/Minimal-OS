@@ -76,17 +76,28 @@ void terminal_keyboard_callback(uint8_t scancode, char character, bool pressed) 
             break;
             
         case USB_KEY_BACKSPACE:
-            // Delete last character
             if (input_pos > 0) {
                 input_pos--;
                 input_buffer[input_pos] = '\0';
                 
-                // Move cursor back, write space, move back again
+                // Move cursor back
                 if (terminal->cursor_x > 0) {
                     terminal->cursor_x--;
-                    graphics_write_textr_char(' ');
-                    terminal->cursor_x--;
+                } else if (terminal->cursor_y > 0) {
+                    terminal->cursor_y--;
+                    terminal->cursor_x = terminal->cols - 1;
                 }
+                
+                // Save current position
+                uint16_t saved_x = terminal->cursor_x;
+                uint16_t saved_y = terminal->cursor_y;
+                
+                // Write space and move forward
+                graphics_write_textr_char(' ');
+                
+                // Restore position
+                terminal->cursor_x = saved_x;
+                terminal->cursor_y = saved_y;
             }
             break;
             
@@ -180,7 +191,8 @@ void terminal_process_command(const char* cmd) {
 // ===========================================
 
 void terminal_update(void) {
-    // Update keyboard (for key repeat)
+    // CRITICAL: Call keyboard update for key repeat!
+    usb_keyboard_update();
     
     // Process pending command
     if (command_ready) {

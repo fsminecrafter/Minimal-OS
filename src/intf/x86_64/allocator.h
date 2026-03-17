@@ -16,5 +16,12 @@ void* alloc(size_t size);
 // Free a previously allocated memory block pointed by `ptr`.
 void free_mem(void* ptr);
 
+// Allocate a memory block of `size` bytes aligned to `alignment` bytes.
+// Returns a pointer to aligned memory or NULL if out of memory.
+void* kmalloc_aligned(size_t size, size_t alignment);
+
+// Free memory previously allocated by kmalloc_aligned.
+void kfree_aligned(void* ptr);
+
 
 #endif // ALLOCATOR_H

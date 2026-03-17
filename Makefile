@@ -12,6 +12,11 @@ x86_64_asm_object_files := $(patsubst src/impl/x86_64/%.asm, build/x86_64/%.o, $
 
 x86_64_object_files := $(x86_64_c_object_files) $(x86_64_asm_object_files)
 
+audio_wav_files := $(shell find src/resources -name '*.wav')
+audio_obj_files_src := $(shell find src/resources -name '*.o')
+audio_obj_files_build := $(patsubst src/resources/%.wav, build/resources/%.o, $(audio_wav_files))
+audio_object_files := $(audio_obj_files_build) $(audio_obj_files_src)
+
 build/kernel/%.o: src/impl/kernel/%.c
 	mkdir -p $(dir $@)
 	$(CC) -c -I src/intf -ffreestanding $(patsubst build/kernel/%.o, src/impl/kernel/%.c, $@) -o $@
@@ -24,10 +29,14 @@ build/x86_64/%.o: src/impl/x86_64/%.asm
 	mkdir -p $(dir $@)
 	nasm -f elf64 $(patsubst build/x86_64/%.o, src/impl/x86_64/%.asm, $@) -o $@
 
+build/resources/%.o: src/resources/%.wav
+	mkdir -p $(dir $@)
+	python3 tools/audioconverter/wavtoheader.py $< $@
+
 .PHONY: build-x86_64
-build-x86_64: $(kernel_object_files) $(x86_64_object_files)
+build-x86_64: $(kernel_object_files) $(x86_64_object_files) $(audio_object_files) 
 	mkdir -p dist/x86_64
-	$(LD) -n -o dist/x86_64/kernel.bin -T targets/x86_64/linker.ld $(kernel_object_files) $(x86_64_object_files)
+	$(LD) -n -o dist/x86_64/kernel.bin -T targets/x86_64/linker.ld $(kernel_object_files) $(x86_64_object_files) $(audio_object_files)
 	cp dist/x86_64/kernel.bin targets/x86_64/iso/boot/kernel.bin
 	grub-mkrescue /usr/lib/grub/i386-pc -o dist/x86_64/kernel.iso targets/x86_64/iso
 
@@ -35,9 +44,23 @@ build-x86_64: $(kernel_object_files) $(x86_64_object_files)
 clean:
 	rm -rf build dist
 
+.PHONY: audio
+audio: $(audio_obj_files_build) $(audio_obj_files_src)
+
+src/resources/%.o: src/resources/%.wav
+	python3 tools/audioconverter/wavtoheader.py $< $@
+
 .PHONY: run
 run: build-x86_64
-	qemu-system-x86_64 -cdrom dist/x86_64/kernel.iso -m 1024M -boot d -serial stdio -audiodev pa,id=speaker -machine pcspk-audiodev=speaker -usb -device usb-kbd
+	qemu-system-x86_64 -cdrom dist/x86_64/kernel.iso -m 1024M -boot d -serial stdio -audiodev pa,id=speaker -machine pcspk-audiodev=speaker -usb -device usb-kbd -audiodev pa,id=audio0 -device AC97,audiodev=audio0 -D qemu-audio.log
+
+.PHONY: run-sdl
+run-sdl: build-x86_64
+	qemu-system-x86_64 -cdrom dist/x86_64/kernel.iso -m 1024M -boot d -serial stdio -audiodev sdl,id=speaker -machine pcspk-audiodev=speaker -usb -device usb-kbd -audiodev sdl,id=audio0 -device AC97,audiodev=audio0
+
+.PHONY: run-alsa
+run-alsa: build-x86_64
+	qemu-system-x86_64 -cdrom dist/x86_64/kernel.iso -m 1024M -boot d -serial stdio -audiodev alsa,id=speaker -machine pcspk-audiodev=speaker -usb -device usb-kbd -audiodev alsa,id=audio0 -device AC97,audiodev=audio0
 
 .PHONY: run-ps2
 run-ps2: build-x86_64

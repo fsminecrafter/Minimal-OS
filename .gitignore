@@ -5,3 +5,4 @@ kernel.bin
 # Building files
 
 *.o
+*.wav

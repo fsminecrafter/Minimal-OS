@@ -19,6 +19,9 @@
 #include "usb/uhci.h"
 #include "x86_64/globaldatatable.h"
 
+#include "x86_64/ac97_driver.h"
+#include "audio.h"
+
 #include "keyboard/unifiedkeyboardbridge.h"
 
 //Applications
@@ -79,6 +82,7 @@ void kernel_main(uint64_t mb2_info_addr) {
     time_set_datetime(&dt);
     terminal_program_entry();
     createProcess("busy", busy);
+    createProcess("kernelaudio", ac97_update);
     schedulerInit();
 
     while(1);

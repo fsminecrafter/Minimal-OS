@@ -113,6 +113,20 @@ uint16_t pci_config_read_word(uint8_t bus, uint8_t device, uint8_t function, uin
     return word;
 }
 
+static void pci_config_write_word(uint8_t bus, uint8_t device, uint8_t function, uint8_t offset, uint16_t value) {
+    uint32_t aligned_offset = offset & 0xFC;
+    uint32_t val = pci_config_read(bus, device, function, aligned_offset);
+    uint8_t pos = offset & 2;
+
+    if (pos == 0) {
+        val = (val & 0xFFFF0000U) | value;
+    } else {
+        val = (val & 0x0000FFFFU) | ((uint32_t)value << 16);
+    }
+
+    pci_write_config_dword(bus, device, function, aligned_offset, val);
+}
+
 void pci_enumerate_all() {
     serial_write_str("Enumerating PCI devices starting from bus 0...\n");
     if (printtodisplay) {
@@ -120,6 +134,38 @@ void pci_enumerate_all() {
         print_str("Enumerating PCI devices starting from bus 0...\n");
     }
     pci_enumerate_bus(0);
+}
+
+int pci_get_device_count(void) {
+    return pci_device_count;
+}
+
+pci_device_t* pci_find_device(uint16_t vendor_id, uint16_t device_id) {
+    for (int i = 0; i < pci_device_count; i++) {
+        if (pci_devices[i].vendor_id == vendor_id &&
+            pci_devices[i].device_id == device_id) {
+            return &pci_devices[i];
+        }
+    }
+    return NULL;
+}
+
+pci_device_t* pci_find_class(uint8_t class_code, uint8_t subclass) {
+    for (int i = 0; i < pci_device_count; i++) {
+        if (pci_devices[i].class_code == class_code &&
+            pci_devices[i].subclass == subclass) {
+            return &pci_devices[i];
+        }
+    }
+    return NULL;
+}
+
+void pci_enable_io_busmaster(pci_device_t* dev) {
+    if (!dev) return;
+    uint16_t cmd = pci_config_read_word(dev->bus, dev->device, dev->function, 0x04);
+    cmd |= (1U << 0); // I/O space
+    cmd |= (1U << 2); // Bus master
+    pci_config_write_word(dev->bus, dev->device, dev->function, 0x04, cmd);
 }
 
 void pci_enumerate_bus(uint8_t bus) {

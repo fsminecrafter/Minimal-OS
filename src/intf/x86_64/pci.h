@@ -37,3 +37,8 @@ void print_pci_devices(); //Prints in the serial COM1 output
 uint32_t pci_read_data(void);
 void test_gpu();
 void initializeGraphicsDevice();
+
+int pci_get_device_count(void);
+pci_device_t* pci_find_device(uint16_t vendor_id, uint16_t device_id);
+pci_device_t* pci_find_class(uint8_t class_code, uint8_t subclass);
+void pci_enable_io_busmaster(pci_device_t* dev);

@@ -15,6 +15,7 @@
 #include "x86_64/gdt.h"
 #include "x86_64/tss.h"
 #include "time.h"
+#include "x86_64/ac97_driver.h"
 
 #define HEAP_START 0x400000  // 4 MiB - should be above kernel and reserved areas
 
@@ -74,5 +75,13 @@ void startroutine(uint64_t total_ram_bytes) {
     print_str("Enumerating PCI devices\n");
     pci_enumerate_all();
     print_pci_devices();
+    print_str("Initializing Audio\n");
+    audio_init();
+    
+    // Initialize hardware driver (AC97)
+    if (!ac97_init()) {
+        serial_write_str("ERROR: Audio hardware not found!\n");
+        return;
+    }
     print_str("Startup routine Done.\n");
 }

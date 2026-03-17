@@ -4,6 +4,7 @@
 #include "x86_64/interupthandler.h"
 #include "x86_64/idt.h"
 #include "x86_64/scheduler.h"
+#include "audio.h"
 #include "time.h"
 #include "panic.h"
 
@@ -47,6 +48,9 @@ void pit_irq_handler() {
     // Usb poll
     usb_poll();
     
+    // Audio update (mix into HW buffer)
+    audio_update();
+
     // Run scheduler
     scheduler_tick();
     

@@ -52,7 +52,7 @@ src/resources/%.o: src/resources/%.wav
 
 .PHONY: run
 run: build-x86_64
-	qemu-system-x86_64 -cdrom dist/x86_64/kernel.iso -m 1024M -boot d -serial stdio -audiodev pa,id=speaker -machine pcspk-audiodev=speaker -usb -device usb-kbd -audiodev pa,id=audio0 -device AC97,audiodev=audio0 -D qemu-audio.log
+	qemu-system-x86_64 -cdrom dist/x86_64/kernel.iso -m 1024M -boot d -serial stdio -audiodev pa,id=speaker -machine pcspk-audiodev=speaker -usb -device usb-kbd -audiodev pa,id=audio0 -device AC97,audiodev=audio0 -device ahci,id=ahci -drive id=disk0,file=sata256.img,if=none,format=raw -device ide-hd,drive=disk0,bus=ahci.0
 
 .PHONY: run-sdl
 run-sdl: build-x86_64

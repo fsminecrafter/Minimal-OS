@@ -1,0 +1,45 @@
+MinimaFS is a filesystem spefically made for MinimalOS.
+
+Tree structure
+with a dir descriptor in every directory / folder
+/ is root of the storage device
+storage devices are mounted at "" and have names like 1: 2: 3: 4:
+
+average dir 
+
+1:/etc/apt/configureahhfile.txt
+
+2:/
+
+4kb alignment
+
+files are formatted like this:
+
+@HEADER@
+@FILETYPE:text@
+@FILEFORMAT:txt@
+@FILELEN:8@ // including header in Bytes
+@FILENAME:'hellowordlwzasuz123__aa  '@ // '' as to have it as a string
+@CREATEDDATE:'12jan2025'@
+@LASTCHANGED:'13jan2026'@
+@PARENTFOLDER@:'things'@
+@RUNNABLE:True@
+@ENTRYPOINT:0x2940083@ //only if is runnable
+@RUNWITH:1:/programs/idk.smt //only if no ENTRYPOINT use another file to run it.
+@HIDDEN:False@
+
+@DATA@
+... // DATA
+
+...
+
+@END
+
+and every folder has a file called folder.desc which is HIDDEN
+it has every child in it but not the children of the children. so if a folder is in another folder the folder.desc will only
+mention the child folder and not its contents.
+
+every storage device has a storage.desc file in the root of the drive.
+it has name of the drive which can be 1 - 99 or a name like 'mydrive'
+but by default its 1 - 99. It has the fs description like password, child folders and files, usage (kilobytes)
+and other essentials

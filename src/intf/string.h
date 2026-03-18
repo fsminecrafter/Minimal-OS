@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdarg.h>
 
 // ===========================================
 // TRADITIONAL C STRING FUNCTIONS
@@ -12,6 +13,8 @@
 size_t strlen(const char* str);
 int strcmp(const char* s1, const char* s2);
 int strncmp(const char* s1, const char* s2, size_t n);
+int snprintf(char* buffer, size_t size, const char* fmt, ...);
+int sprintf(char* buffer, const char* fmt, ...);
 
 char* strcpy(char* dest, const char* src);
 char* strncpy(char* dest, const char* src, size_t n);

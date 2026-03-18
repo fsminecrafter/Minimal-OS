@@ -30,6 +30,11 @@
 #include "keyboard/swedishKeyboard.h"
 #include "keyboard/usKeyboard.h"
 
+//MinimaFS
+
+#include "x86_64/minimafs.h"
+#include "x86_64/ahci.h"
+
 void busy(void) {
     for (volatile int i = 0; i < 100; i++);
 }
@@ -80,7 +85,8 @@ void kernel_main(uint64_t mb2_info_addr) {
     dt.second = 30;
 
     time_set_datetime(&dt);
-    terminal_program_entry();
+
+    terminal_program_entry();    
     createProcess("busy", busy);
     createProcess("kernelaudio", ac97_update);
     schedulerInit();

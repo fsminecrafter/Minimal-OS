@@ -164,6 +164,7 @@ void pci_enable_io_busmaster(pci_device_t* dev) {
     if (!dev) return;
     uint16_t cmd = pci_config_read_word(dev->bus, dev->device, dev->function, 0x04);
     cmd |= (1U << 0); // I/O space
+    cmd |= (1U << 1); // Memory space
     cmd |= (1U << 2); // Bus master
     pci_config_write_word(dev->bus, dev->device, dev->function, 0x04, cmd);
 }
@@ -289,9 +290,9 @@ void print_pci_devices() {
             pci_device_t* dev = &pci_devices[i];
             print_str("PCI Device found: ");
             print_uint64_hex(dev->bus);
-            print_str(':');
+            print_char(':');
             print_uint64_hex(dev->device);
-            print_str(':');
+            print_char(':');
             print_uint64_hex(dev->function);
             print_str(" Vendor: ");
             print_uint64_hex(dev->vendor_id);

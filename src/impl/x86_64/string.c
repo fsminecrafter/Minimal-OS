@@ -587,3 +587,97 @@ void itoa(int value, char* str, int base) {
         *ptr1++ = tmp_char;
     }
 }
+
+static size_t append_to_buffer(char* buf, size_t bufsize, size_t pos, const char* src) {
+    while (*src && pos + 1 < bufsize) {
+        buf[pos++] = *src++;
+    }
+    return pos;
+}
+
+static size_t append_char_to_buffer(char* buf, size_t bufsize, size_t pos, char c) {
+    if (pos + 1 < bufsize) {
+        buf[pos++] = c;
+    }
+    return pos;
+}
+
+// ------------------------
+// Minimal vsnprintf implementation
+// ------------------------
+static int vsnprintf_internal(char* buffer, size_t size, const char* fmt, va_list args) {
+    size_t pos = 0;
+
+    while (*fmt) {
+        if (*fmt == '%') {
+            fmt++;
+            if (*fmt == '\0') break;
+
+            switch (*fmt) {
+                case 's': {
+                    const char* s = va_arg(args, const char*);
+                    if (!s) s = "(null)";
+                    pos = append_to_buffer(buffer, size, pos, s);
+                    break;
+                }
+                case 'c': {
+                    char c = (char)va_arg(args, int);
+                    pos = append_char_to_buffer(buffer, size, pos, c);
+                    break;
+                }
+                case 'd': {
+                    int64_t val = va_arg(args, int);
+                    char tmp[32];
+                    int_to_str(val, tmp);
+                    pos = append_to_buffer(buffer, size, pos, tmp);
+                    break;
+                }
+                case 'u': {
+                    uint64_t val = va_arg(args, unsigned int);
+                    char tmp[32];
+                    uint_to_str(val, tmp);
+                    pos = append_to_buffer(buffer, size, pos, tmp);
+                    break;
+                }
+                case '%': {
+                    pos = append_char_to_buffer(buffer, size, pos, '%');
+                    break;
+                }
+                default:
+                    // Unknown specifier: print literally
+                    pos = append_char_to_buffer(buffer, size, pos, '%');
+                    pos = append_char_to_buffer(buffer, size, pos, *fmt);
+                    break;
+            }
+        } else {
+            pos = append_char_to_buffer(buffer, size, pos, *fmt);
+        }
+        fmt++;
+    }
+
+    if (size > 0) {
+        buffer[pos < size ? pos : size - 1] = '\0';
+    }
+
+    return (int)pos; // number of chars that would have been written
+}
+
+// ------------------------
+// Public functions
+// ------------------------
+int snprintf(char* buffer, size_t size, const char* fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    int ret = vsnprintf_internal(buffer, size, fmt, args);
+    va_end(args);
+    return ret;
+}
+
+int sprintf(char* buffer, const char* fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    // Use a huge buffer size to simulate "unbounded" sprintf
+    int ret = vsnprintf_internal(buffer, (size_t)-1, fmt, args);
+    va_end(args);
+    return ret;
+}

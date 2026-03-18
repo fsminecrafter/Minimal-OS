@@ -35,8 +35,8 @@ def wav_to_header(input_file, output_file):
     with open(output_file, 'w') as f:
         guard = f"{var_name.upper()}_H"
         f.write(f"#ifndef {guard}\n#define {guard}\n\n#include \"audio.h\"\n\n")
-    f.write(f"// {base_name}: {wav['num_channels']}ch {wav['sample_rate']}Hz {wav['bits_per_sample']}bit {duration:.2f}s\n")
-    f.write(f"// Metadata: type={audio_type}, bitrate={bitrate}bps, duration={duration:.2f}s\n\n")
+        f.write(f"// {base_name}: {wav['num_channels']}ch {wav['sample_rate']}Hz {wav['bits_per_sample']}bit {duration:.2f}s\n")
+        f.write(f"// Metadata: type={audio_type}, bitrate={bitrate}bps, duration={duration:.2f}s\n\n")
         f.write(f"static const wav_header_t {var_name}_header = {{\n")
         f.write(f"    {{'R','I','F','F'}}, {wav['data_size']+36}, {{'W','A','V','E'}},\n")
         f.write(f"    {{'f','m','t',' '}}, 16, {wav['audio_format']}, {wav['num_channels']},\n")
@@ -50,12 +50,14 @@ def wav_to_header(input_file, output_file):
         f.write(f"const audio_sound_t {var_name}_sound = {{\n")
         f.write(f"    \"{base_name}\", &{var_name}_header, {var_name}_data,\n")
         f.write(f"    sizeof({var_name}_data), {num_samples}, {wav['num_channels']},\n")
-    f.write(f"    {wav['bits_per_sample']}, {wav['sample_rate']}, {wav['audio_format']},\n")
-    f.write(f"    {bitrate}, (uint32_t)({duration * 1000:.0f})\n}};\n\n")
+        f.write(f"    {wav['bits_per_sample']}, {wav['sample_rate']}, {wav['audio_format']},\n")
+        f.write(f"    {bitrate}, (uint32_t)({duration * 1000:.0f})\n}};\n\n")
         f.write(f"#endif // {guard}\n")
     print(f"Created {output_file}")
     print(f"Use: extern const audio_sound_t {var_name}_sound;")
     print(f"     audio_play(&{var_name}_sound, stream, 75, false);")
+    print(f"Metadata written, type: {audio_type}, bitrate {bitrate}bps, {duration:.2f}s")
+
 
 def _objcopy_symbol_base(input_path):
     # objcopy uses the provided input path and replaces non-alnum with '_'
@@ -74,6 +76,7 @@ def wav_to_object(input_file, output_file):
     subprocess.check_call(cmd)
     print(f"Created {output_file}")
     print(f"Symbols: _binary_{base}_wav_start/_end/_size")
+    
 
 if __name__ == "__main__":
     if len(sys.argv) != 3:

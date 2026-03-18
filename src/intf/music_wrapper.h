@@ -85,6 +85,11 @@ static inline void init_music_sound(audio_sound_t* sound) {
         block_align = header->block_align;
         bits_per_sample = header->bits_per_sample;
     }
+    // Fallback to defaults when metadata is missing or zeroed
+    if (sample_rate == 0) sample_rate = AUDIO_SAMPLE_RATE;
+    if (byte_rate == 0 && bits_per_sample > 0 && num_channels > 0) {
+        byte_rate = sample_rate * num_channels * (bits_per_sample / 8);
+    }
 
     sound->name = "music";
     sound->header = header;
@@ -101,6 +106,8 @@ static inline void init_music_sound(audio_sound_t* sound) {
     sound->num_samples = (bytes_per_sample > 0) ? (data_size / bytes_per_sample) : 0;
     if (byte_rate > 0) {
         sound->duration_ms = (data_size * 1000U) / byte_rate;
+    } else if (sample_rate > 0 && sound->num_samples > 0) {
+        sound->duration_ms = (sound->num_samples * 1000U) / sample_rate;
     } else {
         sound->duration_ms = 0;
     }

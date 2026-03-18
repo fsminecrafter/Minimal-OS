@@ -17,7 +17,11 @@
 #include "time.h"
 #include "x86_64/ac97_driver.h"
 
-#define HEAP_START 0x400000  // 4 MiB - should be above kernel and reserved areas
+#define HEAP_MIN_START 0x400000  // 4 MiB - fallback if kernel end is lower
+
+static inline uintptr_t align_up_uintptr(uintptr_t value, uintptr_t alignment) {
+    return (value + alignment - 1) & ~(alignment - 1);
+}
 
 void print_pic_masks() {
     uint8_t master_mask = port_inb(0x21);
@@ -31,7 +35,15 @@ void print_pic_masks() {
 }
 
 void startroutine(uint64_t total_ram_bytes) {
-    uint64_t uintheapsize = total_ram_bytes - HEAP_START;
+    extern char _kernel_end;
+    uintptr_t heap_start = align_up_uintptr((uintptr_t)&_kernel_end, 0x1000);
+    if (heap_start < HEAP_MIN_START) {
+        heap_start = HEAP_MIN_START;
+    }
+    if (heap_start >= total_ram_bytes) {
+        PANIC("Heap start beyond total RAM");
+    }
+    uint64_t uintheapsize = total_ram_bytes - heap_start;
     print_set_color(PRINT_COLOR_WHITE, PRINT_COLOR_BLACK);
     print_str("Startup Routine\n");
     print_str("init rtc\n");
@@ -63,7 +75,10 @@ void startroutine(uint64_t total_ram_bytes) {
     while (pit_get_ticks() < 5) {
         asm volatile("hlt");
     }
-    allocator_init((void*)HEAP_START, uintheapsize);
+    serial_write_str("Heap start: 0x");
+    serial_write_hex(heap_start);
+    serial_write_str("\n");
+    allocator_init((void*)heap_start, uintheapsize);
     pmm_init((void*)0x1000000, 0x4000000);  // Start at 16MB instead
     print_str("PIT working!\n");
     print_str("Init serial\n");

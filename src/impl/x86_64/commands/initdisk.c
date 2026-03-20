@@ -7,9 +7,7 @@
 #include "minimafshandler.h"
 
 void cmd_initdisk(int argc, const char** argv) {
-    initializeminimafs();
-    ahci_drive_t* drive = getdrive(1);
-    minimafs_disk_device_t* disk = setdrive(drive);
+    initializeminimafs(0);
 }
 
 void register_initdisk(void) {

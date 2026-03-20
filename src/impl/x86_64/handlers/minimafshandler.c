@@ -7,7 +7,6 @@
 
 // Globals
 
-
 pci_device_t* ahci_pci;
 ahci_controller_t* ahci;
 uint8_t drive_count;
@@ -35,7 +34,7 @@ void exampleinit(void) {
     }
     
     // Probe for drives
-    uint8_t drive_count = ahci_probe_ports(ahci);
+    drive_count = ahci_probe_ports(ahci);
     
     serial_write_str("Found ");
     serial_write_dec(drive_count);
@@ -174,7 +173,7 @@ void exampleinit(void) {
     serial_write_str("=== Storage System Ready! ===\n");
 }
 
-void initializeminimafs(void) {
+minimafs_disk_device_t* initializeminimafs(int driveindex) {
     serial_write_str("=== Initializing Storage System ===\n");
     
     // Find AHCI controller via PCI
@@ -183,7 +182,7 @@ void initializeminimafs(void) {
     if (!ahci_pci) {
         serial_write_str("ERROR: No AHCI controller found!\n");
         serial_write_str("Your system may not have SATA support.\n");
-        return;
+        return NULL;
     }
     
     // Initialize AHCI controller
@@ -191,11 +190,10 @@ void initializeminimafs(void) {
     
     if (!ahci) {
         serial_write_str("ERROR: Failed to initialize AHCI\n");
-        return;
+        return NULL;
     }
-}
-
-ahci_drive_t* getdrive(int driveindex) {
+    
+    // Probe for drives
     drive_count = ahci_probe_ports(ahci);
     
     serial_write_str("Found ");
@@ -207,11 +205,10 @@ ahci_drive_t* getdrive(int driveindex) {
         return NULL;
     }
     
-    disk = ahci_get_drive(ahci, driveindex);
+    // Get first drive
+    disk = ahci_get_drive(ahci, 0);
     if (!disk) {
-        serial_write_str("ERROR: Failed to get drive ");
-        serial_write_dec(driveindex);
-        serial_write("\n");
+        serial_write_str("ERROR: Failed to get drive 0\n");
         return NULL;
     }
     
@@ -224,7 +221,17 @@ ahci_drive_t* getdrive(int driveindex) {
     serial_write_dec(disk->sector_size);
     serial_write_str(" bytes\n");
     
-    return disk;
+    minimafs_init();
+    
+    device = (minimafs_disk_device_t*)alloc(sizeof(minimafs_disk_device_t));
+    if (!device) {
+        serial_write_str("ERROR: Failed to allocate MinimaFS device wrapper\n");
+        return;
+    }
+    device->ahci_drive = disk;
+    device->sector_size = disk->sector_size;
+
+    return device;
 }
 
 minimafs_disk_device_t* setdrive(ahci_drive_t* disk) {
@@ -238,24 +245,26 @@ minimafs_disk_device_t* setdrive(ahci_drive_t* disk) {
     return device;
 }
 
-bool mountdrive(minimafs_disk_device_t* device, int deviceindex) {
-    if (!minimafs_mount(device, deviceindex)) {
+int mountdrive(minimafs_disk_device_t* device, int deviceindex) {
+    int successcode = minimafs_mount(device, deviceindex);
+    if (!successcode == 1) {
         serial_write_str("ERROR: Failed to mount filesystem\n");
-        return NULL;
+        return 0;
     }
     
     serial_write_str("Filesystem mounted as drive ");
     serial_write_dec(deviceindex);
     serial_write_str(": \n");
+    return successcode;
 }
 
 minimafs_disk_device_t* getminimadrive() {
     if (device) {
+        serial_write_str("Returning device\n");
         return device;
-        serial_write("Returning device");
     } else {
+        serial_write_str("No device\n");
         return NULL;
-        serial_write("No device");
     }
 }
 
@@ -265,4 +274,8 @@ minimafs_disk_device_t* getahci() {
     } else {
         return NULL;
     }
+}
+
+ahci_drive_t* getadrive() {
+    return disk;
 }

@@ -28,7 +28,7 @@ double_fault_stack:     resb 4096
 double_fault_stack_top:
     align 16
 kernel_stack:
-    resb 0x4000
+    resb 0x40000
 kernel_stack_top:
 
 

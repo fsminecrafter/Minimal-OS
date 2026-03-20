@@ -12,6 +12,8 @@
 #include "x86_64/allocator.h"
 #include "serial.h"
 
+bool adebug = false;
+
 // AC97 PCI IDs
 #define AC97_VENDOR_INTEL  0x8086
 #define AC97_DEVICE_ICH    0x2415
@@ -258,24 +260,25 @@ void ac97_update(void) {
             int16_t s = g_audio_buffers[civ_dbg][i];
             energy += (s < 0) ? -s : s;
         }
-
-        serial_write_str("AC97: DMA civ=");
-        serial_write_dec(civ_dbg);
-        serial_write_str(" lvi=");
-        serial_write_dec(lvi);
-        serial_write_str(" picb=");
-        serial_write_dec(picb);
-        serial_write_str(" sr=0x");
-        serial_write_hex(sr);
-        serial_write_str(" cr=0x");
-        serial_write_hex(cr);
-        serial_write_str(" next=");
-        serial_write_dec(g_next_fill);
-        serial_write_str(" queued=");
-        serial_write_dec(queued);
-        serial_write_str(" energy=");
-        serial_write_dec(energy);
-        serial_write_str("\n");
+        if (adebug == true) {
+            serial_write_str("AC97: DMA civ=");
+            serial_write_dec(civ_dbg);
+            serial_write_str(" lvi=");
+            serial_write_dec(lvi);
+            serial_write_str(" picb=");
+            serial_write_dec(picb);
+            serial_write_str(" sr=0x");
+            serial_write_hex(sr);
+            serial_write_str(" cr=0x");
+            serial_write_hex(cr);
+            serial_write_str(" next=");
+            serial_write_dec(g_next_fill);
+            serial_write_str(" queued=");
+            serial_write_dec(queued);
+            serial_write_str(" energy=");
+            serial_write_dec(energy);
+            serial_write_str("\n");
+        }
 
         if (sr != 0) {
             // Clear latched status bits

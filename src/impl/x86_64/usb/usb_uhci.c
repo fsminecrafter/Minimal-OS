@@ -14,6 +14,8 @@
 // EXTERNAL DEPENDENCIES
 // ===========================================
 
+bool udebug = false;
+
 // Forward declarations from pci.c
 extern uint32_t pci_read_config_dword(uint8_t bus, uint8_t device, uint8_t function, uint8_t offset);
 extern void pci_write_config_dword(uint8_t bus, uint8_t device, uint8_t function, uint8_t offset, uint32_t value);
@@ -1041,26 +1043,28 @@ bool uhci_keyboard_interrupt_poll(uint8_t* buffer, uint16_t length) {
     g_interrupt_polls++;
     uint32_t status = keyboard_int_td->status;
     
-    // Debug EVERY poll for first 20, then every 100
-    if (poll_count <= 20 || (poll_count % 100) == 0) {
-        serial_write_str("UHCI: Poll #");
-        serial_write_dec(poll_count);
-        serial_write_str(" TD status=0x");
-        serial_write_hex(status);
-        
-        if (status & UHCI_TD_ACTIVE) {
-            serial_write_str(" [ACTIVE - waiting]");
-        } else {
-            serial_write_str(" [COMPLETE");
-            if (status & UHCI_TD_NAK) serial_write_str(" NAK");
-            if (status & UHCI_TD_STALLED) serial_write_str(" STALL");
-            if (status & UHCI_TD_DBERR) serial_write_str(" DBERR");
-            if (status & UHCI_TD_BABBLE) serial_write_str(" BABBLE");
-            if (status & UHCI_TD_CRCTIMEOUT) serial_write_str(" CRC");
-            if (status & UHCI_TD_BITSTUFF) serial_write_str(" BITSTUFF");
-            serial_write_str("]");
+    if (udebug == true) {
+        // Debug EVERY poll for first 20, then every 100
+        if (poll_count <= 20 || (poll_count % 100) == 0) {
+            serial_write_str("UHCI: Poll #");
+            serial_write_dec(poll_count);
+            serial_write_str(" TD status=0x");
+            serial_write_hex(status);
+            
+            if (status & UHCI_TD_ACTIVE) {
+                serial_write_str(" [ACTIVE - waiting]");
+            } else {
+                serial_write_str(" [COMPLETE");
+                if (status & UHCI_TD_NAK) serial_write_str(" NAK");
+                if (status & UHCI_TD_STALLED) serial_write_str(" STALL");
+                if (status & UHCI_TD_DBERR) serial_write_str(" DBERR");
+                if (status & UHCI_TD_BABBLE) serial_write_str(" BABBLE");
+                if (status & UHCI_TD_CRCTIMEOUT) serial_write_str(" CRC");
+                if (status & UHCI_TD_BITSTUFF) serial_write_str(" BITSTUFF");
+                serial_write_str("]");
+            }
+            serial_write_str("\n");
         }
-        serial_write_str("\n");
     }
     
     // Check if TD is still active

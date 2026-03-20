@@ -27,16 +27,17 @@ static bool g_self_test_done[MINIMAFS_MAX_DRIVES];
 
 #define MINIMAFS_ENABLE_SELF_TEST 1
 #define MINIMAFS_SELF_TEST_MAX_SECTOR 4096
+#define MINIMAFS_MAX_ENTRIES 4096
 
 // ===========================================
 // INTERNAL HELPERS
 // ===========================================
 
-static minimafs_drive_t* get_drive(uint8_t drive_number) {
-    if (drive_number == 0 || drive_number > MINIMAFS_MAX_DRIVES) {
+minimafs_drive_t* get_drive(uint8_t drive_number) {
+    if (drive_number >= MINIMAFS_MAX_DRIVES) {
         return NULL;
     }
-    return &g_drives[drive_number - 1];
+    return &g_drives[drive_number];
 }
 
 static bool minimafs_read_blocks(minimafs_drive_t* drive, uint32_t block_num,
@@ -47,16 +48,17 @@ static uint32_t block_alloc_run(uint8_t drive_num, uint32_t count);
 static void block_free_run(uint8_t drive_num, uint32_t block_num, uint32_t count);
 bool minimafs_read_folder_desc(minimafs_drive_t* drive, const char* path,
                                minimafs_folder_desc_t* desc);
-bool minimafs_write_folder_desc(minimafs_drive_t* drive, const minimafs_folder_desc_t* desc);
-static bool minimafs_write_storage_desc(minimafs_drive_t* drive, const minimafs_storage_desc_t* desc);
+bool minimafs_write_folder_desc(minimafs_drive_t* drive, minimafs_folder_desc_t* desc);
+bool minimafs_write_storage_desc(minimafs_drive_t* drive);
+bool minimafs_storage_add_entry(minimafs_drive_t* drive, minimafs_dir_entry_t* entry);
 static bool minimafs_read_storage_desc(minimafs_drive_t* drive, minimafs_storage_desc_t* desc);
-static void minimafs_refresh_storage_desc(minimafs_drive_t* drive);
+void minimafs_refresh_storage_desc(minimafs_drive_t* drive);
 
 static bool ensure_dma_bounce(uint8_t drive_number) {
-    if (drive_number == 0 || drive_number > MINIMAFS_MAX_DRIVES) {
+    if (drive_number >= MINIMAFS_MAX_DRIVES) {
         return false;
     }
-    uint8_t idx = drive_number - 1;
+    uint8_t idx = drive_number;
     if (g_dma_bounce[idx]) {
         return true;
     }
@@ -163,7 +165,7 @@ void minimafs_init(void) {
     
     for (int i = 0; i < MINIMAFS_MAX_DRIVES; i++) {
         g_drives[i].mounted = false;
-        g_drives[i].drive_number = i + 1;
+        g_drives[i].drive_number = i;
     }
     
     g_initialized = true;
@@ -234,7 +236,7 @@ bool minimafs_parse_path(const char* path, uint8_t* drive_number, char* local_pa
             *drive_number = (*drive_number * 10) + (drive_str[i] - '0');
         }
         
-        if (*drive_number == 0 || *drive_number > MINIMAFS_MAX_DRIVES) {
+        if (*drive_number >= MINIMAFS_MAX_DRIVES) {
             return false;
         }
     } else {
@@ -467,76 +469,97 @@ static char* minimafs_generate_file_header(const minimafs_file_metadata_t* metad
 static bool minimafs_write_file_to_disk(minimafs_drive_t* drive, const char* local_path,
                                         minimafs_file_metadata_t* metadata,
                                         const void* data, uint32_t data_size) {
-    // Generate header
     if (!drive || !metadata) return false;
-    
+
     metadata->data_length = data_size;
     metadata->file_length = 0;
-    
+
     uint32_t header_size = 0;
     uint32_t footer_size = 5;  // "@END\n"
+
+    // Generate header twice to stabilize size
     for (int i = 0; i < 2; i++) {
         metadata->file_length = header_size + data_size + footer_size;
+
         char* tmp = minimafs_generate_file_header(metadata, &header_size);
         if (!tmp) return false;
         free_mem(tmp);
     }
+
     metadata->file_length = header_size + data_size + footer_size;
-    
+
     char* header = minimafs_generate_file_header(metadata, &header_size);
     if (!header) return false;
-    
+
     uint32_t total_size = header_size + data_size + footer_size;
-    uint32_t aligned_size = ((total_size + MINIMAFS_BLOCK_SIZE - 1) / MINIMAFS_BLOCK_SIZE) * MINIMAFS_BLOCK_SIZE;
+    uint32_t aligned_size =
+        ((total_size + MINIMAFS_BLOCK_SIZE - 1) / MINIMAFS_BLOCK_SIZE) * MINIMAFS_BLOCK_SIZE;
     uint32_t block_count = aligned_size / MINIMAFS_BLOCK_SIZE;
-    
+
     uint32_t start_block = metadata->block_offset;
     uint32_t old_count = metadata->block_count;
     uint32_t old_offset = metadata->block_offset;
-    
+
+    // Reuse or allocate blocks
     if (start_block != 0 && old_count >= block_count) {
         if (old_count > block_count) {
-            block_free_run(drive->drive_number, old_offset + block_count, old_count - block_count);
+            block_free_run(drive->drive_number,
+                           old_offset + block_count,
+                           old_count - block_count);
         }
     } else {
         start_block = block_alloc_run(drive->drive_number, block_count);
         if (start_block == 0xFFFFFFFF) {
-            free_mem(header);
+            //free(header);
             return false;
         }
+
         if (old_count > 0) {
             block_free_run(drive->drive_number, old_offset, old_count);
         }
+
         metadata->block_offset = start_block;
     }
-    
+
     metadata->block_count = block_count;
-    
+    metadata->block_offset = start_block;
+
+    serial_write_str("Allocated blocks ");
+    serial_write_dec(start_block);
+    serial_write_str(" - ");
+    serial_write_dec(start_block + block_count - 1);
+    serial_write_str("\n");
+
     char* buffer = (char*)alloc(aligned_size);
     if (!buffer) {
-        free_mem(header);
         block_free_run(drive->drive_number, start_block, block_count);
+        //free(header);
         return false;
     }
-    
+
     memset(buffer, 0, aligned_size);
     memcpy(buffer, header, header_size);
-    free_mem(header);
-    
+
     if (data && data_size > 0) {
         memcpy(buffer + header_size, data, data_size);
     }
+
     memcpy(buffer + header_size + data_size, "@END\n", 5);
-    
+
     bool ok = minimafs_write_blocks(drive, start_block, block_count, buffer);
-    free_mem(buffer);
-    
+
     if (!ok) {
         block_free_run(drive->drive_number, start_block, block_count);
+        free_mem(buffer);
+        free_mem(header);
         return false;
     }
-    
+
+    free_mem(buffer);
+    free_mem(header);
+
     minimafs_refresh_storage_desc(drive);
+
     (void)local_path;
     return true;
 }
@@ -583,23 +606,33 @@ bool minimafs_create_file(const char* path, const char* filetype, const char* fi
         return false;
     }
     
-    // Extract filename and parent folder
+    // Split path into parent and filename
     char filename[MINIMAFS_MAX_FILENAME];
     char parent[MINIMAFS_MAX_PATH];
     minimafs_split_local_path(local_path, parent, filename);
-    if (filename[0] == '\0') {
-        return false;
-    }
+    
+    serial_write_str("Creating file: ");
+    serial_write_str(filename);
+    serial_write_str(" in parent: ");
+    serial_write_str(parent);
+    serial_write_str("\n");
     
     // Read parent folder.desc
     minimafs_folder_desc_t parent_desc;
     if (!minimafs_read_folder_desc(drive, parent, &parent_desc)) {
+        serial_write_str("ERROR: Failed to read parent folder.desc\n");
         return false;
     }
     
+    serial_write_str("Parent folder has ");
+    serial_write_dec(parent_desc.entry_count);
+    serial_write_str(" entries before adding\n");
+    
+    // Check if file already exists
     uint32_t existing_index = 0;
     bool exists = minimafs_find_entry_in_folder(&parent_desc, filename, &existing_index);
-    if (exists && parent_desc.entries[existing_index].type == MINIMAFS_TYPE_DIR) {
+    if (exists && parent_desc.entries[existing_index].type != MINIMAFS_TYPE_DIR) {
+        serial_write_str("ERROR: File already exists\n");
         return false;
     }
     
@@ -620,30 +653,42 @@ bool minimafs_create_file(const char* path, const char* filetype, const char* fi
     metadata.runnable = false;
     metadata.hidden = false;
     
-    // Write empty file
+    // Write empty file to disk
     if (!minimafs_write_file_to_disk(drive, local_path, &metadata, NULL, 0)) {
+        serial_write_str("ERROR: Failed to write file to disk\n");
+        return false;
+    }
+
+    if (parent_desc.entry_count >= 256) {
+        serial_write_str("ERROR: Parent folder full\n");
         return false;
     }
     
-    if (exists) {
-        minimafs_dir_entry_t* entry = &parent_desc.entries[existing_index];
-        entry->type = MINIMAFS_TYPE_FILE;
-        entry->block_offset = metadata.block_offset;
-        entry->block_count = metadata.block_count;
-        entry->hidden = metadata.hidden;
-    } else {
-        if (parent_desc.entry_count >= 256) {
-            return false;
-        }
-        minimafs_dir_entry_t* entry = &parent_desc.entries[parent_desc.entry_count++];
-        strcpy(entry->name, filename);
-        entry->type = MINIMAFS_TYPE_FILE;
-        entry->block_offset = metadata.block_offset;
-        entry->block_count = metadata.block_count;
-        entry->hidden = metadata.hidden;
+    // Get the block that was allocated for this file
+    // (You'll need to get this from minimafs_write_file_to_disk or track it)
+    uint32_t file_block = metadata.block_offset;  // Should be set by write_file_to_disk
+    
+    // Add entry
+    minimafs_dir_entry_t* entry = &parent_desc.entries[parent_desc.entry_count];
+    strcpy(entry->name, filename);
+    entry->type = MINIMAFS_TYPE_FILE;
+    entry->block_offset = file_block;
+    entry->hidden = false;
+    
+    parent_desc.entry_count++;
+    
+    serial_write_str("Added entry. Parent now has ");
+    serial_write_dec(parent_desc.entry_count);
+    serial_write_str(" entries\n");
+    
+
+    if (!minimafs_write_folder_desc(drive, &parent_desc)) {
+        serial_write_str("ERROR: Failed to write updated folder.desc\n");
+        return false;
     }
     
-    return minimafs_write_folder_desc(drive, &parent_desc);
+    serial_write_str("File created successfully!\n");
+    return true;
 }
 
 minimafs_file_handle_t* minimafs_open(const char* path, bool read_only) {
@@ -711,13 +756,10 @@ minimafs_file_handle_t* minimafs_open(const char* path, bool read_only) {
     } else {
         uint8_t* raw = (uint8_t*)alloc(total_size);
         if (!raw) {
-            free_mem(handle);
             return NULL;
         }
         
         if (!minimafs_read_blocks(drive, entry.block_offset, entry.block_count, raw)) {
-            free_mem(raw);
-            free_mem(handle);
             return NULL;
         }
         
@@ -749,12 +791,11 @@ minimafs_file_handle_t* minimafs_open(const char* path, bool read_only) {
             handle->data = (uint8_t*)alloc(data_length);
             if (!handle->data) {
                 free_mem(raw);
-                free_mem(handle);
                 return NULL;
             }
             memcpy(handle->data, raw + data_offset, data_length);
         }
-        
+
         free_mem(raw);
     }
     
@@ -803,6 +844,7 @@ void minimafs_close(minimafs_file_handle_t* handle) {
     
     if (handle->data) {
         free_mem(handle->data);
+        handle->data = NULL;
     }
     
     handle->open = false;
@@ -841,7 +883,6 @@ uint32_t minimafs_write(minimafs_file_handle_t* handle, const void* buffer, uint
         
         if (handle->data) {
             memcpy(new_data, handle->data, handle->data_size);
-            free_mem(handle->data);
         }
         
         handle->data = new_data;
@@ -922,7 +963,7 @@ static bool minimafs_read_blocks(minimafs_drive_t* drive, uint32_t block_num,
     if (count == 0) return true;
     
     uint8_t* out = (uint8_t*)buffer;
-    uint8_t* bounce = (uint8_t*)g_dma_bounce[drive->drive_number - 1];
+    uint8_t* bounce = (uint8_t*)g_dma_bounce[drive->drive_number];
     uint32_t remaining = count;
     uint32_t current_block = block_num;
     
@@ -958,7 +999,7 @@ static bool minimafs_write_blocks(minimafs_drive_t* drive, uint32_t block_num,
     if (count == 0) return true;
     
     const uint8_t* in = (const uint8_t*)buffer;
-    uint8_t* bounce = (uint8_t*)g_dma_bounce[drive->drive_number - 1];
+    uint8_t* bounce = (uint8_t*)g_dma_bounce[drive->drive_number];
     uint32_t remaining = count;
     uint32_t current_block = block_num;
     
@@ -998,7 +1039,7 @@ typedef struct {
 static minimafs_block_alloc_t g_block_alloc[MINIMAFS_MAX_DRIVES];
  
 static void block_alloc_init(uint8_t drive_num, uint32_t total_blocks) {
-    minimafs_block_alloc_t* alloc = &g_block_alloc[drive_num - 1];
+    minimafs_block_alloc_t* alloc = &g_block_alloc[drive_num];
     
     memset(alloc->bitmap, 0, MINIMAFS_BITMAP_SIZE);
     alloc->total_blocks = total_blocks;
@@ -1010,7 +1051,7 @@ static void block_alloc_init(uint8_t drive_num, uint32_t total_blocks) {
 }
  
 static void block_alloc_mark_used(uint8_t drive_num, uint32_t block_num, uint32_t count) {
-    minimafs_block_alloc_t* alloc = &g_block_alloc[drive_num - 1];
+    minimafs_block_alloc_t* alloc = &g_block_alloc[drive_num];
     for (uint32_t i = 0; i < count; i++) {
         uint32_t b = block_num + i;
         uint32_t byte = b / 8;
@@ -1026,14 +1067,14 @@ static void block_alloc_mark_used(uint8_t drive_num, uint32_t block_num, uint32_
 }
 
 static uint32_t block_alloc_run(uint8_t drive_num, uint32_t count) {
-    minimafs_block_alloc_t* alloc = &g_block_alloc[drive_num - 1];
+    minimafs_block_alloc_t* alloc = &g_block_alloc[drive_num];
     if (count == 0) return 0xFFFFFFFF;
     
     uint32_t max_blocks = MINIMAFS_BITMAP_SIZE * 8;
     uint32_t run_start = 0;
     uint32_t run_len = 0;
     
-    for (uint32_t b = 0; b < max_blocks; b++) {
+    for (uint32_t b = 1; b < max_blocks; b++) {
         uint32_t byte = b / 8;
         uint8_t bit = b % 8;
         bool used = (alloc->bitmap[byte] & (1 << bit)) != 0;
@@ -1058,7 +1099,7 @@ static uint32_t block_alloc(uint8_t drive_num) {
 }
  
 static void block_free_run(uint8_t drive_num, uint32_t block_num, uint32_t count) {
-    minimafs_block_alloc_t* alloc = &g_block_alloc[drive_num - 1];
+    minimafs_block_alloc_t* alloc = &g_block_alloc[drive_num];
     for (uint32_t i = 0; i < count; i++) {
         uint32_t b = block_num + i;
         uint32_t byte = b / 8;
@@ -1071,15 +1112,37 @@ static void block_free_run(uint8_t drive_num, uint32_t block_num, uint32_t count
     }
 }
 
-static void minimafs_refresh_storage_desc(minimafs_drive_t* drive) {
+void minimafs_refresh_storage_desc(minimafs_drive_t* drive) {
     if (!drive) return;
-    minimafs_block_alloc_t* alloc = &g_block_alloc[drive->drive_number - 1];
-    drive->storage_desc.free_blocks = alloc->free_blocks;
-    drive->storage_desc.used_blocks = alloc->total_blocks - alloc->free_blocks;
-    drive->storage_desc.used_size = (uint64_t)drive->storage_desc.used_blocks * MINIMAFS_BLOCK_SIZE;
-    drive->storage_desc.free_size = drive->storage_desc.total_size - drive->storage_desc.used_size;
-    minimafs_write_storage_desc(drive, &drive->storage_desc);
+
+    minimafs_storage_desc_t desc;
+
+    if (!minimafs_read_storage_desc(drive, &desc)) {
+        serial_write_str("ERROR: Failed to read storage.desc for refresh\n");
+        return;
+    }
+
+    minimafs_block_alloc_t* alloc = &g_block_alloc[drive->drive_number];
+
+    // Update values
+    desc.free_blocks = alloc->free_blocks;
+    desc.used_blocks = alloc->total_blocks - alloc->free_blocks;
+
+    desc.used_size = (uint64_t)desc.used_blocks * MINIMAFS_BLOCK_SIZE;
+    desc.free_size = desc.total_size - desc.used_size;
+
+    minimafs_get_datetime(desc.last_mounted, sizeof(desc.last_mounted));
+
+    if (desc.magic != MINIMAFS_MAGIC || desc.total_blocks == 0) {
+        serial_write_str("ERROR: Refusing to write invalid storage.desc\n");
+        return;
+    }
+
+    // Keep in-memory copy synced
+    drive->storage_desc = desc;
+    minimafs_write_storage_desc(drive);
 }
+ 
  
 // ===========================================
 // FOLDER.DESC OPERATIONS
@@ -1096,87 +1159,127 @@ static uint32_t parse_uint32(const char* str) {
     return result;
 }
 
-static bool minimafs_write_storage_desc(minimafs_drive_t* drive, const minimafs_storage_desc_t* desc) {
-    if (!drive || !desc) return false;
-    char buffer[MINIMAFS_BLOCK_SIZE];
-    memset(buffer, 0, sizeof(buffer));
-    
+bool minimafs_write_storage_desc(minimafs_drive_t* drive) {
+    if (!drive) return false;
+
+    minimafs_storage_desc_t* sd = &drive->storage_desc;
+
+    char* buffer = (char*)alloc(MINIMAFS_BLOCK_SIZE);
+    if (!buffer) {
+        serial_write_str("ERROR: OOM writing storage.desc\n");
+        return false;
+    }
+    memset(buffer, 0, MINIMAFS_BLOCK_SIZE);
     char* ptr = buffer;
-    char numbuf[32];
-    
-    ptr += sprintf(ptr, "@HEADER@\n");
-    
-    hex_to_str(desc->magic, numbuf);
-    ptr += sprintf(ptr, "@MAGIC:0x%s@\n", numbuf);
-    
-    uint_to_str(desc->drive_number, numbuf);
-    ptr += sprintf(ptr, "@DRIVE_NUMBER:%s@\n", numbuf);
-    
-    ptr += sprintf(ptr, "@DRIVE_NAME:'%s'@\n", desc->drive_name);
-    ptr += sprintf(ptr, "@PASSWORD:'%s'@\n", desc->password);
-    ptr += sprintf(ptr, "@PASSWORDPROTECTED:%s@\n", desc->password_protected ? "True" : "False");
-    
-    uint_to_str(desc->total_size, numbuf);
-    ptr += sprintf(ptr, "@TOTAL_SIZE:%s@\n", numbuf);
-    uint_to_str(desc->used_size, numbuf);
-    ptr += sprintf(ptr, "@USED_SIZE:%s@\n", numbuf);
-    uint_to_str(desc->free_size, numbuf);
-    ptr += sprintf(ptr, "@FREE_SIZE:%s@\n", numbuf);
-    
-    uint_to_str(desc->total_blocks, numbuf);
-    ptr += sprintf(ptr, "@TOTAL_BLOCKS:%s@\n", numbuf);
-    uint_to_str(desc->used_blocks, numbuf);
-    ptr += sprintf(ptr, "@USED_BLOCKS:%s@\n", numbuf);
-    uint_to_str(desc->free_blocks, numbuf);
-    ptr += sprintf(ptr, "@FREE_BLOCKS:%s@\n", numbuf);
-    uint_to_str(desc->root_block, numbuf);
-    ptr += sprintf(ptr, "@ROOT_BLOCK:%s@\n", numbuf);
-    
-    ptr += sprintf(ptr, "@FILESYSTEM_LABEL:'%s'@\n", desc->filesystem_label);
-    ptr += sprintf(ptr, "@CREATEDDATE:'%s'@\n", desc->created_date);
-    ptr += sprintf(ptr, "@LASTMOUNTED:'%s'@\n", desc->last_mounted);
-    ptr += sprintf(ptr, "@END\n");
-    
-    return minimafs_write_blocks(drive, 0, 1, buffer);
+
+    ptr += sprintf(ptr, "@MAGIC:%u@\n",            sd->magic);
+    ptr += sprintf(ptr, "@DRIVE_NUMBER:%u@\n",     sd->drive_number);
+    ptr += sprintf(ptr, "@DRIVE_NAME:'%s'@\n",     sd->drive_name);
+    ptr += sprintf(ptr, "@PASSWORD:'%s'@\n",       sd->password);
+    ptr += sprintf(ptr, "@PASSWORDPROTECTED:%s@\n", sd->password_protected ? "True" : "False");
+    ptr += sprintf(ptr, "@TOTAL_SIZE_HI:%u@\n",    (uint32_t)(sd->total_size >> 32));
+    ptr += sprintf(ptr, "@TOTAL_SIZE_LO:%u@\n",    (uint32_t)(sd->total_size & 0xFFFFFFFF));
+    ptr += sprintf(ptr, "@USED_SIZE_HI:%u@\n",     (uint32_t)(sd->used_size >> 32));
+    ptr += sprintf(ptr, "@USED_SIZE_LO:%u@\n",     (uint32_t)(sd->used_size & 0xFFFFFFFF));
+    ptr += sprintf(ptr, "@FREE_SIZE_HI:%u@\n",     (uint32_t)(sd->free_size >> 32));
+    ptr += sprintf(ptr, "@FREE_SIZE_LO:%u@\n",     (uint32_t)(sd->free_size & 0xFFFFFFFF));
+    ptr += sprintf(ptr, "@TOTAL_BLOCKS:%u@\n",     sd->total_blocks);
+    ptr += sprintf(ptr, "@USED_BLOCKS:%u@\n",      sd->used_blocks);
+    ptr += sprintf(ptr, "@FREE_BLOCKS:%u@\n",      sd->free_blocks);
+    ptr += sprintf(ptr, "@ROOT_BLOCK:%u@\n",       sd->root_block);
+    ptr += sprintf(ptr, "@FILESYSTEM_LABEL:'%s'@\n", sd->filesystem_label);
+    ptr += sprintf(ptr, "@CREATEDDATE:'%s'@\n",    sd->created_date);
+    ptr += sprintf(ptr, "@LASTMOUNTED:'%s'@\n",    sd->last_mounted);
+    ptr += sprintf(ptr, "@END@\n");
+
+    if ((size_t)(ptr - buffer) >= MINIMAFS_BLOCK_SIZE) {
+        serial_write_str("ERROR: storage.desc too large for one block\n");
+        free_mem(buffer);
+        return false;
+    }
+
+    if (!minimafs_write_blocks(drive, 0, 1, buffer)) {
+        serial_write_str("ERROR: Failed to write storage.desc block\n");
+        free_mem(buffer);
+        return false;
+    }
+
+    free_mem(buffer);
+    serial_write_str("MinimaFS: storage.desc written to block 0\n");
+    return true;
+}
+
+bool minimafs_storage_add_entry(minimafs_drive_t* drive, minimafs_dir_entry_t* entry) {
+    if (!drive || !entry) return false;
+
+    minimafs_storage_desc_t* storage = &drive->storage_desc;
+
+    // Write back storage.desc to disk (entries live in folder.desc, not storage.desc)
+    if (!minimafs_write_storage_desc(drive)) {
+        serial_write_str("ERROR: Failed to write storage.desc\n");
+        return false;
+    }
+
+    return true;
 }
 
 static bool minimafs_read_storage_desc(minimafs_drive_t* drive, minimafs_storage_desc_t* desc) {
     if (!drive || !desc) return false;
-    
-    char buffer[MINIMAFS_BLOCK_SIZE + 1];
+
+    char* buffer = (char*)alloc(MINIMAFS_BLOCK_SIZE + 1);
+    if (!buffer) {
+        serial_write_str("MinimaFS: OOM reading storage.desc\n");
+        return false;
+    }
+
     if (!minimafs_read_blocks(drive, 0, 1, buffer)) {
         serial_write_str("MinimaFS: Read storage.desc failed\n");
         return false;
     }
+
     buffer[MINIMAFS_BLOCK_SIZE] = '\0';
-    
+
     memset(desc, 0, sizeof(minimafs_storage_desc_t));
+
     desc->magic = (uint32_t)parse_tag_uint64(buffer, "MAGIC");
     desc->drive_number = (uint8_t)parse_tag_uint64(buffer, "DRIVE_NUMBER");
+
     parse_tag(buffer, "DRIVE_NAME", desc->drive_name, sizeof(desc->drive_name));
     parse_tag(buffer, "PASSWORD", desc->password, sizeof(desc->password));
+
     desc->password_protected = parse_tag_bool(buffer, "PASSWORDPROTECTED");
-    desc->total_size = parse_tag_uint64(buffer, "TOTAL_SIZE");
-    desc->used_size = parse_tag_uint64(buffer, "USED_SIZE");
-    desc->free_size = parse_tag_uint64(buffer, "FREE_SIZE");
+
+    desc->total_size  = ((uint64_t)parse_tag_uint64(buffer, "TOTAL_SIZE_HI") << 32)
+                      |  (uint64_t)parse_tag_uint64(buffer, "TOTAL_SIZE_LO");
+    desc->used_size   = ((uint64_t)parse_tag_uint64(buffer, "USED_SIZE_HI") << 32)
+                      |  (uint64_t)parse_tag_uint64(buffer, "USED_SIZE_LO");
+    desc->free_size   = ((uint64_t)parse_tag_uint64(buffer, "FREE_SIZE_HI") << 32)
+                      |  (uint64_t)parse_tag_uint64(buffer, "FREE_SIZE_LO");
+
     desc->total_blocks = (uint32_t)parse_tag_uint64(buffer, "TOTAL_BLOCKS");
-    desc->used_blocks = (uint32_t)parse_tag_uint64(buffer, "USED_BLOCKS");
-    desc->free_blocks = (uint32_t)parse_tag_uint64(buffer, "FREE_BLOCKS");
+    desc->used_blocks  = (uint32_t)parse_tag_uint64(buffer, "USED_BLOCKS");
+    desc->free_blocks  = (uint32_t)parse_tag_uint64(buffer, "FREE_BLOCKS");
+
     desc->root_block = (uint32_t)parse_tag_uint64(buffer, "ROOT_BLOCK");
+
     parse_tag(buffer, "FILESYSTEM_LABEL", desc->filesystem_label, sizeof(desc->filesystem_label));
     parse_tag(buffer, "CREATEDDATE", desc->created_date, sizeof(desc->created_date));
     parse_tag(buffer, "LASTMOUNTED", desc->last_mounted, sizeof(desc->last_mounted));
-    
-    if (desc->magic != MINIMAFS_MAGIC) {
-        serial_write_str("MinimaFS: storage.desc magic mismatch: 0x");
-        serial_write_hex(desc->magic);
-        serial_write_str("\n");
-        serial_write_str("MinimaFS: storage.desc head: ");
+
+    if (desc->magic != MINIMAFS_MAGIC ||
+        desc->total_blocks == 0 ||
+        desc->total_size == 0 ||
+        desc->root_block == 0) {
+
+        serial_write_str("MinimaFS: storage.desc invalid structure\n");
+        serial_write_str("Dump:\n");
         serial_write_str(buffer);
         serial_write_str("\n");
+        free_mem(buffer);
         return false;
     }
-    
+
+    free_mem(buffer);
     return true;
 }
 
@@ -1189,7 +1292,7 @@ static bool parse_folder_entry_line(const char* line, minimafs_dir_entry_t* entr
     if (!comma) return false;
     
     size_t name_len = comma - p;
-    if (name_len >= MINIMAFS_MAX_FILENAME) name_len = MINIMAFS_MAX_FILENAME - 1;
+    if (name_len >= MINIMAFS_MAX_ENTRY_NAME) name_len = MINIMAFS_MAX_ENTRY_NAME - 1;
     memcpy(entry->name, p, name_len);
     entry->name[name_len] = '\0';
     
@@ -1224,8 +1327,13 @@ static bool parse_folder_entry_line(const char* line, minimafs_dir_entry_t* entr
 
 static bool minimafs_read_folder_desc_block(minimafs_drive_t* drive, uint32_t block,
                                             minimafs_folder_desc_t* desc) {
-    char buffer[MINIMAFS_BLOCK_SIZE + 1];
+    char* buffer = (char*)alloc(MINIMAFS_BLOCK_SIZE + 1);
+    if (!buffer) {
+        serial_write_str("MinimaFS: OOM reading folder.desc\n");
+        return false;
+    }
     if (!minimafs_read_blocks(drive, block, 1, buffer)) {
+        free_mem(buffer);
         return false;
     }
     buffer[MINIMAFS_BLOCK_SIZE] = '\0';
@@ -1261,7 +1369,8 @@ static bool minimafs_read_folder_desc_block(minimafs_drive_t* drive, uint32_t bl
     
     desc->entry_count = parsed_count;
     (void)expected_count;
-    
+
+    free_mem(buffer);
     return true;
 }
 
@@ -1308,8 +1417,10 @@ static bool minimafs_get_folder_block(minimafs_drive_t* drive, const char* path,
 }
 
 static uint32_t minimafs_calc_file_block_count(minimafs_drive_t* drive, uint32_t block_offset) {
-    char buffer[MINIMAFS_BLOCK_SIZE + 1];
+    char* buffer = (char*)alloc(MINIMAFS_BLOCK_SIZE + 1);
+    if (!buffer) return 1;
     if (!minimafs_read_blocks(drive, block_offset, 1, buffer)) {
+        free_mem(buffer);
         return 1;
     }
     buffer[MINIMAFS_BLOCK_SIZE] = '\0';
@@ -1329,27 +1440,41 @@ static uint32_t minimafs_calc_file_block_count(minimafs_drive_t* drive, uint32_t
         }
     }
     
+    free_mem(buffer);
     uint32_t aligned = ((file_len + MINIMAFS_BLOCK_SIZE - 1) / MINIMAFS_BLOCK_SIZE) * MINIMAFS_BLOCK_SIZE;
     return aligned / MINIMAFS_BLOCK_SIZE;
 }
 
-static void minimafs_scan_directory(minimafs_drive_t* drive, uint32_t block) {
-    minimafs_folder_desc_t desc;
-    if (!minimafs_read_folder_desc_block(drive, block, &desc)) {
+void minimafs_scan_directory(minimafs_drive_t* drive, uint32_t block) {
+    // Allocate folder descriptor on heap
+    minimafs_folder_desc_t* desc = alloc_page_zeroed();
+    if (!desc) return;
+
+    // Read the folder descriptor from disk
+    if (!minimafs_read_folder_desc_block(drive, block, desc)) {
         return;
     }
-    
-    for (uint32_t i = 0; i < desc.entry_count; i++) {
-        minimafs_dir_entry_t* entry = &desc.entries[i];
-        uint32_t count = entry->block_count;
-        if (count == 0) {
-            count = (entry->type == MINIMAFS_TYPE_DIR) ? 1 : minimafs_calc_file_block_count(drive, entry->block_offset);
+
+    // Ensure entry_count does not exceed MAX_ENTRIES
+    uint32_t count = (desc->entry_count > MINIMAFS_MAX_ENTRIES) ? MINIMAFS_MAX_ENTRIES : desc->entry_count;
+
+    // Iterate over entries safely
+    for (uint32_t i = 0; i < count; i++) {
+        minimafs_dir_entry_t* entry = &desc->entries[i];
+
+        uint32_t blocks_to_mark = entry->block_count;
+        if (blocks_to_mark == 0) {
+            blocks_to_mark = (entry->type == MINIMAFS_TYPE_DIR) ? 1 : minimafs_calc_file_block_count(drive, entry->block_offset);
         }
-        block_alloc_mark_used(drive->drive_number, entry->block_offset, count);
+
+        block_alloc_mark_used(drive->drive_number, entry->block_offset, blocks_to_mark);
+
         if (entry->type == MINIMAFS_TYPE_DIR) {
             minimafs_scan_directory(drive, entry->block_offset);
         }
     }
+
+    // Free the folder descriptor
 }
 
 bool minimafs_read_folder_desc(minimafs_drive_t* drive, const char* path,
@@ -1373,40 +1498,41 @@ bool minimafs_read_folder_desc(minimafs_drive_t* drive, const char* path,
     return true;
 }
  
-bool minimafs_write_folder_desc(minimafs_drive_t* drive, const minimafs_folder_desc_t* desc) {
+bool minimafs_write_folder_desc(minimafs_drive_t* drive, minimafs_folder_desc_t* desc) {
     if (!drive || !desc) return false;
     if (desc->block_offset == 0) return false;
-    
-    char buffer[MINIMAFS_BLOCK_SIZE];
-    memset(buffer, 0, sizeof(buffer));
+
+    char* buffer = (char*)alloc(MINIMAFS_BLOCK_SIZE);
+    if (!buffer) {
+        serial_write_str("ERROR: OOM writing folder.desc\n");
+        return false;
+    }
+    memset(buffer, 0, MINIMAFS_BLOCK_SIZE);
     char* ptr = buffer;
-    
-    ptr += sprintf(ptr, "@HEADER@\n");
-    ptr += sprintf(ptr, "@FILETYPE:descriptor@\n");
-    ptr += sprintf(ptr, "@FILEFORMAT:desc@\n");
-    ptr += sprintf(ptr, "@FILENAME:'folder.desc'@\n");
-    ptr += sprintf(ptr, "@PARENTFOLDER:'%s'@\n", desc->path);
-    ptr += sprintf(ptr, "@HIDDEN:True@\n");
-    ptr += sprintf(ptr, "@DATA@\n");
+
     ptr += sprintf(ptr, "FOLDER:%s\n", desc->path);
     ptr += sprintf(ptr, "ENTRIES:%u\n", desc->entry_count);
-    
+
     for (uint32_t i = 0; i < desc->entry_count; i++) {
         const minimafs_dir_entry_t* entry = &desc->entries[i];
         if ((size_t)(ptr - buffer) > MINIMAFS_BLOCK_SIZE - 128) {
+            serial_write_str("ERROR: folder.desc too large for one block\n");
+            free_mem(buffer);
             return false;
         }
         ptr += sprintf(ptr, "ENTRY:%s,%s,BLOCK:%u,COUNT:%u,HIDDEN:%u\n",
-                      entry->name,
-                      entry->type == MINIMAFS_TYPE_DIR ? "DIR" : "FILE",
-                      entry->block_offset,
-                      entry->block_count,
-                      entry->hidden ? 1 : 0);
+                       entry->name,
+                       entry->type == MINIMAFS_TYPE_DIR ? "DIR" : "FILE",
+                       entry->block_offset,
+                       entry->block_count,
+                       entry->hidden ? 1 : 0);
     }
-    
+
     ptr += sprintf(ptr, "@END\n");
-    
-    return minimafs_write_blocks(drive, desc->block_offset, 1, buffer);
+
+    bool ok = minimafs_write_blocks(drive, desc->block_offset, 1, buffer);
+    free_mem(buffer);
+    return ok;
 }
  
 // ===========================================
@@ -1659,19 +1785,19 @@ bool minimafs_is_dir(const char* path) {
 // MOUNT/UNMOUNT
 // ===========================================
  
-bool minimafs_mount(void* device_handle, uint8_t drive_number) {
-    if (drive_number == 0 || drive_number > MINIMAFS_MAX_DRIVES) {
-        return false;
+int minimafs_mount(void* device_handle, uint8_t drive_number) {
+    if (drive_number >= MINIMAFS_MAX_DRIVES) {
+        return 0;
     }
     if (!device_handle) {
         serial_write_str("MinimaFS: Invalid device handle\n");
-        return false;
+        return 0;
     }
     
     minimafs_drive_t* drive = get_drive(drive_number);
     if (drive->mounted) {
         serial_write_str("MinimaFS: Drive already mounted\n");
-        return false;
+        return 2;
     }
     
     serial_write_str("MinimaFS: Mounting drive ");
@@ -1681,34 +1807,41 @@ bool minimafs_mount(void* device_handle, uint8_t drive_number) {
     drive->device_handle = device_handle;
 
 #if MINIMAFS_ENABLE_SELF_TEST
-    if (!g_self_test_done[drive_number - 1]) {
+    if (!g_self_test_done[drive_number]) {
         serial_write_str("MinimaFS: Running self-test...\n");
         bool ok = minimafs_self_test_drive(drive);
-        g_self_test_done[drive_number - 1] = true;
+        g_self_test_done[drive_number] = true;
         if (!ok) {
             serial_write_str("MinimaFS: Self-test failed\n");
-            return false;
+            return 0;
         }
         serial_write_str("MinimaFS: Self-test passed\n");
     }
 #endif
     
-    if (!minimafs_read_storage_desc(drive, &drive->storage_desc)) {
+    minimafs_storage_desc_t* sd = alloc_page_zeroed();
+    if (!minimafs_read_storage_desc(drive, sd)) {
         serial_write_str("MinimaFS: Failed to parse storage.desc\n");
-        return false;
+        return 3;
     }
-    if (drive->storage_desc.root_block == 0) {
-        serial_write_str("MinimaFS: Invalid root block\n");
-        return false;
+
+    // Validate fields
+    if (sd->magic != MINIMAFS_MAGIC || sd->root_block == 0 || sd->total_blocks == 0) {
+        serial_write_str("MinimaFS: Invalid storage.desc\n");
+        return 5;
     }
-    if (drive->storage_desc.total_blocks > (MINIMAFS_BITMAP_SIZE * 8)) {
-        serial_write_str("MinimaFS: Drive too large for bitmap\n");
-        return false;
+
+    // Validate root_block is in range
+    if (sd->root_block >= sd->total_blocks) {
+        serial_write_str("MinimaFS: root_block out of range\n");
+        return 4;
     }
-    
-    if (drive->storage_desc.drive_number == 0) {
-        drive->storage_desc.drive_number = drive_number;
-    }
+
+    serial_write_str("Passed checks\n");
+
+    drive->storage_desc.drive_number = drive_number;
+    drive->storage_desc = *sd;
+     // optional if you have free
     
     drive->drive_number = drive_number;
     strncpy(drive->drive_name, drive->storage_desc.drive_name, sizeof(drive->drive_name) - 1);
@@ -1721,12 +1854,18 @@ bool minimafs_mount(void* device_handle, uint8_t drive_number) {
     block_alloc_init(drive_number, drive->storage_desc.total_blocks);
     block_alloc_mark_used(drive_number, 0, 1);
     block_alloc_mark_used(drive_number, drive->storage_desc.root_block, 1);
-    
+    serial_write_str("Some initializations\n");
+
     minimafs_scan_directory(drive, drive->storage_desc.root_block);
+    serial_write_str("scanned dir\n");
     minimafs_refresh_storage_desc(drive);
     
+    serial_write_str("Scanned disk\n");
+
     minimafs_get_datetime(drive->storage_desc.last_mounted, sizeof(drive->storage_desc.last_mounted));
-    minimafs_write_storage_desc(drive, &drive->storage_desc);
+    minimafs_write_storage_desc(drive);
+
+    serial_write_str("Wrote to storage_desc\n");
     
     drive->mounted = true;
     
@@ -1734,7 +1873,7 @@ bool minimafs_mount(void* device_handle, uint8_t drive_number) {
     serial_write_dec(drive_number);
     serial_write_str(" mounted successfully\n");
     
-    return true;
+    return 1;
 }
  
 bool minimafs_unmount(uint8_t drive_number) {
@@ -1748,7 +1887,7 @@ bool minimafs_unmount(uint8_t drive_number) {
     serial_write_str("\n");
     
     minimafs_refresh_storage_desc(drive);
-    minimafs_write_storage_desc(drive, &drive->storage_desc);
+    minimafs_write_storage_desc(drive);
     
     drive->mounted = false;
     drive->device_handle = NULL;
@@ -1761,90 +1900,111 @@ bool minimafs_unmount(uint8_t drive_number) {
 // ===========================================
  
 bool minimafs_format(void* device_handle, uint64_t size, 
-                    uint8_t drive_number, const char* drive_name) {
+                     uint8_t drive_number, const char* drive_name) 
+{
     serial_write_str("MinimaFS: Formatting drive ");
     serial_write_dec(drive_number);
     serial_write_str(" (");
     serial_write_dec(size / (1024 * 1024));
     serial_write_str(" MB)\n");
-    
+
     // Calculate blocks
     uint32_t total_blocks = size / MINIMAFS_BLOCK_SIZE;
     if (total_blocks > (MINIMAFS_BITMAP_SIZE * 8)) {
         serial_write_str("MinimaFS: Drive too large for bitmap\n");
         return false;
     }
-    
+
     // Initialize block allocator
     block_alloc_init(drive_number, total_blocks);
-    
+    serial_write_str("block alloc initialized\n");
+
     minimafs_drive_t* drive = get_drive(drive_number);
     if (!drive) return false;
     drive->device_handle = device_handle;
     drive->drive_number = drive_number;
-    
-    // Create storage.desc
-    minimafs_storage_desc_t storage_desc;
-    memset(&storage_desc, 0, sizeof(storage_desc));
-    
-    storage_desc.magic = MINIMAFS_MAGIC;
-    storage_desc.drive_number = drive_number;
-    
+
+    // --- Allocate storage.desc on heap ---
+    minimafs_storage_desc_t* storage_desc = alloc_page_zeroed();
+    memset(storage_desc, 0, sizeof(minimafs_storage_desc_t));
+
+    storage_desc->magic = MINIMAFS_MAGIC;
+    storage_desc->drive_number = drive_number;
     if (drive_name) {
-        strcpy(storage_desc.drive_name, drive_name);
+        strncpy(storage_desc->drive_name, drive_name, sizeof(storage_desc->drive_name) - 1);
+        storage_desc->drive_name[sizeof(storage_desc->drive_name) - 1] = '\0';
     } else {
-        sprintf(storage_desc.drive_name, "%u", drive_number);
+        snprintf(storage_desc->drive_name, sizeof(storage_desc->drive_name), "%u", drive_number);
     }
-    
-    storage_desc.total_size = size;
-    storage_desc.used_size = MINIMAFS_BLOCK_SIZE;  // storage.desc
-    storage_desc.free_size = size - MINIMAFS_BLOCK_SIZE;
-    
-    storage_desc.total_blocks = total_blocks;
-    
-    // Allocate root folder block
-    uint32_t root_block = block_alloc(drive_number);
-    if (root_block == 0xFFFFFFFF) {
+
+    storage_desc->total_size = size;
+    storage_desc->used_size = MINIMAFS_BLOCK_SIZE;  // storage.desc itself
+    storage_desc->free_size = size - MINIMAFS_BLOCK_SIZE;
+    storage_desc->total_blocks = total_blocks;
+
+    // Allocate root folder block (must not be 0)
+    uint32_t root_block = block_alloc_run(drive_number, 1);
+    if (root_block == 0 || root_block == 0xFFFFFFFF) {
+        serial_write_str("MinimaFS: Failed to allocate root block\n");
         return false;
     }
-    storage_desc.root_block = root_block;
-    
-    storage_desc.used_blocks = 2;  // storage.desc + root folder
-    storage_desc.free_blocks = total_blocks - 2;
-    storage_desc.used_size = (uint64_t)storage_desc.used_blocks * MINIMAFS_BLOCK_SIZE;
-    storage_desc.free_size = size - storage_desc.used_size;
-    
-    minimafs_get_datetime(storage_desc.created_date, sizeof(storage_desc.created_date));
-    minimafs_get_datetime(storage_desc.last_mounted, sizeof(storage_desc.last_mounted));
-    
-    if (!minimafs_write_storage_desc(drive, &storage_desc)) {
+    storage_desc->root_block = root_block;
+
+    // Mark blocks used
+    block_alloc_mark_used(drive_number, 0, 1);            // storage.desc
+    block_alloc_mark_used(drive_number, root_block, 1);   // root folder
+    storage_desc->used_blocks = 2;
+    storage_desc->free_blocks = total_blocks - 2;
+    storage_desc->used_size = (uint64_t)storage_desc->used_blocks * MINIMAFS_BLOCK_SIZE;
+    storage_desc->free_size = size - storage_desc->used_size;
+
+    minimafs_get_datetime(storage_desc->created_date, sizeof(storage_desc->created_date));
+    minimafs_get_datetime(storage_desc->last_mounted, sizeof(storage_desc->last_mounted));
+
+    // Save storage_desc in drive struct FIRST so subsequent calls work
+    drive->storage_desc = *storage_desc;
+
+    if (!minimafs_write_storage_desc(drive)) {
         serial_write_str("MinimaFS: Failed to write storage.desc\n");
         return false;
     }
-    
-    // Read-back verify
+
+    // Verify
     minimafs_storage_desc_t verify_desc;
     if (!minimafs_read_storage_desc(drive, &verify_desc)) {
         serial_write_str("MinimaFS: storage.desc verify failed\n");
         return false;
     }
-    
-    // Create root folder.desc
+
+    // --- Write root folder.desc ---
     minimafs_folder_desc_t root_desc;
-    memset(&root_desc, 0, sizeof(root_desc));
+    memset(&root_desc, 0, sizeof(minimafs_folder_desc_t));
+    serial_write_str("Storage desc size: ");
+    serial_write_dec(sizeof(minimafs_storage_desc_t));
+    serial_write_str("\n");
     strcpy(root_desc.path, "/");
     root_desc.block_offset = root_block;
     root_desc.entry_count = 0;
-    
-    if (!minimafs_write_folder_desc(drive, &root_desc)) {
-        serial_write_str("MinimaFS: Failed to write root folder.desc\n");
+
+    if (drive->device_handle == NULL || root_desc.block_offset == 0xFFFFFFFF) {
+        serial_write_str("MinimaFS: Invalid root_desc\n");
         return false;
     }
-    
-    drive->storage_desc = storage_desc;
-    
+
+    // Write root folder.desc directly to its block (no file-system overhead)
+    char folder_buf[MINIMAFS_BLOCK_SIZE];
+    memset(folder_buf, 0, sizeof(folder_buf));
+    char* fptr = folder_buf;
+    fptr += sprintf(fptr, "FOLDER:/\n");
+    fptr += sprintf(fptr, "ENTRIES:0\n");
+    fptr += sprintf(fptr, "@END\n");
+
+    if (!minimafs_write_blocks(drive, root_block, 1, folder_buf)) {
+        serial_write_str("MinimaFS: Failed to write root folder.desc block\n");
+        return false;
+    }
+
     serial_write_str("MinimaFS: Format complete\n");
-    
     return true;
 }
  

@@ -22,9 +22,11 @@
 // ===========================================
 
 #define MINIMAFS_BLOCK_SIZE         4096        // 4KB alignment
-#define MINIMAFS_MAX_FILENAME       256         // Max filename length
+#define MINIMAFS_MAX_FILENAME       256         // Max filename length (metadata)
+#define MINIMAFS_MAX_ENTRY_NAME     64          // Max name in dir entry (keep struct small)
 #define MINIMAFS_MAX_PATH           1024        // Max path length
-#define MINIMAFS_MAX_DRIVES         99          // 1: through 99:
+#define MINIMAFS_MAX_DRIVES         99          // 0: through 99:
+#define MINIMAFS_MAX_ROOT_ENTRIES   64          // Max entries per folder
 #define MINIMAFS_MAGIC              0x4D494E46  // "MINF"
 
 #define MINIMAFS_FOLDER_DESC        "folder.desc"
@@ -73,7 +75,7 @@ typedef struct {
 // ===========================================
 
 typedef struct {
-    char name[MINIMAFS_MAX_FILENAME];           // Entry name
+    char name[MINIMAFS_MAX_ENTRY_NAME];         // Entry name (short)
     minimafs_filetype_t type;                   // File or directory
     uint32_t block_offset;                      // Where entry starts on disk
     uint32_t block_count;                       // Number of blocks
@@ -85,10 +87,10 @@ typedef struct {
 // ===========================================
 
 typedef struct {
-    char path[MINIMAFS_MAX_PATH];               // Full path to this directory
-    uint32_t block_offset;                      // Block where folder.desc lives
-    uint32_t entry_count;                       // Number of entries
-    minimafs_dir_entry_t entries[256];          // Child entries (not recursive)
+    char path[MINIMAFS_MAX_PATH];
+    uint32_t block_offset;
+    uint32_t entry_count;
+    minimafs_dir_entry_t entries[MINIMAFS_MAX_ROOT_ENTRIES]; // inline array
 } minimafs_folder_desc_t;
 
 // ===========================================
@@ -114,6 +116,7 @@ typedef struct {
     uint32_t root_block;                        // Root folder.desc block
     
     uint32_t root_entries;                      // Number of root entries
+    minimafs_dir_entry_t entries[MINIMAFS_MAX_ROOT_ENTRIES];
     char filesystem_label[64];                  // Volume label
     
     char created_date[32];                      // Creation date
@@ -183,7 +186,7 @@ bool minimafs_format(void* device_handle, uint64_t size,
  * @param drive_number Drive number (1-99)
  * @return true on success
  */
-bool minimafs_mount(void* device_handle, uint8_t drive_number);
+int minimafs_mount(void* device_handle, uint8_t drive_number);
 
 /**
  * Unmount a drive
@@ -335,5 +338,10 @@ bool minimafs_parse_path(const char* path, uint8_t* drive_number, char* local_pa
  * @param size Buffer size
  */
 void minimafs_get_datetime(char* buffer, size_t size);
+
+minimafs_drive_t* get_drive(uint8_t drive_number);
+void minimafs_scan_directory(minimafs_drive_t* drive, uint32_t block);
+void minimafs_refresh_storage_desc(minimafs_drive_t* drive);
+bool minimafs_write_storage_desc(minimafs_drive_t* drive);
 
 #endif // MINIMAFS_H

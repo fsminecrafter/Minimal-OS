@@ -29,6 +29,9 @@ typedef struct {
 #define COLOR_LIGHT_GRAY  ((color_t){0xC0, 0xC0, 0xC0, 0xFF})
 #define COLOR_DARK_GRAY   ((color_t){0x40, 0x40, 0x40, 0xFF})
 
+#define TERM_MAX_COLS 256
+#define TERM_MAX_ROWS 128
+
 // Graphics configuration
 extern bool graphics_safety_mode;  // true = panic on out-of-bounds, false = clamp to nearest
 

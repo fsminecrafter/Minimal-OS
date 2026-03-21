@@ -14,6 +14,39 @@ bool graphics_safety_mode = true;
 static terminal_t g_terminal = {0};
 static font_t g_current_font = {0};
 
+// ===========================================
+// Terminal character buffer for scroll support
+// Stores one char + fg color per cell for redraw-on-scroll.
+// TERM_MAX_COLS and TERM_MAX_ROWS come from graphics.h.
+// ===========================================
+
+typedef struct {
+    char    ch;
+    uint8_t r, g, b;
+} term_cell_t;
+
+// Use the header's TERM_MAX_ROWS / TERM_MAX_COLS values.
+// Declared as a flat array in BSS — no heap allocation needed.
+static term_cell_t g_term_buf[TERM_MAX_ROWS][TERM_MAX_COLS];
+
+void term_buf_clear_row(uint32_t row) {
+    if (row >= TERM_MAX_ROWS) return;
+    for (uint32_t c = 0; c < TERM_MAX_COLS; c++) {
+        g_term_buf[row][c].ch = ' ';
+        g_term_buf[row][c].r  = g_terminal.fg_color.r;
+        g_term_buf[row][c].g  = g_terminal.fg_color.g;
+        g_term_buf[row][c].b  = g_terminal.fg_color.b;
+    }
+}
+
+void term_buf_set(uint32_t col, uint32_t row, char ch, color_t fg) {
+    if (col >= TERM_MAX_COLS || row >= TERM_MAX_ROWS) return;
+    g_term_buf[row][col].ch = ch;
+    g_term_buf[row][col].r  = fg.r;
+    g_term_buf[row][col].g  = fg.g;
+    g_term_buf[row][col].b  = fg.b;
+}
+
 // Helper macros
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
@@ -51,70 +84,95 @@ typedef struct {
 #pragma pack(pop)
 
 bool graphics_load_bmp(bmp_image_t* image, const uint8_t* bmp_data, uint32_t data_size) {
-    if (!image || !bmp_data) return false;
-    
-    // Read BMP header
-    bmp_header_t* header = (bmp_header_t*)bmp_data;
-    if (header->signature != 0x4D42) {  // 'BM'
+    if (!image || !bmp_data || data_size < sizeof(bmp_header_t) + sizeof(bmp_info_header_t)) {
+        serial_write_str("graphics: BMP data too small or NULL\n");
+        return false;
+    }
+
+    const bmp_header_t* header = (const bmp_header_t*)bmp_data;
+    if (header->signature != 0x4D42) {
         serial_write_str("graphics: Invalid BMP signature\n");
         return false;
     }
-    
-    // Read info header
-    bmp_info_header_t* info = (bmp_info_header_t*)(bmp_data + sizeof(bmp_header_t));
-    
-    image->width = ABS(info->width);
-    image->height = ABS(info->height);
-    
+
+    // data_offset must be within the buffer
+    if (header->data_offset >= data_size) {
+        serial_write_str("graphics: BMP data_offset out of range\n");
+        return false;
+    }
+
+    const bmp_info_header_t* info = (const bmp_info_header_t*)(bmp_data + sizeof(bmp_header_t));
+
+    // Only support 24bpp and 32bpp uncompressed
+    if (info->compression != 0) {
+        serial_write_str("graphics: BMP compression not supported\n");
+        return false;
+    }
+    if (info->bits_per_pixel != 24 && info->bits_per_pixel != 32) {
+        serial_write_str("graphics: BMP bpp not supported (need 24 or 32)\n");
+        return false;
+    }
+
+    uint32_t width  = (uint32_t)ABS(info->width);
+    uint32_t height = (uint32_t)ABS(info->height);
+
+    if (width == 0 || height == 0 || width > 8192 || height > 8192) {
+        serial_write_str("graphics: BMP dimensions out of range\n");
+        return false;
+    }
+
+    // Check pixel buffer fits in the file
+    uint32_t bytes_per_pixel = info->bits_per_pixel / 8;
+    uint32_t row_size = ((info->bits_per_pixel * width + 31) / 32) * 4;
+    // Overflow-safe check: row_size * height <= data_size - data_offset
+    if (height > 0 && row_size > (data_size - header->data_offset) / height) {
+        serial_write_str("graphics: BMP pixel data overflows buffer\n");
+        return false;
+    }
+
     serial_write_str("Loading BMP: ");
-    serial_write_dec(image->width);
+    serial_write_dec(width);
     serial_write_str("x");
-    serial_write_dec(image->height);
+    serial_write_dec(height);
     serial_write_str(" @ ");
     serial_write_dec(info->bits_per_pixel);
     serial_write_str(" bpp\n");
-    
-    // Allocate pixel buffer
-    image->pixels = alloc(image->width * image->height * sizeof(uint32_t));
+
+    // Use alloc_unzeroed — we fill every pixel below
+    image->pixels = (uint32_t*)alloc_unzeroed(width * height * sizeof(uint32_t));
     if (!image->pixels) {
         serial_write_str("graphics: Failed to allocate BMP pixel buffer\n");
         return false;
     }
-    
-    // Read pixel data
+
+    image->width  = width;
+    image->height = height;
+
     const uint8_t* pixel_data = bmp_data + header->data_offset;
     bool bottom_up = info->height > 0;
-    uint32_t abs_height = ABS(info->height);
-    
-    // BMP rows are padded to 4-byte boundaries
-    uint32_t row_size = ((info->bits_per_pixel * image->width + 31) / 32) * 4;
-    
-    for (uint32_t y = 0; y < abs_height; y++) {
-        uint32_t src_y = bottom_up ? (abs_height - 1 - y) : y;
+
+    for (uint32_t y = 0; y < height; y++) {
+        uint32_t src_y = bottom_up ? (height - 1 - y) : y;
         const uint8_t* row = pixel_data + src_y * row_size;
-        
-        for (uint32_t x = 0; x < image->width; x++) {
-            uint32_t pixel = 0xFF000000;  // Alpha = 0xFF
-            
+
+        for (uint32_t x = 0; x < width; x++) {
+            uint32_t pixel;
             if (info->bits_per_pixel == 24) {
-                // BGR format
                 uint8_t b = row[x * 3 + 0];
                 uint8_t g = row[x * 3 + 1];
                 uint8_t r = row[x * 3 + 2];
-                pixel = 0xFF000000 | (r << 16) | (g << 8) | b;
-            } else if (info->bits_per_pixel == 32) {
-                // BGRA format
+                pixel = 0xFF000000 | ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+            } else {
                 uint8_t b = row[x * 4 + 0];
                 uint8_t g = row[x * 4 + 1];
                 uint8_t r = row[x * 4 + 2];
                 uint8_t a = row[x * 4 + 3];
-                pixel = (a << 24) | (r << 16) | (g << 8) | b;
+                pixel = ((uint32_t)a << 24) | ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
             }
-            
-            image->pixels[y * image->width + x] = pixel;
+            image->pixels[y * width + x] = pixel;
         }
     }
-    
+
     image->loaded = true;
     serial_write_str("BMP loaded successfully\n");
     return true;
@@ -225,7 +283,7 @@ void terminalUpdateCursor() {
 
 void graphics_set_resolution(uint32_t cols, uint32_t rows) {
     if (!g_gpu) {
-        PANIC("graphics: GPU not initialized");
+        serial_write_str("graphics_set_resolution: GPU not initialized\n");
         return;
     }
 
@@ -275,6 +333,10 @@ void graphics_terminal_clear(void) {
     graphics_clear_c(g_terminal.bg_color);
     g_terminal.cursor_x = 0;
     g_terminal.cursor_y = 0;
+    // Clear character buffer
+    for (uint32_t row = 0; row < TERM_MAX_ROWS; row++) {
+        term_buf_clear_row(row);
+    }
 }
 
 void graphics_terminal_newline(void) {
@@ -287,10 +349,31 @@ void graphics_terminal_newline(void) {
 }
 
 void graphics_terminal_scroll(void) {
-    // Copy all rows up by one
-    // For simplicity, just clear and reset to top
-    // A real implementation would copy pixel data
-    g_terminal.cursor_y = g_terminal.rows - 1;
+    if (!g_gpu) return;
+
+    uint32_t rows = g_terminal.rows;
+    uint32_t cols = g_terminal.cols;
+
+    // Shift the character buffer up by one row
+    for (uint32_t row = 1; row < rows && row < TERM_MAX_ROWS; row++) {
+        for (uint32_t col = 0; col < cols && col < TERM_MAX_COLS; col++) {
+            g_term_buf[row - 1][col] = g_term_buf[row][col];
+        }
+    }
+
+    // Clear the last row in the buffer
+    if (rows > 0) term_buf_clear_row(rows - 1);
+
+    // Redraw all rows from the character buffer
+    for (uint32_t row = 0; row < rows && row < TERM_MAX_ROWS; row++) {
+        for (uint32_t col = 0; col < cols && col < TERM_MAX_COLS; col++) {
+            term_cell_t* cell = &g_term_buf[row][col];
+            color_t fg = {cell->r, cell->g, cell->b, 0xFF};
+            graphics_terminal_putchar(cell->ch, col, row, fg, g_terminal.bg_color);
+        }
+    }
+
+    g_terminal.cursor_y = rows - 1;
 }
 
 void graphics_terminal_set_cursor(uint32_t x, uint32_t y) {
@@ -320,16 +403,18 @@ void graphics_write_textr_char(char c) {
     }
     
     if (c == '\t') {
-        g_terminal.cursor_x = (g_terminal.cursor_x + 4) & ~3;  // Tab to next multiple of 4
+        g_terminal.cursor_x = (g_terminal.cursor_x + 4) & ~3;
         if (g_terminal.cursor_x >= g_terminal.cols) {
             graphics_terminal_newline();
         }
         return;
     }
     
+    // Record in character buffer for scroll support
+    term_buf_set(g_terminal.cursor_x, g_terminal.cursor_y, c, g_terminal.fg_color);
+
     // Draw character
-    graphics_terminal_putchar(c, g_terminal.cursor_x, g_terminal.cursor_y, 
-                            g_terminal.fg_color, g_terminal.bg_color);
+    graphics_terminal_putchar(c, g_terminal.cursor_x, g_terminal.cursor_y, g_terminal.fg_color, g_terminal.bg_color);
     
     // Advance cursor
     g_terminal.cursor_x++;
@@ -498,39 +583,28 @@ uint32_t graphics_get_height(void) {
     return g_gpu ? g_gpu->height : 0;
 }
 
-// Validate and fix coordinates
+// Validate coordinates: returns false and sets x/y to -1 if GPU not ready,
+// otherwise clamps to screen bounds and returns true.
+// Drawing functions should skip the pixel when this returns false.
 bool graphics_validate_coords(int32_t* x, int32_t* y) {
-    if (!g_gpu) {
-        PANIC("graphics: GPU not initialized");
-        return false;
-    }
-    
-    int32_t width = (int32_t)g_gpu->width;
+    if (!g_gpu) return false;
+
+    int32_t width  = (int32_t)g_gpu->width;
     int32_t height = (int32_t)g_gpu->height;
-    
-    // Check if out of bounds
+
+    // Silently discard completely off-screen pixels
     if (*x < 0 || *x >= width || *y < 0 || *y >= height) {
         if (graphics_safety_mode) {
-            serial_write_str("graphics: Out of bounds pixel at (");
-            serial_write_dec(*x);
-            serial_write_str(", ");
-            serial_write_dec(*y);
-            serial_write_str(") - framebuffer is ");
-            serial_write_dec(width);
-            serial_write_str("x");
-            serial_write_dec(height);
-            serial_write_str("\n");
-            PANIC("graphics: Pixel out of bounds (safety mode enabled)");
+            // In safety mode: skip the pixel entirely (don't draw, don't panic)
             return false;
-        } else {
-            // Clamp to nearest valid pixel
-            if (*x < 0) *x = 0;
-            if (*x >= width) *x = width - 1;
-            if (*y < 0) *y = 0;
-            if (*y >= height) *y = height - 1;
         }
+        // Clamp to nearest valid pixel
+        if (*x < 0)       *x = 0;
+        if (*x >= width)  *x = width  - 1;
+        if (*y < 0)       *y = 0;
+        if (*y >= height) *y = height - 1;
     }
-    
+
     return true;
 }
 
@@ -781,7 +855,7 @@ void graphics_write_ellipse_c(int32_t center_x, int32_t center_y, uint32_t radiu
 // Clear screen
 void graphics_clear(uint8_t r, uint8_t g, uint8_t b) {
     if (!g_gpu) {
-        PANIC("graphics: GPU not initialized");
+        serial_write_str("graphics_clear: GPU not initialized\n");
         return;
     }
     

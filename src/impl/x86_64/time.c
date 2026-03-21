@@ -24,34 +24,59 @@ static int time_str_idx = 0;
 // HELPER FUNCTIONS
 // ===========================================
 
+// RTC hardware returns values in BCD (Binary Coded Decimal).
+// e.g. 0x26 means "26" not decimal 38.
+// Decode: high nibble * 10 + low nibble.
+static inline uint8_t bcd_to_bin(uint8_t bcd) {
+    return ((bcd >> 4) * 10) + (bcd & 0x0F);
+}
+
+// Year comes back as a 2-digit BCD value (e.g. 0x26 = year 26 of century).
+// Century is typically 20, so full year = 2000 + bcd_to_bin(raw_year).
+// If rtc_year() already returns a 16-bit full year this is still safe
+// because bcd_to_bin(0x26) = 26 and 2000+26 = 2026.
+static inline uint16_t bcd_to_year(uint8_t raw) {
+    uint8_t two_digit = bcd_to_bin(raw);
+    // Assume 21st century. If the decoded value is >= 70 it's likely 19xx
+    // (handles RTC chips that hold years 70-99 as 1970-1999).
+    return (two_digit >= 70) ? (uint16_t)(1900 + two_digit)
+                             : (uint16_t)(2000 + two_digit);
+}
+
 static char* get_str_buffer(void) {
     char* buf = time_str_bufs[time_str_idx++ % 4];
     return buf;
 }
 
+// Encode binary back to BCD for writing to the RTC chip
+static inline uint8_t bin_to_bcd(uint8_t bin) {
+    return ((bin / 10) << 4) | (bin % 10);
+}
+
 static void write_rtc_if_needed(void) {
+    datetime_t rtc_raw;
+    rtc_get_datetime(&rtc_raw);
 
-    datetime_t rtc_now;
+    // rtc_raw fields are BCD — decode before comparing to our binary values
+    if (bcd_to_bin(rtc_raw.second) != current_datetime.second)
+        rtc_write_seconds(bin_to_bcd(current_datetime.second));
 
-    rtc_get_datetime(&rtc_now);
+    if (bcd_to_bin(rtc_raw.minute) != current_datetime.minute)
+        rtc_write_minutes(bin_to_bcd(current_datetime.minute));
 
-    if (rtc_now.second != current_datetime.second)
-        rtc_write_seconds(current_datetime.second);
+    if (bcd_to_bin(rtc_raw.hour) != current_datetime.hour)
+        rtc_write_hours(bin_to_bcd(current_datetime.hour));
 
-    if (rtc_now.minute != current_datetime.minute)
-        rtc_write_minutes(current_datetime.minute);
+    if (bcd_to_bin(rtc_raw.day) != current_datetime.day)
+        rtc_write_day(bin_to_bcd(current_datetime.day));
 
-    if (rtc_now.hour != current_datetime.hour)
-        rtc_write_hours(current_datetime.hour);
+    if (bcd_to_bin(rtc_raw.month) != current_datetime.month)
+        rtc_write_month(bin_to_bcd(current_datetime.month));
 
-    if (rtc_now.day != current_datetime.day)
-        rtc_write_day(current_datetime.day);
-
-    if (rtc_now.month != current_datetime.month)
-        rtc_write_month(current_datetime.month);
-
-    if (rtc_now.year != current_datetime.year)
-        rtc_write_year(current_datetime.year);
+    // Year: write back the 2-digit BCD form of the current year
+    uint8_t year_2digit = (uint8_t)(current_datetime.year % 100);
+    if (bcd_to_year(rtc_raw.year) != current_datetime.year)
+        rtc_write_year(bin_to_bcd(year_2digit));
 }
 // ===========================================
 // INITIALIZATION & UPDATES
@@ -60,13 +85,13 @@ static void write_rtc_if_needed(void) {
 void time_init(void) {
     serial_write_str("Initializing time subsystem...\n");
     
-    // Read initial RTC values
-    current_datetime.year = rtc_year();
-    current_datetime.month = rtc_month();
-    current_datetime.day = rtc_day();
-    current_datetime.hour = rtc_hours();
-    current_datetime.minute = rtc_minutes();
-    current_datetime.second = rtc_seconds();
+    // Read initial RTC values — all fields are BCD-encoded on real hardware
+    current_datetime.year   = bcd_to_year(rtc_year());
+    current_datetime.month  = bcd_to_bin(rtc_month());
+    current_datetime.day    = bcd_to_bin(rtc_day());
+    current_datetime.hour   = bcd_to_bin(rtc_hours());
+    current_datetime.minute = bcd_to_bin(rtc_minutes());
+    current_datetime.second = bcd_to_bin(rtc_seconds());
     
     system_uptime_ms = 0;
     last_pit_ticks = 0;
@@ -89,12 +114,13 @@ void time_tick(uint32_t pit_frequency) {
     if (system_uptime_ms - last_rtc_update_ms >= 1000) {
         last_rtc_update_ms = system_uptime_ms;
         
-        current_datetime.second = rtc_seconds();
-        current_datetime.minute = rtc_minutes();
-        current_datetime.hour = rtc_hours();
-        current_datetime.day = rtc_day();
-        current_datetime.month = rtc_month();
-        current_datetime.year = rtc_year();
+        // Re-read RTC — all fields are BCD-encoded
+        current_datetime.second = bcd_to_bin(rtc_seconds());
+        current_datetime.minute = bcd_to_bin(rtc_minutes());
+        current_datetime.hour   = bcd_to_bin(rtc_hours());
+        current_datetime.day    = bcd_to_bin(rtc_day());
+        current_datetime.month  = bcd_to_bin(rtc_month());
+        current_datetime.year   = bcd_to_year(rtc_year());
     }
 }
 

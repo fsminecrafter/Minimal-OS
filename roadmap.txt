@@ -13,7 +13,7 @@ startupRoutine [X]
 Processes and ProcessManager [X]
 GRAPHICS!!! [X] 🥳🥳🥳
 
-V 0.4.04
+V 0.4.05
 
 Better allocator [X]
 Time Scheduler [X]
@@ -25,7 +25,7 @@ Displaying and reading images [X] !limited support!
 Fonts [X] !also a little limited for now!
 
 USB 1.1 [X]
-Keyboard []
+Keyboard [X]
 Simple Audio ! []
 System calls !! []
 File system !!! []

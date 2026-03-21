@@ -5,7 +5,7 @@ find roadmap in roadmap.txt or below (might be old or un-synced!)
 
 ## ROADMAP
 
-Last synced 2026 - Mar 10 - 17:40
+Last synced 2026 - Mar 21 - 16:05
 
 #### X = Done
 #### C = Come back later
@@ -20,7 +20,7 @@ Last synced 2026 - Mar 10 - 17:40
 * Processes and ProcessManager [X]
 * GRAPHICS!!! [X] 🥳🥳🥳
 
-#### V 0.4.04
+#### V 0.4.05
 
 * Better allocator [X]
 * Time Scheduler [X]
@@ -32,7 +32,7 @@ Last synced 2026 - Mar 10 - 17:40
 * Fonts [X] !also a little limited for now!
 
 * USB 1.1 [X]
-* Keyboard []
+* Keyboard [X]
 * Simple Audio ! []
 * System calls !! []
 * File system !!! []

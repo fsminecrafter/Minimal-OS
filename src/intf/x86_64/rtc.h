@@ -18,6 +18,8 @@
 #define RTC_STATUS_A      0x0A
 #define RTC_STATUS_B      0x0B
 
+#define RTC_SYNC_INTERVAL_MS 100000
+
 // Initialize RTC
 void rtc_init(void);
 

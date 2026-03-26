@@ -22,7 +22,7 @@ void rtc_get_datetime(datetime_t* dt) {
 
 uint8_t rtc_hours() {
     uint8_t hour = rtc_read_reg(RTC_HOURS);
-    uint8_t status_b = cmos_read(RTC_STATUS_B);
+    uint8_t status_b = rtc_read_reg(RTC_STATUS_B);
     
     // Handle 12-hour format if bit 1 is not set
     if (!(status_b & 0x02)) {
@@ -58,7 +58,7 @@ uint16_t rtc_year() {
     if (century == 0 || century == 0xFF) {
         century = 20;
     } else {
-        uint8_t status_b = cmos_read(RTC_STATUS_B);
+        uint8_t status_b = rtc_read_reg(RTC_STATUS_B);
         if (!(status_b & 0x04)) {
             // BCD mode
             century = bcd_to_binary(century);

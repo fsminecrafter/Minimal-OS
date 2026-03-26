@@ -458,3 +458,7 @@ void usb_keyboard_update(void) {
         g_keyboard_state.last_repeat_number = repeat_number;
     }
 }
+
+usb_keyboard_callback_t usb_keyboard_get_callback(void) {
+    return g_user_callback;
+}

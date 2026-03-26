@@ -7,6 +7,7 @@
 #include "print.h"
 #include "serial.h"
 #include "string.h"
+#include "x86_64/port.h"
 
 // System uptime tracking
 static uint64_t system_uptime_ms = 0;
@@ -84,19 +85,22 @@ static void write_rtc_if_needed(void) {
 
 void time_init(void) {
     serial_write_str("Initializing time subsystem...\n");
-    
-    // Read initial RTC values — all fields are BCD-encoded on real hardware
+
+    // Wait until RTC is not updating
+    while (cmos_read(RTC_STATUS_A) & 0x80);
+
+    // Read RTC once
     current_datetime.year   = bcd_to_year(rtc_year());
     current_datetime.month  = bcd_to_bin(rtc_month());
     current_datetime.day    = bcd_to_bin(rtc_day());
     current_datetime.hour   = bcd_to_bin(rtc_hours());
     current_datetime.minute = bcd_to_bin(rtc_minutes());
     current_datetime.second = bcd_to_bin(rtc_seconds());
-    
+
     system_uptime_ms = 0;
-    last_pit_ticks = 0;
+    last_pit_ticks = pit_get_ticks();
     last_rtc_update_ms = 0;
-    
+
     serial_write_str("Time initialized: ");
     serial_write_str(datetime_str());
     serial_write_str("\n");
@@ -106,22 +110,46 @@ void time_tick(uint32_t pit_frequency) {
     uint64_t current_ticks = pit_get_ticks();
     uint64_t elapsed_ticks = current_ticks - last_pit_ticks;
     last_pit_ticks = current_ticks;
-    
+
     uint64_t ms_elapsed = (elapsed_ticks * 1000) / pit_frequency;
     system_uptime_ms += ms_elapsed;
-    
-    // Update RTC cache every second
-    if (system_uptime_ms - last_rtc_update_ms >= 1000) {
-        last_rtc_update_ms = system_uptime_ms;
-        
-        // Re-read RTC — all fields are BCD-encoded
-        current_datetime.second = bcd_to_bin(rtc_seconds());
-        current_datetime.minute = bcd_to_bin(rtc_minutes());
-        current_datetime.hour   = bcd_to_bin(rtc_hours());
-        current_datetime.day    = bcd_to_bin(rtc_day());
-        current_datetime.month  = bcd_to_bin(rtc_month());
-        current_datetime.year   = bcd_to_year(rtc_year());
+
+    // Advance time in 1-second steps
+    while (system_uptime_ms - last_rtc_update_ms >= 1000) {
+        last_rtc_update_ms += 1000;
+
+        current_datetime.second++;
+
+        if (current_datetime.second >= 60) {
+            current_datetime.second = 0;
+            current_datetime.minute++;
+
+            if (current_datetime.minute >= 60) {
+                current_datetime.minute = 0;
+                current_datetime.hour++;
+
+                if (current_datetime.hour >= 24) {
+                    current_datetime.hour = 0;
+                    current_datetime.day++;
+
+                    if (current_datetime.day > time_days_in_month(current_datetime.month, current_datetime.year)) {
+                        current_datetime.day = 1;
+                        current_datetime.month++;
+
+                        if (current_datetime.month > 12) {
+                            current_datetime.month = 1;
+                            current_datetime.year++;
+                        }
+                    }
+                }
+            }
+        }
     }
+
+    if (system_uptime_ms % RTC_SYNC_INTERVAL_MS < 1000) {
+        write_rtc_if_needed();
+    }
+
 }
 
 // ===========================================

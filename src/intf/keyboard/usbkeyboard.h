@@ -300,6 +300,8 @@ typedef void (*usb_keyboard_callback_t)(uint8_t scancode, char character, bool p
 
 // Register callback for key events
 void usb_keyboard_set_callback(usb_keyboard_callback_t callback);
+// Gets the current callback for key events
+usb_keyboard_callback_t usb_keyboard_get_callback(void);
 
 // ===========================================
 // UTILITY FUNCTIONS

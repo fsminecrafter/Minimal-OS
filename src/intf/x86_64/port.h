@@ -4,6 +4,9 @@
 #include <stdint.h>
 #include "x86_64/rtc.h"
 
+#define CMOS_ADDRESS 0x70
+#define CMOS_DATA    0x71
+
 // x86 I/O port operations
 
 static inline void port_outb(uint16_t port, uint8_t val) {
@@ -43,7 +46,7 @@ static uint8_t binary_to_bcd(uint8_t val) {
 
 // Read from CMOS register
 static uint8_t cmos_read(uint8_t reg) {
-    port_outb(CMOS_ADDRESS, reg);
+    port_outb(CMOS_ADDRESS, (reg | 0x80)); // disable NMI
     return port_inb(CMOS_DATA);
 }
 

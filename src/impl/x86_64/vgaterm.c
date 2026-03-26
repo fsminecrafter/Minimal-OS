@@ -940,18 +940,20 @@ void callback(uint8_t scancode, char character, bool down) {
 }
 
 char vgaterm_wait_key(void) {
+    key = 0;
+    pressed = false;
 
-    // Set callback
+    // Save old callback
+    usb_keyboard_callback_t old_cb = usb_keyboard_get_callback();
+
+    // Set temporary callback
     usb_keyboard_set_callback(callback);
 
-    // Poll until key pressed
     while (!pressed) {
-        usb_keyboard_update(); // process repeats and held keys
-        // Optionally: call some USB polling function if needed
+        usb_keyboard_update();
     }
 
-    // Reset callback to NULL or original handler if necessary
-    usb_keyboard_set_callback(NULL);
+    usb_keyboard_set_callback(old_cb);
 
     return key;
 }

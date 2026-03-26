@@ -1,46 +1,51 @@
 ENTRY(start)
 
+MEMORY
+{
+    RAM (rwx) : ORIGIN = 1M, LENGTH = 512M
+}
+
 SECTIONS
 {
-    /* Start at 1MB (Multiboot requirement) */
     . = 1M;
 
     /* Multiboot header */
     .boot :
     {
         KEEP(*(.multiboot_header))
-    }
+    } > RAM
 
-    /* Constructor section for registering commands */
+    /* Command constructors */
     .command_ctors ALIGN(8) :
     {
         __start_command_ctors = .;
         KEEP(*(.command_ctors))
+        KEEP(*(.command_ctors.*))
         __stop_command_ctors = .;
-    }
+    } > RAM
 
-    /* Kernel code (read-only and executable) */
+    /* Code */
     .text ALIGN(4K) :
     {
         *(.text)
         *(.text.*)
-    }
+    } > RAM
 
-    /* Read-only data (e.g., strings, const variables) */
+    /* Read-only data */
     .rodata ALIGN(4K) :
     {
         *(.rodata)
         *(.rodata.*)
-    }
+    } > RAM
 
-    /* Initialized data (global vars with values) */
+    /* Data */
     .data ALIGN(4K) :
     {
         *(.data)
         *(.data.*)
-    }
+    } > RAM
 
-    /* Uninitialized data (BSS) */
+    /* BSS */
     .bss ALIGN(4K) (NOLOAD) :
     {
         __bss_start = .;
@@ -48,11 +53,10 @@ SECTIONS
         *(.bss.*)
         *(COMMON)
         __bss_end = .;
-    }
+    } > RAM
 
     /DISCARD/ : { *(.comment) *(.note*) *(.eh_frame) }
 
-    /* Optional: provide symbols for start/end of kernel */
     _kernel_start = 1M;
     _kernel_end = .;
 }

@@ -48,7 +48,7 @@ void kernel_main(uint64_t mb2_info_addr) {
     print_str("Minimal OS\n");
     print_set_color(PRINT_COLOR_GREEN, PRINT_COLOR_BLACK);
     print_uint64_dec(total_ram_bytes / 1024);
-    print_str("KiB / ");
+    print_str("KiB ||  ");
     print_uint64_dec(total_ram_bytes / 1048576);
     print_str("MiB");
     print_set_color(PRINT_COLOR_WHITE, PRINT_COLOR_BLACK);
@@ -60,6 +60,8 @@ void kernel_main(uint64_t mb2_info_addr) {
 
     //memory_scanner_init();
     //memory_scan_full();
+
+    addvar(total_ram_bytes, "totalrambytes");
 
     pci_enumerate_all();
     

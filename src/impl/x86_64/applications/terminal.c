@@ -11,6 +11,9 @@
 #include "string.h"
 #include "time.h"
 
+#include "vgaterm.h"
+#include "minimafshandler.h"
+
 // ===========================================
 // TERMINAL STATE
 // ===========================================
@@ -272,6 +275,7 @@ void terminal_program_entry(void) {
     // Initialize command system
     serial_write_str("Terminal: Initializing command system...\n");
     commandhandler_init();
+    vgaterm_init();
     
     // Initialize keyboard
     terminal_init_keyboard();
@@ -297,10 +301,39 @@ void terminal_program_entry(void) {
     graphics_write_textr("Type a command and press Enter.\n");
     graphics_write_textr("Type 'help' for available commands.\n\n");
     
-    terminalPrompt();
-    
     serial_write_str("=== TERMINAL READY ===\n");
-    
+
+    if (vgaterm_ask_yn("Mount disk?", true)) {
+        vgaterm_print("Mounting disk...\n");
+        command_execute("initdisk");
+        minimafs_disk_device_t* device;
+        device = getminimadrive();
+        int success = mountdrive(device, 0);
+        if (success == 1) {
+            vgaterm_print("Mount succeded.\n");
+        }else if (success == 2) {
+            vgaterm_print("/cr255g0b0/MinimaFS: Drive already mounted/cr255g255b255/\n");
+        }else if (success == 3) {
+            vgaterm_print("/cr255g0b0/MinimaFS: Failed to parse storage.desc/cr255g255b255/\n");
+        }else if (success == 4) {
+            vgaterm_print("/cr255g0b0/MinimaFS: Invalid root block/cr255g255b255/\n");
+        }else if (success == 5) {
+            vgaterm_print("/cr255g0b0/MinimaFS: Drive too large for bitmap/cr255g255b255/\n");
+        } else {
+            vgaterm_print("/cr255g0b0/Mount failed.\n");
+        }
+        minimafs_drive_t* d = get_drive(0);
+
+        if (!d) {
+            serial_write_str("/cr255g0b0/Drive 0 = NULL/cr255g255b255/\n");
+        } else if (!d->mounted) {
+            serial_write_str("/cr255g0b0/Drive 0 not mounted/cr255g255b255/\n");
+        } else {
+            vgaterm_print("/cr0g255b0/Drive 0 OK/cr255g255b255/\n");
+        }
+    }
+
+    terminalPrompt();
     // Main terminal loop
     while (1) {
         terminal_update();

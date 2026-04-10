@@ -15,6 +15,7 @@ int strcmp(const char* s1, const char* s2);
 int strncmp(const char* s1, const char* s2, size_t n);
 int snprintf(char* buffer, size_t size, const char* fmt, ...);
 int sprintf(char* buffer, const char* fmt, ...);
+int vsnprintf(char* buffer, size_t size, const char* fmt, va_list args);
 
 char* strcpy(char* dest, const char* src);
 char* strncpy(char* dest, const char* src, size_t n);

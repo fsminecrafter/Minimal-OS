@@ -613,6 +613,16 @@ static int vsnprintf_internal(char* buffer, size_t size, const char* fmt, va_lis
             fmt++;
             if (*fmt == '\0') break;
 
+            bool longlong = false;
+
+            if (*fmt == 'l') {
+                fmt++;
+                if (*fmt == 'l') {
+                    longlong = true;
+                    fmt++;
+                }
+            }
+
             switch (*fmt) {
                 case 's': {
                     const char* s = va_arg(args, const char*);
@@ -620,34 +630,58 @@ static int vsnprintf_internal(char* buffer, size_t size, const char* fmt, va_lis
                     pos = append_to_buffer(buffer, size, pos, s);
                     break;
                 }
+
                 case 'c': {
                     char c = (char)va_arg(args, int);
                     pos = append_char_to_buffer(buffer, size, pos, c);
                     break;
                 }
-                case 'd': {
-                    int64_t val = va_arg(args, int);
+
+                case 'd':
+                case 'i': {
+                    int64_t val = longlong ? va_arg(args, int64_t) : va_arg(args, int);
                     char tmp[32];
                     int_to_str(val, tmp);
                     pos = append_to_buffer(buffer, size, pos, tmp);
                     break;
                 }
+
                 case 'u': {
-                    uint64_t val = va_arg(args, unsigned int);
+                    uint64_t val = longlong ? va_arg(args, uint64_t) : va_arg(args, unsigned int);
                     char tmp[32];
                     uint_to_str(val, tmp);
                     pos = append_to_buffer(buffer, size, pos, tmp);
                     break;
                 }
+
+                case 'x':
+                case 'X': {
+                    uint64_t val = longlong ? va_arg(args, uint64_t) : va_arg(args, unsigned int);
+                    char tmp[32];
+                    hex_to_str(val, tmp);
+                    pos = append_to_buffer(buffer, size, pos, tmp);
+                    break;
+                }
+
+                case 'p': {
+                    uint64_t val = (uint64_t)va_arg(args, void*);
+                    char tmp[32];
+                    hex_to_str(val, tmp);
+                    pos = append_to_buffer(buffer, size, pos, "0x");
+                    pos = append_to_buffer(buffer, size, pos, tmp);
+                    break;
+                }
+
                 case '%': {
                     pos = append_char_to_buffer(buffer, size, pos, '%');
                     break;
                 }
-                default:
-                    // Unknown specifier: print literally
+
+                default: {
                     pos = append_char_to_buffer(buffer, size, pos, '%');
                     pos = append_char_to_buffer(buffer, size, pos, *fmt);
                     break;
+                }
             }
         } else {
             pos = append_char_to_buffer(buffer, size, pos, *fmt);
@@ -680,4 +714,8 @@ int sprintf(char* buffer, const char* fmt, ...) {
     int ret = vsnprintf_internal(buffer, (size_t)-1, fmt, args);
     va_end(args);
     return ret;
+}
+
+int vsnprintf(char* buffer, size_t size, const char* fmt, va_list args) {
+    return vsnprintf_internal(buffer, size, fmt, args);
 }

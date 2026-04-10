@@ -6,6 +6,7 @@
 #include "x86_64/scheduler.h"
 #include "panic.h"
 #include "print.h"
+#include "x86_64/exec_trace.h"
 
 #define IDT_IRQ0_TIMER 0x20
 #define IDT_IRQ1_KEYBOARD 0x21
@@ -95,7 +96,7 @@ void idt_init() {
 
 	idt_load(&idt_ptr);
 	
-	asm volatile("sti");
+	sti();
 }
 
 void idt_set_handler_keyboard(void (*handler)()) {

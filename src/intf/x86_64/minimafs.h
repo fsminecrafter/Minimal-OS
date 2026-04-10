@@ -234,9 +234,9 @@ uint32_t minimafs_write(minimafs_file_handle_t* handle, const void* buffer, uint
 /**
  * Seek to position in file
  * @param handle File handle
- * @param position Position in bytes
+ * @param offset offset in bytes
  */
-void minimafs_seek(minimafs_file_handle_t* handle, uint32_t position);
+bool minimafs_seek(minimafs_file_handle_t* handle, uint32_t offset);
 
 /**
  * Create a new file
@@ -322,6 +322,14 @@ bool minimafs_set_metadata(const char* path, const minimafs_file_metadata_t* met
  * @return true on success
  */
 bool minimafs_get_storage_desc(uint8_t drive_number, minimafs_storage_desc_t* desc);
+bool minimafs_read_folder_desc(minimafs_drive_t* drive, const char* path,
+                               minimafs_folder_desc_t* desc);
+bool minimafs_write_folder_desc(minimafs_drive_t* drive, minimafs_folder_desc_t* desc);
+bool minimafs_write_file_segments(const char* path,
+                                  const void* seg1, uint32_t seg1_len,
+                                  const void* seg2, uint32_t seg2_len,
+                                  const char* filetype, const char* fileformat);
+bool minimafs_append_file(const char* path, const void* data, uint32_t data_len);
 
 /**
  * Parse path into drive and local path
@@ -343,5 +351,14 @@ minimafs_drive_t* get_drive(uint8_t drive_number);
 void minimafs_scan_directory(minimafs_drive_t* drive, uint32_t block);
 void minimafs_refresh_storage_desc(minimafs_drive_t* drive);
 bool minimafs_write_storage_desc(minimafs_drive_t* drive);
+
+uint32_t minimafs_tell(minimafs_file_handle_t* handle);
+uint32_t minimafs_size(minimafs_file_handle_t* handle);
+bool minimafs_eof(minimafs_file_handle_t* handle);
+int32_t findinfile(const char* needle, const char* path);
+bool minimafs_read_line(minimafs_file_handle_t* handle, char* buffer, size_t buffer_size);
+bool getvalfromsplit(const char* str, const char* delimiter, int index, char* output, size_t output_size);
+int32_t minimafs_parse_int(const char* str);
+bool minimafs_get_config_value(const char* key, const char* path, char* output, size_t output_size);
 
 #endif // MINIMAFS_H

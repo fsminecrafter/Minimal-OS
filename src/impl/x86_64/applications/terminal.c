@@ -308,29 +308,35 @@ void terminal_program_entry(void) {
         command_execute("initdisk");
         minimafs_disk_device_t* device;
         device = getminimadrive();
-        int success = mountdrive(device, 0);
-        if (success == 1) {
-            vgaterm_print("Mount succeded.\n");
-        }else if (success == 2) {
-            vgaterm_print("/cr255g0b0/MinimaFS: Drive already mounted/cr255g255b255/\n");
-        }else if (success == 3) {
-            vgaterm_print("/cr255g0b0/MinimaFS: Failed to parse storage.desc/cr255g255b255/\n");
-        }else if (success == 4) {
-            vgaterm_print("/cr255g0b0/MinimaFS: Invalid root block/cr255g255b255/\n");
-        }else if (success == 5) {
-            vgaterm_print("/cr255g0b0/MinimaFS: Drive too large for bitmap/cr255g255b255/\n");
+        if (!device) {
+            vgaterm_print("/cr255g0b0/No disk device found/cr255g255b255/\n");
         } else {
-            vgaterm_print("/cr255g0b0/Mount failed.\n");
-        }
-        minimafs_drive_t* d = get_drive(0);
+            int success = mountdrive(device, 0);
+            if (success == 1) {
+                vgaterm_print("Mount succeded.\n");
+            }else if (success == 2) {
+                vgaterm_print("/cr255g0b0/MinimaFS: Drive already mounted/cr255g255b255/\n");
+            }else if (success == 3) {
+                vgaterm_print("/cr255g0b0/MinimaFS: Failed to parse storage.desc/cr255g255b255/\n");
+            }else if (success == 4) {
+                vgaterm_print("/cr255g0b0/MinimaFS: Invalid root block/cr255g255b255/\n");
+            }else if (success == 5) {
+                vgaterm_print("/cr255g0b0/MinimaFS: Drive too large for bitmap/cr255g255b255/\n");
+            } else {
+                vgaterm_print("/cr255g0b0/Mount failed.\n");
+            }
+        minimafs_drive_t* d = get_drive(1);
 
         if (!d) {
-            serial_write_str("/cr255g0b0/Drive 0 = NULL/cr255g255b255/\n");
+            serial_write_str("/cr255g0b0/Drive 1 = NULL/cr255g255b255/\n");
         } else if (!d->mounted) {
-            serial_write_str("/cr255g0b0/Drive 0 not mounted/cr255g255b255/\n");
+            serial_write_str("/cr255g0b0/Drive 1 not mounted/cr255g255b255/\n");
         } else {
-            vgaterm_print("/cr0g255b0/Drive 0 OK/cr255g255b255/\n");
+            vgaterm_print("/cr0g255b0/Drive 1 OK/cr255g255b255/\n");
         }
+        }
+        command_execute("createmusicfile 0");
+        vgaterm_print("Created music file.\n");
     }
 
     terminalPrompt();

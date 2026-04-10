@@ -31,7 +31,7 @@ build/x86_64/%.o: src/impl/x86_64/%.asm
 
 build/resources/%.o: src/resources/%.wav
 	mkdir -p $(dir $@)
-	python3 tools/audioconverter/wavtoheader.py $< $@
+	python tools/audioconverter/wavtoadi.py --format IADPCM --object-file $< $@
 
 .PHONY: build-x86_64
 build-x86_64: $(kernel_object_files) $(x86_64_object_files) $(audio_object_files) 
@@ -56,11 +56,11 @@ run: build-x86_64
 
 .PHONY: run-sdl
 run-sdl: build-x86_64
-	qemu-system-x86_64 -cdrom dist/x86_64/kernel.iso -m 1024M -boot d -serial stdio -audiodev sdl,id=speaker -machine pcspk-audiodev=speaker -usb -device usb-kbd -audiodev sdl,id=audio0 -device AC97,audiodev=audio0
+	qemu-system-x86_64 -cdrom dist/x86_64/kernel.iso -m 1024M -boot d -serial stdio -audiodev sdl,id=speaker -machine pcspk-audiodev=speaker -usb -device usb-kbd -audiodev sdl,id=audio0 -device AC97,audiodev=audio0 -device ahci,id=ahci -drive id=disk0,file=sata256.img,if=none,format=raw -device ide-hd,drive=disk0,bus=ahci.0
 
 .PHONY: run-alsa
 run-alsa: build-x86_64
-	qemu-system-x86_64 -cdrom dist/x86_64/kernel.iso -m 1024M -boot d -serial stdio -audiodev alsa,id=speaker -machine pcspk-audiodev=speaker -usb -device usb-kbd -audiodev alsa,id=audio0 -device AC97,audiodev=audio0
+	qemu-system-x86_64 -cdrom dist/x86_64/kernel.iso -m 1024M -boot d -serial stdio -audiodev alsa,id=speaker -machine pcspk-audiodev=speaker -usb -device usb-kbd -audiodev alsa,id=audio0 -device AC97,audiodev=audio0 -device ahci,id=ahci -drive id=disk0,file=sata256.img,if=none,format=raw -device ide-hd,drive=disk0,bus=ahci.0
 
 .PHONY: run-ps2
 run-ps2: build-x86_64

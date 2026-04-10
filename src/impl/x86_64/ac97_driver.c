@@ -6,6 +6,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "audio.h"
+#include "x86_64/ac97_driver.h"
 #include "x86_64/pci.h"
 #include "x86_64/mmio.h"
 #include "x86_64/port.h"

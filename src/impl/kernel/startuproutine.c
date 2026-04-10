@@ -16,6 +16,7 @@
 #include "x86_64/tss.h"
 #include "time.h"
 #include "x86_64/ac97_driver.h"
+#include "x86_64/exec_trace.h"
 
 #define HEAP_MIN_START 0x400000  // 4 MiB - fallback if kernel end is lower
 
@@ -68,10 +69,10 @@ void startroutine(uint64_t total_ram_bytes) {
     //beep();
     print_str("Running pit test\n");
 
-    asm volatile("cli");
+    cli();
     extern uint64_t pit_get_ticks();
     print_uint64_dec(pit_get_ticks()); // Should be 0
-    asm volatile("sti");
+    sti();
     while (pit_get_ticks() < 5) {
         asm volatile("hlt");
     }

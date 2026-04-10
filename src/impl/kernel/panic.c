@@ -1,5 +1,6 @@
 #include "panic.h"
 #include "print.h"
+#include "x86_64/exec_trace.h"
 
 #define SCREEN_WIDTH 80
 #define SCREEN_HEIGHT 25
@@ -47,7 +48,7 @@ static void print_registers(const RegisterState* regs, int start_row) {
 }
 
 noreturn void panic(const char* message, const char* file, int line, const RegisterState* regs) {
-	asm volatile("cli");
+	cli();
 
 	// Blue background, white text
 	print_clear_color(PRINT_COLOR_WHITE, PRINT_COLOR_BLUE);

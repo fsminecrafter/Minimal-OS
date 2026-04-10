@@ -6,25 +6,77 @@
 #include "x86_64/pci.h"
 #include "x86_64/mmio.h"
 #include "x86_64/port.h"
+#include "time.h"
+#include "x86_64/exec_trace.h"
+#include "x86_64/safeints.h"
 
 // ===========================================
 // PORT MANAGEMENT
 // ===========================================
 
+// Global AHCI lock to prevent concurrent command submission
+static volatile int g_ahci_lock = 0;
+
+// Command timeout/retry tuning
+#define AHCI_CMD_TIMEOUT_MS 2000
+#define AHCI_CMD_RETRIES 3
+
+static void ahci_dump_port(const char* tag, hba_port_t* port);
+
+static inline void ahci_lock_acquire(void) {
+    while (__sync_lock_test_and_set(&g_ahci_lock, 1)) { /* spin */ }
+}
+
+static inline void ahci_lock_release(void) {
+    __sync_lock_release(&g_ahci_lock);
+}
+
+static inline bool ahci_irq_enabled(uint64_t flags) {
+    return (flags & (1ULL << 9)) != 0;
+}
+
+static void ahci_sleep_ms(uint32_t ms) {
+    uint64_t flags = irq_save(__FILE__, __func__, __LINE__);
+    bool ints_enabled = ahci_irq_enabled(flags);
+    irq_restore(flags, __FILE__, __func__, __LINE__);
+
+    if (ints_enabled) {
+        uint64_t start = time_get_uptime_ms();
+        while (time_get_uptime_ms() - start < ms) {
+            asm volatile("hlt");
+        }
+    } else {
+        // If interrupts are off, avoid time-based waits and do a short busy spin.
+        for (volatile uint32_t i = 0; i < (ms * 10000u); i++) {
+            asm volatile("nop");
+        }
+    }
+}
+
 static void ahci_start_cmd(hba_port_t* port) {
     // Wait until CR (bit 15) is cleared
-    while (port->cmd & (1 << 15));
+    int timeout = 1000000;
+    while ((port->cmd & (1 << 15)) && timeout-- > 0) { }
+    if (timeout == 0) {
+        serial_write_str("AHCI: start_cmd CR clear timeout\n");
+        ahci_dump_port("start-cr-timeout", port);
+        return;
+    }
     
     // Set FRE (bit 4) and ST (bit 0)
     port->cmd |= (1 << 4);
     port->cmd |= (1 << 0);
 
     // Wait for FR/CR to become set (engine running)
-    int timeout = 1000000;
+    timeout = 1000000;
     while (timeout-- > 0) {
         if ((port->cmd & (1 << 14)) && (port->cmd & (1 << 15))) {
             break;
         }
+    }
+    if (timeout == 0) {
+        serial_write_str("AHCI: start_cmd engine timeout\n");
+        ahci_dump_port("start-engine-timeout", port);
     }
 }
 
@@ -36,7 +88,12 @@ static void ahci_stop_cmd(hba_port_t* port) {
     port->cmd &= ~(1 << 4);
     
     // Wait until FR (bit 14) and CR (bit 15) are cleared
-    while (port->cmd & ((1 << 14) | (1 << 15)));
+    int timeout = 1000000;
+    while ((port->cmd & ((1 << 14) | (1 << 15))) && timeout-- > 0) { }
+    if (timeout == 0) {
+        serial_write_str("AHCI: stop_cmd timeout\n");
+        ahci_dump_port("stop-timeout", port);
+    }
 }
 
 static uint32_t ahci_check_type(hba_port_t* port) {
@@ -68,6 +125,27 @@ static uint32_t ahci_check_type(hba_port_t* port) {
 }
 
 static int ahci_find_cmdslot(hba_port_t* port);
+
+static void ahci_wait_port_idle(hba_port_t* port) {
+    TRACE_ENTER();
+    
+    uint32_t timeout = 5000;
+    while ((port->ci != 0 || (port->cmd & 0x8000)) && timeout > 0) {
+        for (volatile int i = 0; i < 1000; i++) asm("nop");
+        timeout--;
+    }
+    
+    if (timeout == 0) {
+        TRACE_MSG("Port idle timeout");
+        TRACE_HEX("ci", port->ci);
+        TRACE_HEX("cmd", port->cmd);
+    }
+    
+    // Small delay
+    for (volatile int i = 0; i < 100000; i++) asm("nop");
+    
+    TRACE_EXIT();
+}
 
 static bool ahci_port_reset(hba_port_t* port) {
     if (!port) return false;
@@ -101,11 +179,14 @@ static bool ahci_port_reset(hba_port_t* port) {
 }
 
 static bool ahci_port_wait_ready(hba_port_t* port) {
-    int timeout = 1000000;
-    while ((port->tfd & (ATA_DEV_BUSY | ATA_DEV_DRQ)) && timeout > 0) {
-        timeout--;
+    uint64_t start_ms = time_get_uptime_ms();
+    while (port->tfd & (ATA_DEV_BUSY | ATA_DEV_DRQ)) {
+        if ((time_get_uptime_ms() - start_ms) > AHCI_CMD_TIMEOUT_MS) {
+            return false;
+        }
+        port_wait();
     }
-    return timeout > 0;
+    return true;
 }
 
 static void ahci_dump_port(const char* tag, hba_port_t* port) {
@@ -139,6 +220,52 @@ static bool ahci_wait_engine(hba_port_t* port) {
         }
     }
     return false;
+}
+
+// Split large writes into smaller chunks
+static bool ahci_write_split(ahci_drive_t* drive, uint64_t lba, 
+                             uint32_t count, const void* buffer) {
+    TRACE_ENTER();
+    TRACE_VALUE("count", count);
+    
+    const uint32_t MAX_SECTORS = 32;  // 16 KB max
+    
+    uint32_t written = 0;
+    const uint8_t* src = (const uint8_t*)buffer;
+    
+    while (written < count) {
+        uint32_t this_write = count - written;
+        if (this_write > MAX_SECTORS) this_write = MAX_SECTORS;
+        
+        TRACE_VALUE("this_write", this_write);
+        TRACE_VALUE("lba", lba + written);
+        
+        // Enable interrupts during write
+        uint64_t flags = irq_save(__FILE__, __func__, __LINE__);
+        
+        bool ok = ahci_write(drive, lba + written, this_write, src);
+        
+        // Disable interrupts
+        irq_restore(flags, __FILE__, __func__, __LINE__);
+        
+        if (!ok) {
+            TRACE_MSG("Write failed");
+            TRACE_EXIT();
+            return false;
+        }
+        
+        written += this_write;
+        src += this_write * drive->sector_size;
+        
+        // Wait between writes
+        ahci_wait_port_idle(drive->port);
+        
+        // Small delay (10ms)
+        ahci_sleep_ms(10);
+    }
+    
+    TRACE_EXIT();
+    return true;
 }
 
 static void ahci_port_enable(hba_port_t* port) {
@@ -176,7 +303,12 @@ static bool ahci_identify(ahci_drive_t* drive) {
 
     hba_cmd_header_t* cmdheader = (hba_cmd_header_t*)((uintptr_t)port->clb | ((uint64_t)port->clbu << 32));
     cmdheader += slot;
+    // Preserve command table pointers set during port rebase
+    uint32_t ctba = cmdheader->ctba;
+    uint32_t ctbau = cmdheader->ctbau;
     memset(cmdheader, 0, sizeof(hba_cmd_header_t));
+    cmdheader->ctba = ctba;
+    cmdheader->ctbau = ctbau;
     cmdheader->cfl = sizeof(fis_reg_h2d_t) / sizeof(uint32_t);
     cmdheader->w = 0;
     cmdheader->prdtl = 1;
@@ -525,166 +657,257 @@ static int ahci_find_cmdslot(hba_port_t* port) {
 bool ahci_read(ahci_drive_t* drive, uint64_t lba, uint32_t count, void* buffer) {
     if (!drive || !drive->present || !buffer) return false;
     
+    ahci_lock_acquire();
+
     hba_port_t* port = drive->port;
-    ahci_port_enable(port);
-    
-    // Clear interrupt status
-    port->is = 0xFFFFFFFF;
-    port->serr = 0xFFFFFFFF;
-    
-    // Find free command slot
-    int slot = ahci_find_cmdslot(port);
-    if (slot == -1) {
-        serial_write_str("AHCI: No free command slots\n");
-        return false;
-    }
-    
-    hba_cmd_header_t* cmdheader = (hba_cmd_header_t*)((uintptr_t)port->clb | ((uint64_t)port->clbu << 32));
-    cmdheader += slot;
-    memset(cmdheader, 0, sizeof(hba_cmd_header_t));
-    cmdheader->cfl = sizeof(fis_reg_h2d_t) / sizeof(uint32_t);
-    cmdheader->w = 0;  // Read
-    cmdheader->prdtl = 1;  // One PRDT entry
-    cmdheader->prdbc = 0;
-    
-    hba_cmd_tbl_t* cmdtbl = (hba_cmd_tbl_t*)((uintptr_t)cmdheader->ctba | ((uint64_t)cmdheader->ctbau << 32));
-    memset(cmdtbl, 0, sizeof(hba_cmd_tbl_t));
-    
-    // Setup PRDT
-    cmdtbl->prdt_entry[0].dba = ((uintptr_t)buffer) & 0xFFFFFFFF;
-    cmdtbl->prdt_entry[0].dbau = ((uintptr_t)buffer >> 32) & 0xFFFFFFFF;
-    cmdtbl->prdt_entry[0].dbc = (count * drive->sector_size) - 1;
-    cmdtbl->prdt_entry[0].i = 1;  // Interrupt on completion
-    
-    // Setup command FIS
-    fis_reg_h2d_t* cmdfis = (fis_reg_h2d_t*)(cmdtbl->cfis);
-    cmdfis->fis_type = 0x27;  // Register H2D
-    cmdfis->c = 1;  // Command
-    cmdfis->command = ATA_CMD_READ_DMA_EX;
-    
-    cmdfis->lba0 = lba & 0xFF;
-    cmdfis->lba1 = (lba >> 8) & 0xFF;
-    cmdfis->lba2 = (lba >> 16) & 0xFF;
-    cmdfis->device = 1 << 6;  // LBA mode
-    
-    cmdfis->lba3 = (lba >> 24) & 0xFF;
-    cmdfis->lba4 = (lba >> 32) & 0xFF;
-    cmdfis->lba5 = (lba >> 40) & 0xFF;
-    
-    cmdfis->countl = count & 0xFF;
-    cmdfis->counth = (count >> 8) & 0xFF;
-    
-    // Wait for port to be ready
-    if (!ahci_port_wait_ready(port)) {
-        serial_write_str("AHCI: Port busy timeout\n");
-        ahci_dump_port("read-busy", port);
-        return false;
-    }
-    
-    // Issue command
-    port->ci = 1 << slot;
-    
-    // Wait for completion
-    int timeout = 1000000;
-    while (true) {
-        if ((port->ci & (1 << slot)) == 0) break;
-        if (port->is & (1 << 30)) {  // Task file error
-            serial_write_str("AHCI: Task file error\n");
-            ahci_dump_port("read-tfe", port);
-            return false;
+    bool ok = false;
+
+    for (int attempt = 0; attempt < AHCI_CMD_RETRIES && !ok; attempt++) {
+        ahci_port_enable(port);
+
+        // Clear interrupt status
+        port->is = 0xFFFFFFFF;
+        port->serr = 0xFFFFFFFF;
+
+        // Find free command slot
+        int slot = ahci_find_cmdslot(port);
+        if (slot == -1) {
+            serial_write_str("AHCI: No free command slots\n");
+            ahci_port_reset(port);
+            ahci_start_cmd(port);
+            continue;
         }
-        if (--timeout == 0) {
-            serial_write_str("AHCI: Read timeout\n");
-            ahci_dump_port("read-timeout", port);
-            return false;
+        
+        hba_cmd_header_t* cmdheader = (hba_cmd_header_t*)((uintptr_t)port->clb | ((uint64_t)port->clbu << 32));
+        cmdheader += slot;
+        // Preserve command table pointers set during port rebase
+        uint32_t ctba = cmdheader->ctba;
+        uint32_t ctbau = cmdheader->ctbau;
+        memset(cmdheader, 0, sizeof(hba_cmd_header_t));
+        cmdheader->ctba = ctba;
+        cmdheader->ctbau = ctbau;
+        cmdheader->cfl = sizeof(fis_reg_h2d_t) / sizeof(uint32_t);
+        cmdheader->w = 0;  // Read
+        cmdheader->prdtl = 1;  // One PRDT entry
+        cmdheader->prdbc = 0;
+        
+        hba_cmd_tbl_t* cmdtbl = (hba_cmd_tbl_t*)((uintptr_t)cmdheader->ctba | ((uint64_t)cmdheader->ctbau << 32));
+        memset(cmdtbl, 0, sizeof(hba_cmd_tbl_t));
+        
+        // Setup PRDT
+        cmdtbl->prdt_entry[0].dba = ((uintptr_t)buffer) & 0xFFFFFFFF;
+        cmdtbl->prdt_entry[0].dbau = ((uintptr_t)buffer >> 32) & 0xFFFFFFFF;
+        cmdtbl->prdt_entry[0].dbc = (count * drive->sector_size) - 1;
+        cmdtbl->prdt_entry[0].i = 1;  // Interrupt on completion
+        
+        // Setup command FIS
+        fis_reg_h2d_t* cmdfis = (fis_reg_h2d_t*)(cmdtbl->cfis);
+        cmdfis->fis_type = 0x27;  // Register H2D
+        cmdfis->c = 1;  // Command
+        cmdfis->command = ATA_CMD_READ_DMA_EX;
+        
+        cmdfis->lba0 = lba & 0xFF;
+        cmdfis->lba1 = (lba >> 8) & 0xFF;
+        cmdfis->lba2 = (lba >> 16) & 0xFF;
+        cmdfis->device = 1 << 6;  // LBA mode
+        
+        cmdfis->lba3 = (lba >> 24) & 0xFF;
+        cmdfis->lba4 = (lba >> 32) & 0xFF;
+        cmdfis->lba5 = (lba >> 40) & 0xFF;
+        
+        cmdfis->countl = count & 0xFF;
+        cmdfis->counth = (count >> 8) & 0xFF;
+        
+        // Wait for port to be ready
+        if (!ahci_port_wait_ready(port)) {
+            serial_write_str("AHCI: Port busy timeout\n");
+            ahci_dump_port("read-busy", port);
+            ahci_port_reset(port);
+            ahci_start_cmd(port);
+            continue;
         }
-    }
-    
-    // Check for errors
-    if (port->is & (1 << 30)) {
-        serial_write_str("AHCI: Read error\n");
-        ahci_dump_port("read-error", port);
-        return false;
+        
+        // Issue command
+        port->ci = 1 << slot;
+        
+        // Wait for completion (time-based timeout)
+        uint64_t start_ms = time_get_uptime_ms();
+        while (true) {
+            if ((port->ci & (1 << slot)) == 0) break;
+            if (port->is & (1 << 30)) {  // Task file error
+                serial_write_str("AHCI: Task file error\n");
+                ahci_dump_port("read-tfe", port);
+                break;
+            }
+            if ((time_get_uptime_ms() - start_ms) > AHCI_CMD_TIMEOUT_MS) {
+                serial_write_str("AHCI: Read timeout\n");
+                ahci_dump_port("read-timeout", port);
+                break;
+            }
+        }
+        
+        // Check for errors
+        if (port->is & (1 << 30)) {
+            ahci_port_reset(port);
+            ahci_start_cmd(port);
+            continue;
+        }
+        if (port->ci & (1 << slot)) {
+            ahci_port_reset(port);
+            ahci_start_cmd(port);
+            continue;
+        }
+        if (cmdheader->prdbc == 0) {
+            serial_write_str("AHCI: Read transferred 0 bytes\n");
+            ahci_dump_port("read-prdbc0", port);
+            ahci_port_reset(port);
+            ahci_start_cmd(port);
+            continue;
+        }
+
+        ok = true;
     }
 
-    if (cmdheader->prdbc == 0) {
-        serial_write_str("AHCI: Read transferred 0 bytes\n");
-        ahci_dump_port("read-prdbc0", port);
-        return false;
-    }
-    
-    return true;
+    ahci_lock_release();
+    return ok;
 }
 
 bool ahci_write(ahci_drive_t* drive, uint64_t lba, uint32_t count, const void* buffer) {
-    if (!drive || !drive->present || !buffer) return false;
+    TRACE_ENTER();
+    TRACE_VALUE("lba", lba);
+    TRACE_VALUE("count", count);
+    TRACE_PTR("buffer", buffer);
     
-    // Similar to read but with ATA_CMD_WRITE_DMA_EX and w=1
-    // Implementation similar to ahci_read() but with write command
-    
-    hba_port_t* port = drive->port;
-    ahci_port_enable(port);
-    port->is = 0xFFFFFFFF;
-    port->serr = 0xFFFFFFFF;
-    
-    int slot = ahci_find_cmdslot(port);
-    if (slot == -1) return false;
-    
-    hba_cmd_header_t* cmdheader = (hba_cmd_header_t*)((uintptr_t)port->clb | ((uint64_t)port->clbu << 32));
-    cmdheader += slot;
-    memset(cmdheader, 0, sizeof(hba_cmd_header_t));
-    cmdheader->cfl = sizeof(fis_reg_h2d_t) / sizeof(uint32_t);
-    cmdheader->w = 1;  // Write
-    cmdheader->prdtl = 1;
-    cmdheader->prdbc = 0;
-    
-    hba_cmd_tbl_t* cmdtbl = (hba_cmd_tbl_t*)((uintptr_t)cmdheader->ctba | ((uint64_t)cmdheader->ctbau << 32));
-    memset(cmdtbl, 0, sizeof(hba_cmd_tbl_t));
-    
-    cmdtbl->prdt_entry[0].dba = ((uintptr_t)buffer) & 0xFFFFFFFF;
-    cmdtbl->prdt_entry[0].dbau = ((uintptr_t)buffer >> 32) & 0xFFFFFFFF;
-    cmdtbl->prdt_entry[0].dbc = (count * drive->sector_size) - 1;
-    cmdtbl->prdt_entry[0].i = 1;
-    
-    fis_reg_h2d_t* cmdfis = (fis_reg_h2d_t*)(cmdtbl->cfis);
-    cmdfis->fis_type = 0x27;
-    cmdfis->c = 1;
-    cmdfis->command = ATA_CMD_WRITE_DMA_EX;
-    
-    cmdfis->lba0 = lba & 0xFF;
-    cmdfis->lba1 = (lba >> 8) & 0xFF;
-    cmdfis->lba2 = (lba >> 16) & 0xFF;
-    cmdfis->device = 1 << 6;
-    
-    cmdfis->lba3 = (lba >> 24) & 0xFF;
-    cmdfis->lba4 = (lba >> 32) & 0xFF;
-    cmdfis->lba5 = (lba >> 40) & 0xFF;
-    
-    cmdfis->countl = count & 0xFF;
-    cmdfis->counth = (count >> 8) & 0xFF;
-    
-    if (!ahci_port_wait_ready(port)) return false;
-    
-    port->ci = 1 << slot;
-    
-    int timeout = 1000000;
-    while (true) {
-        if ((port->ci & (1 << slot)) == 0) break;
-        if (port->is & (1 << 30)) {
-            ahci_dump_port("write-tfe", port);
-            return false;
-        }
-        if (--timeout == 0) {
-            ahci_dump_port("write-timeout", port);
-            return false;
-        }
-    }
-    
-    if (cmdheader->prdbc == 0) {
-        serial_write_str("AHCI: Write transferred 0 bytes\n");
-        ahci_dump_port("write-prdbc0", port);
+    if (!drive || !drive->present || !buffer) {
+        TRACE_MSG("Invalid parameters");
+        TRACE_EXIT();
         return false;
     }
-
-    return true;
+    
+    // Split large writes
+    if (count > 32) {
+        TRACE_MSG("Splitting large write");
+        bool result = ahci_write_split(drive, lba, count, buffer);
+        TRACE_EXIT();
+        return result;
+    }
+    
+    ahci_lock_acquire();
+    
+    hba_port_t* port = drive->port;
+    bool ok = false;
+    
+    for (int attempt = 0; attempt < AHCI_CMD_RETRIES && !ok; attempt++) {
+        TRACE_VALUE("attempt", attempt);
+        
+        ahci_port_enable(port);
+        port->is = 0xFFFFFFFF;
+        port->serr = 0xFFFFFFFF;
+        
+        int slot = ahci_find_cmdslot(port);
+        if (slot == -1) {
+            TRACE_MSG("No free slot");
+            ahci_port_reset(port);
+            ahci_start_cmd(port);
+            continue;
+        }
+        
+        TRACE_VALUE("slot", slot);
+        
+        hba_cmd_header_t* cmdheader = (hba_cmd_header_t*)((uintptr_t)port->clb | ((uint64_t)port->clbu << 32));
+        cmdheader += slot;
+        
+        uint32_t ctba = cmdheader->ctba;
+        uint32_t ctbau = cmdheader->ctbau;
+        memset(cmdheader, 0, sizeof(hba_cmd_header_t));
+        cmdheader->ctba = ctba;
+        cmdheader->ctbau = ctbau;
+        cmdheader->cfl = sizeof(fis_reg_h2d_t) / sizeof(uint32_t);
+        cmdheader->w = 1;  // Write
+        cmdheader->prdtl = 1;
+        cmdheader->prdbc = 0;
+        
+        hba_cmd_tbl_t* cmdtbl = (hba_cmd_tbl_t*)((uintptr_t)cmdheader->ctba | ((uint64_t)cmdheader->ctbau << 32));
+        memset(cmdtbl, 0, sizeof(hba_cmd_tbl_t));
+        
+        cmdtbl->prdt_entry[0].dba = ((uintptr_t)buffer) & 0xFFFFFFFF;
+        cmdtbl->prdt_entry[0].dbau = ((uintptr_t)buffer >> 32) & 0xFFFFFFFF;
+        cmdtbl->prdt_entry[0].dbc = (count * drive->sector_size) - 1;
+        cmdtbl->prdt_entry[0].i = 1;
+        
+        fis_reg_h2d_t* cmdfis = (fis_reg_h2d_t*)(cmdtbl->cfis);
+        cmdfis->fis_type = 0x27;
+        cmdfis->c = 1;
+        cmdfis->command = ATA_CMD_WRITE_DMA_EX;
+        
+        cmdfis->lba0 = lba & 0xFF;
+        cmdfis->lba1 = (lba >> 8) & 0xFF;
+        cmdfis->lba2 = (lba >> 16) & 0xFF;
+        cmdfis->device = 1 << 6;
+        
+        cmdfis->lba3 = (lba >> 24) & 0xFF;
+        cmdfis->lba4 = (lba >> 32) & 0xFF;
+        cmdfis->lba5 = (lba >> 40) & 0xFF;
+        
+        cmdfis->countl = count & 0xFF;
+        cmdfis->counth = (count >> 8) & 0xFF;
+        
+        if (!ahci_port_wait_ready(port)) {
+            TRACE_MSG("Port not ready");
+            ahci_dump_port("write-busy", port);
+            ahci_port_reset(port);
+            ahci_start_cmd(port);
+            continue;
+        }
+        
+        TRACE_MSG("Issuing command");
+        port->ci = 1 << slot;
+        
+        // Wait for completion with timeout
+        uint64_t start_ms = time_get_uptime_ms();
+        while (true) {
+            if ((port->ci & (1 << slot)) == 0) break;
+            
+            if (port->is & (1 << 30)) {
+                TRACE_MSG("Task file error");
+                ahci_dump_port("write-tfe", port);
+                break;
+            }
+            
+            uint64_t elapsed = time_get_uptime_ms() - start_ms;
+            if (elapsed > AHCI_CMD_TIMEOUT_MS) {
+                TRACE_MSG("Timeout!");
+                TRACE_VALUE("elapsed_ms", elapsed);
+                ahci_dump_port("write-timeout", port);
+                break;
+            }
+            
+            // Show progress every 100ms
+            if ((elapsed % 100) == 0 && elapsed > 0) {
+                TRACE_VALUE("waiting_ms", elapsed);
+            }
+        }
+        
+        // Check for errors
+        if (port->is & (1 << 30)) {
+            TRACE_MSG("Error bit set");
+            ahci_port_reset(port);
+            ahci_start_cmd(port);
+            continue;
+        }
+        
+        if (port->ci & (1 << slot)) {
+            TRACE_MSG("Command did not complete");
+            ahci_port_reset(port);
+            ahci_start_cmd(port);
+            continue;
+        }
+        
+        TRACE_MSG("Write successful");
+        ok = true;
+    }
+    
+    ahci_lock_release();
+    TRACE_EXIT();
+    return ok;
 }

@@ -214,6 +214,117 @@ void trace_dump_interrupt_audit(void) {
     serial_write_str("=====================\n");
 }
 
+//Function to dump all registers - useful for debugging IRQ context issues
+void trace_dump_registers(void) {
+    serial_write_str("\n=== REGISTER DUMP ===\n");
+
+    uint64_t rax, rbx, rcx, rdx;
+    uint64_t rsi, rdi, rbp, rsp;
+    uint64_t r8, r9, r10, r11, r12, r13, r14, r15;
+    uint64_t rip, rflags;
+    uint64_t cs, ds, es, fs, gs, ss;
+    uint64_t cr0, cr2, cr3, cr4;
+
+    // --- GPR batch 1 ---
+    __asm__ volatile (
+        "mov %%rax, %0\n"
+        "mov %%rbx, %1\n"
+        "mov %%rcx, %2\n"
+        "mov %%rdx, %3\n"
+        : "=r"(rax), "=r"(rbx), "=r"(rcx), "=r"(rdx)
+    );
+
+    // --- GPR batch 2 ---
+    __asm__ volatile (
+        "mov %%rsi, %0\n"
+        "mov %%rdi, %1\n"
+        "mov %%rbp, %2\n"
+        "mov %%rsp, %3\n"
+        : "=r"(rsi), "=r"(rdi), "=r"(rbp), "=r"(rsp)
+    );
+
+    // --- GPR batch 3 ---
+    __asm__ volatile (
+        "mov %%r8,  %0\n"
+        "mov %%r9,  %1\n"
+        "mov %%r10, %2\n"
+        "mov %%r11, %3\n"
+        : "=r"(r8), "=r"(r9), "=r"(r10), "=r"(r11)
+    );
+
+    // --- GPR batch 4 ---
+    __asm__ volatile (
+        "mov %%r12, %0\n"
+        "mov %%r13, %1\n"
+        "mov %%r14, %2\n"
+        "mov %%r15, %3\n"
+        : "=r"(r12), "=r"(r13), "=r"(r14), "=r"(r15)
+    );
+
+    // --- RIP ---
+    __asm__ volatile (
+        "lea (%%rip), %0"
+        : "=r"(rip)
+    );
+
+    // --- RFLAGS ---
+    __asm__ volatile (
+        "pushfq\n"
+        "pop %0"
+        : "=r"(rflags)
+    );
+
+    // --- Segment registers ---
+    __asm__ volatile (
+        "mov %%cs, %0\n"
+        "mov %%ds, %1\n"
+        "mov %%es, %2\n"
+        "mov %%fs, %3\n"
+        "mov %%gs, %4\n"
+        "mov %%ss, %5\n"
+        : "=r"(cs), "=r"(ds), "=r"(es),
+          "=r"(fs), "=r"(gs), "=r"(ss)
+    );
+
+    // --- Control registers ---
+    __asm__ volatile (
+        "mov %%cr0, %0\n"
+        "mov %%cr2, %1\n"
+        "mov %%cr3, %2\n"
+        "mov %%cr4, %3\n"
+        : "=r"(cr0), "=r"(cr2), "=r"(cr3), "=r"(cr4)
+    );
+
+    #define REG(name, val) \
+        serial_write_str(name ": "); \
+        serial_write_hex(val); \
+        serial_write_str("\n");
+
+    REG("RAX", rax); REG("RBX", rbx);
+    REG("RCX", rcx); REG("RDX", rdx);
+    REG("RSI", rsi); REG("RDI", rdi);
+    REG("RBP", rbp); REG("RSP", rsp);
+
+    REG("R8 ", r8); REG("R9 ", r9);
+    REG("R10", r10); REG("R11", r11);
+    REG("R12", r12); REG("R13", r13);
+    REG("R14", r14); REG("R15", r15);
+
+    REG("RIP", rip);
+    REG("RFLAGS", rflags);
+
+    REG("CS", cs); REG("DS", ds);
+    REG("ES", es); REG("FS", fs);
+    REG("GS", gs); REG("SS", ss);
+
+    REG("CR0", cr0);
+    REG("CR2", cr2);
+    REG("CR3", cr3);
+    REG("CR4", cr4);
+
+    serial_write_str("=====================\n");
+}
+
 // ===========================================
 // SAFE WRAPPERS
 // ===========================================

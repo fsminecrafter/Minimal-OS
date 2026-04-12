@@ -25,8 +25,8 @@ else
 fi 
 
 # Update package lists and install dependencies
-apt update
-apt install -y python3-pip python3-venv python3-dev
+sudo apt update
+sudo apt install -y python3-pip python3-venv python3-dev
 
 sudo apt install -y \
   build-essential \
@@ -91,3 +91,7 @@ cd ..
 rm -rf build-gcc gcc-11.1.0 gcc-11.1.0.tar.xz
 
 echo "Setup complete! Cross-compiler and NASM installed successfully."
+
+# Create QEMU disk image
+echo "Creating QEMU disk image (sata256.img, 128MB)..."
+qemu-img create -f raw sata256.img 128M

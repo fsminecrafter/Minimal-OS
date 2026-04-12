@@ -76,8 +76,12 @@ typedef struct {
     
     // Current state
     uint32_t current_offset;     // Current position in file
+    uint32_t data_offset;   // absolute file offset of the first ADI audio byte
     uint32_t total_size;         // Total file size
     uint8_t* buffer;             // Chunk buffer
+    uint8_t* prefetch_buf;     // leftover audio bytes from header scan
+    uint32_t prefetch_size;    // how many bytes are in prefetch_buf
+    uint32_t prefetch_pos;     // how many have been consumed
     bool end_of_stream;
     
     // ADI metadata (if audio file)
@@ -173,10 +177,12 @@ const char* adi_format_name(audio_format_t format);
  * @param input_size Size of compressed data
  * @param output Output PCM16 buffer (must be 4x input_size)
  * @param output_size Output: number of PCM16 samples produced
+ * @param max_output Maximum samples to decode (prevents buffer overflow)
  * @return true on success
  */
 bool decode_ima_adpcm(const uint8_t* input, uint32_t input_size,
-                      int16_t* output, uint32_t* output_size);
+                      int16_t* output, uint32_t* output_size,
+                      uint32_t max_output);
 
 /**
  * Decode Microsoft ADPCM to PCM16
@@ -198,9 +204,13 @@ typedef struct {
     audio_datastream_t* stream;
     audio_format_t format;
     
-    int16_t* pcm_buffer;         // Decoded PCM buffer
+    int16_t* pcm_buffer;         // Decoded PCM buffer (double-buffered)
     uint32_t pcm_buffer_size;    // Size in samples
     uint32_t pcm_position;       // Current playback position
+    uint32_t pcm_capacity;       // total allocated samples (per buffer)
+    uint32_t pcm_size;           // decoded samples in current buffer
+    
+    int current_buffer;          // 0=front, 1=back (for double buffering)
     
     uint8_t volume;              // 0-100
     bool playing;

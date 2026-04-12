@@ -78,235 +78,149 @@ static inline void ac97_mixer_write(uint16_t reg, uint16_t val) {
 
 bool ac97_init(void) {
     serial_write_str("AC97: Searching for audio controller...\n");
-    
+
     if (pci_get_device_count() == 0) {
         pci_enumerate_all();
     }
 
-    // Find AC97 device on PCI bus
     pci_device_t* dev = pci_find_device(AC97_VENDOR_INTEL, AC97_DEVICE_ICH);
     if (!dev) {
         dev = pci_find_class(PCI_CLASS_MULTIMEDIA, PCI_SUBCLASS_AUDIO);
     }
-    
+
     if (!dev) {
         serial_write_str("AC97: No compatible device found\n");
         return false;
     }
 
     pci_enable_io_busmaster(dev);
-    
-    // Get NABM base address from BAR1
-    if (dev->bar_type[1] != PCI_BAR_IO || dev->bar[1] == 0) {
-        serial_write_str("AC97: Invalid NABM BAR\n");
-        return false;
-    }
 
     g_nabm_base = dev->bar[1];
+    g_nam_base  = dev->bar[0];
 
-    // Get NAM (mixer) base address from BAR0
-    if (dev->bar_type[0] != PCI_BAR_IO || dev->bar[0] == 0) {
-        serial_write_str("AC97: Invalid NAM BAR\n");
+    if (!g_nabm_base || !g_nam_base) {
+        serial_write_str("AC97: Invalid BARs\n");
         return false;
     }
 
-    g_nam_base = dev->bar[0];
-    
-    serial_write_str("AC97: NABM Base = 0x");
-    serial_write_hex(g_nabm_base);
-    serial_write_str("\n");
-    serial_write_str("AC97: NAM  Base = 0x");
-    serial_write_hex(g_nam_base);
-    serial_write_str("\n");
-
-    uint16_t pci_cmd = pci_config_read_word(dev->bus, dev->device, dev->function, 0x04);
-    serial_write_str("AC97: PCI CMD = 0x");
-    serial_write_hex(pci_cmd);
-    serial_write_str(" (IO+BM expected)\n");
-
-    // Reset codec and set volumes (unmute)
     ac97_mixer_write(AC97_NAM_RESET, 0x0000);
-    ac97_mixer_write(AC97_NAM_MASTER, 0x0000);  // 0 dB, unmuted
-    ac97_mixer_write(AC97_NAM_PCM_OUT, 0x0000); // 0 dB, unmuted
+    ac97_mixer_write(AC97_NAM_MASTER, 0x0000);
+    ac97_mixer_write(AC97_NAM_PCM_OUT, 0x0000);
 
-    uint16_t vid1 = ac97_mixer_read(AC97_NAM_VENDOR_ID1);
-    uint16_t vid2 = ac97_mixer_read(AC97_NAM_VENDOR_ID2);
-    serial_write_str("AC97: Codec Vendor ID = 0x");
-    serial_write_hex(((uint32_t)vid1 << 16) | vid2);
-    serial_write_str("\n");
-    
-    // Allocate Buffer Descriptor List (32 entries, 256-byte aligned)
-    g_bd_list = (ac97_bd_t*)kmalloc_aligned(AC97_BD_COUNT * sizeof(ac97_bd_t), 256);
-    
-    // Allocate audio buffers (ring of 32 buffers)
-    g_audio_buffer_base = (int16_t*)kmalloc_aligned(AC97_BD_COUNT * AC97_BUFFER_BYTES, 4096);
-    
-    // Setup buffer descriptors
-    for (int i = 0; i < AC97_BD_COUNT; i++) {
-        g_audio_buffers[i] = (int16_t*)((uint8_t*)g_audio_buffer_base + (i * AC97_BUFFER_BYTES));
-        g_bd_list[i].buffer_addr = (uint32_t)(uintptr_t)g_audio_buffers[i];
-        g_bd_list[i].length = (uint16_t)(AC97_FRAMES_PER_BUFFER * AC97_CHANNELS);
-        g_bd_list[i].flags = AC97_BD_IOC | AC97_BD_BUP;  // IOC + underrun policy
+    g_bd_list = (ac97_bd_t*)kmalloc_aligned(
+        AC97_BD_COUNT * sizeof(ac97_bd_t), 256);
+
+    g_audio_buffer_base = (int16_t*)kmalloc_aligned(
+        AC97_BD_COUNT * AC97_BUFFER_BYTES, 4096);
+
+    if (!g_bd_list || !g_audio_buffer_base) {
+        serial_write_str("AC97: alloc failed\n");
+        return false;
     }
-    
-    // Write BD list address to controller
-    port_outl(g_nabm_base + AC97_NABM_POBDBAR, (uint32_t)(uintptr_t)g_bd_list);
-    
-    // Stop PCM out, clear status
-    port_outb(g_nabm_base + AC97_NABM_POCR, 0x00);
-    port_outb(g_nabm_base + AC97_NABM_POSR, 0x1F); // write-1-to-clear
 
-    // Set Last Valid Index
+    // IMPORTANT FIX: correct sample count per buffer
+    uint32_t samples_per_buffer =
+        AC97_FRAMES_PER_BUFFER * AC97_CHANNELS;
+
+    for (int i = 0; i < AC97_BD_COUNT; i++) {
+
+        g_audio_buffers[i] =
+            (int16_t*)((uint8_t*)g_audio_buffer_base +
+            (i * AC97_BUFFER_BYTES));
+
+        g_bd_list[i].buffer_addr =
+            (uint32_t)(uintptr_t)g_audio_buffers[i];
+
+        g_bd_list[i].length = (uint16_t)samples_per_buffer;
+
+        // IMPORTANT: IOC causes interrupts → optional, but stable
+        g_bd_list[i].flags = AC97_BD_BUP;
+    }
+
+    port_outl(g_nabm_base + AC97_NABM_POBDBAR,
+              (uint32_t)(uintptr_t)g_bd_list);
+
+    port_outb(g_nabm_base + AC97_NABM_POSR, 0x1F);
+    port_outb(g_nabm_base + AC97_NABM_POCR, 0x00);
+
     g_last_valid = AC97_BD_COUNT - 1;
     port_outb(g_nabm_base + AC97_NABM_POLVI, g_last_valid);
-    
-    // Start playback
-    port_outb(g_nabm_base + AC97_NABM_POCR, 0x05);  // Run + IOC interrupt enable
 
-    serial_write_str("AC97: BDBAR=0x");
-    serial_write_hex(port_inl(g_nabm_base + AC97_NABM_POBDBAR));
-    serial_write_str(" LVI=");
-    serial_write_dec(port_inb(g_nabm_base + AC97_NABM_POLVI));
-    serial_write_str(" SR=0x");
-    serial_write_hex(port_inb(g_nabm_base + AC97_NABM_POSR));
-    serial_write_str(" CR=0x");
-    serial_write_hex(port_inb(g_nabm_base + AC97_NABM_POCR));
-    serial_write_str("\n");
-
-    serial_write_str("AC97: BD list ptr=");
-    serial_write_hex((uintptr_t)g_bd_list);
-    serial_write_str(" align=");
-    serial_write_dec((uintptr_t)g_bd_list & 0xFF);
-    serial_write_str(" buf base=");
-    serial_write_hex((uintptr_t)g_audio_buffer_base);
-    serial_write_str("\n");
-    serial_write_str("AC97: BD0 addr=0x");
-    serial_write_hex(g_bd_list[0].buffer_addr);
-    serial_write_str(" len=");
-    serial_write_dec(g_bd_list[0].length);
-    serial_write_str(" flags=0x");
-    serial_write_hex(g_bd_list[0].flags);
-    serial_write_str("\n");
-
-    // Enable variable rate audio if supported and set to 48 kHz (AC97 native rate)
-    uint16_t ext_id = ac97_mixer_read(AC97_NAM_EXT_AUDIO_ID);
-    if (ext_id & 0x0001) {
-        g_vra_supported = true;
-        uint16_t ext_ctrl = ac97_mixer_read(AC97_NAM_EXT_AUDIO_CTRL);
-        ac97_mixer_write(AC97_NAM_EXT_AUDIO_CTRL, ext_ctrl | 0x0001);
-        ac97_mixer_write(AC97_NAM_PCM_FRONT_DAC_RATE, 48000);
-        serial_write_str("AC97: VRA enabled, rate=48000\n");
-    } else {
-        g_vra_supported = false;
-        serial_write_str("AC97: VRA not supported, using 48kHz fixed\n");
-    }
-
-    // Pre-fill all buffers before starting playback
+    // Prime buffers
     for (int i = 0; i < AC97_BD_COUNT; i++) {
         audio_mix_streams(g_audio_buffers[i], AC97_FRAMES_PER_BUFFER);
-        g_last_valid = (uint8_t)i;
+        g_last_valid = i;
         port_outb(g_nabm_base + AC97_NABM_POLVI, g_last_valid);
     }
-    g_next_fill = 0;
-    
+
+    port_outb(g_nabm_base + AC97_NABM_POCR, 0x05);
+
+    uint16_t ext_id = ac97_mixer_read(AC97_NAM_EXT_AUDIO_ID);
+    if (ext_id & 0x1) {
+        g_vra_supported = true;
+        ac97_mixer_write(AC97_NAM_EXT_AUDIO_CTRL, 0x1);
+        ac97_mixer_write(AC97_NAM_PCM_FRONT_DAC_RATE, 48000);
+    }
+
     g_ac97_initialized = true;
-    serial_write_str("AC97: Initialized and playing\n");
+    serial_write_str("AC97: Initialized OK\n");
     return true;
 }
 
+// TODO: AC97 DMA / FIFO feeding - Improve buffer feeding strategy
 // Called from timer interrupt or dedicated audio interrupt
 void ac97_update(void) {
     if (!g_ac97_initialized) return;
-    
-    // Keep a few buffers queued ahead of the current index to avoid underruns
+
     uint8_t civ = port_inb((uint16_t)(g_nabm_base + AC97_NABM_CIV));
+
     static uint8_t last_civ = 0xFF;
-    static uint32_t stall_ticks = 0;
+    static uint32_t stall = 0;
 
-    if (civ == last_civ) {
-        stall_ticks++;
-    } else {
-        stall_ticks = 0;
-        last_civ = civ;
-    }
+    if (civ == last_civ) stall++;
+    else { stall = 0; last_civ = civ; }
 
-    if (stall_ticks > 25) { // ~0.25s at 100Hz
-        serial_write_str("AC97: DMA stall detected, re-priming\n");
+    if (stall > 25) {
         ac97_kick();
-        stall_ticks = 0;
+        stall = 0;
+        return;
     }
 
-    uint8_t queued = (g_last_valid + AC97_BD_COUNT - civ) % AC97_BD_COUNT;
-    uint8_t next = (g_last_valid + 1) % AC97_BD_COUNT;
-    while (queued < g_target_ahead && next != civ) {
+    uint8_t safety_gap = 2;
+
+    for (uint8_t i = 0; i < g_target_ahead; i++) {
+        uint8_t next = (g_last_valid + 1) % AC97_BD_COUNT;
+
+        uint8_t dist = (next + AC97_BD_COUNT - civ) % AC97_BD_COUNT;
+        if (dist <= safety_gap) break;
+
+        // FIX: use audio_mix_streams like ac97_kick does,
+        // instead of the broken g_audio_ring direct copy
         audio_mix_streams(g_audio_buffers[next], AC97_FRAMES_PER_BUFFER);
+
         g_last_valid = next;
         port_outb(g_nabm_base + AC97_NABM_POLVI, g_last_valid);
-        queued++;
-        next = (g_last_valid + 1) % AC97_BD_COUNT;
-    }
-    g_next_fill = next;
-    
-    static uint32_t debug_tick = 0;
-    debug_tick++;
-    if ((debug_tick % 100) == 0) {
-        uint8_t civ_dbg = port_inb((uint16_t)(g_nabm_base + AC97_NABM_CIV));
-        uint8_t lvi = port_inb((uint16_t)(g_nabm_base + AC97_NABM_POLVI));
-        uint16_t picb = port_inw((uint16_t)(g_nabm_base + AC97_NABM_PICB));
-        uint8_t sr = port_inb((uint16_t)(g_nabm_base + AC97_NABM_POSR));
-        uint8_t cr = port_inb((uint16_t)(g_nabm_base + AC97_NABM_POCR));
-
-        int32_t energy = 0;
-        for (int i = 0; i < 64; i++) {
-            int16_t s = g_audio_buffers[civ_dbg][i];
-            energy += (s < 0) ? -s : s;
-        }
-        if (adebug == true) {
-            serial_write_str("AC97: DMA civ=");
-            serial_write_dec(civ_dbg);
-            serial_write_str(" lvi=");
-            serial_write_dec(lvi);
-            serial_write_str(" picb=");
-            serial_write_dec(picb);
-            serial_write_str(" sr=0x");
-            serial_write_hex(sr);
-            serial_write_str(" cr=0x");
-            serial_write_hex(cr);
-            serial_write_str(" next=");
-            serial_write_dec(g_next_fill);
-            serial_write_str(" queued=");
-            serial_write_dec(queued);
-            serial_write_str(" energy=");
-            serial_write_dec(energy);
-            serial_write_str("\n");
-        }
-
-        if (sr != 0) {
-            // Clear latched status bits
-            port_outb((uint16_t)(g_nabm_base + AC97_NABM_POSR), 0x1F);
-        }
     }
 
-    // Hardware will play it automatically!
+    g_next_fill = (g_last_valid + 1) % AC97_BD_COUNT;
 }
 
 void ac97_kick(void) {
     if (!g_ac97_initialized) return;
 
-    // Refill all buffers based on current streams
-    for (int i = 0; i < AC97_BD_COUNT; i++) {
-        audio_mix_streams(g_audio_buffers[i], AC97_FRAMES_PER_BUFFER);
-        g_last_valid = (uint8_t)i;
-    }
-    g_next_fill = 0;
-
-    // Reset/clear status and restart DMA
     port_outb(g_nabm_base + AC97_NABM_POCR, 0x00);
     port_outb(g_nabm_base + AC97_NABM_POSR, 0x1F);
+
+    for (int i = 0; i < AC97_BD_COUNT; i++) {
+        audio_mix_streams(g_audio_buffers[i], AC97_FRAMES_PER_BUFFER);
+        g_last_valid = i;
+    }
+
     port_outb(g_nabm_base + AC97_NABM_POLVI, g_last_valid);
     port_outb(g_nabm_base + AC97_NABM_POCR, 0x05);
 }
 
+// TODO: correct sample rate propagation - Ensure sample rate changes sync with audio player timing
 void ac97_set_sample_rate(uint32_t rate_hz) {
     if (!g_ac97_initialized) return;
     if (!g_vra_supported) return;
@@ -316,4 +230,5 @@ void ac97_set_sample_rate(uint32_t rate_hz) {
     serial_write_str("AC97: Set DAC rate=");
     serial_write_dec(rate_hz);
     serial_write_str("\n");
+    // TODO: Propagate rate to player state for accurate buffer timing
 }

@@ -813,31 +813,41 @@ minimafs_file_handle_t* minimafs_open(const char* path, bool read_only) {
     handle->modified = false;
     
     uint32_t total_size = entry.block_count * MINIMAFS_BLOCK_SIZE;
+    
+    // Initialize streaming fields
+    handle->use_streaming = false;
+    handle->file_block_offset = entry.block_offset;
+    handle->file_block_count = entry.block_count;
+    handle->data_offset_in_blocks = 0;
+    handle->stream_cache = NULL;
+    handle->cached_block_index = (uint32_t)-1;
+    
     if (total_size == 0) {
         memset(&handle->metadata, 0, sizeof(handle->metadata));
         handle->data = NULL;
         handle->data_size = 0;
     } else {
-        uint8_t* raw = (uint8_t*)alloc_unzeroed(total_size);
-        if (!raw) {
+        // Read first block to parse header
+        uint8_t* first_block = (uint8_t*)alloc_unzeroed(MINIMAFS_BLOCK_SIZE);
+        if (!first_block) {
             free_mem(handle);
             return NULL;
         }
         
-        if (!minimafs_read_blocks(drive, entry.block_offset, entry.block_count, raw)) {
-            free_mem(raw);
+        if (!minimafs_read_blocks(drive, entry.block_offset, 1, first_block)) {
+            free_mem(first_block);
             free_mem(handle);
             return NULL;
         }
         
         minimafs_file_metadata_t meta;
         memset(&meta, 0, sizeof(meta));
-        minimafs_parse_file_header((const char*)raw, &meta);
+        minimafs_parse_file_header((const char*)first_block, &meta);
         meta.block_offset = entry.block_offset;
         meta.block_count = entry.block_count;
         
-        const char* data_marker = strstr((const char*)raw, "@DATA@\n");
-        uint32_t data_offset = data_marker ? (uint32_t)(data_marker - (const char*)raw) + 7 : 0;
+        const char* data_marker = strstr((const char*)first_block, "@DATA@\n");
+        uint32_t data_offset = data_marker ? (uint32_t)(data_marker - (const char*)first_block) + 7 : 0;
         uint32_t data_length = meta.data_length;
         if (data_length == 0 && meta.file_length > data_offset + 5) {
             data_length = meta.file_length - data_offset - 5;
@@ -851,19 +861,85 @@ minimafs_file_handle_t* minimafs_open(const char* path, bool read_only) {
         }
         
         handle->metadata = meta;
-        handle->data = NULL;
+        handle->data_offset_in_blocks = data_offset;
         handle->data_size = data_length;
         
-        if (data_length > 0) {
-            handle->data = (uint8_t*)alloc_unzeroed(data_length);
-            if (!handle->data) {
+        // Decide: streaming vs loading all data
+        // Threshold: 2 MB - files larger than this use streaming mode
+        #define MINIMAFS_STREAMING_THRESHOLD (2 * 1024 * 1024)
+        
+        if (data_length > MINIMAFS_STREAMING_THRESHOLD) {
+            // Use streaming mode for large files (regardless of read-only mode)
+            serial_write_str("[MinimaFS] Using streaming for large file: ");
+            serial_write_dec(data_length);
+            serial_write_str(" bytes\n");
+            
+            handle->use_streaming = true;
+            handle->data = NULL;
+            
+            // Allocate stream cache (one block)
+            handle->stream_cache = (uint8_t*)alloc_unzeroed(MINIMAFS_BLOCK_SIZE);
+            if (!handle->stream_cache) {
+                // If cache allocation fails, fall back to loading all
+                serial_write_str("[MinimaFS] WARNING: stream_cache alloc failed, falling back to standard mode\n");
+                handle->use_streaming = false;
+                uint8_t* raw = (uint8_t*)alloc_unzeroed(total_size);
+                if (!raw) {
+                    free_mem(first_block);
+                    free_mem(handle);
+                    return NULL;
+                }
+                
+                if (!minimafs_read_blocks(drive, entry.block_offset, entry.block_count, raw)) {
+                    free_mem(raw);
+                    free_mem(first_block);
+                    free_mem(handle);
+                    return NULL;
+                }
+                
+                handle->data = (uint8_t*)alloc_unzeroed(data_length);
+                if (!handle->data) {
+                    free_mem(raw);
+                    free_mem(first_block);
+                    free_mem(handle);
+                    return NULL;
+                }
+                memcpy(handle->data, raw + data_offset, data_length);
                 free_mem(raw);
-                return NULL;
             }
-            memcpy(handle->data, raw + data_offset, data_length);
+        } else {
+            // Load all data into memory (small file - acceptable size for RAM)
+            handle->use_streaming = false;
+            handle->data = NULL;
+            
+            if (data_length > 0) {
+                uint8_t* raw = (uint8_t*)alloc_unzeroed(total_size);
+                if (!raw) {
+                    free_mem(first_block);
+                    free_mem(handle);
+                    return NULL;
+                }
+                
+                if (!minimafs_read_blocks(drive, entry.block_offset, entry.block_count, raw)) {
+                    free_mem(raw);
+                    free_mem(first_block);
+                    free_mem(handle);
+                    return NULL;
+                }
+                
+                handle->data = (uint8_t*)alloc_unzeroed(data_length);
+                if (!handle->data) {
+                    free_mem(raw);
+                    free_mem(first_block);
+                    free_mem(handle);
+                    return NULL;
+                }
+                memcpy(handle->data, raw + data_offset, data_length);
+                free_mem(raw);
+            }
         }
 
-        free_mem(raw);
+        free_mem(first_block);
     }
     
     serial_write_str("MinimaFS: Opened ");
@@ -914,6 +990,11 @@ void minimafs_close(minimafs_file_handle_t* handle) {
         handle->data = NULL;
     }
     
+    if (handle->stream_cache) {
+        free_mem(handle->stream_cache);
+        handle->stream_cache = NULL;
+    }
+    
     handle->open = false;
     free_mem(handle);
 }
@@ -930,11 +1011,81 @@ uint32_t minimafs_read(minimafs_file_handle_t* handle, void* buffer, uint32_t si
     uint32_t available = handle->data_size - handle->position;
     uint32_t to_read = (size < available) ? size : available;
     
-    // Copy data
-    memcpy(buffer, handle->data + handle->position, to_read);
-    handle->position += to_read;
-    
-    return to_read;
+    if (handle->use_streaming) {
+        // Streaming mode: load blocks on demand
+        if (!handle->stream_cache) {
+            // Cache not allocated - this shouldn't happen, but handle gracefully
+            serial_write_str("[MinimaFS] ERROR: stream_cache is NULL in streaming mode!\n");
+            return 0;
+        }
+        
+        minimafs_drive_t* drive = get_drive(handle->drive_number);
+        if (!drive || !drive->mounted) {
+            serial_write_str("[MinimaFS] ERROR: drive not mounted in streaming read\n");
+            return 0;
+        }
+        
+        // Calculate source position in file blocks
+        uint32_t source_pos = handle->data_offset_in_blocks + handle->position;
+        uint32_t bytes_read_total = 0;
+        
+        while (to_read > 0 && bytes_read_total < to_read) {
+            // Which block do we need?
+            uint32_t block_index = source_pos / MINIMAFS_BLOCK_SIZE;
+            uint32_t offset_in_block = source_pos % MINIMAFS_BLOCK_SIZE;
+            
+            // Safety check: ensure we're not trying to read beyond file blocks
+            if (block_index >= handle->file_block_count) {
+                serial_write_str("[MinimaFS] ERROR: block_index ");
+                serial_write_dec(block_index);
+                serial_write_str(" >= file_block_count ");
+                serial_write_dec(handle->file_block_count);
+                serial_write_str("\n");
+                break;
+            }
+            
+            // Load block if not cached
+            if (block_index != handle->cached_block_index) {
+                if (!minimafs_read_blocks(drive, handle->file_block_offset + block_index, 1, handle->stream_cache)) {
+                    // Read error
+                    serial_write_str("[MinimaFS] ERROR: failed to read block ");
+                    serial_write_dec(block_index);
+                    serial_write_str(" (offset ");
+                    serial_write_dec(handle->file_block_offset + block_index);
+                    serial_write_str(")\n");
+                    break;
+                }
+                handle->cached_block_index = block_index;
+            }
+            
+            // How much can we read from this block?
+            uint32_t available_in_block = MINIMAFS_BLOCK_SIZE - offset_in_block;
+            uint32_t to_read_from_block = (to_read < available_in_block) ? to_read : available_in_block;
+            
+            // Copy data from cached block
+            memcpy((uint8_t*)buffer + bytes_read_total,
+                   handle->stream_cache + offset_in_block,
+                   to_read_from_block);
+            
+            bytes_read_total += to_read_from_block;
+            handle->position += to_read_from_block;
+            source_pos += to_read_from_block;
+            to_read -= to_read_from_block;
+        }
+        
+        return bytes_read_total;
+    } else {
+        // Standard mode: data already in memory
+        if (!handle->data) {
+            // No data loaded - shouldn't happen
+            serial_write_str("[MinimaFS] ERROR: data is NULL in standard read mode!\n");
+            return 0;
+        }
+        
+        memcpy(buffer, handle->data + handle->position, to_read);
+        handle->position += to_read;
+        return to_read;
+    }
 }
 
 uint32_t minimafs_write(minimafs_file_handle_t* handle, const void* buffer, uint32_t size) {

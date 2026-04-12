@@ -16,24 +16,30 @@ typedef struct {
 gdtvar globallist[MAX_VARS];
 
 uint32_t findvar(const char* name) {
+    if (!name) return 0;
+
     for (int i = 0; i < MAX_VARS; i++) {
-        if (globallist[i].used && strcmp(globallist[i].name, name) == 0) {
+        if (globallist[i].used && strncmp(globallist[i].name, name, MAX_NAME_LEN) == 0) {
             return globallist[i].variable;
         }
     }
 
-    PANIC("Variable not found");
     return 0;
 }
 
 bool addvar(uint32_t variable, const char* name) {
+    if (!name) return false;
+
+    // overwrite existing
     for (int i = 0; i < MAX_VARS; i++) {
-        if (globallist[i].used && strcmp(globallist[i].name, name) == 0) {
-            globallist[i].variable = variable; // overwrite
+        if (globallist[i].used &&
+            strncmp(globallist[i].name, name, MAX_NAME_LEN) == 0) {
+            globallist[i].variable = variable;
             return true;
         }
     }
 
+    // insert new
     for (int i = 0; i < MAX_VARS; i++) {
         if (!globallist[i].used) {
             globallist[i].used = true;

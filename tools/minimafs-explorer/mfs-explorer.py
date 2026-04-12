@@ -8,6 +8,8 @@ import struct
 import subprocess
 import sys
 
+import sv_ttk
+
 BLOCK_SIZE = 4096
 MAX_SCAN_BLOCKS = 10000
 STREAM_CHUNK = 64 * 1024  # 64KB window
@@ -19,24 +21,19 @@ STREAM_CHUNK = 64 * 1024  # 64KB window
 def install_theme():
     """Install Sun-Valley theme if needed"""
     try:
-        import ttkbootstrap
+        import sv_ttk
     except ImportError:
-        print("Installing ttkbootstrap (Sun-Valley theme)...")
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "ttkbootstrap", "-q"])
-        import ttkbootstrap
+        print("Installing theme...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "sv_ttk", "-q"])
 
 
 def setup_theme(root):
     """Setup Sun-Valley dark theme"""
     try:
-        from ttkbootstrap import Style
-        style = Style(theme="darkly")
-        return style
+        sv_ttk.set_theme("dark")
     except:
-        # Fallback to basic dark theme
-        style = ttk.Style()
-        style.theme_use('clam')
-        return style
+        debug(None, "Failed to set theme, using default")
+        pass
 
 
 # ==========================================
@@ -232,11 +229,10 @@ class App:
     def setup_theme(self):
         """Configure modern theme"""
         try:
-            from ttkbootstrap import Style
-            self.style = Style(theme="darkly")
+            sv_ttk.set_theme("dark")
         except:
-            self.style = ttk.Style()
-            self.style.theme_use('clam')
+            debug(self.log, "Failed to set theme, using default")
+            pass
 
     def setup_keybindings(self):
         """Setup keyboard shortcuts"""

@@ -91,13 +91,6 @@ void startroutine(uint64_t total_ram_bytes) {
     print_str("Enumerating PCI devices\n");
     pci_enumerate_all();
     print_pci_devices();
-    print_str("Initializing Audio\n");
-    audio_init();
-    
-    // Initialize hardware driver (AC97)
-    if (!ac97_init()) {
-        serial_write_str("ERROR: Audio hardware not found!\n");
-        return;
-    }
+
     print_str("Startup routine Done.\n");
 }

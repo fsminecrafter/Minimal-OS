@@ -35,8 +35,17 @@
 #include "x86_64/minimafs.h"
 #include "x86_64/ahci.h"
 
+#include "x86_64/exec_trace.h"
+
 void busy(void) {
     for (volatile int i = 0; i < 100; i++);
+}
+
+void audioupdate(void) {
+    while (1) {
+        audio_update();
+        sleep(1);
+    }
 }
 
 void kernel_main(uint64_t mb2_info_addr) {
@@ -88,10 +97,18 @@ void kernel_main(uint64_t mb2_info_addr) {
 
     time_set_datetime(&dt);
 
+    audio_init();
+    
+    // Initialize hardware driver (AC97)
+    if (!ac97_init()) {
+        serial_write_str("ERROR: Audio hardware not found!\n");
+        return;
+    }
+    sti();
     terminal_program_entry();    
     createProcess("busy", busy);
-    createProcess("kernelaudio", ac97_update);
+    createProcess("kernelaudio", audioupdate);
     schedulerInit();
-
+    sti();
     while(1);
 }

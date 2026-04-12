@@ -158,6 +158,14 @@ typedef struct {
     
     bool modified;                              // Has file been modified?
     bool read_only;                             // Read-only mode?
+    
+    // Streaming fields (for large files)
+    bool use_streaming;                         // Use streaming instead of loading all data?
+    uint32_t file_block_offset;                 // Where the file's blocks start on disk
+    uint32_t file_block_count;                  // Number of blocks for this file
+    uint32_t data_offset_in_blocks;             // Byte offset of data section from block start
+    uint8_t* stream_cache;                      // Cached block buffer (1 block = 4KB)
+    uint32_t cached_block_index;                // Which block is in stream_cache (-1 = invalid)
 } minimafs_file_handle_t;
 
 // ===========================================

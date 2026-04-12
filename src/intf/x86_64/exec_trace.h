@@ -177,6 +177,9 @@ void trace_set_filter(const char* pattern);
  */
 void trace_clear_filter(void);
 
+
+void trace_dump_registers(void);
+
 // ===========================================
 // INTERRUPT TRACE API
 // ===========================================

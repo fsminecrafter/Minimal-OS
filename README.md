@@ -35,26 +35,26 @@ Last synced 2026 - Mar 21 - 16:05
 
 #### V 0.4.00
 
-* Panic screen [X]
-* simple audio [C]
-* allocator [X]
-* startupRoutine [X]
-* Processes and ProcessManager [X]
-* GRAPHICS!!! [X] 🥳🥳🥳
+- [x] Panic screen 
+- [x] simple audio [C]
+- [x] allocator 
+- [x] startupRoutine 
+- [x] Processes and ProcessManager 
+- [x] GRAPHICS!!! 🥳🥳🥳
 
 #### V 0.4.05
 
-* Better allocator [X]
-* Time Scheduler [X]
-* Improved scheduler and proc [X]
-* Graphics handler (display.h) [X]
-* Time handler (time.h) [X]
+- [x] Better allocator 
+- [x] Time Scheduler 
+- [x] Improved scheduler and proc 
+- [x] Graphics handler (display.h) 
+- [x] Time handler (time.h) 
 
-* Displaying and reading images [X] !limited support!
-* Fonts [X] !also a little limited for now!
+- [x] Displaying and reading images !limited support!
+- [x] Fonts !also a little limited for now!
 
-* USB 1.1 [X]
-* Keyboard [X]
-* Simple Audio ! []
-* System calls !! []
-* File system !!! [X] (MinimaFS)
+- [x] USB 1.1 
+- [x] Keyboard
+- [ ] Simple Audio ! 
+- [x] System calls !! 
+- [x] File system !!! (MinimaFS)

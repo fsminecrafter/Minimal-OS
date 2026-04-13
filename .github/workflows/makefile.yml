@@ -80,9 +80,6 @@ jobs:
     - name: Add toolchain to PATH
       run: echo "$HOME/cross/bin" >> $GITHUB_PATH
 
-    - name: Configure
-      run: ./configure
-
     - name: Build
       run: make
 

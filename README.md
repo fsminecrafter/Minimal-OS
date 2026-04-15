@@ -12,7 +12,7 @@ find roadmap in roadmap.txt or below (might be old or un-synced!)
 * ```help``` List all available commands
 * ```echo``` [Text] Echoes text back to terminal
 * ```memsize``` Returns the size of available memory in MB
-* ```initdisk``` Searches and activates the disk(s) available
+* ```initdisk``` [Index] Searches and activates the disk(s) available
 * ```format``` [Index] Formats the Selected disk to MinimaFS
 * ```mount``` [Index] Mounts the selected disk
 * ```createmusicfile``` Takes the music.wav from `src/resources` and puts it on disk as music.adi

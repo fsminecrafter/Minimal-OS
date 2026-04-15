@@ -29,54 +29,36 @@ jobs:
           curl \
           nasm
 
+
     - name: Restore cached toolchain
       id: cache-toolchain
       uses: actions/cache@v4
       with:
         path: ~/cross
-        key: ${{ runner.os }}-x86_64-elf-toolchain-v1
-
-    - name: Build x86_64-elf toolchain (if not cached)
-      if: steps.cache-toolchain.outputs.cache-hit != 'true'
+        key: ${{ runner.os }}-x86_64-elf-toolchain-gcc14.1.0-binutils2.42
+    
+    - name: Verify toolchain
+      run: |
+        if [ ! -f "$HOME/cross/bin/x86_64-elf-gcc" ]; then
+          echo "CACHE_INVALID=true" >> $GITHUB_ENV
+        fi
+    
+    - name: Build x86_64-elf toolchain (if needed)
+      if: steps.cache-toolchain.outputs.cache-hit != 'true' || env.CACHE_INVALID == 'true'
       run: |
         export PREFIX="$HOME/cross"
         export TARGET=x86_64-elf
         export PATH="$PREFIX/bin:$PATH"
-
+    
         mkdir -p $HOME/src
         cd $HOME/src
-
-        wget https://ftp.gnu.org/gnu/binutils/binutils-2.42.tar.gz
-        wget https://ftp.gnu.org/gnu/gcc/gcc-14.1.0/gcc-14.1.0.tar.gz
-
-        tar -xf binutils-2.42.tar.gz
-        tar -xf gcc-14.1.0.tar.gz
-
-        # Build binutils
-        mkdir build-binutils && cd build-binutils
-        ../binutils-2.42/configure \
-          --target=$TARGET \
-          --prefix=$PREFIX \
-          --with-sysroot \
-          --disable-nls \
-          --disable-werror
-        make -j$(nproc)
-        make install
-        cd ..
-
-        # Build GCC
-        mkdir build-gcc && cd build-gcc
-        ../gcc-14.1.0/configure \
-          --target=$TARGET \
-          --prefix=$PREFIX \
-          --disable-nls \
-          --enable-languages=c \
-          --without-headers
-        make -j$(nproc) all-gcc
-        make -j$(nproc) all-target-libgcc
-        make install-gcc
-        make install-target-libgcc
-
+    
+        wget -nc https://ftp.gnu.org/gnu/binutils/binutils-2.42.tar.gz
+        wget -nc https://ftp.gnu.org/gnu/gcc/gcc-14.1.0/gcc-14.1.0.tar.gz
+    
+        tar -xf binutils-2.42.tar.gz || true
+        tar -xf gcc-14.1.0.tar.gz || true
+          
     - name: Add toolchain to PATH
       run: echo "$HOME/cross/bin" >> $GITHUB_PATH
 

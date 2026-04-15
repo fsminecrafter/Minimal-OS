@@ -1,13 +1,26 @@
-CC := /opt/cross/bin/x86_64-elf-gcc
-LD := /opt/cross/bin/x86_64-elf-ld
+# ===== Toolchain configuration =====
+# Allow override from environment:
+#   make CROSS_PREFIX=x86_64-elf-
+#   make CROSS_PREFIX=/opt/cross/bin/x86_64-elf-
+CROSS_PREFIX ?= x86_64-elf-
 
-kernel_source_files := $(shell find src/impl/kernel -name *.c)
+CC   := $(CROSS_PREFIX)gcc
+LD   := $(CROSS_PREFIX)ld
+AS   := nasm
+PY   := python3
+
+# Optional: allow overriding tools completely
+# make CC=clang LD=ld.lld
+# make AS=yasm
+
+# ===== Source discovery =====
+kernel_source_files := $(shell find src/impl/kernel -name '*.c')
 kernel_object_files := $(patsubst src/impl/kernel/%.c, build/kernel/%.o, $(kernel_source_files))
 
-x86_64_c_source_files := $(shell find src/impl/x86_64 -name *.c)
+x86_64_c_source_files := $(shell find src/impl/x86_64 -name '*.c')
 x86_64_c_object_files := $(patsubst src/impl/x86_64/%.c, build/x86_64/%.o, $(x86_64_c_source_files))
 
-x86_64_asm_source_files := $(shell find src/impl/x86_64 -name *.asm)
+x86_64_asm_source_files := $(shell find src/impl/x86_64 -name '*.asm')
 x86_64_asm_object_files := $(patsubst src/impl/x86_64/%.asm, build/x86_64/%.o, $(x86_64_asm_source_files))
 
 x86_64_object_files := $(x86_64_c_object_files) $(x86_64_asm_object_files)
@@ -17,28 +30,55 @@ audio_obj_files_src := $(shell find src/resources -name '*.o')
 audio_obj_files_build := $(patsubst src/resources/%.wav, build/resources/%.o, $(audio_wav_files))
 audio_object_files := $(audio_obj_files_build) $(audio_obj_files_src)
 
+# ===== Compile rules =====
 build/kernel/%.o: src/impl/kernel/%.c
 	mkdir -p $(dir $@)
-	$(CC) -c -I src/intf -ffreestanding $(patsubst build/kernel/%.o, src/impl/kernel/%.c, $@) -o $@
+	$(CC) -c -I src/intf -ffreestanding $< -o $@
 
 build/x86_64/%.o: src/impl/x86_64/%.c
 	mkdir -p $(dir $@)
-	$(CC) -c -I src/intf -ffreestanding $(patsubst build/x86_64/%.o, src/impl/x86_64/%.c, $@) -o $@
+	$(CC) -c -I src/intf -ffreestanding $< -o $@
 
 build/x86_64/%.o: src/impl/x86_64/%.asm
 	mkdir -p $(dir $@)
-	nasm -f elf64 $(patsubst build/x86_64/%.o, src/impl/x86_64/%.asm, $@) -o $@
+	$(AS) -f elf64 $< -o $@
 
 build/resources/%.o: src/resources/%.wav
 	mkdir -p $(dir $@)
-	python tools/audioconverter/wavtoadi.py --format IADPCM --object-file $< $@
+	$(PY) tools/audioconverter/wavtoadi.py --format IADPCM --object-file $< $@
 
+src/resources/%.o: src/resources/%.wav
+	$(PY) tools/audioconverter/wavtoheader.py $< $@
+
+# ===== Build =====
 .PHONY: build-x86_64
-build-x86_64: $(kernel_object_files) $(x86_64_object_files) $(audio_object_files) 
+build-x86_64: $(kernel_object_files) $(x86_64_object_files) $(audio_object_files)
 	mkdir -p dist/x86_64
-	$(LD) -n -o dist/x86_64/kernel.bin -T targets/x86_64/linker.ld $(kernel_object_files) $(x86_64_object_files) $(audio_object_files)
+	$(LD) -n -o dist/x86_64/kernel.bin -T targets/x86_64/linker.ld \
+		$(kernel_object_files) $(x86_64_object_files) $(audio_object_files)
 	cp dist/x86_64/kernel.bin targets/x86_64/iso/boot/kernel.bin
-	grub-mkrescue /usr/lib/grub/i386-pc -o dist/x86_64/kernel.iso targets/x86_64/iso
+	grub-mkrescue -o dist/x86_64/kernel.iso targets/x86_64/iso
+
+# ===== Utils =====
+.PHONY: clean
+clean:
+	rm -rf build dist
+
+.PHONY: audio
+audio: $(audio_obj_files_build) $(audio_obj_files_src)
+
+# ===== Run =====
+QEMU := qemu-system-x86_64
+
+.PHONY: run
+run: build-x86_64
+	$(QEMU) -cdrom dist/x86_64/kernel.iso -m 1024M -boot d -serial stdio \
+	-audiodev pa,id=speaker -machine pcspk-audiodev=speaker \
+	-usb -device usb-kbd \
+	-audiodev pa,id=audio0 -device AC97,audiodev=audio0 \
+	-device ahci,id=ahci \
+	-drive id=disk0,file=sata256.img,if=none,format=raw \
+	-device ide-hd,drive=disk0,bus=ahci.0
 
 .PHONY: clean
 clean:

@@ -58,7 +58,7 @@ build/x86_64/%.o: src/impl/x86_64/%.c
 
 build/x86_64/%.o: src/impl/x86_64/%.asm
 	@mkdir -p $(dir $@)
-	$(AS) -f elf64 $< -o $@
+	nasm -f elf64 $< -o $@
 
 build/resources/%.o: src/resources/%.wav
 	@mkdir -p $(dir $@)

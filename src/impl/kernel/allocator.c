@@ -201,6 +201,12 @@ static void remove_free_block(block_header* b) {
     b->free = false;
 }
 
+static inline uint64_t read_cr3(void) {
+    uint64_t val;
+    __asm__ volatile("mov %%cr3, %0" : "=r"(val));
+    return val;
+}
+
 // Coalesce b with its immediate successor if adjacent and free
 static void try_merge_with_next(block_header* b) {
     if (!b->next) return;
@@ -313,6 +319,64 @@ void allocator_init(void* memory, size_t size) {
     serial_write_str(", free=");
     serial_write_dec(total_free);
     serial_write_str(" bytes\n");
+}
+
+
+uint32_t vmm_virt_to_phys(void* ptr) {
+    uint64_t virt = (uint64_t)ptr;
+
+    // Extract indices
+    uint64_t pml4_i = (virt >> 39) & 0x1FF;
+    uint64_t pdpt_i = (virt >> 30) & 0x1FF;
+    uint64_t pd_i   = (virt >> 21) & 0x1FF;
+    uint64_t pt_i   = (virt >> 12) & 0x1FF;
+    uint64_t offset = virt & 0xFFF;
+
+    // Get PML4 base (physical)
+    uint64_t cr3 = read_cr3();
+    uint64_t* pml4 = (uint64_t*)(cr3 & ~0xFFFULL);
+
+    // NOTE:
+    // We assume higher-half direct mapping or identity mapping exists.
+    // If not, you MUST map physical memory before dereferencing.
+
+    // PML4
+    uint64_t pml4e = pml4[pml4_i];
+    if (!(pml4e & 1)) return 0;
+
+    uint64_t* pdpt = (uint64_t*)(pml4e & ~0xFFFULL);
+
+    // PDPT
+    uint64_t pdpte = pdpt[pdpt_i];
+    if (!(pdpte & 1)) return 0;
+
+    // 1GB page
+    if (pdpte & (1ULL << 7)) {
+        uint64_t phys = (pdpte & 0x000FFFFFC0000000ULL) + (virt & 0x3FFFFFFFULL);
+        return (uint32_t)phys;
+    }
+
+    uint64_t* pd = (uint64_t*)(pdpte & ~0xFFFULL);
+
+    // PD
+    uint64_t pde = pd[pd_i];
+    if (!(pde & 1)) return 0;
+
+    // 2MB page
+    if (pde & (1ULL << 7)) {
+        uint64_t phys = (pde & 0x000FFFFFFFE00000ULL) + (virt & 0x1FFFFFULL);
+        return (uint32_t)phys;
+    }
+
+    uint64_t* pt = (uint64_t*)(pde & ~0xFFFULL);
+
+    // PT
+    uint64_t pte = pt[pt_i];
+    if (!(pte & 1)) return 0;
+
+    uint64_t phys = (pte & ~0xFFFULL) + offset;
+
+    return (uint32_t)phys;
 }
 
 // ===========================================

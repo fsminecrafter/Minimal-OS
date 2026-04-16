@@ -2,6 +2,7 @@
 #include "x86_64/ahci.h"
 #include "x86_64/minimafs.h"
 #include "minimafshandler.h"
+#include "x86_64/exec_trace.h"
 
 #include <stdbool.h>
 
@@ -231,6 +232,8 @@ minimafs_disk_device_t* initializeminimafs(int driveindex) {
     device->ahci_drive = disk;
     device->sector_size = disk->sector_size;
 
+    trace_sti(__FILE__, "initializeminimafs", __LINE__);
+
     return device;
 }
 
@@ -255,6 +258,7 @@ int mountdrive(minimafs_disk_device_t* device, int deviceindex) {
     serial_write_str("Filesystem mounted as drive ");
     serial_write_dec(deviceindex);
     serial_write_str(": \n");
+    trace_sti(__FILE__, "mountdrive", __LINE__);
     return successcode;
 }
 

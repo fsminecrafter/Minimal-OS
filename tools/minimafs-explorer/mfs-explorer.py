@@ -278,20 +278,20 @@ class App:
         top_frame = ttk.Frame(self.root)
         top_frame.pack(fill="x", padx=5, pady=3)
 
-        ttk.Button(top_frame, text="📂 Open IMG", command=self.open_img).pack(side="left", padx=3)
-        ttk.Button(top_frame, text="🔍 Search", command=self.open_search_window).pack(side="left", padx=3)
-        ttk.Button(top_frame, text="➕ New File", command=self.new_file_dialog).pack(side="left", padx=3)
-        ttk.Button(top_frame, text="📁 New Folder", command=self.new_folder_dialog).pack(side="left", padx=3)
+        ttk.Button(top_frame, text="📂 Open IMG", command=self.open_img, style="Accent.TButton").pack(side="left", padx=3)
+        ttk.Button(top_frame, text="🔍 Search", command=self.open_search_window, style="Accent.TButton").pack(side="left", padx=3)
+        ttk.Button(top_frame, text="➕ New File", command=self.new_file_dialog, style="Accent.TButton").pack(side="left", padx=3)
+        ttk.Button(top_frame, text="📁 New Folder", command=self.new_folder_dialog, style="Accent.TButton").pack(side="left", padx=3)
         
         ttk.Separator(top_frame, orient="vertical").pack(side="left", fill="y", padx=10)
         
-        ttk.Button(top_frame, text="💾 Save", command=self.save_fs).pack(side="left", padx=3)
-        ttk.Button(top_frame, text="↶ Undo", command=self.undo_edit).pack(side="left", padx=3)
-        ttk.Button(top_frame, text="↷ Redo", command=self.redo_edit).pack(side="left", padx=3)
+        ttk.Button(top_frame, text="💾 Save", command=self.save_fs, style="Accent.TButton").pack(side="left", padx=3)
+        ttk.Button(top_frame, text="↶ Undo", command=self.undo_edit, style="Accent.TButton").pack(side="left", padx=3)
+        ttk.Button(top_frame, text="↷ Redo", command=self.redo_edit, style="Accent.TButton").pack(side="left", padx=3)
         
         ttk.Separator(top_frame, orient="vertical").pack(side="left", fill="y", padx=10)
         
-        ttk.Button(top_frame, text="🔄 Toggle RAW", command=self.toggle_raw).pack(side="left", padx=3)
+        ttk.Button(top_frame, text="🔄 Toggle RAW", command=self.toggle_raw, style="Accent.TButton").pack(side="left", padx=3)
 
         # STATUS BAR
         status_frame = ttk.Frame(self.root)
@@ -336,7 +336,7 @@ class App:
         self.part_var = tk.IntVar(value=0)
         self.part_spin = ttk.Spinbox(info_frame, from_=0, to=0, textvariable=self.part_var, width=8)
         self.part_spin.pack(side="left", padx=5)
-        ttk.Button(info_frame, text="View", command=self.view_part, width=8).pack(side="left", padx=5)
+        ttk.Button(info_frame, text="View", command=self.view_part, width=8,style="Accent.TButton").pack(side="left", padx=5)
 
         # Text editor
         text_frame = ttk.Frame(right_frame)
@@ -368,6 +368,9 @@ class App:
         
         self.log.pack(side="left", fill="both", expand=True)
         log_scroll.pack(side="right", fill="y")
+
+        #Copy context menu for text widget
+        self.text.bind("<Button-3>", self.show_text_context_menu)
 
     # --------------------------------------
 
@@ -730,10 +733,10 @@ class App:
         search_entry.focus()
 
         self.whole_word_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(search_win, text="Whole Word Match", variable=self.whole_word_var).pack(anchor="w", padx=20, pady=5)
+        ttk.Checkbutton(search_win, text="Whole Word Match", variable=self.whole_word_var, style="Accent.TButton").pack(anchor="w", padx=20, pady=5)
 
         self.match_case_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(search_win, text="Match Case (Sensitive)", variable=self.match_case_var).pack(anchor="w", padx=20, pady=5)
+        ttk.Checkbutton(search_win, text="Match Case (Sensitive)", variable=self.match_case_var, style="Accent.TButton").pack(anchor="w", padx=20, pady=5)
 
         def do_search():
             self.search_entry = search_entry
@@ -743,8 +746,8 @@ class App:
         button_frame = ttk.Frame(search_win)
         button_frame.pack(pady=20)
         
-        ttk.Button(button_frame, text="Search", command=do_search).pack(side="left", padx=5)
-        ttk.Button(button_frame, text="Cancel", command=search_win.destroy).pack(side="left", padx=5)
+        ttk.Button(button_frame, text="Search", command=do_search, style="Accent.TButton").pack(side="left", padx=5)
+        ttk.Button(button_frame, text="Cancel", command=search_win.destroy, style="Accent.TButton").pack(side="left", padx=5)
 
     # EDIT PERMISSION
     def check_edit_allowed(self):
@@ -790,6 +793,13 @@ class App:
             menu.add_separator()
             menu.add_command(label="Delete (Zero Block)", command=self.delete_file)
             menu.post(event.x_root, event.y_root)
+
+    def show_text_context_menu(self, event):
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label="Copy", command=lambda: self.text.event_generate("<<Copy>>"))
+        menu.add_command(label="Cut", command=lambda: self.text.event_generate("<<Cut>>"))
+        menu.add_command(label="Paste", command=lambda: self.text.event_generate("<<Paste>>"))
+        menu.tk_popup(event.x_root, event.y_root)
 
     def copy_file(self):
         """Copy selected file to clipboard"""

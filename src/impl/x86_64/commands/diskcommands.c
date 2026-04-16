@@ -374,7 +374,14 @@ void cmd_mount(int argc, const char** argv) {
 }
 
 void cmd_initdisk(int argc, const char** argv) {
-    initializeminimafs(0);
+    uint8_t drive = 0;
+    if (argc >= 2) {
+        drive = parse_u8(argv[1], 0);
+    } else {
+        graphics_write_textr("No drive number specified, defaulting to 0.\n");
+        drive = 0;
+    }
+    initializeminimafs(drive);
 }
 
 void register_listdisk(void) {

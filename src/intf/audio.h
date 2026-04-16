@@ -180,9 +180,13 @@ const char* adi_format_name(audio_format_t format);
  * @param max_output Maximum samples to decode (prevents buffer overflow)
  * @return true on success
  */
-bool decode_ima_adpcm(const uint8_t* input, uint32_t input_size,
-                      int16_t* output, uint32_t* output_size,
-                      uint32_t max_output);
+bool decode_ima_adpcm(
+    const uint8_t* input, uint32_t input_size,
+    int16_t* output, uint32_t* output_size,
+    uint32_t max_output,
+    int* pred_l, int* step_l,
+    int* pred_r, int* step_r
+);
 
 /**
  * Decode Microsoft ADPCM to PCM16
@@ -209,6 +213,10 @@ typedef struct {
     uint32_t pcm_position;       // Current playback position
     uint32_t pcm_capacity;       // total allocated samples (per buffer)
     uint32_t pcm_size;           // decoded samples in current buffer
+    int adpcm_pred_l;
+    int adpcm_step_l;
+    int adpcm_pred_r;
+    int adpcm_step_r;
     
     int current_buffer;          // 0=front, 1=back (for double buffering)
     

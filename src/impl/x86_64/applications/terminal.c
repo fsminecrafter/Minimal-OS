@@ -328,15 +328,13 @@ void terminal_program_entry(void) {
         minimafs_drive_t* d = get_drive(1);
 
         if (!d) {
-            serial_write_str("/cr255g0b0/Drive 1 = NULL/cr255g255b255/\n");
+            serial_write_str("Drive 1 = NULL\n");
         } else if (!d->mounted) {
-            serial_write_str("/cr255g0b0/Drive 1 not mounted/cr255g255b255/\n");
+            serial_write_str("Drive 1 not mounted\n");
         } else {
-            vgaterm_print("/cr0g255b0/Drive 1 OK/cr255g255b255/\n");
+            vgaterm_print("Drive 1 OK\n");
         }
         }
-        command_execute("createmusicfile 0");
-        vgaterm_print("Created music file.\n");
     }
 
     terminalPrompt();

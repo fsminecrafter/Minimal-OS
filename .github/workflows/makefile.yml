@@ -1,129 +1,125 @@
 name: Makefile CI
 
 on:
-push:
-branches: [ "main" ]
-pull_request:
-branches: [ "main" ]
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
 
 jobs:
-build:
-runs-on: ubuntu-latest
+  build:
+    runs-on: ubuntu-latest
 
-```
-steps:
-- uses: actions/checkout@v4
+    steps:
+      - uses: actions/checkout@v4
 
-# ===== Install dependencies =====
-- name: Install dependencies
-  run: |
-    sudo apt update
-    sudo apt install -y \
-      build-essential \
-      bison \
-      flex \
-      libgmp3-dev \
-      libmpc-dev \
-      libmpfr-dev \
-      libisl-dev \
-      texinfo \
-      wget \
-      curl \
-      nasm \
-      grub-pc-bin \
-      xorriso \
-      qemu-system-x86 \
-      python3
+      # ===== Install dependencies =====
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y \
+            build-essential \
+            bison \
+            flex \
+            libgmp3-dev \
+            libmpc-dev \
+            libmpfr-dev \
+            libisl-dev \
+            texinfo \
+            wget \
+            curl \
+            nasm \
+            grub-pc-bin \
+            xorriso \
+            qemu-system-x86 \
+            python3
 
-# ===== Ensure cache dir exists (CRITICAL FIX) =====
-- name: Prepare cache directory
-  run: mkdir -p $HOME/cross
+      # ===== Ensure cache dir exists =====
+      - name: Prepare cache directory
+        run: mkdir -p $HOME/cross
 
-# ===== Cache toolchain =====
-- name: Restore cached toolchain
-  id: cache-toolchain
-  uses: actions/cache@v4
-  with:
-    path: ~/cross
-    key: ${{ runner.os }}-x86_64-elf-gcc14.1.0-binutils2.42
+      # ===== Cache toolchain =====
+      - name: Restore cached toolchain
+        id: cache-toolchain
+        uses: actions/cache@v4
+        with:
+          path: ~/cross
+          key: ${{ runner.os }}-x86_64-elf-gcc14.1.0-binutils2.42
 
-# ===== Verify toolchain =====
-- name: Check if toolchain exists
-  id: check-toolchain
-  run: |
-    if [ -f "$HOME/cross/bin/x86_64-elf-gcc" ]; then
-      echo "exists=true" >> $GITHUB_OUTPUT
-    else
-      echo "exists=false" >> $GITHUB_OUTPUT
-    fi
+      # ===== Verify toolchain =====
+      - name: Check if toolchain exists
+        id: check-toolchain
+        run: |
+          if [ -f "$HOME/cross/bin/x86_64-elf-gcc" ]; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
 
-# ===== Build toolchain if missing =====
-- name: Build x86_64-elf toolchain
-  if: steps.check-toolchain.outputs.exists != 'true'
-  run: |
-    export PREFIX="$HOME/cross"
-    export TARGET=x86_64-elf
-    export PATH="$PREFIX/bin:$PATH"
+      # ===== Build toolchain if missing =====
+      - name: Build x86_64-elf toolchain
+        if: steps.check-toolchain.outputs.exists != 'true'
+        run: |
+          export PREFIX="$HOME/cross"
+          export TARGET=x86_64-elf
+          export PATH="$PREFIX/bin:$PATH"
 
-    mkdir -p $HOME/src
-    cd $HOME/src
+          mkdir -p $HOME/src
+          cd $HOME/src
 
-    wget -nc https://ftp.gnu.org/gnu/binutils/binutils-2.42.tar.gz
-    wget -nc https://ftp.gnu.org/gnu/gcc/gcc-14.1.0/gcc-14.1.0.tar.gz
+          wget -nc https://ftp.gnu.org/gnu/binutils/binutils-2.42.tar.gz
+          wget -nc https://ftp.gnu.org/gnu/gcc/gcc-14.1.0/gcc-14.1.0.tar.gz
 
-    tar -xf binutils-2.42.tar.gz || true
-    tar -xf gcc-14.1.0.tar.gz || true
+          tar -xf binutils-2.42.tar.gz || true
+          tar -xf gcc-14.1.0.tar.gz || true
 
-    # ===== Build binutils =====
-    mkdir -p build-binutils
-    cd build-binutils
-    ../binutils-2.42/configure \
-      --target=$TARGET \
-      --prefix=$PREFIX \
-      --with-sysroot \
-      --disable-nls \
-      --disable-werror
-    make -j$(nproc)
-    make install
-    cd ..
+          # ===== Build binutils =====
+          mkdir -p build-binutils
+          cd build-binutils
+          ../binutils-2.42/configure \
+            --target=$TARGET \
+            --prefix=$PREFIX \
+            --with-sysroot \
+            --disable-nls \
+            --disable-werror
+          make -j$(nproc)
+          make install
+          cd ..
 
-    # ===== Build GCC =====
-    mkdir -p build-gcc
-    cd build-gcc
-    ../gcc-14.1.0/configure \
-      --target=$TARGET \
-      --prefix=$PREFIX \
-      --disable-nls \
-      --enable-languages=c \
-      --without-headers
-    make -j$(nproc) all-gcc
-    make -j$(nproc) all-target-libgcc
-    make install-gcc
-    make install-target-libgcc
+          # ===== Build GCC =====
+          mkdir -p build-gcc
+          cd build-gcc
+          ../gcc-14.1.0/configure \
+            --target=$TARGET \
+            --prefix=$PREFIX \
+            --disable-nls \
+            --enable-languages=c \
+            --without-headers
+          make -j$(nproc) all-gcc
+          make -j$(nproc) all-target-libgcc
+          make install-gcc
+          make install-target-libgcc
 
-# ===== Add toolchain to PATH =====
-- name: Add toolchain to PATH
-  run: echo "$HOME/cross/bin" >> $GITHUB_PATH
+      # ===== Add toolchain to PATH =====
+      - name: Add toolchain to PATH
+        run: echo "$HOME/cross/bin" >> $GITHUB_PATH
 
-# ===== Verify toolchain installed =====
-- name: Verify compiler
-  run: |
-    x86_64-elf-gcc --version
+      # ===== Verify toolchain installed =====
+      - name: Verify compiler
+        run: x86_64-elf-gcc --version
 
-# ===== Build project =====
-- name: Build
-  run: make
+      # ===== Build project =====
+      - name: Build
+        run: make
 
-# ===== Verify output =====
-- name: Verify ISO exists
-  run: |
-    test -f dist/x86_64/kernel.iso
+      # ===== Verify output =====
+      - name: Verify ISO exists
+        run: test -f dist/x86_64/kernel.iso
 
-# ===== Optional boot test =====
-- name: Boot test (QEMU)
-  run: |
-    timeout 10s qemu-system-x86_64 \
-      -cdrom dist/x86_64/kernel.iso \
-      -nographic \
-      -serial stdio || true
-```
+      # ===== Optional boot test =====
+      - name: Boot test (QEMU)
+        run: |
+          timeout 10s qemu-system-x86_64 \
+            -cdrom dist/x86_64/kernel.iso \
+            -nographic \
+            -serial stdio || true

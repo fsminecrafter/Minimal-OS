@@ -194,15 +194,17 @@ void terminal_process_command(const char* cmd) {
 // ===========================================
 
 void terminal_update(void) {
-    // CRITICAL: Call keyboard update for key repeat!
-    usb_keyboard_update();
-    
-    // Process pending command
-    if (command_ready) {
-        terminal_process_command(input_buffer);
-        input_pos = 0;
-        input_buffer[0] = '\0';
-        command_ready = false;
+    while (1) {
+        usb_keyboard_update();
+        
+        // Process pending command
+        if (command_ready) {
+            terminal_process_command(input_buffer);
+            input_pos = 0;
+            input_buffer[0] = '\0';
+            command_ready = false;
+        }
+        sleep(10);
     }
 }
 
@@ -246,6 +248,8 @@ void terminal_init_keyboard(void) {
     
     serial_write_str("Terminal: Keyboard ready!\n");
 }
+
+
 
 // ===========================================
 // TERMINAL INITIALIZATION
@@ -338,9 +342,7 @@ void terminal_program_entry(void) {
     }
 
     terminalPrompt();
-    // Main terminal loop
-    while (1) {
-        terminal_update();
-        sleep(10);  // Update every 10ms
-    }
+    createProcess("terminal_update", terminal_update);
+    schedulerInit();
+
 }

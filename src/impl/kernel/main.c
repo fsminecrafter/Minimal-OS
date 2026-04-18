@@ -38,14 +38,21 @@
 
 #include "x86_64/exec_trace.h"
 
+//Audio
+
+#include "x86_64/global_audio_state.h"
+
 void busy(void) {
-    for (volatile int i = 0; i < 100; i++);
+    serial_write_str("Busy process\n");
+    process_exit();
 }
 
 void audioupdate(void) {
     while (1) {
-        audio_update();
-        sleep(1);
+        if (g_audio_state.playing && g_audio_state.player) {
+            audio_player_update(g_audio_state.player);
+        }
+        sleep(10);
     }
 }
 
@@ -106,10 +113,8 @@ void kernel_main(uint64_t mb2_info_addr) {
         return;
     }
     sti();
-    terminal_program_entry();    
     createProcess("busy", busy);
     createProcess("kernelaudio", audioupdate);
-    schedulerInit();
-    sti();
+    terminal_program_entry();    
     while(1);
 }

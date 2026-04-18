@@ -78,28 +78,32 @@ static uint32_t audio_player_fill_buffer(audio_player_t* player, uint8_t buf_idx
         serial_write_str("[AUDIO] fill_buffer: capacity is zero\n");
         return 0;
     }
-
+ 
     int16_t* target_buffer = player->pcm_buffer +
                              (uint32_t)buf_idx * player->pcm_capacity;
-
+ 
     uint32_t bytes_read = 0;
     uint8_t* compressed = readstream(player->stream, &bytes_read);
-
+ 
     if (!compressed || bytes_read == 0) {
         if (player->loop) {
+            /* Reset ADPCM state on loop so we decode from clean predictor */
+            player->adpcm_pred_l = 0;
+            player->adpcm_step_l = 0;
+            player->adpcm_pred_r = 0;
+            player->adpcm_step_r = 0;
             seekstream(player->stream, 0);
             compressed = readstream(player->stream, &bytes_read);
         }
         if (!compressed || bytes_read == 0) {
             serial_write_str("[AUDIO] fill_buffer: no data (EOF)\n");
-            g_audio_state.playing = false;
             return 0;
         }
     }
-
+ 
     uint32_t decoded_samples = 0;
     bool     success         = false;
-
+ 
     switch (player->format) {
         case AUDIO_FORMAT_IMA_ADPCM:
             success = decode_ima_adpcm(
@@ -113,7 +117,7 @@ static uint32_t audio_player_fill_buffer(audio_player_t* player, uint8_t buf_idx
                 &player->adpcm_step_r
             );
             break;
-
+ 
         case AUDIO_FORMAT_PCM16: {
             uint32_t max_bytes = player->pcm_capacity * sizeof(int16_t);
             uint32_t copy      = audio_min_u32(bytes_read, max_bytes);
@@ -122,30 +126,27 @@ static uint32_t audio_player_fill_buffer(audio_player_t* player, uint8_t buf_idx
             success = (decoded_samples > 0);
             break;
         }
-
+ 
         case AUDIO_FORMAT_MS_ADPCM:
             success = decode_ms_adpcm(compressed, bytes_read,
                                       target_buffer, &decoded_samples);
             break;
-
+ 
         case AUDIO_FORMAT_FLAC:
             success = decode_flac(compressed, bytes_read,
                                   target_buffer, &decoded_samples);
             break;
-
+ 
         default:
             success = false;
             break;
     }
-
+ 
     if (!success || decoded_samples == 0) {
         serial_write_str("[AUDIO] fill_buffer: decode failed/empty\n");
-        g_audio_state.playing = false;
         return 0;
     }
-
-    player->pcm_position = 0;
-    player->pcm_size     = decoded_samples;
+ 
     return decoded_samples;
 }
 
@@ -159,9 +160,6 @@ void audio_init(void) {
 
 void audio_update(void) {
     ac97_update();
-    if (g_audio_state.playing && g_audio_state.player) {
-        audio_player_update(g_audio_state.player);
-    }
 }
 
 /* ============================================================
@@ -172,52 +170,63 @@ void audio_update(void) {
  * ============================================================ */
 void audio_mix_streams(int16_t* out, uint32_t frames) {
     if (!out || frames == 0) return;
-
+ 
     uint32_t out_samples = frames * AUDIO_CHANNELS;
     audio_player_t* player = g_audio_state.player;
-
-    if (!player || !g_audio_state.playing) {
+ 
+    if (!player || !g_audio_state.playing || !player->playing) {
         memset(out, 0, out_samples * sizeof(int16_t));
         return;
     }
-
+ 
     if (!player->pcm_buffer) {
         memset(out, 0, out_samples * sizeof(int16_t));
         serial_write_str("[AUDIO] ERROR: pcm_buffer NULL in mix\n");
         return;
     }
-
+ 
     uint8_t src_channels = player->stream ?
                            player->stream->adi_header.channels : AUDIO_CHANNELS;
     if (src_channels == 0) src_channels = AUDIO_CHANNELS;
-
+ 
     const uint8_t out_channels = AUDIO_CHANNELS;
     const uint8_t volume       = (player->volume > 100) ? 100 : player->volume;
-
-    int16_t* current_buffer = player->pcm_buffer +
-                              (uint32_t)player->current_buffer * player->pcm_capacity;
-
+ 
+    int16_t* current_buf = player->pcm_buffer +
+                           (uint32_t)player->current_buffer * player->pcm_capacity;
+ 
     uint32_t out_idx = 0;
-
+ 
     while (out_idx < out_samples) {
-        /* Buffer exhausted — try to refill */
+        /* ---- Buffer exhausted? ---- */
         if (player->pcm_position >= player->pcm_size) {
-            bool ok = audio_player_update(player);
-            if (!ok || player->pcm_size == 0) {
+            if (player->back_buffer_ready) {
+                /* Swap to back buffer */
+                player->current_buffer ^= 1;
+                player->pcm_position    = 0;
+                player->pcm_size        = player->back_buffer_size;
+                player->back_buffer_ready = false;
+                player->needs_refill    = true;
+                current_buf = player->pcm_buffer +
+                              (uint32_t)player->current_buffer * player->pcm_capacity;
+            } else {
+                /* Underrun: back buffer not ready yet – output silence */
                 memset(out + out_idx, 0,
                        (out_samples - out_idx) * sizeof(int16_t));
+                static uint32_t underrun_count = 0;
+                if ((++underrun_count & 0x3F) == 0) {
+                    serial_write_str("[AUDIO] underrun (increase sleep interval in audioupdate)\n");
+                }
                 return;
             }
-            /* Refresh pointer after buffer switch */
-            current_buffer = player->pcm_buffer +
-                             (uint32_t)player->current_buffer * player->pcm_capacity;
-            continue;
         }
-
+ 
+        uint32_t remaining_block = out_samples - out_idx;
+ 
         if (src_channels <= 1) {
-            /* Mono source → duplicate to all output channels */
+            /* Mono → duplicate to all output channels */
             int16_t s = audio_apply_volume(
-                current_buffer[player->pcm_position++], volume);
+                current_buf[player->pcm_position++], volume);
             if (out_channels == 1) {
                 out[out_idx++] = s;
             } else {
@@ -225,18 +234,18 @@ void audio_mix_streams(int16_t* out, uint32_t frames) {
                 if (out_idx < out_samples) out[out_idx++] = s;
             }
         } else {
-            /* Stereo source: need at least 2 samples (L + R) */
+            /* Stereo: need at least 2 samples (L + R) */
             if (player->pcm_position + 2 > player->pcm_size) {
-                /* Not enough samples left — let the top of the loop refill */
+                /* Not enough samples left – force a buffer check next iteration */
                 player->pcm_position = player->pcm_size;
                 continue;
             }
-
+ 
             int16_t l = audio_apply_volume(
-                current_buffer[player->pcm_position++], volume);
+                current_buf[player->pcm_position++], volume);
             int16_t r = audio_apply_volume(
-                current_buffer[player->pcm_position++], volume);
-
+                current_buf[player->pcm_position++], volume);
+ 
             /* Skip surplus channels if source has > 2 */
             if (src_channels > 2) {
                 uint32_t skip = src_channels - 2;
@@ -245,7 +254,7 @@ void audio_mix_streams(int16_t* out, uint32_t frames) {
                 else
                     player->pcm_position = player->pcm_size;
             }
-
+ 
             if (out_channels == 1) {
                 out[out_idx++] = (int16_t)(((int32_t)l + r) / 2);
             } else {
@@ -838,39 +847,49 @@ void audio_player_play(audio_player_t* player) {
         serial_write_str("[PLAYER] play: invalid state\n");
         return;
     }
-
+ 
     g_audio_state.player  = player;
     g_audio_state.playing = false;
-
+ 
     /* Set sample rate BEFORE priming buffers */
     if (player->stream->adi_header.sample_rate != 0) {
         ac97_set_sample_rate(player->stream->adi_header.sample_rate);
     }
-
-    /* Prefill front buffer (index 0) */
-    serial_write_str("[PLAYER] Prefilling buffer 0...\n");
-    uint32_t samples = audio_player_fill_buffer(player, 0);
-    if (samples == 0) {
-        serial_write_str("[PLAYER] Prefill failed — no samples decoded\n");
+ 
+    /* --- Prefill front buffer (index 0) --- */
+    serial_write_str("[PLAYER] Prefilling buffer 0 (front)...\n");
+    uint32_t front_samples = audio_player_fill_buffer(player, 0);
+    if (front_samples == 0) {
+        serial_write_str("[PLAYER] Prefill front failed — no samples decoded\n");
         g_audio_state.player = NULL;
         return;
     }
-
     player->current_buffer = 0;
     player->pcm_position   = 0;
-    player->pcm_size       = samples;
-
-    serial_write_str("[PLAYER] Prefill OK, samples=");
-    serial_write_dec(samples);
+    player->pcm_size        = front_samples;
+ 
+    serial_write_str("[PLAYER] Front buffer OK, samples=");
+    serial_write_dec(front_samples);
     serial_write_str("\n");
-
+ 
+    /* --- Prefill back buffer (index 1) --- */
+    serial_write_str("[PLAYER] Prefilling buffer 1 (back)...\n");
+    uint32_t back_samples = audio_player_fill_buffer(player, 1);
+    player->back_buffer_size  = back_samples;
+    player->back_buffer_ready = (back_samples > 0);
+    player->needs_refill      = false;
+ 
+    serial_write_str("[PLAYER] Back buffer OK, samples=");
+    serial_write_dec(back_samples);
+    serial_write_str("\n");
+ 
     /* Expose player to mixer BEFORE starting DMA */
     g_audio_state.playing = true;
     player->playing        = true;
-
-    /* Start DMA — this primes all 32 HW buffers from the player */
+ 
+    /* Start DMA — primes all 32 HW buffers from the player */
     ac97_start();
-
+ 
     serial_write_str("[PLAYER] Playback started\n");
 }
 
@@ -903,21 +922,47 @@ bool audio_player_update(audio_player_t* player) {
     if (!player) return false;
     if (!g_audio_state.playing || g_audio_state.player != player) return false;
     if (!player->playing) return false;
-
-    if (player->pcm_position >= player->pcm_size) {
-        uint8_t  next_buf = player->current_buffer ^ 1;
-        uint32_t samples  = audio_player_fill_buffer(player, next_buf);
+ 
+    /* Only work when the mixer has signalled it needs a refill AND
+     * the back buffer is not already ready. */
+    if (!player->needs_refill || player->back_buffer_ready) {
+        return true; /* Nothing to do right now */
+    }
+ 
+    /* Fill the buffer that is NOT currently being consumed */
+    uint8_t back = (uint8_t)(player->current_buffer ^ 1);
+ 
+    uint32_t samples = audio_player_fill_buffer(player, back);
+ 
+    if (samples == 0) {
+        /* End of stream and no looping */
+        if (!player->loop) {
+            g_audio_state.playing  = false;
+            player->playing         = false;
+            g_audio_state.player   = NULL;
+            serial_write_str("[PLAYER] End of stream\n");
+            return false;
+        }
+        /* Loop: seek to start and try again */
+        player->adpcm_pred_l = 0;
+        player->adpcm_step_l = 0;
+        player->adpcm_pred_r = 0;
+        player->adpcm_step_r = 0;
+        seekstream(player->stream, 0);
+        samples = audio_player_fill_buffer(player, back);
         if (samples == 0) {
             g_audio_state.playing = false;
             player->playing        = false;
-            g_audio_state.player   = NULL;
             return false;
         }
-        player->current_buffer = next_buf;
-        player->pcm_position   = 0;
-        player->pcm_size       = samples;
     }
-
+ 
+    player->back_buffer_size  = samples;
+    /* Clear needs_refill BEFORE setting back_buffer_ready so the mixer
+     * never sees back_buffer_ready=true with needs_refill still set. */
+    player->needs_refill      = false;
+    player->back_buffer_ready = true;
+ 
     return true;
 }
 

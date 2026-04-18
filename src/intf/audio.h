@@ -204,23 +204,49 @@ bool decode_flac(const uint8_t* input, uint32_t input_size,
 // AUDIO PLAYBACK
 // ===========================================
 
+    /* Double-buffer layout:
+     *   pcm_buffer[0 .. pcm_capacity-1]          = front (current_buffer == 0)
+     *   pcm_buffer[pcm_capacity .. 2*pcm_capacity-1] = back  (current_buffer == 1)
+     *
+     * The mixer (interrupt context) reads from the front buffer.
+     * The background process fills the back buffer.
+     *
+     * Handoff protocol (lock-free, single-producer / single-consumer):
+     *
+     *   back_buffer_ready  – written by background, read by mixer.
+     *                        TRUE  = back buffer has fresh decoded PCM.
+     *                        FALSE = back buffer is stale / being refilled.
+     *
+     *   needs_refill       – written by mixer, read by background.
+     *                        TRUE  = mixer just swapped to the back buffer;
+     *                                background should now refill the other one.
+     *                        FALSE = nothing to do yet.
+     *
+     *   back_buffer_size   – number of valid samples in the back buffer.
+     *                        Written by background before setting back_buffer_ready.
+     *                        Read by mixer when it switches buffers.
+     */
+
 typedef struct {
     audio_datastream_t* stream;
     audio_format_t format;
-    
-    int16_t* pcm_buffer;         // Decoded PCM buffer (double-buffered)
-    uint32_t pcm_buffer_size;    // Size in samples
-    uint32_t pcm_position;       // Current playback position
-    uint32_t pcm_capacity;       // total allocated samples (per buffer)
-    uint32_t pcm_size;           // decoded samples in current buffer
+    int16_t* pcm_buffer;
+    uint32_t pcm_capacity;       /* samples per half-buffer (each side) */
+    uint32_t pcm_position;       /* read head inside the current (front) buffer */
+    uint32_t pcm_size;           /* valid sample count in the front buffer */
+ 
+    volatile bool back_buffer_ready; /* background → mixer */
+    volatile bool needs_refill;      /* mixer → background */
+    uint32_t back_buffer_size;       /* valid samples in back buffer */
+ 
     int adpcm_pred_l;
     int adpcm_step_l;
     int adpcm_pred_r;
     int adpcm_step_r;
-    
-    int current_buffer;          // 0=front, 1=back (for double buffering)
-    
-    uint8_t volume;              // 0-100
+ 
+    int current_buffer;          /* 0 = first half is front, 1 = second half is front */
+ 
+    uint8_t volume;              /* 0-100 */
     bool playing;
     bool loop;
 } audio_player_t;

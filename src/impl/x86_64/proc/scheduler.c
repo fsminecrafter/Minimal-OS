@@ -111,24 +111,29 @@ void schedule() {
 
     while (curr) {
         if (curr->state == PROCESS_ZOMBIE || curr->state == PROCESS_TERMINATED) {
+            if (curr == current_process) {
+                prev = curr;
+                curr = curr->next;
+                continue;
+            }
+
             serial_write_str("Cleaning up process: ");
             serial_write_str(curr->name);
             serial_write_str("\n");
-            
+
             process_t* to_free = curr;
-            
-            // Remove from list
+
             if (prev) {
                 prev->next = curr->next;
             } else {
                 proc_list_head = curr->next;
             }
 
-            // Free resources
             if (to_free->kernel_stack) {
                 void* stack_base = (void*)((uint8_t*)to_free->kernel_stack - STACK_SIZE);
                 free_mem(stack_base);
             }
+
             free_mem(to_free);
 
             curr = (prev) ? prev->next : proc_list_head;
@@ -284,4 +289,23 @@ void scheduler_print_stats() {
     print_str(", Zombie: ");
     print_int(zombie);
     print_str("\n============================\n");
+}
+
+void process_exit(void) {
+    if (!current_process) {
+        PANIC("process_exit() called with no current process");
+    }
+
+    serial_write_str("[PROC] Exiting process: ");
+    serial_write_str(current_process->name);
+    serial_write_str("\n");
+
+    // Mark as terminated (scheduler will clean it up)
+    current_process->state = PROCESS_TERMINATED;
+
+    // Force a reschedule
+    schedule();
+
+    // We should NEVER return here
+    PANIC("process_exit() returned!");
 }

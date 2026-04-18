@@ -9,6 +9,8 @@
 #include "x86_64/allocator.h"
 #include "serial.h"
 
+#define SCHED_DEBUG 0   // 0 = off, 1 = important, 2 = verbose
+
 bool scheduler_on = false;
 
 // The currently running process
@@ -44,9 +46,15 @@ static void wake_sleeping_processes() {
                 proc->state = PROCESS_READY;
                 proc->wake_time_ms = 0;
                 
-                serial_write_str("Waking process: ");
-                serial_write_str(proc->name);
-                serial_write_str("\n");
+                static uint64_t last_wake_log = 0;
+
+                if (SCHED_DEBUG >= 2) {
+                    uint64_t now = time_get_uptime_ms();
+                    if (now - last_wake_log > 1000) { // max once per second
+                        serial_write_str("[WAKE]\n");
+                        last_wake_log = now;
+                    }
+                }
             }
         }
     }
@@ -117,9 +125,11 @@ void schedule() {
                 continue;
             }
 
-            serial_write_str("Cleaning up process: ");
-            serial_write_str(curr->name);
-            serial_write_str("\n");
+            if (SCHED_DEBUG >= 1) {
+                serial_write_str("Cleaning: ");
+                serial_write_str(curr->name);
+                serial_write_str("\n");
+            }
 
             process_t* to_free = curr;
 
@@ -185,14 +195,16 @@ void schedule() {
     current_process = next;
     total_context_switches++;
 
-    serial_write_str("Context switch ");
-    serial_write_dec(total_context_switches);
-    serial_write_str(": ");
-    serial_write_str(old->name);
-    serial_write_str(" -> ");
-    serial_write_str(next->name);
-    serial_write_str("\n");
-    
+    if (SCHED_DEBUG >= 1) {
+        serial_write_str("CS ");
+        serial_write_dec(total_context_switches);
+        serial_write_str(": ");
+        serial_write_str(old->name);
+        serial_write_str(" -> ");
+        serial_write_str(next->name);
+        serial_write_str("\n");
+    }
+        
     context_switch(old, next);
 }
 
@@ -203,11 +215,13 @@ void sleep(uint64_t milliseconds) {
     current_process->wake_time_ms = wake_time;
     current_process->state = PROCESS_WAITING;
     
-    serial_write_str("Process ");
-    serial_write_str(current_process->name);
-    serial_write_str(" sleeping for ");
-    serial_write_dec(milliseconds);
-    serial_write_str("ms\n");
+    if (SCHED_DEBUG >= 2) {
+        serial_write_str("[SLEEP] ");
+        serial_write_str(current_process->name);
+        serial_write_str(" for ");
+        serial_write_dec(milliseconds);
+        serial_write_str(" ms\n");
+    }
     
     // Mark as waiting and switch to another process
     schedule();
@@ -216,9 +230,11 @@ void sleep(uint64_t milliseconds) {
     // The state was changed to READY/RUNNING by wake_sleeping_processes()
     // Just return - we're done sleeping!
     
-    serial_write_str("Process ");
-    serial_write_str(current_process->name);
-    serial_write_str(" woke up\n");
+    if (SCHED_DEBUG >= 2) {
+        serial_write_str("[WAKE-UP] ");
+        serial_write_str(current_process->name);
+        serial_write_str("\n");
+    }
 }
 
 static int tick_counter = 0;

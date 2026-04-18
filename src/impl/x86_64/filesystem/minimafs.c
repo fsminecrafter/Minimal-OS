@@ -1218,6 +1218,7 @@ static bool minimafs_write_blocks(minimafs_drive_t* drive, uint32_t block_num,
     TRACE_ENTER();
     TRACE_VALUE("block_num", block_num);
     TRACE_VALUE("count", count);
+    trace_assert_irq_consistency(__FILE__, "minimafs_write_blocks", __LINE__);
     
     if (!drive || !drive->device_handle) {
         TRACE_MSG("No drive");
@@ -1352,55 +1353,6 @@ bool ahci_write_with_timeout(ahci_drive_t* drive, uint64_t lba, uint32_t count, 
     
     // Normal write with timeout
     return ahci_write(drive, lba, count, buffer);
-}
- 
-static bool minimafs_write_blocks_safe(minimafs_drive_t* drive, uint32_t block_num, uint32_t count, const void* buffer) {
-    if (!drive || !buffer || count == 0) return false;
-    
-    minimafs_disk_device_t* disk = (minimafs_disk_device_t*)drive->device_handle;
-    if (!disk || !disk->ahci_drive) return false;
-    
-    // CRITICAL: Write in smaller chunks to avoid stalling
-    const uint32_t MAX_BLOCKS_PER_WRITE = 8;  // 32 KB at a time
-    
-    uint32_t blocks_written = 0;
-    const uint8_t* src = (const uint8_t*)buffer;
-    
-    while (blocks_written < count) {
-        uint32_t blocks_this_write = count - blocks_written;
-        if (blocks_this_write > MAX_BLOCKS_PER_WRITE) {
-            blocks_this_write = MAX_BLOCKS_PER_WRITE;
-        }        
-        uint32_t sectors_per_block = MINIMAFS_BLOCK_SIZE / disk->sector_size;
-        uint64_t lba = (uint64_t)(block_num + blocks_written) * sectors_per_block;
-        uint32_t sector_count = blocks_this_write * sectors_per_block;
-
-        // Progress indicator every 128 blocks (512 KB)
-        if ((blocks_written % 128) == 0) {
-            serial_write_str("MinimaFS: Progress ");
-            serial_write_dec(blocks_written);
-            serial_write_str("/");
-            serial_write_dec(count);
-            serial_write_str("\n");
-        }
-        
-        // Write to disk
-        if (!ahci_write(disk->ahci_drive, lba, sector_count, src)) {
-            serial_write_str("MinimaFS: Write failed at block ");
-            serial_write_dec(block_num + blocks_written);
-            serial_write_str("\n");
-            return false;
-        }
-        
-        blocks_written += blocks_this_write;
-        src += blocks_this_write * MINIMAFS_BLOCK_SIZE;
-        
-        // CRITICAL: Yield CPU briefly to allow interrupts
-        // This prevents lockups during large writes
-        minimafs_yield_irqsafe();
-    }
-    
-    return true;
 }
  
 // ===========================================

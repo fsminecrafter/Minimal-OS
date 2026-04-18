@@ -233,7 +233,7 @@ minimafs_disk_device_t* initializeminimafs(int driveindex) {
     }
     device->ahci_drive = disk;
     device->sector_size = disk->sector_size;
-
+    serial_write_str("MinimaFS device wrapper created\n");
     trace_sti(__FILE__, "initializeminimafs", __LINE__);
 
     return device;

@@ -52,7 +52,7 @@ void audioupdate(void) {
         if (g_audio_state.playing && g_audio_state.player) {
             audio_player_update(g_audio_state.player);
         }
-        sleep(10);
+        sleep(4);
     }
 }
 

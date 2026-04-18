@@ -14,6 +14,9 @@ bool graphics_safety_mode = true;
 static terminal_t g_terminal = {0};
 static font_t g_current_font = {0};
 
+static int last_x = -1;
+static int last_y = -1;
+
 // ===========================================
 // Terminal character buffer for scroll support
 // Stores one char + fg color per cell for redraw-on-scroll.
@@ -259,22 +262,62 @@ void graphics_terminal_putchar(char c, uint32_t col, uint32_t row, color_t fg, c
     }
 }
 
+char terminal_get_char(uint32_t col, uint32_t row) {
+    if (col >= TERM_MAX_COLS || row >= TERM_MAX_ROWS) {
+        return ' ';
+    }
+
+    return g_term_buf[row][col].ch;
+}
+
+color_t terminal_get_color(uint32_t col, uint32_t row) {
+    if (col >= TERM_MAX_COLS || row >= TERM_MAX_ROWS) {
+        return g_terminal.fg_color;
+    }
+
+    term_cell_t* cell = &g_term_buf[row][col];
+    return (color_t){cell->r, cell->g, cell->b, 0xFF};
+}
+
+void erase_cursor(int cx, int cy) {
+    if (cx < 0 || cy < 0) return;
+
+    char c = terminal_get_char(cx, cy);
+    color_t fg = terminal_get_color(cx, cy);
+
+    graphics_terminal_putchar(
+        c,
+        cx,
+        cy,
+        fg,
+        g_terminal.bg_color
+    );
+}
+
 void terminalUpdateCursor() {
-    serial_write_dec(g_terminal.cursor_visible);
+    // Erase old cursor
+    if (last_x != -1 && last_y != -1) {
+        erase_cursor(last_x, last_y);
+    }
+
+    if (!g_terminal.cursor_visible) {
+        last_x = -1;
+        last_y = -1;
+        return;
+    }
 
     uint32_t px = g_terminal.cursor_x * g_terminal.char_width;
     uint32_t py = g_terminal.cursor_y * g_terminal.char_height;
 
-    uint32_t cursor_y = py + g_terminal.char_height - 2;
+    uint32_t cy = py + g_terminal.char_height - 2;
 
     for (uint32_t x = 0; x < g_terminal.char_width; x++) {
-        color_t color = g_terminal.cursor_visible ? 
-                        g_terminal.fg_color : 
-                        g_terminal.bg_color;
-
-        graphics_write_pixel_c(px + x, cursor_y, color);
-        graphics_write_pixel_c(px + x, cursor_y + 1, color);
+        graphics_write_pixel_c(px + x, cy, g_terminal.fg_color);
+        graphics_write_pixel_c(px + x, cy + 1, g_terminal.fg_color);
     }
+
+    last_x = g_terminal.cursor_x;
+    last_y = g_terminal.cursor_y;
 }
 
 // ===========================================

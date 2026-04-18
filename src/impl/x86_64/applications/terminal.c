@@ -195,7 +195,6 @@ void terminal_process_command(const char* cmd) {
 
 void terminal_update(void) {
     while (1) {
-        usb_keyboard_update();
         
         // Process pending command
         if (command_ready) {
@@ -343,6 +342,7 @@ void terminal_program_entry(void) {
 
     terminalPrompt();
     createProcess("terminal_update", terminal_update);
+    createProcess("usb_keyboard_update", usb_keyboard_update);
     schedulerInit();
 
 }

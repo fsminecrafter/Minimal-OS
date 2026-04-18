@@ -185,6 +185,9 @@ void graphics_write_textr_hex64(uint64_t value);
 void graphics_write_textr_bin(uint64_t value);
 void graphics_write_textr_char(char c);
 
+// Demo helper used by gpu_test()
+void graphics_complete_demo(gpu_device_t* gpu);
+
 // Terminal control
 void graphics_terminal_clear(void);
 void graphics_terminal_newline(void);

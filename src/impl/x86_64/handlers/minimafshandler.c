@@ -3,6 +3,8 @@
 #include "x86_64/minimafs.h"
 #include "minimafshandler.h"
 #include "x86_64/exec_trace.h"
+#include "x86_64/allocator.h"
+#include "string.h"
 
 #include <stdbool.h>
 
@@ -227,7 +229,7 @@ minimafs_disk_device_t* initializeminimafs(int driveindex) {
     device = (minimafs_disk_device_t*)alloc(sizeof(minimafs_disk_device_t));
     if (!device) {
         serial_write_str("ERROR: Failed to allocate MinimaFS device wrapper\n");
-        return;
+        return NULL;
     }
     device->ahci_drive = disk;
     device->sector_size = disk->sector_size;
@@ -241,7 +243,7 @@ minimafs_disk_device_t* setdrive(ahci_drive_t* disk) {
     device = (minimafs_disk_device_t*)alloc(sizeof(minimafs_disk_device_t));
     if (!device) {
         serial_write_str("ERROR: Failed to allocate MinimaFS device wrapper\n");
-        return;
+        return NULL;
     }
     device->ahci_drive = disk;
     device->sector_size = disk->sector_size;

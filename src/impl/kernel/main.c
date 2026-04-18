@@ -18,6 +18,7 @@
 #include "prochandler.h"
 #include "usb/uhci.h"
 #include "x86_64/globaldatatable.h"
+#include "serial.h"
 
 #include "x86_64/ac97_driver.h"
 #include "audio.h"
@@ -82,7 +83,7 @@ void kernel_main(uint64_t mb2_info_addr) {
     terminal_init_keyboard();
 
     initializeGraphicsDevice();
-    char *proc_list[32];
+    const char* proc_list[32];
     getprocslistNames(proc_list, 32);
     serial_write_str(proc_list[0]);
 

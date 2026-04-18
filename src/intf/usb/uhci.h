@@ -18,5 +18,6 @@ bool usb_keyboard_init_device(usb_device_t* dev);
 
 // Keyboard polling
 void usb_poll_keyboard(usb_device_t* dev);
+void uhci_keyboard_interrupt_init(usb_device_t* dev);
 
 #endif // UHCI_H

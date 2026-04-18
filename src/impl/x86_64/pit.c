@@ -7,6 +7,7 @@
 #include "audio.h"
 #include "time.h"
 #include "panic.h"
+#include "usb/usb_stack.h"
 
 // PIT ports
 #define PIT_COMMAND_PORT 0x43

@@ -8,6 +8,7 @@
 #include "serial.h"
 #include "string.h"
 #include "time.h"
+#include "x86_64/scheduler.h"
 #include <stdbool.h>
 
 // ===========================================

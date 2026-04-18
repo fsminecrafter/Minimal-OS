@@ -65,7 +65,7 @@ void command_register(const char* name, command_func_t func) {
 }
 
 void command_execute(const char* input) {
-    serial_write("Executing...");
+    serial_write_str("Executing...");
     // Tokenize
     static char buffer[256];
     strncpy(buffer, input, sizeof(buffer));
@@ -112,7 +112,3 @@ void command_list(void) {
     
     graphics_write_textr(" commands\n");
 }
-
-#define REGISTER_COMMAND(fn) \
-    static void (*_reg_##fn)(void) \
-    __attribute__((used, section(".command_ctors"))) = fn;

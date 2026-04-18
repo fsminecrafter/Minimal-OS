@@ -12,6 +12,7 @@
 #include "string.h"
 #include "minimafshandler.h"
 #include "serial.h"
+#include "x86_64/allocator.h"
 
 // Test writing progressively larger files
 void cmd_testwrite(int argc, const char** argv) {

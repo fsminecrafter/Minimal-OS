@@ -39,17 +39,10 @@ struct IdtEntry {
 	uint32_t reserved;
 } __attribute__((packed));
 
-struct IdtPtr {
-	uint16_t limit;
-	uint64_t base;
-} __attribute__((packed));
-
 struct IdtEntry idt[256] __attribute__((aligned(16)));
 struct IdtPtr idt_ptr;
 
 void (*idt_handler_keyboard_user)();
-
-extern void idt_load(struct IdtPtr* idt_ptr);
 
 extern void idt_handler_keyboard_wrapped();
 
@@ -57,7 +50,7 @@ extern void idt_handler_keyboard_wrapped();
 void idt_reload() {
     idt_ptr.limit = sizeof(idt) - 1;
     idt_ptr.base  = (uint64_t)&idt;
-    lidt(&idt_ptr);
+    idt_load(&idt_ptr);
 }
 
 void idt_handler_keyboard() {
@@ -68,8 +61,6 @@ void idt_handler_keyboard() {
 	pic_eoi_master();
 }
 
-
-extern struct IdtEntry idt[256];
 
 void idt_set_entry(uint8_t vector,uint64_t isr_addr,uint16_t selector,uint8_t type_attr,uint8_t ist_index)
 {
@@ -110,7 +101,6 @@ void idt_handler_pit() {
 	pic_eoi_master();
 }
 
-__attribute__((noreturn))
 void idt_handler_doublefault() {
     PANIC("Double fault!");
     while (1) __asm__("hlt");

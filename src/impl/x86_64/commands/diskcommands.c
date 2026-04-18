@@ -11,6 +11,7 @@
 #include "systeminfo.h"
 #include "music.h"
 #include "x86_64/exec_trace.h"
+#include "x86_64/safeints.h"
 
 // ===========================================
 // FORMAT COMMAND

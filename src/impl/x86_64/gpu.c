@@ -133,7 +133,7 @@ bool gpu_init(gpu_device_t* gpu, pci_device_t* pci_dev, uint32_t width, uint32_t
         serial_write_hex(reg_size);
         serial_write_str("\n");
         
-        reg_va = mmio_alloc_va(reg_size);
+        reg_va = (uintptr_t)mmio_alloc_va(reg_size);
         
         serial_write_str("mmio_alloc_va returned for BAR2: ");
         serial_write_hex(reg_va);

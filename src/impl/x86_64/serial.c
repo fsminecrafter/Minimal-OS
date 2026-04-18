@@ -35,10 +35,9 @@ int serial_received() {
 }
 
 char serial_read() {
-    if (!initialized) return NULL;
-    if (!enabled) return;
+    if (!initialized || !enabled) return 0;
     while (serial_received() == 0);
-    return inb(SERIAL_COM1);
+    return (char)inb(SERIAL_COM1);
 }
 
 int serial_is_transmit_empty() {

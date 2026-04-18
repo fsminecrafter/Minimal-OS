@@ -84,7 +84,7 @@ void print_char(char character) {
     col++;
 }
 
-void print_str(char* str) {
+void print_str(const char* str) {
     for (size_t i = 0; 1; i++) {
         char character = (uint8_t) str[i];
 

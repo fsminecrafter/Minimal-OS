@@ -21,18 +21,20 @@ static inline uint64_t irq_save(const char* file, const char* func, int line) {
         return flags | IRQ_SAVE_DID_DISABLE;
     }
 
+    asm volatile("cli" ::: "memory");
     return flags;
 }
 
 static inline void irq_restore(uint64_t flags, const char* file, const char* func, int line) {
-    bool should_enable = flags & (1 << 9);
     bool did_disable = (flags & IRQ_SAVE_DID_DISABLE) != 0;
-
-    if (!did_disable) {
-        return;
-    }
+    if (!did_disable) return;
 
     trace_irq_restore(file, func, line);
+
+    // Actually re-enable interrupts if they were enabled before
+    if (flags & (1 << 9)) {
+        asm volatile("sti" ::: "memory");
+    }
 }
 
 void trace_assert_irq_consistency(const char* file, const char* func, int line);

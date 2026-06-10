@@ -21,7 +21,6 @@ static inline uint64_t irq_save(const char* file, const char* func, int line) {
         return flags | IRQ_SAVE_DID_DISABLE;
     }
 
-    asm volatile("cli" ::: "memory");
     return flags;
 }
 

@@ -66,9 +66,16 @@ void pci_write_config_dword(uint8_t bus, uint8_t device, uint8_t function, uint8
 
 // --- pci_read_data already replaced by port_inl above; can remove redundant functions ---
 
-uint32_t pci_read_data(void) {
+uint32_t pci_read_data(void)
+{
     uint32_t ret;
-    asm volatile ("inl %1, %0" : "=a"(ret) : "Nd"(PCI_CONFIG_DATA));
+
+    asm volatile (
+        "inl %w1, %0"
+        : "=a"(ret)
+        : "d"(PCI_CONFIG_DATA)
+    );
+
     return ret;
 }
 

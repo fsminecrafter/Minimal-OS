@@ -1,5 +1,5 @@
-CC := /opt/cross/bin/x86_64-elf-gcc
-LD := /opt/cross/bin/x86_64-elf-ld
+CC := $(HOME)/cross/bin/x86_64-elf-gcc
+LD := $(HOME)/cross/bin/x86_64-elf-ld
 
 kernel_source_files := $(shell find src/impl/kernel -name *.c)
 kernel_object_files := $(patsubst src/impl/kernel/%.c, build/kernel/%.o, $(kernel_source_files))
@@ -31,7 +31,7 @@ build/x86_64/%.o: src/impl/x86_64/%.asm
 
 build/resources/%.o: src/resources/%.wav
 	mkdir -p $(dir $@)
-	python tools/audioconverter/wavtoadi.py --format IADPCM --object-file $< $@
+	python3 tools/audioconverter/wavtoadi.py --format IADPCM --object-file $< $@
 
 .PHONY: build-x86_64
 build-x86_64: $(kernel_object_files) $(x86_64_object_files) $(audio_object_files) 

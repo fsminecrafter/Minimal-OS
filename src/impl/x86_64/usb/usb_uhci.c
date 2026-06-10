@@ -407,96 +407,78 @@ bool uhci_init(pci_device_t* dev) {
 
 static void uhci_reset_port(uint8_t port) {
     uint16_t port_reg = (port == 0) ? UHCI_PORTSC1 : UHCI_PORTSC2;
-    
+
     serial_write_str("UHCI: Resetting port ");
     serial_write_dec(port);
     serial_write_str("\n");
-    
-    // Read initial status
-    uint16_t val = uhci_read16(port_reg);
-    serial_write_str("UHCI: Port status before reset: 0x");
-    serial_write_hex(val);
-    serial_write_str("\n");
-    
+
+    uint16_t val;
+
     // Disable port first
+    val = uhci_read16(port_reg);
     val &= ~UHCI_PORT_PED;
     uhci_write16(port_reg, val);
-    sleep(20);  // Wait for disable
-    
-    // Clear any status change bits (write 1 to clear)
+
+    // Busy-spin 20ms (safe before scheduler is running)
+    for (volatile uint32_t i = 0; i < 200000; i++) asm volatile("nop");
+
+    // Clear status change bits
     val = uhci_read16(port_reg);
-    if (val & UHCI_PORT_CSC) {
-        uhci_write16(port_reg, val | UHCI_PORT_CSC);  // Clear CSC
+    if (val & UHCI_PORT_CSC)  uhci_write16(port_reg, val | UHCI_PORT_CSC);
+    if (val & UHCI_PORT_PEDC) uhci_write16(port_reg, val | UHCI_PORT_PEDC);
+
+    // Assert reset for 60ms (busy-spin, reliable regardless of scheduler state)
+    val = uhci_read16(port_reg) | UHCI_PORT_PR;
+    uhci_write16(port_reg, val);
+    for (volatile uint32_t i = 0; i < 600000; i++) asm volatile("nop");
+
+    // De-assert reset
+    val = uhci_read16(port_reg) & ~UHCI_PORT_PR;
+    uhci_write16(port_reg, val);
+
+    // Recovery delay: 20ms busy-spin
+    for (volatile uint32_t i = 0; i < 200000; i++) asm volatile("nop");
+
+    // Enable port with up to 5 retries
+    for (int attempt = 0; attempt < 5; attempt++) {
+        val = uhci_read16(port_reg);
+
+        // Clear any change bits
+        if (val & (UHCI_PORT_CSC | UHCI_PORT_PEDC)) {
+            uhci_write16(port_reg, val | UHCI_PORT_CSC | UHCI_PORT_PEDC);
+            for (volatile uint32_t i = 0; i < 50000; i++) asm volatile("nop");
+            val = uhci_read16(port_reg);
+        }
+
+        // Try to enable
+        uhci_write16(port_reg, val | UHCI_PORT_PED);
+
+        // Wait 50ms for enable to take effect
+        for (volatile uint32_t i = 0; i < 500000; i++) asm volatile("nop");
+
+        val = uhci_read16(port_reg);
+        if (val & UHCI_PORT_PED) {
+            serial_write_str("UHCI: Port enabled on attempt ");
+            serial_write_dec(attempt + 1);
+            serial_write_str("\n");
+            break;
+        }
+
+        serial_write_str("UHCI: Port enable attempt ");
+        serial_write_dec(attempt + 1);
+        serial_write_str(" failed, retrying\n");
     }
-    if (val & UHCI_PORT_PEDC) {
-        uhci_write16(port_reg, val | UHCI_PORT_PEDC);  // Clear PEDC
-    }
-    
-    // Start reset - MUST be at least 50ms
+
+    // Final 200ms stabilization
+    for (volatile uint32_t i = 0; i < 2000000; i++) asm volatile("nop");
+
     val = uhci_read16(port_reg);
-    val |= UHCI_PORT_PR;
-    uhci_write16(port_reg, val);
-    
-    serial_write_str("UHCI: Reset asserted, waiting 50ms\n");
-    sleep(50);  // USB spec minimum
-    
-    // Clear reset
-    val = uhci_read16(port_reg);
-    val &= ~UHCI_PORT_PR;
-    uhci_write16(port_reg, val);
-    
-    serial_write_str("UHCI: Reset cleared, waiting 10ms recovery\n");
-    sleep(10);  // USB spec minimum recovery
-    
-    // Enable port
-    val = uhci_read16(port_reg);
-    val |= UHCI_PORT_PED;
-    uhci_write16(port_reg, val);
-    
-    serial_write_str("UHCI: Port enabled, waiting 200ms stabilization\n");
-    sleep(200);  // CRITICAL: Give device time to stabilize!
-    
-    // Check final status
-    val = uhci_read16(port_reg);
-    serial_write_str("UHCI: Port status after reset: 0x");
+    serial_write_str("UHCI: Port final status: 0x");
     serial_write_hex(val);
-    
-    if (val & UHCI_PORT_PED) {
-        serial_write_str(" [ENABLED]");
-    } else {
-        serial_write_str(" [DISABLED]");
-    }
-    
-    if (val & UHCI_PORT_CCS) {
-        serial_write_str(" [CONNECTED]");
-    } else {
-        serial_write_str(" [DISCONNECTED]");
-    }
-    
-    if (val & UHCI_PORT_LSDA) {
-        serial_write_str(" [LOW-SPEED]");
-    } else {
-        serial_write_str(" [FULL-SPEED]");
-    }
-    
-    if (val & UHCI_PORT_CSC) {
-        serial_write_str(" [STATUS-CHANGED]");
-    }
-    
-    if (val & UHCI_PORT_PEDC) {
-        serial_write_str(" [ENABLE-CHANGED]");
-    }
-    
+    serial_write_str(val & UHCI_PORT_PED ? " [ENABLED]" : " [DISABLED]");
+    serial_write_str(val & UHCI_PORT_CCS ? " [CONNECTED]" : " [DISCONNECTED]");
+    serial_write_str(val & UHCI_PORT_LSDA ? " [LOW-SPEED]" : " [FULL-SPEED]");
     serial_write_str("\n");
-    
-    // Verify port is actually enabled
-    if (!(val & UHCI_PORT_PED)) {
-        serial_write_str("UHCI: WARNING - Port did not enable!\n");
-    }
-    
-    if (!(val & UHCI_PORT_CCS)) {
-        serial_write_str("UHCI: WARNING - Device disconnected!\n");
-    }
 }
 
 // ===========================================

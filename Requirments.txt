@@ -20,12 +20,21 @@ sudo apt install -y \
   texinfo \
   libisl-dev \
   wget \
-  curl
-
+  curl \
+  make \
+  nasm \
+  xorriso \
+  grub-pc-bin \
+  grub-common \
+  mtools
 
 Build GCC
 
 Build Binutils
+
+Create sata256.img
+
+fallocate -l 256M sata256.img
 
 ;;;
 

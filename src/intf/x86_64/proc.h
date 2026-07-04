@@ -22,21 +22,33 @@ typedef struct process {
     uint64_t pid;                      // Process ID
     char name[MAX_PROCESS_NAME_LEN];   // Process name
     process_state_t state;             // Current state
-    
+
     // Register state (for context switching)
     uint64_t regs[9];                  // RBX, RBP, R12-R15, RSP, RIP, RFLAGS
-    
+
     // Memory management
     uint64_t pml4;                     // Page table (physical address)
     uint64_t* kernel_stack;            // Kernel stack pointer
-    
+
     // Timing
     uint64_t wake_time_ms;             // When to wake if sleeping (0 = not sleeping)
     uint64_t cpu_time_ms;              // Total CPU time used
     uint64_t creation_time_ms;         // When process was created
-    
+
     // Linked list
     struct process* next;              // Next process in list
+
+    // Real process entry point. regs[7] (the saved RIP) is ALWAYS set
+    // to the internal trampoline (proc_trampoline in proc.c), never to
+    // this pointer directly - see proc_trampoline()'s comment for why.
+    //
+    // IMPORTANT: this field is appended at the very END of the struct
+    // on purpose. context_switch.asm indexes into this struct using
+    // hard-coded byte offsets (regs at 0x90, pml4 at 0xD8, kernel_stack
+    // at 0xE0). No field before `next` may ever move, grow, or shrink
+    // without updating that assembly to match. Adding a field after
+    // all of them is safe.
+    void (*entry_point)();
 } process_t;
 
 // Global process list head (defined in proc.c)

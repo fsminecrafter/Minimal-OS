@@ -56,6 +56,28 @@ void audioupdate(void) {
     }
 }
 
+/*
+ * usb_keyboard_update() (declared in keyboard/usbkeyboard.h) is a
+ * single-pass function meant to be invoked periodically - it checks
+ * whether the currently-held key has been down long enough to fire a
+ * repeat, then returns. It has no internal loop.
+ *
+ * It must NOT be used directly as a process entry point: every process
+ * entry function is expected to either loop forever or terminate
+ * itself via process_exit()/kill(). A function that simply returns
+ * once is now caught by proc_trampoline()'s safety net (so it can no
+ * longer corrupt/hang the system), but running it only once still
+ * means USB key-repeat handling would silently stop working after the
+ * very first tick. This wrapper gives it the periodic loop it actually
+ * needs.
+ */
+void usb_keyboard_update_task(void) {
+    while (1) {
+        usb_keyboard_update();
+        sleep(10);
+    }
+}
+
 void kernel_main(uint64_t mb2_info_addr) {
     multiboot2_info_t* mb_info = (multiboot2_info_t*)mb2_info_addr;
     uint64_t total_ram_bytes = get_total_memory(mb_info);
@@ -81,7 +103,7 @@ void kernel_main(uint64_t mb2_info_addr) {
     addvar(total_ram_bytes, "totalrambytes");
 
     pci_enumerate_all();
-    
+
     if (usb_init()) {
         serial_write_str("USB keyboard available!\n");
     } else {
@@ -106,7 +128,7 @@ void kernel_main(uint64_t mb2_info_addr) {
     time_set_datetime(&dt);
 
     audio_init();
-    
+
     // Initialize hardware driver (AC97)
     if (!ac97_init()) {
         serial_write_str("ERROR: Audio hardware not found!\n");
@@ -115,6 +137,6 @@ void kernel_main(uint64_t mb2_info_addr) {
     sti();
     createProcess("busy", busy);
     createProcess("kernelaudio", audioupdate);
-    terminal_program_entry();    
+    terminal_program_entry();
     while(1);
 }

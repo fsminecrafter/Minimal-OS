@@ -89,56 +89,51 @@ static inline bool minimafs_irq_enabled(uint64_t flags) {
 /*
  * Sleep for approximately `ms` milliseconds during block I/O pacing.
  *
- * SAFETY: this must NEVER be able to hang forever, even if the kernel's
- * interrupt-audit bookkeeping (exec_trace.c / safeints.h) has become
- * desynchronized from the real CPU interrupt-enable state. That can
- * happen under preemptive scheduling because the audit stack is a
- * single global stack shared by every process context, not something
- * scoped per-context, and a timer interrupt can context-switch away
- * mid "cli-protected region" from a totally unrelated call site.
+ * SAFETY CONTRACT: this function must return in bounded time under ALL
+ * circumstances - even if the PIT has stopped ticking, interrupts are
+ * (correctly or incorrectly) disabled when we're called, or this
+ * kernel's interrupt-audit bookkeeping (exec_trace.c / safeints.h) has
+ * desynced from the real CPU state.
  *
- * If we ever trusted that bookkeeping to justify an *unbounded* hlt
- * loop and it turned out interrupts were actually disabled at the
- * hardware level, hlt would halt the CPU permanently with nothing able
- * to wake it. So here we never trust it for correctness:
- *   - we force interrupts on ourselves before waiting (nothing on this
- *     path legitimately needs them off),
- *   - we cap how many hlt attempts we'll make,
- *   - we always finish with a bounded, interrupt-independent busy-spin,
- *     so this function is guaranteed to return.
+ * For that reason this function deliberately never executes `hlt`.
+ * `hlt` with real IF=0 halts the CPU until the next interrupt, and
+ * nothing guarantees one will ever arrive - so a single wrong
+ * assumption about interrupt state turns "sleep 5ms" into "freeze
+ * forever". A calibrated busy-spin wastes some CPU time but is
+ * guaranteed to terminate.
  */
 static void minimafs_sleep_ms(uint32_t ms) {
     if (ms == 0) return;
 
     uint64_t start = time_get_uptime_ms();
 
-    /* Generous bound: each attempt should return almost immediately
-     * once the PIT fires. If interrupts are somehow still not really
-     * working, we bail out after this many tries instead of trusting
-     * hlt to always wake up. */
-    const uint32_t MAX_HLT_ATTEMPTS = 2000;
-    uint32_t attempts = 0;
+    /* Primary path: poll the uptime clock. This works as long as the
+     * PIT is still ticking somewhere in the system, regardless of our
+     * own interrupt-enable state right here - it only requires that
+     * *something* is still calling pit_irq_handler(), not that this
+     * function itself has interrupts enabled. */
+    const uint32_t MAX_POLL_ITERATIONS = 20000000u; /* hard upper bound */
+    uint32_t iterations = 0;
 
-    while ((time_get_uptime_ms() - start) < ms && attempts < MAX_HLT_ATTEMPTS) {
-        /* sti;hlt is the standard atomic "enable interrupts and wait
-         * for one" idiom: sti guarantees the CPU cannot be interrupted
-         * again until after the very next instruction executes, so
-         * there's no race where an interrupt slips in between enabling
-         * and halting. We force sti unconditionally here rather than
-         * trusting tracked state, since nothing on this call path
-         * should ever have interrupts legitimately disabled. */
-        asm volatile("sti; hlt" ::: "memory");
-        attempts++;
+    while ((time_get_uptime_ms() - start) < ms) {
+        asm volatile("pause" ::: "memory");
+        if (++iterations >= MAX_POLL_ITERATIONS) {
+            /* Clock genuinely isn't advancing (timer stalled/masked).
+             * Stop polling a dead clock and fall through to the fixed
+             * fallback below instead. */
+            break;
+        }
     }
 
-    /* Bounded, interrupt-independent fallback for whatever time is
-     * left (zero if the loop above already satisfied the delay). This
-     * guarantees the function terminates regardless of timer/IRQ state. */
-    uint64_t now = time_get_uptime_ms();
-    uint64_t remaining_ms = (now - start < ms) ? (ms - (now - start)) : 0;
-
-    for (volatile uint32_t i = 0; i < (uint32_t)(remaining_ms * 10000u); i++) {
-        asm volatile("nop");
+    /* Fallback path: a fixed-iteration nop spin that does not depend on
+     * time_get_uptime_ms() advancing at all. Guarantees this function
+     * always returns even if the timer has completely stopped. The
+     * iteration count is a rough estimate, not calibrated to exact CPU
+     * speed - it only needs to be "a short, bounded delay". */
+    if ((time_get_uptime_ms() - start) < ms) {
+        for (volatile uint32_t i = 0; i < (ms * 100000u); i++) {
+            asm volatile("nop");
+        }
     }
 }
 

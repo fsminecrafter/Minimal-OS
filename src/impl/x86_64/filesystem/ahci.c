@@ -35,34 +35,36 @@ static inline bool ahci_irq_enabled(uint64_t flags) {
     return (flags & (1ULL << 9)) != 0;
 }
 
+
 /*
  * Sleep for approximately `ms` milliseconds.
  *
- * SAFETY: must never be able to hang forever — see the matching comment
- * on minimafs_sleep_ms() in minimafs.c for the full rationale. In short:
- * the interrupt-enabled bookkeeping this kernel uses is a single global
- * stack shared across all process contexts and can desync from the real
- * CPU state across a context switch, so we must not gate an unbounded
- * hlt loop purely on that tracked state.
+ * SAFETY CONTRACT: matches minimafs_sleep_ms() in minimafs.c - this
+ * function must always return in bounded time, so it never executes
+ * `hlt`. See that function's comment for the full rationale: hlt with
+ * real IF=0 can halt the CPU forever with no guaranteed wakeup, and
+ * this kernel's interrupt-audit bookkeeping has already been observed
+ * to desync from the real CPU state, so it cannot be trusted to decide
+ * whether hlt is safe here.
  */
 static void ahci_sleep_ms(uint32_t ms) {
     if (ms == 0) return;
 
     uint64_t start = time_get_uptime_ms();
+    const uint32_t MAX_POLL_ITERATIONS = 20000000u;
+    uint32_t iterations = 0;
 
-    const uint32_t MAX_HLT_ATTEMPTS = 2000;
-    uint32_t attempts = 0;
-
-    while ((time_get_uptime_ms() - start) < ms && attempts < MAX_HLT_ATTEMPTS) {
-        asm volatile("sti; hlt" ::: "memory");
-        attempts++;
+    while ((time_get_uptime_ms() - start) < ms) {
+        asm volatile("pause" ::: "memory");
+        if (++iterations >= MAX_POLL_ITERATIONS) {
+            break;
+        }
     }
 
-    uint64_t now = time_get_uptime_ms();
-    uint64_t remaining_ms = (now - start < ms) ? (ms - (now - start)) : 0;
-
-    for (volatile uint32_t i = 0; i < (uint32_t)(remaining_ms * 10000u); i++) {
-        asm volatile("nop");
+    if ((time_get_uptime_ms() - start) < ms) {
+        for (volatile uint32_t i = 0; i < (ms * 100000u); i++) {
+            asm volatile("nop");
+        }
     }
 }
 

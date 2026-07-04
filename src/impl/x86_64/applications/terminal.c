@@ -14,6 +14,8 @@
 #include "vgaterm.h"
 #include "minimafshandler.h"
 
+void usb_keyboard_update_task(void);
+
 // ===========================================
 // TERMINAL STATE
 // ===========================================
@@ -342,7 +344,7 @@ void terminal_program_entry(void) {
 
     terminalPrompt();
     createProcess("terminal_update", terminal_update);
-    createProcess("usb_keyboard_update", usb_keyboard_update);
+    createProcess("usb_keyboard_update", usb_keyboard_update_task);
     schedulerInit();
 
 }

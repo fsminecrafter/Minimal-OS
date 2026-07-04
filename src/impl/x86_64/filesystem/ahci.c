@@ -35,21 +35,34 @@ static inline bool ahci_irq_enabled(uint64_t flags) {
     return (flags & (1ULL << 9)) != 0;
 }
 
+/*
+ * Sleep for approximately `ms` milliseconds.
+ *
+ * SAFETY: must never be able to hang forever — see the matching comment
+ * on minimafs_sleep_ms() in minimafs.c for the full rationale. In short:
+ * the interrupt-enabled bookkeeping this kernel uses is a single global
+ * stack shared across all process contexts and can desync from the real
+ * CPU state across a context switch, so we must not gate an unbounded
+ * hlt loop purely on that tracked state.
+ */
 static void ahci_sleep_ms(uint32_t ms) {
-    uint64_t flags = irq_save(__FILE__, __func__, __LINE__);
-    bool ints_enabled = ahci_irq_enabled(flags);
-    irq_restore(flags, __FILE__, __func__, __LINE__);
+    if (ms == 0) return;
 
-    if (ints_enabled) {
-        uint64_t start = time_get_uptime_ms();
-        while (time_get_uptime_ms() - start < ms) {
-            asm volatile("hlt");
-        }
-    } else {
-        // If interrupts are off, avoid time-based waits and do a short busy spin.
-        for (volatile uint32_t i = 0; i < (ms * 10000u); i++) {
-            asm volatile("nop");
-        }
+    uint64_t start = time_get_uptime_ms();
+
+    const uint32_t MAX_HLT_ATTEMPTS = 2000;
+    uint32_t attempts = 0;
+
+    while ((time_get_uptime_ms() - start) < ms && attempts < MAX_HLT_ATTEMPTS) {
+        asm volatile("sti; hlt" ::: "memory");
+        attempts++;
+    }
+
+    uint64_t now = time_get_uptime_ms();
+    uint64_t remaining_ms = (now - start < ms) ? (ms - (now - start)) : 0;
+
+    for (volatile uint32_t i = 0; i < (uint32_t)(remaining_ms * 10000u); i++) {
+        asm volatile("nop");
     }
 }
 

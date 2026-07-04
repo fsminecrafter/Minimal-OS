@@ -273,13 +273,19 @@ void listdisk_recursive(const char* path, int indent) {
     graphics_write_textr(path);
     graphics_write_textr("/\n");
 
-    // Collect subdir names before freeing folder
     uint32_t entry_count = folder->entry_count;
 
-    // Print all entries and collect subdir paths
-    // We process files first, then recurse into dirs after freeing folder
-    char subdirs[MINIMAFS_MAX_ROOT_ENTRIES][MINIMAFS_MAX_PATH];
+    // HEAP — 64 * 1024 bytes is 16x the 4KB kernel stack; never on-stack,
+    // especially in a recursive function.
+    char (*subdirs)[MINIMAFS_MAX_PATH] =
+    (char (*)[MINIMAFS_MAX_PATH])alloc(MINIMAFS_MAX_ROOT_ENTRIES * MINIMAFS_MAX_PATH);
     uint32_t subdir_count = 0;
+
+    if (!subdirs) {
+        serial_write_str("listdisk_recursive: OOM allocating subdirs buffer\n");
+        free_mem(folder);
+        return;
+    }
 
     for (uint32_t i = 0; i < entry_count; i++) {
         minimafs_dir_entry_t* entry = &folder->entries[i];
@@ -304,10 +310,12 @@ void listdisk_recursive(const char* path, int indent) {
 
     free_mem(folder);
 
-    // Now recurse into subdirs with folder freed
+    // Recurse into subdirs with folder already freed
     for (uint32_t i = 0; i < subdir_count; i++) {
         listdisk_recursive(subdirs[i], indent + 1);
     }
+
+    free_mem(subdirs);
 }
 
 void cmd_listdisk(int argc, const char** argv) {

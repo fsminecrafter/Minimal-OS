@@ -86,18 +86,59 @@ static inline bool minimafs_irq_enabled(uint64_t flags) {
     return (flags & (1ULL << 9)) != 0;
 }
 
+/*
+ * Sleep for approximately `ms` milliseconds during block I/O pacing.
+ *
+ * SAFETY: this must NEVER be able to hang forever, even if the kernel's
+ * interrupt-audit bookkeeping (exec_trace.c / safeints.h) has become
+ * desynchronized from the real CPU interrupt-enable state. That can
+ * happen under preemptive scheduling because the audit stack is a
+ * single global stack shared by every process context, not something
+ * scoped per-context, and a timer interrupt can context-switch away
+ * mid "cli-protected region" from a totally unrelated call site.
+ *
+ * If we ever trusted that bookkeeping to justify an *unbounded* hlt
+ * loop and it turned out interrupts were actually disabled at the
+ * hardware level, hlt would halt the CPU permanently with nothing able
+ * to wake it. So here we never trust it for correctness:
+ *   - we force interrupts on ourselves before waiting (nothing on this
+ *     path legitimately needs them off),
+ *   - we cap how many hlt attempts we'll make,
+ *   - we always finish with a bounded, interrupt-independent busy-spin,
+ *     so this function is guaranteed to return.
+ */
 static void minimafs_sleep_ms(uint32_t ms) {
-    uint64_t flags = irq_save(__FILE__, "minimafs_sleep_ms", __LINE__);
-    bool ints_enabled = minimafs_irq_enabled(flags);
-    irq_restore(flags, __FILE__, "minimafs_sleep_ms", __LINE__);
+    if (ms == 0) return;
 
-    if (ints_enabled) {
-        uint64_t start = time_get_uptime_ms();
-        while (time_get_uptime_ms() - start < ms)
-            asm volatile("hlt");
-    } else {
-        for (volatile uint32_t i = 0; i < (ms * 10000u); i++)
-            asm volatile("nop");
+    uint64_t start = time_get_uptime_ms();
+
+    /* Generous bound: each attempt should return almost immediately
+     * once the PIT fires. If interrupts are somehow still not really
+     * working, we bail out after this many tries instead of trusting
+     * hlt to always wake up. */
+    const uint32_t MAX_HLT_ATTEMPTS = 2000;
+    uint32_t attempts = 0;
+
+    while ((time_get_uptime_ms() - start) < ms && attempts < MAX_HLT_ATTEMPTS) {
+        /* sti;hlt is the standard atomic "enable interrupts and wait
+         * for one" idiom: sti guarantees the CPU cannot be interrupted
+         * again until after the very next instruction executes, so
+         * there's no race where an interrupt slips in between enabling
+         * and halting. We force sti unconditionally here rather than
+         * trusting tracked state, since nothing on this call path
+         * should ever have interrupts legitimately disabled. */
+        asm volatile("sti; hlt" ::: "memory");
+        attempts++;
+    }
+
+    /* Bounded, interrupt-independent fallback for whatever time is
+     * left (zero if the loop above already satisfied the delay). This
+     * guarantees the function terminates regardless of timer/IRQ state. */
+    uint64_t now = time_get_uptime_ms();
+    uint64_t remaining_ms = (now - start < ms) ? (ms - (now - start)) : 0;
+
+    for (volatile uint32_t i = 0; i < (uint32_t)(remaining_ms * 10000u); i++) {
+        asm volatile("nop");
     }
 }
 
@@ -1911,70 +1952,86 @@ bool minimafs_write_file_segments(const char* path,
                                   const void* seg1, uint32_t seg1_len,
                                   const void* seg2, uint32_t seg2_len,
                                   const char* filetype, const char* fileformat) {
-    uint8_t drive_num;
-    char local_path[MINIMAFS_MAX_PATH];
-    if (!minimafs_parse_path(path, &drive_num, local_path)) return false;
+    bool result = false;
 
-    minimafs_drive_t* drive = get_drive(drive_num);
-    if (!drive || !drive->mounted) return false;
+    /* HEAP — local_path/parent are 1KB each and metadata is ~2.5KB.
+     * Combined they overflow the 4KB kernel stack on their own, before
+     * counting the caller's or callee's frame. Must never be on-stack. */
+    char* local_path = (char*)alloc_unzeroed(MINIMAFS_MAX_PATH);
+    char* filename    = (char*)alloc_unzeroed(MINIMAFS_MAX_FILENAME);
+    char* parent      = (char*)alloc_unzeroed(MINIMAFS_MAX_PATH);
+    minimafs_file_metadata_t* metadata =
+    (minimafs_file_metadata_t*)alloc(sizeof(minimafs_file_metadata_t));
+    minimafs_folder_desc_t* pd = NULL;
 
-    char filename[MINIMAFS_MAX_FILENAME];
-    char parent[MINIMAFS_MAX_PATH];
+    uint8_t drive_num = 0;
+    minimafs_drive_t* drive = NULL;
+    uint32_t idx = 0;
+    bool exists = false;
+
+    if (!local_path || !filename || !parent || !metadata) {
+        serial_write_str("MinimaFS: OOM in write_file_segments\n");
+        goto cleanup;
+    }
+
+    if (!minimafs_parse_path(path, &drive_num, local_path)) goto cleanup;
+
+    drive = get_drive(drive_num);
+    if (!drive || !drive->mounted) goto cleanup;
+
     minimafs_split_local_path(local_path, parent, filename);
 
-    /* HEAP – was on stack (crash!) */
-    minimafs_folder_desc_t* pd =
-        (minimafs_folder_desc_t*)alloc(sizeof(minimafs_folder_desc_t));
-    if (!pd) return false;
+    pd = (minimafs_folder_desc_t*)alloc(sizeof(minimafs_folder_desc_t));
+    if (!pd) goto cleanup;
 
-    if (!minimafs_read_folder_desc(drive, parent, pd)) {
-        free_mem(pd); return false;
-    }
+    if (!minimafs_read_folder_desc(drive, parent, pd)) goto cleanup;
 
-    uint32_t idx = 0;
-    bool exists = minimafs_find_entry_in_folder(pd, filename, &idx);
-    if (exists && pd->entries[idx].type == MINIMAFS_TYPE_DIR) {
-        free_mem(pd); return false;
-    }
+    exists = minimafs_find_entry_in_folder(pd, filename, &idx);
+    if (exists && pd->entries[idx].type == MINIMAFS_TYPE_DIR) goto cleanup;
 
-    minimafs_file_metadata_t metadata;
-    memset(&metadata, 0, sizeof(metadata));
-    strncpy(metadata.filename,      filename, sizeof(metadata.filename)      - 1);
-    strncpy(metadata.filetype,      filetype ? filetype : "binary",
-            sizeof(metadata.filetype)      - 1);
-    strncpy(metadata.fileformat,    fileformat ? fileformat : "bin",
-            sizeof(metadata.fileformat)    - 1);
-    strncpy(metadata.parent_folder, parent,   sizeof(metadata.parent_folder) - 1);
-    minimafs_get_datetime(metadata.created_date, sizeof(metadata.created_date));
-    minimafs_get_datetime(metadata.last_changed, sizeof(metadata.last_changed));
+    memset(metadata, 0, sizeof(*metadata));
+    strncpy(metadata->filename,      filename, sizeof(metadata->filename)      - 1);
+    strncpy(metadata->filetype,      filetype ? filetype : "binary",
+            sizeof(metadata->filetype)      - 1);
+    strncpy(metadata->fileformat,    fileformat ? fileformat : "bin",
+            sizeof(metadata->fileformat)    - 1);
+    strncpy(metadata->parent_folder, parent,   sizeof(metadata->parent_folder) - 1);
+    minimafs_get_datetime(metadata->created_date, sizeof(metadata->created_date));
+    minimafs_get_datetime(metadata->last_changed, sizeof(metadata->last_changed));
 
     if (exists) {
-        metadata.block_offset = pd->entries[idx].block_offset;
-        metadata.block_count  = pd->entries[idx].block_count;
-        metadata.hidden       = pd->entries[idx].hidden;
+        metadata->block_offset = pd->entries[idx].block_offset;
+        metadata->block_count  = pd->entries[idx].block_count;
+        metadata->hidden       = pd->entries[idx].hidden;
     }
 
-    if (!minimafs_write_file_to_disk_segments(drive, local_path, &metadata,
-                                              seg1, seg1_len, seg2, seg2_len)) {
-        free_mem(pd); return false;
-    }
+    if (!minimafs_write_file_to_disk_segments(drive, local_path, metadata,
+        seg1, seg1_len, seg2, seg2_len)) {
+        goto cleanup;
+        }
 
-    if (!exists) {
-        if (pd->entry_count >= 256) { free_mem(pd); return false; }
-        idx = pd->entry_count++;
-        memset(&pd->entries[idx], 0, sizeof(minimafs_dir_entry_t));
-        strncpy(pd->entries[idx].name, filename,
-                sizeof(pd->entries[idx].name) - 1);
-        pd->entries[idx].type = MINIMAFS_TYPE_FILE;
-    }
-    pd->entries[idx].block_offset = metadata.block_offset;
-    pd->entries[idx].block_count  = metadata.block_count;
-    pd->entries[idx].hidden       = metadata.hidden;
+        if (!exists) {
+            if (pd->entry_count >= 256) goto cleanup;
+            idx = pd->entry_count++;
+            memset(&pd->entries[idx], 0, sizeof(minimafs_dir_entry_t));
+            strncpy(pd->entries[idx].name, filename,
+                    sizeof(pd->entries[idx].name) - 1);
+            pd->entries[idx].type = MINIMAFS_TYPE_FILE;
+        }
+        pd->entries[idx].block_offset = metadata->block_offset;
+        pd->entries[idx].block_count  = metadata->block_count;
+        pd->entries[idx].hidden       = metadata->hidden;
 
-    bool ok = minimafs_write_folder_desc(drive, pd);
-    free_mem(pd);
-    return ok;
-}
+        result = minimafs_write_folder_desc(drive, pd);
+
+        cleanup:
+        if (pd)         free_mem(pd);
+        if (metadata)   free_mem(metadata);
+        if (parent)     free_mem(parent);
+        if (filename)   free_mem(filename);
+        if (local_path) free_mem(local_path);
+        return result;
+                                  }
 
 /* ================================================================
  * UTILITY

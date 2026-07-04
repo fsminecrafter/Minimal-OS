@@ -28,9 +28,10 @@ sudo apt install -y \
   grub-common \
   mtools
 
-Build GCC
+  Build Tools
 
-Build Binutils
+  ./build_gccbinutils.sh
+
 
 Create sata256.img
 

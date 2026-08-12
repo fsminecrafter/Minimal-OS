@@ -1,4 +1,4 @@
-// Audio metadata for /mnt/WDC-Drive/Minimal-OS/build/resources/music.o
+// Audio metadata for /run/media/fsminecrafter/TheSoup/Minimal-OS/build/resources/music.o
 #define AUDIO_FORMAT "IADPCM"
 #define AUDIO_LENGTH 214
 #define AUDIO_DATALEN 2365414

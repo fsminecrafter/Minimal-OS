@@ -109,7 +109,25 @@ void kernel_main(uint64_t mb2_info_addr) {
     } else {
         serial_write_str("Falling back to PS/2\n");
     }
-    terminal_init_keyboard();
+
+    /*
+     * NOTE: terminal_init_keyboard() used to be called here AND again
+     * inside terminal_program_entry() a little further down. That
+     * double call was redundant (harmless, but wasteful - it re-runs
+     * usb_keyboard_init()/layout load/callback registration and
+     * re-logs USB-vs-PS/2 detection a second time) so it has been
+     * removed from here; terminal_program_entry() is the single place
+     * that now initializes the keyboard, right before the terminal
+     * actually needs it.
+     *
+     * This was NOT the cause of the intermittent PS/2 fallback -
+     * terminal_init_keyboard() never touches the USB host controller's
+     * enumeration state, only this driver's own HID-report processing
+     * state. The real cause was sleep() silently no-op'ing during
+     * usb_init()'s enumeration because no process exists yet at this
+     * point in boot - see the fix and comment in scheduler.c's
+     * sleep().
+     */
 
     initializeGraphicsDevice();
     const char* proc_list[32];

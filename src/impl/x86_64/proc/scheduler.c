@@ -39,13 +39,13 @@ void schedulerInit() {
 // Wake up sleeping processes whose time has come
 static void wake_sleeping_processes() {
     uint64_t current_time = time_get_uptime_ms();
-    
+
     for (process_t* proc = proc_list_head; proc != NULL; proc = proc->next) {
         if (proc->state == PROCESS_WAITING && proc->wake_time_ms > 0) {
             if (current_time >= proc->wake_time_ms) {
                 proc->state = PROCESS_READY;
                 proc->wake_time_ms = 0;
-                
+
                 static uint64_t last_wake_log = 0;
 
                 if (SCHED_DEBUG >= 2) {
@@ -84,14 +84,14 @@ void currentstate() {
 // Find next ready process using round-robin
 static process_t* find_next_ready_process() {
     if (!proc_list_head) return NULL;
-    
+
     // Start from next process after current, or from head if no current
-    process_t* start = current_process ? 
-        (current_process->next ? current_process->next : proc_list_head) : 
-        proc_list_head;
-    
+    process_t* start = current_process ?
+    (current_process->next ? current_process->next : proc_list_head) :
+    proc_list_head;
+
     process_t* next = start;
-    
+
     // Look for a READY process
     do {
         if (next->state == PROCESS_READY) {
@@ -99,20 +99,20 @@ static process_t* find_next_ready_process() {
         }
         next = next->next ? next->next : proc_list_head;
     } while (next != start);
-    
+
     // If current process is still runnable, keep it
-    if (current_process && 
-        (current_process->state == PROCESS_RUNNING || 
-         current_process->state == PROCESS_READY)) {
+    if (current_process &&
+        (current_process->state == PROCESS_RUNNING ||
+        current_process->state == PROCESS_READY)) {
         return current_process;
-    }
-    
-    return NULL;
+        }
+
+        return NULL;
 }
 
 // Main scheduling function
 void schedule() {
-    
+
     // Clean up ZOMBIE or TERMINATED processes
     process_t* prev = NULL;
     process_t* curr = proc_list_head;
@@ -161,7 +161,7 @@ void schedule() {
             PANIC("No processes to schedule, but scheduler called");
         }
         current_process->state = PROCESS_RUNNING;
-        
+
         serial_write_str("Starting first process: ");
         serial_write_str(current_process->name);
         serial_write_str("\n");
@@ -185,13 +185,13 @@ void schedule() {
 
     // Perform context switch
     process_t* old = current_process;
-    
+
     // Update states
     if (old->state == PROCESS_RUNNING) {
         old->state = PROCESS_READY;
     }
     next->state = PROCESS_RUNNING;
-    
+
     current_process = next;
     total_context_switches++;
 
@@ -204,17 +204,76 @@ void schedule() {
         serial_write_str(next->name);
         serial_write_str("\n");
     }
-        
+
     context_switch(old, next);
 }
 
+/*
+ * Busy-wait sleep used only when there is no current_process yet (i.e.
+ * before the scheduler has ever run - see the comment in sleep() below
+ * for why this matters). Bounded, guaranteed-terminating: polls the
+ * uptime clock if it's advancing, otherwise falls back to a fixed nop
+ * spin. Mirrors the pattern already used by ahci_sleep_ms() /
+ * minimafs_sleep_ms() for exactly the same reason - it must never rely
+ * on hlt or on anything that could fail to return.
+ */
+static void sleep_busy_wait_ms(uint64_t milliseconds) {
+    if (milliseconds == 0) return;
+
+    uint64_t start = time_get_uptime_ms();
+    const uint32_t MAX_POLL_ITERATIONS = 20000000u;
+    uint32_t iterations = 0;
+
+    while ((time_get_uptime_ms() - start) < milliseconds) {
+        asm volatile("pause" ::: "memory");
+        if (++iterations >= MAX_POLL_ITERATIONS) {
+            break;
+        }
+    }
+
+    if ((time_get_uptime_ms() - start) < milliseconds) {
+        for (volatile uint32_t i = 0; i < (milliseconds * 100000u); i++) {
+            asm volatile("nop");
+        }
+    }
+}
+
 void sleep(uint64_t milliseconds) {
-    if (!current_process) return;
-    
+    if (milliseconds == 0) return;
+
+    if (!current_process) {
+        /*
+         * No process context yet. This is not a rare edge case: it is
+         * exactly the situation during early boot, before
+         * schedulerInit()/the first schedule() has ever run - which
+         * covers all of usb_init()'s device enumeration
+         * (uhci_control_transfer()'s completion poll, the
+         * "wait for device to stabilize" delay, the post-SET_ADDRESS
+         * recovery delay, etc.), since createProcess() isn't called
+         * until after USB, keyboard, GPU, and audio init have already
+         * completed in kernel_main().
+         *
+         * The old behaviour here was `if (!current_process) return;`
+         * - silently skipping the wait entirely. That turned every
+         * "wait N ms" call during USB enumeration into a no-op, making
+         * enumeration timing purely dependent on how fast the
+         * surrounding code happened to run on a given boot. That is
+         * exactly why the USB keyboard was intermittently not fully
+         * enumerated/configured in time and the code fell back to
+         * PS/2 - roughly one boot in every handful, depending on host
+         * scheduling jitter under QEMU.
+         *
+         * Do a real, bounded busy-wait instead so callers outside any
+         * process context still get an actual delay.
+         */
+        sleep_busy_wait_ms(milliseconds);
+        return;
+    }
+
     uint64_t wake_time = time_get_uptime_ms() + milliseconds;
     current_process->wake_time_ms = wake_time;
     current_process->state = PROCESS_WAITING;
-    
+
     if (SCHED_DEBUG >= 2) {
         serial_write_str("[SLEEP] ");
         serial_write_str(current_process->name);
@@ -222,14 +281,14 @@ void sleep(uint64_t milliseconds) {
         serial_write_dec(milliseconds);
         serial_write_str(" ms\n");
     }
-    
+
     // Mark as waiting and switch to another process
     schedule();
-    
+
     // When we return here, this process has been woken up and rescheduled
     // The state was changed to READY/RUNNING by wake_sleeping_processes()
     // Just return - we're done sleeping!
-    
+
     if (SCHED_DEBUG >= 2) {
         serial_write_str("[WAKE-UP] ");
         serial_write_str(current_process->name);
@@ -246,7 +305,7 @@ void scheduler_tick() {
         return; // Prevent re-entrancy
     }
 
-    wake_sleeping_processes(); 
+    wake_sleeping_processes();
 
     if (!current_process) {
         schedule();
@@ -254,14 +313,14 @@ void scheduler_tick() {
     }
 
     tick_counter++;
-    
+
     // Schedule every N ticks (time slice)
     if (tick_counter >= TICKS_PER_SCHEDULE) {
         tick_counter = 0;
-        
+
         process_t* last = current_process;
         schedule();
-        
+
         // Only print if we actually switched
         if (last != current_process && current_process) {
             // Already printed in schedule()
@@ -283,7 +342,7 @@ void scheduler_print_stats() {
     print_str("\nIdle cycles: ");
     print_uint64_dec(idle_cycles);
     print_str("\n");
-    
+
     // Count processes by state
     int ready = 0, running = 0, waiting = 0, zombie = 0;
     for (process_t* p = proc_list_head; p != NULL; p = p->next) {
@@ -295,7 +354,7 @@ void scheduler_print_stats() {
             default: break;
         }
     }
-    
+
     print_str("Processes - Ready: ");
     print_int(ready);
     print_str(", Running: ");

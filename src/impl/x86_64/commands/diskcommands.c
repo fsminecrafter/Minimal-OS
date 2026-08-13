@@ -20,28 +20,33 @@
 void cmd_format_debug(int argc, const char** argv) {
     serial_write_str("\n=== FORMAT DEBUG ===\n");
     graphics_write_textr("Formatting drive...\n");
-    
+
     minimafs_disk_device_t* device = getminimadrive();
     if (!device) {
         graphics_write_textr("ERROR: No device!\n");
         serial_write_str("ERROR: getminimadrive() returned NULL\n");
         return;
     }
-    
+
     serial_write_str("Device OK\n");
-    
+    minimafs_drive_t* existing = get_drive(0);
+    if (existing && existing->mounted) {
+        serial_write_str("Drive 0 already mounted, unmounting before format...\n");
+        minimafs_unmount(0);
+    }
+
     uint64_t size = 128ULL * 1024 * 1024;  // 128 MB
-    
+
     serial_write_str("Calling minimafs_format...\n");
     if (!minimafs_format(device, size, 0, "maindisk")) {
         graphics_write_textr("ERROR: Formatting failed!\n");
         serial_write_str("ERROR: minimafs_format returned false\n");
         return;
     }
-    
+
     graphics_write_textr("Format OK. Mounting...\n");
     serial_write_str("Format succeeded. Calling minimafs_mount...\n");
-    
+
     int mount_result = minimafs_mount(device, 0);
     if (mount_result != 1) {
         graphics_write_textr("ERROR: Mount failed! Code=");
@@ -54,21 +59,21 @@ void cmd_format_debug(int argc, const char** argv) {
         serial_write_str("\n");
         return;
     }
-    
+
     graphics_write_textr("Mounted OK.\n");
     serial_write_str("Mount succeeded.\n");
-    
+
     minimafs_drive_t* drive = get_drive(0);
     if (!drive || !drive->mounted) {
         serial_write_str("ERROR: Drive 0 not accessible\n");
         graphics_write_textr("ERROR: Drive not accessible!\n");
         return;
     }
-    
+
     serial_write_str("Drive 0 is mounted. Root block=");
     serial_write_dec(drive->storage_desc.root_block);
     serial_write_str("\n");
-    
+
     minimafs_refresh_storage_desc(drive);
 
     serial_write_str("Creating system files...\n");

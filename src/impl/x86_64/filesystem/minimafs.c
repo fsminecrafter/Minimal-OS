@@ -463,7 +463,7 @@ static bool minimafs_write_blocks(minimafs_drive_t* drive, uint32_t block_num,
     uint32_t       remaining  = count;
     uint32_t       cur_block  = block_num;
 
-    const uint32_t MAX_CHUNK  = 4;   /* 16 KB at a time – keeps AHCI happy */
+    const uint32_t MAX_CHUNK  = 16;   /* 64 KB at a time – keeps AHCI happy */
 
     while (remaining > 0) {
         uint32_t chunk = (remaining > MAX_CHUNK) ? MAX_CHUNK : remaining;
@@ -893,17 +893,25 @@ static uint32_t minimafs_calc_file_block_count(minimafs_drive_t* drive,
     if (!minimafs_read_blocks(drive, block_offset, 1, buf)) { free_mem(buf); return 1; }
     buf[MINIMAFS_BLOCK_SIZE] = '\0';
 
-    minimafs_file_metadata_t meta;
-    memset(&meta, 0, sizeof(meta));
-    minimafs_parse_file_header(buf, &meta);
+    /* HEAP — this struct is ~2.5KB; this function is called from inside
+     * the recursive minimafs_scan_directory(), so a stack copy here
+     * would multiply by recursion (directory nesting) depth. */
+    minimafs_file_metadata_t* meta =
+    (minimafs_file_metadata_t*)alloc(sizeof(minimafs_file_metadata_t));
+    if (!meta) { free_mem(buf); return 1; }
+
+    minimafs_parse_file_header(buf, meta);
     free_mem(buf);
 
-    uint32_t file_len = meta.file_length;
+    uint32_t file_len = meta->file_length;
     if (file_len == 0) file_len = MINIMAFS_BLOCK_SIZE;
     uint32_t aligned = ((file_len + MINIMAFS_BLOCK_SIZE - 1) / MINIMAFS_BLOCK_SIZE)
-                        * MINIMAFS_BLOCK_SIZE;
-    return aligned / MINIMAFS_BLOCK_SIZE;
-}
+    * MINIMAFS_BLOCK_SIZE;
+    uint32_t blocks = aligned / MINIMAFS_BLOCK_SIZE;
+
+    free_mem(meta);
+    return blocks;
+                                               }
 
 void minimafs_scan_directory(minimafs_drive_t* drive, uint32_t block) {
     /* Heap-allocate to avoid recursive stack explosion */
@@ -1106,211 +1114,255 @@ static bool minimafs_find_entry_in_folder(minimafs_folder_desc_t* desc,
 
 bool minimafs_create_file(const char* path, const char* filetype,
                           const char* fileformat) {
-    uint8_t drive_num;
-    char local_path[MINIMAFS_MAX_PATH];
-    if (!minimafs_parse_path(path, &drive_num, local_path)) return false;
+    bool result = false;
 
-    minimafs_drive_t* drive = get_drive(drive_num);
-    if (!drive || !drive->mounted) {
-        serial_write_str("MinimaFS: Drive not mounted\n");
-        return false;
+    /* HEAP — local_path/parent are 1KB each and metadata is ~2.5KB.
+     * Combined they overflow the 4KB kernel stack on their own, before
+     * counting the caller's or callee's frame. Must never be on-stack. */
+    char* local_path = (char*)alloc_unzeroed(MINIMAFS_MAX_PATH);
+    char* filename    = (char*)alloc_unzeroed(MINIMAFS_MAX_FILENAME);
+    char* parent      = (char*)alloc_unzeroed(MINIMAFS_MAX_PATH);
+    minimafs_file_metadata_t* metadata =
+    (minimafs_file_metadata_t*)alloc(sizeof(minimafs_file_metadata_t));
+    minimafs_folder_desc_t* parent_desc = NULL;
+
+    uint8_t drive_num = 0;
+    minimafs_drive_t* drive = NULL;
+    uint32_t existing_index = 0;
+    bool exists = false;
+
+    if (!local_path || !filename || !parent || !metadata) {
+        serial_write_str("MinimaFS: OOM in minimafs_create_file\n");
+        goto cleanup;
     }
 
-    char filename[MINIMAFS_MAX_FILENAME];
-    char parent[MINIMAFS_MAX_PATH];
+    if (!minimafs_parse_path(path, &drive_num, local_path)) goto cleanup;
+
+    drive = get_drive(drive_num);
+    if (!drive || !drive->mounted) {
+        serial_write_str("MinimaFS: Drive not mounted\n");
+        goto cleanup;
+    }
+
     minimafs_split_local_path(local_path, parent, filename);
 
-    /* HEAP – was on stack (crash!) */
-    minimafs_folder_desc_t* parent_desc =
-        (minimafs_folder_desc_t*)alloc(sizeof(minimafs_folder_desc_t));
-    if (!parent_desc) return false;
+    parent_desc = (minimafs_folder_desc_t*)alloc(sizeof(minimafs_folder_desc_t));
+    if (!parent_desc) goto cleanup;
 
     if (!minimafs_read_folder_desc(drive, parent, parent_desc)) {
         serial_write_str("ERROR: Failed to read parent folder.desc\n");
-        free_mem(parent_desc); return false;
+        goto cleanup;
     }
 
-    uint32_t existing_index = 0;
-    bool exists = minimafs_find_entry_in_folder(parent_desc, filename, &existing_index);
+    exists = minimafs_find_entry_in_folder(parent_desc, filename, &existing_index);
     if (exists && parent_desc->entries[existing_index].type != MINIMAFS_TYPE_DIR) {
         serial_write_str("ERROR: File already exists\n");
-        free_mem(parent_desc); return false;
+        goto cleanup;
     }
 
     if (parent_desc->entry_count >= 256) {
         serial_write_str("ERROR: Parent folder full\n");
-        free_mem(parent_desc); return false;
+        goto cleanup;
     }
 
-    minimafs_file_metadata_t metadata;
-    memset(&metadata, 0, sizeof(metadata));
-    strcpy(metadata.filename,      filename);
-    strcpy(metadata.filetype,      filetype);
-    strcpy(metadata.fileformat,    fileformat);
-    strcpy(metadata.parent_folder, parent);
-    minimafs_get_datetime(metadata.created_date, sizeof(metadata.created_date));
-    minimafs_get_datetime(metadata.last_changed, sizeof(metadata.last_changed));
+    memset(metadata, 0, sizeof(*metadata));
+    strncpy(metadata->filename,      filename,   sizeof(metadata->filename)      - 1);
+    strncpy(metadata->filetype,      filetype,   sizeof(metadata->filetype)      - 1);
+    strncpy(metadata->fileformat,    fileformat, sizeof(metadata->fileformat)    - 1);
+    strncpy(metadata->parent_folder, parent,     sizeof(metadata->parent_folder) - 1);
+    minimafs_get_datetime(metadata->created_date, sizeof(metadata->created_date));
+    minimafs_get_datetime(metadata->last_changed, sizeof(metadata->last_changed));
 
-    if (!minimafs_write_file_to_disk(drive, local_path, &metadata, NULL, 0)) {
+    if (!minimafs_write_file_to_disk(drive, local_path, metadata, NULL, 0)) {
         serial_write_str("ERROR: Failed to write file to disk\n");
-        free_mem(parent_desc); return false;
+        goto cleanup;
     }
 
-    minimafs_dir_entry_t* entry = &parent_desc->entries[parent_desc->entry_count];
-    strcpy(entry->name, filename);
-    entry->type         = MINIMAFS_TYPE_FILE;
-    entry->block_offset = metadata.block_offset;
-    entry->block_count  = metadata.block_count;
-    entry->hidden       = false;
-    parent_desc->entry_count++;
+    {
+        minimafs_dir_entry_t* entry = &parent_desc->entries[parent_desc->entry_count];
+        strncpy(entry->name, filename, sizeof(entry->name) - 1);
+        entry->name[sizeof(entry->name) - 1] = '\0';
+        entry->type         = MINIMAFS_TYPE_FILE;
+        entry->block_offset = metadata->block_offset;
+        entry->block_count  = metadata->block_count;
+        entry->hidden       = false;
+        parent_desc->entry_count++;
+    }
 
     if (!minimafs_write_folder_desc(drive, parent_desc)) {
         serial_write_str("ERROR: Failed to write updated folder.desc\n");
-        free_mem(parent_desc); return false;
+        goto cleanup;
     }
 
-    free_mem(parent_desc);
     serial_write_str("MinimaFS: File created: ");
     serial_write_str(path);
     serial_write_str("\n");
-    return true;
+    result = true;
+
+    cleanup:
+    if (parent_desc) free_mem(parent_desc);
+    if (metadata)    free_mem(metadata);
+    if (parent)      free_mem(parent);
+    if (filename)    free_mem(filename);
+    if (local_path)  free_mem(local_path);
+    return result;
 }
 
-minimafs_file_handle_t* minimafs_open(const char* path, bool read_only) {
-    uint8_t drive_num;
-    char local_path[MINIMAFS_MAX_PATH];
-    if (!minimafs_parse_path(path, &drive_num, local_path)) return NULL;
+#define MINIMAFS_STREAMING_THRESHOLD (2 * 1024 * 1024)
 
-    minimafs_drive_t* drive = get_drive(drive_num);
+minimafs_file_handle_t* minimafs_open(const char* path, bool read_only) {
+    minimafs_file_handle_t* handle = NULL;
+
+    /* HEAP — local_path/parent (1KB each) plus a metadata struct
+     * (~2.5KB) used to coexist on the stack in this function and
+     * blew the 4KB kernel stack. All moved to heap. */
+    char* local_path = (char*)alloc_unzeroed(MINIMAFS_MAX_PATH);
+    char* filename    = (char*)alloc_unzeroed(MINIMAFS_MAX_FILENAME);
+    char* parent      = (char*)alloc_unzeroed(MINIMAFS_MAX_PATH);
+    minimafs_folder_desc_t* parent_desc = NULL;
+    uint8_t* first_block = NULL;
+    minimafs_file_metadata_t* meta = NULL;
+
+    uint8_t drive_num = 0;
+    minimafs_drive_t* drive = NULL;
+    uint32_t entry_index = 0;
+    minimafs_dir_entry_t entry;
+    uint32_t total_size = 0;
+    uint32_t data_offset = 0;
+    uint32_t data_length = 0;
+
+    if (!local_path || !filename || !parent) {
+        serial_write_str("MinimaFS: OOM in minimafs_open (paths)\n");
+        goto fail;
+    }
+
+    if (!minimafs_parse_path(path, &drive_num, local_path)) goto fail;
+
+    drive = get_drive(drive_num);
     if (!drive || !drive->mounted) {
         serial_write_str("MinimaFS: Drive not mounted\n");
-        return NULL;
+        goto fail;
     }
 
-    char filename[MINIMAFS_MAX_FILENAME];
-    char parent[MINIMAFS_MAX_PATH];
     minimafs_split_local_path(local_path, parent, filename);
 
-    /* HEAP – was on stack (crash!) */
-    minimafs_folder_desc_t* parent_desc =
-        (minimafs_folder_desc_t*)alloc(sizeof(minimafs_folder_desc_t));
-    if (!parent_desc) return NULL;
+    parent_desc = (minimafs_folder_desc_t*)alloc(sizeof(minimafs_folder_desc_t));
+    if (!parent_desc) goto fail;
 
-    if (!minimafs_read_folder_desc(drive, parent, parent_desc)) {
-        free_mem(parent_desc); return NULL;
-    }
+    if (!minimafs_read_folder_desc(drive, parent, parent_desc)) goto fail;
 
-    uint32_t entry_index = 0;
     if (!minimafs_find_entry_in_folder(parent_desc, filename, &entry_index)) {
-        if (read_only) { free_mem(parent_desc); return NULL; }
-        if (!minimafs_create_file(path, "binary", "bin")) {
-            free_mem(parent_desc); return NULL;
-        }
-        /* Re-read after creation */
-        if (!minimafs_read_folder_desc(drive, parent, parent_desc)) {
-            free_mem(parent_desc); return NULL;
-        }
-        if (!minimafs_find_entry_in_folder(parent_desc, filename, &entry_index)) {
-            free_mem(parent_desc); return NULL;
-        }
+        if (read_only) goto fail;
+        if (!minimafs_create_file(path, "binary", "bin")) goto fail;
+        if (!minimafs_read_folder_desc(drive, parent, parent_desc)) goto fail;
+        if (!minimafs_find_entry_in_folder(parent_desc, filename, &entry_index)) goto fail;
     }
 
-    minimafs_dir_entry_t entry = parent_desc->entries[entry_index];
-    free_mem(parent_desc);   /* no longer needed */
+    entry = parent_desc->entries[entry_index];
+    free_mem(parent_desc);
+    parent_desc = NULL;
 
-    if (entry.type == MINIMAFS_TYPE_DIR) return NULL;
+    if (entry.type == MINIMAFS_TYPE_DIR) goto fail;
 
-    minimafs_file_handle_t* handle =
-        (minimafs_file_handle_t*)alloc_unzeroed(sizeof(minimafs_file_handle_t));
-    if (!handle) return NULL;
+    handle = (minimafs_file_handle_t*)alloc_unzeroed(sizeof(minimafs_file_handle_t));
+    if (!handle) goto fail;
     memset(handle, 0, sizeof(minimafs_file_handle_t));
 
     handle->open          = true;
     handle->drive_number  = drive_num;
-    strcpy(handle->path, path);
+    strncpy(handle->path, path, sizeof(handle->path) - 1);
     handle->read_only     = read_only;
     handle->position      = 0;
     handle->modified      = false;
 
-    handle->file_block_offset  = entry.block_offset;
-    handle->file_block_count   = entry.block_count;
+    handle->file_block_offset     = entry.block_offset;
+    handle->file_block_count      = entry.block_count;
     handle->data_offset_in_blocks = 0;
-    handle->stream_cache       = NULL;
-    handle->cached_block_index = (uint32_t)-1;
-    handle->use_streaming      = false;
+    handle->stream_cache          = NULL;
+    handle->cached_block_index    = (uint32_t)-1;
+    handle->use_streaming         = false;
 
-    uint32_t total_size = entry.block_count * MINIMAFS_BLOCK_SIZE;
+    total_size = entry.block_count * MINIMAFS_BLOCK_SIZE;
 
     if (total_size == 0) {
         memset(&handle->metadata, 0, sizeof(handle->metadata));
         handle->data      = NULL;
         handle->data_size = 0;
-        return handle;
+        goto done;
     }
 
     /* Read first block for header */
-    uint8_t* first_block = (uint8_t*)alloc_unzeroed(MINIMAFS_BLOCK_SIZE);
-    if (!first_block) { free_mem(handle); return NULL; }
+    first_block = (uint8_t*)alloc_unzeroed(MINIMAFS_BLOCK_SIZE);
+    if (!first_block) { free_mem(handle); handle = NULL; goto fail; }
 
     if (!minimafs_read_blocks(drive, entry.block_offset, 1, first_block)) {
-        free_mem(first_block); free_mem(handle); return NULL;
+        free_mem(handle); handle = NULL; goto fail;
     }
 
-    minimafs_file_metadata_t meta;
-    memset(&meta, 0, sizeof(meta));
-    minimafs_parse_file_header((const char*)first_block, &meta);
-    meta.block_offset = entry.block_offset;
-    meta.block_count  = entry.block_count;
+    meta = (minimafs_file_metadata_t*)alloc(sizeof(minimafs_file_metadata_t));
+    if (!meta) { free_mem(handle); handle = NULL; goto fail; }
 
-    const char* data_marker = strstr((const char*)first_block, "@DATA@\n");
-    uint32_t data_offset    = data_marker ?
+    minimafs_parse_file_header((const char*)first_block, meta);
+    meta->block_offset = entry.block_offset;
+    meta->block_count  = entry.block_count;
+
+    {
+        const char* data_marker = strstr((const char*)first_block, "@DATA@\n");
+        data_offset = data_marker ?
         (uint32_t)(data_marker - (const char*)first_block) + 7 : 0;
-    uint32_t data_length    = meta.data_length;
+    }
+    data_length = meta->data_length;
 
-    if (data_length == 0 && meta.file_length > data_offset + 5)
-        data_length = meta.file_length - data_offset - 5;
+    if (data_length == 0 && meta->file_length > data_offset + 5)
+        data_length = meta->file_length - data_offset - 5;
     if (data_offset + data_length > total_size) {
         data_length = (total_size > data_offset) ? total_size - data_offset : 0;
     }
 
-    handle->metadata              = meta;
+    handle->metadata              = *meta;
     handle->data_offset_in_blocks = data_offset;
     handle->data_size             = data_length;
 
-    free_mem(first_block);
-
-#define MINIMAFS_STREAMING_THRESHOLD (2 * 1024 * 1024)
+    free_mem(meta);        meta = NULL;
+    free_mem(first_block); first_block = NULL;
 
     if (data_length > MINIMAFS_STREAMING_THRESHOLD) {
         handle->use_streaming = true;
         handle->data          = NULL;
         handle->stream_cache  = (uint8_t*)alloc_unzeroed(MINIMAFS_BLOCK_SIZE);
         if (!handle->stream_cache) {
-            /* Fall back to full load */
             handle->use_streaming = false;
             goto full_load;
         }
-        return handle;
+        goto done;
     }
 
-full_load:
+    full_load:
     handle->use_streaming = false;
     handle->data          = NULL;
 
     if (data_length > 0) {
         uint8_t* raw = (uint8_t*)alloc_unzeroed(total_size);
-        if (!raw) { free_mem(handle); return NULL; }
+        if (!raw) { free_mem(handle); handle = NULL; goto fail; }
 
         if (!minimafs_read_blocks(drive, entry.block_offset, entry.block_count, raw)) {
-            free_mem(raw); free_mem(handle); return NULL;
+            free_mem(raw); free_mem(handle); handle = NULL; goto fail;
         }
 
         handle->data = (uint8_t*)alloc_unzeroed(data_length);
-        if (!handle->data) { free_mem(raw); free_mem(handle); return NULL; }
+        if (!handle->data) { free_mem(raw); free_mem(handle); handle = NULL; goto fail; }
         memcpy(handle->data, raw + data_offset, data_length);
         free_mem(raw);
     }
 
+    done:
+    fail:
+    if (parent_desc) free_mem(parent_desc);
+    if (first_block) free_mem(first_block);
+    if (meta)         free_mem(meta);
+    if (parent)       free_mem(parent);
+    if (filename)     free_mem(filename);
+    if (local_path)   free_mem(local_path);
     return handle;
 }
 
@@ -1320,18 +1372,24 @@ void minimafs_close(minimafs_file_handle_t* handle) {
     if (handle->modified && !handle->read_only) {
         minimafs_drive_t* drive = get_drive(handle->drive_number);
         if (drive && drive->mounted) {
-            char local_path[MINIMAFS_MAX_PATH];
+            /* HEAP — these buffers together are ~2.3KB; keeping them on
+             * the stack while calling into the write path (which adds
+             * further stack frames) risks overflowing the 4KB kernel
+             * stack. */
+            char* local_path = (char*)alloc_unzeroed(MINIMAFS_MAX_PATH);
             uint8_t dn;
-            if (minimafs_parse_path(handle->path, &dn, local_path)) {
+
+            if (local_path && minimafs_parse_path(handle->path, &dn, local_path)) {
                 if (minimafs_write_file_to_disk(drive, local_path, &handle->metadata,
-                                               handle->data, handle->data_size)) {
-                    char filename[MINIMAFS_MAX_FILENAME];
-                    char parent[MINIMAFS_MAX_PATH];
+                    handle->data, handle->data_size)) {
+                    char* filename = (char*)alloc_unzeroed(MINIMAFS_MAX_FILENAME);
+                char* parent   = (char*)alloc_unzeroed(MINIMAFS_MAX_PATH);
+
+                if (filename && parent) {
                     minimafs_split_local_path(local_path, parent, filename);
 
-                    /* HEAP – was on stack (crash!) */
                     minimafs_folder_desc_t* pd =
-                        (minimafs_folder_desc_t*)alloc(sizeof(minimafs_folder_desc_t));
+                    (minimafs_folder_desc_t*)alloc(sizeof(minimafs_folder_desc_t));
                     if (pd) {
                         if (minimafs_read_folder_desc(drive, parent, pd)) {
                             uint32_t idx = 0;
@@ -1345,7 +1403,13 @@ void minimafs_close(minimafs_file_handle_t* handle) {
                         free_mem(pd);
                     }
                 }
+
+                if (filename) free_mem(filename);
+                if (parent)   free_mem(parent);
+                    }
             }
+
+            if (local_path) free_mem(local_path);
         }
     }
 
@@ -1890,44 +1954,67 @@ bool minimafs_set_metadata(const char* path, const minimafs_file_metadata_t* met
     minimafs_file_handle_t* h = minimafs_open(path, false);
     if (!h) return false;
 
-    minimafs_file_metadata_t updated = h->metadata;
-    strcpy(updated.filetype,   metadata->filetype);
-    strcpy(updated.fileformat, metadata->fileformat);
-    updated.runnable   = metadata->runnable;
-    updated.entrypoint = metadata->entrypoint;
-    strcpy(updated.run_with, metadata->run_with);
-    updated.hidden = metadata->hidden;
-    minimafs_get_datetime(updated.last_changed, sizeof(updated.last_changed));
-
     bool ok = false;
-    minimafs_drive_t* drive = get_drive(h->drive_number);
-    if (drive && drive->mounted) {
-        char local_path[MINIMAFS_MAX_PATH];
-        uint8_t dn;
-        if (minimafs_parse_path(h->path, &dn, local_path)) {
-            ok = minimafs_write_file_to_disk(drive, local_path, &updated,
-                                             h->data, h->data_size);
-            if (ok) {
-                char filename[MINIMAFS_MAX_FILENAME];
-                char parent[MINIMAFS_MAX_PATH];
-                minimafs_split_local_path(local_path, parent, filename);
 
-                minimafs_folder_desc_t* pd =
-                    (minimafs_folder_desc_t*)alloc(sizeof(minimafs_folder_desc_t));
-                if (pd) {
-                    if (minimafs_read_folder_desc(drive, parent, pd)) {
-                        uint32_t idx = 0;
-                        if (minimafs_find_entry_in_folder(pd, filename, &idx)) {
-                            pd->entries[idx].hidden = updated.hidden;
-                            minimafs_write_folder_desc(drive, pd);
+    /* HEAP — 'updated' (~2.5KB) plus local_path/filename/parent
+     * (~2.3KB) used to coexist on the stack, overflowing the 4KB
+     * kernel stack. */
+    minimafs_file_metadata_t* updated =
+    (minimafs_file_metadata_t*)alloc(sizeof(minimafs_file_metadata_t));
+    char* local_path = (char*)alloc_unzeroed(MINIMAFS_MAX_PATH);
+
+    if (!updated || !local_path) {
+        serial_write_str("MinimaFS: OOM in minimafs_set_metadata\n");
+        goto cleanup;
+    }
+
+    *updated = h->metadata;
+    strncpy(updated->filetype,   metadata->filetype,   sizeof(updated->filetype)   - 1);
+    strncpy(updated->fileformat, metadata->fileformat, sizeof(updated->fileformat) - 1);
+    updated->runnable   = metadata->runnable;
+    updated->entrypoint = metadata->entrypoint;
+    strncpy(updated->run_with, metadata->run_with, sizeof(updated->run_with) - 1);
+    updated->hidden = metadata->hidden;
+    minimafs_get_datetime(updated->last_changed, sizeof(updated->last_changed));
+
+    {
+        minimafs_drive_t* drive = get_drive(h->drive_number);
+        if (drive && drive->mounted) {
+            uint8_t dn;
+            if (minimafs_parse_path(h->path, &dn, local_path)) {
+                ok = minimafs_write_file_to_disk(drive, local_path, updated,
+                                                 h->data, h->data_size);
+                if (ok) {
+                    char* filename = (char*)alloc_unzeroed(MINIMAFS_MAX_FILENAME);
+                    char* parent   = (char*)alloc_unzeroed(MINIMAFS_MAX_PATH);
+
+                    if (filename && parent) {
+                        minimafs_split_local_path(local_path, parent, filename);
+
+                        minimafs_folder_desc_t* pd =
+                        (minimafs_folder_desc_t*)alloc(sizeof(minimafs_folder_desc_t));
+                        if (pd) {
+                            if (minimafs_read_folder_desc(drive, parent, pd)) {
+                                uint32_t idx = 0;
+                                if (minimafs_find_entry_in_folder(pd, filename, &idx)) {
+                                    pd->entries[idx].hidden = updated->hidden;
+                                    minimafs_write_folder_desc(drive, pd);
+                                }
+                            }
+                            free_mem(pd);
                         }
                     }
-                    free_mem(pd);
+
+                    if (filename) free_mem(filename);
+                    if (parent)   free_mem(parent);
                 }
             }
         }
     }
 
+    cleanup:
+    if (updated)    free_mem(updated);
+    if (local_path) free_mem(local_path);
     minimafs_close(h);
     return ok;
 }
@@ -2221,148 +2308,170 @@ static uint32_t odr_read(minimafs_old_data_reader_t* r, uint8_t* dst, uint32_t l
 bool minimafs_append_file(const char* path, const void* data, uint32_t data_len) {
     if (!path || !data || data_len == 0) return false;
 
-    uint8_t drive_num;
-    char local_path[MINIMAFS_MAX_PATH];
-    if (!minimafs_parse_path(path, &drive_num, local_path)) return false;
+    bool result = false;
 
-    minimafs_drive_t* drive = get_drive(drive_num);
-    if (!drive || !drive->mounted) return false;
-
-    char filename[MINIMAFS_MAX_FILENAME];
-    char parent[MINIMAFS_MAX_PATH];
-    minimafs_split_local_path(local_path, parent, filename);
-
-    /* HEAP */
-    minimafs_folder_desc_t* pd =
-        (minimafs_folder_desc_t*)alloc(sizeof(minimafs_folder_desc_t));
-    if (!pd) return false;
-
-    if (!minimafs_read_folder_desc(drive, parent, pd)) { free_mem(pd); return false; }
-
-    uint32_t idx = 0;
-    if (!minimafs_find_entry_in_folder(pd, filename, &idx) ||
-        pd->entries[idx].type == MINIMAFS_TYPE_DIR) {
-        free_mem(pd); return false;
-    }
-
-    minimafs_dir_entry_t entry = pd->entries[idx];
-
-    /* Read first block for header info */
-    uint8_t* first = (uint8_t*)alloc_unzeroed(MINIMAFS_BLOCK_SIZE + 1);
-    if (!first) { free_mem(pd); return false; }
-
-    if (!minimafs_read_blocks(drive, entry.block_offset, 1, first)) {
-        free_mem(first); free_mem(pd); return false;
-    }
-    first[MINIMAFS_BLOCK_SIZE] = '\0';
-
-    minimafs_file_metadata_t meta;
-    memset(&meta, 0, sizeof(meta));
-    if (!minimafs_parse_file_header((char*)first, &meta)) {
-        free_mem(first); free_mem(pd); return false;
-    }
-
-    const char* marker = strstr((char*)first, "@DATA@\n");
-    if (!marker) { free_mem(first); free_mem(pd); return false; }
-    uint32_t old_header_size = (uint32_t)(marker - (char*)first) + 7;
-    free_mem(first);
-
-    uint32_t footer_size  = 5;
-    uint32_t old_file_len = meta.file_length;
-    if (old_file_len == 0) old_file_len = entry.block_count * MINIMAFS_BLOCK_SIZE;
-    uint32_t old_data_len = (old_file_len > old_header_size + footer_size) ?
-                             old_file_len - old_header_size - footer_size : 0;
-    uint32_t new_data_len = old_data_len + data_len;
-
-    minimafs_get_datetime(meta.last_changed, sizeof(meta.last_changed));
-    meta.data_length  = new_data_len;
-    meta.file_length  = 0;
-
-    uint32_t header_size = 0;
-    for (int i = 0; i < 2; i++) {
-        meta.file_length = header_size + new_data_len + footer_size;
-        char* tmp = minimafs_generate_file_header(&meta, &header_size);
-        if (!tmp) { free_mem(pd); return false; }
-        free_mem(tmp);
-    }
-    meta.file_length = header_size + new_data_len + footer_size;
-
-    char* header = minimafs_generate_file_header(&meta, &header_size);
-    if (!header) { free_mem(pd); return false; }
-
-    uint32_t total_size   = header_size + new_data_len + footer_size;
-    uint32_t block_count  = ((total_size + MINIMAFS_BLOCK_SIZE - 1) / MINIMAFS_BLOCK_SIZE);
-
-    uint32_t new_start = block_alloc_run(drive->drive_number, block_count);
-    if (new_start == 0xFFFFFFFF) { free_mem(header); free_mem(pd); return false; }
-
+    /* HEAP — local_path/parent (1KB each) plus the metadata struct
+     * (~2.5KB) used to all live on the stack simultaneously here,
+     * well over the 4KB kernel stack before any nested calls. */
+    char* local_path = (char*)alloc_unzeroed(MINIMAFS_MAX_PATH);
+    char* filename    = (char*)alloc_unzeroed(MINIMAFS_MAX_FILENAME);
+    char* parent      = (char*)alloc_unzeroed(MINIMAFS_MAX_PATH);
+    minimafs_folder_desc_t* pd = NULL;
+    uint8_t* first = NULL;
+    minimafs_file_metadata_t* meta = NULL;
+    char* header = NULL;
+    uint8_t* block_buf = NULL;
+    bool reader_inited = false;
     minimafs_old_data_reader_t reader;
-    if (!odr_init(&reader, drive, entry.block_offset, old_header_size, old_data_len)) {
-        block_free_run(drive->drive_number, new_start, block_count);
-        free_mem(header); free_mem(pd); return false;
-    }
 
+    uint8_t drive_num = 0;
+    minimafs_drive_t* drive = NULL;
+    uint32_t idx = 0;
+    minimafs_dir_entry_t entry;
+    uint32_t old_header_size = 0;
+    uint32_t footer_size = 5;
+    uint32_t old_file_len = 0;
+    uint32_t old_data_len = 0;
+    uint32_t new_data_len = 0;
+    uint32_t header_size = 0;
+    uint32_t total_size = 0;
+    uint32_t block_count = 0;
+    uint32_t new_start = 0xFFFFFFFF;
     const uint8_t footer[5] = {'@','E','N','D','\n'};
 
-    /* Single block buffer – reused each iteration */
-    uint8_t* block_buf = (uint8_t*)alloc_unzeroed(MINIMAFS_BLOCK_SIZE);
-    if (!block_buf) {
-        odr_free(&reader);
-        block_free_run(drive->drive_number, new_start, block_count);
-        free_mem(header); free_mem(pd); return false;
+    if (!local_path || !filename || !parent) {
+        serial_write_str("MinimaFS: OOM in minimafs_append_file (paths)\n");
+        goto cleanup;
     }
 
-    uint32_t seg = 0, seg_pos = 0, data_pos2 = 0;
+    if (!minimafs_parse_path(path, &drive_num, local_path)) goto cleanup;
 
-    for (uint32_t i = 0; i < block_count; i++) {
-        memset(block_buf, 0, MINIMAFS_BLOCK_SIZE);
-        uint32_t out_pos = 0;
+    drive = get_drive(drive_num);
+    if (!drive || !drive->mounted) goto cleanup;
 
-        while (out_pos < MINIMAFS_BLOCK_SIZE && seg < 4) {
-            uint32_t rem = MINIMAFS_BLOCK_SIZE - out_pos;
+    minimafs_split_local_path(local_path, parent, filename);
 
-            if (seg == 0) {         /* header */
-                uint32_t avail = header_size - seg_pos;
-                uint32_t cp = rem < avail ? rem : avail;
-                memcpy(block_buf + out_pos, header + seg_pos, cp);
-                seg_pos += cp; out_pos += cp;
-                if (seg_pos >= header_size) { seg = 1; seg_pos = 0; }
+    pd = (minimafs_folder_desc_t*)alloc(sizeof(minimafs_folder_desc_t));
+    if (!pd) goto cleanup;
 
-            } else if (seg == 1) {  /* old data */
-                if (reader.data_pos >= old_data_len) { seg = 2; seg_pos = 0; continue; }
-                uint32_t avail = old_data_len - reader.data_pos;
-                uint32_t cp = rem < avail ? rem : avail;
-                uint32_t got = odr_read(&reader, block_buf + out_pos, cp);
-                out_pos += got;
-                if (reader.data_pos >= old_data_len) { seg = 2; seg_pos = 0; }
+    if (!minimafs_read_folder_desc(drive, parent, pd)) goto cleanup;
 
-            } else if (seg == 2) {  /* new data */
-                if (data_pos2 >= data_len) { seg = 3; seg_pos = 0; continue; }
-                uint32_t avail = data_len - data_pos2;
-                uint32_t cp = rem < avail ? rem : avail;
-                memcpy(block_buf + out_pos, (const uint8_t*)data + data_pos2, cp);
-                data_pos2 += cp; out_pos += cp;
-                if (data_pos2 >= data_len) { seg = 3; seg_pos = 0; }
+    if (!minimafs_find_entry_in_folder(pd, filename, &idx) ||
+        pd->entries[idx].type == MINIMAFS_TYPE_DIR) {
+        goto cleanup;
+        }
 
-            } else {                /* footer */
-                uint32_t avail = 5 - seg_pos;
-                uint32_t cp = rem < avail ? rem : avail;
-                memcpy(block_buf + out_pos, footer + seg_pos, cp);
-                seg_pos += cp; out_pos += cp;
-                if (seg_pos >= 5) seg = 4;
+        entry = pd->entries[idx];
+
+    first = (uint8_t*)alloc_unzeroed(MINIMAFS_BLOCK_SIZE + 1);
+    if (!first) goto cleanup;
+
+    if (!minimafs_read_blocks(drive, entry.block_offset, 1, first)) goto cleanup;
+    first[MINIMAFS_BLOCK_SIZE] = '\0';
+
+    meta = (minimafs_file_metadata_t*)alloc(sizeof(minimafs_file_metadata_t));
+    if (!meta) goto cleanup;
+
+    if (!minimafs_parse_file_header((char*)first, meta)) goto cleanup;
+
+    {
+        const char* marker = strstr((char*)first, "@DATA@\n");
+        if (!marker) goto cleanup;
+        old_header_size = (uint32_t)(marker - (char*)first) + 7;
+    }
+    free_mem(first);
+    first = NULL;
+
+    old_file_len = meta->file_length;
+    if (old_file_len == 0) old_file_len = entry.block_count * MINIMAFS_BLOCK_SIZE;
+    old_data_len = (old_file_len > old_header_size + footer_size) ?
+    old_file_len - old_header_size - footer_size : 0;
+    new_data_len = old_data_len + data_len;
+
+    minimafs_get_datetime(meta->last_changed, sizeof(meta->last_changed));
+    meta->data_length = new_data_len;
+    meta->file_length  = 0;
+
+    for (int i = 0; i < 2; i++) {
+        meta->file_length = header_size + new_data_len + footer_size;
+        char* tmp = minimafs_generate_file_header(meta, &header_size);
+        if (!tmp) goto cleanup;
+        free_mem(tmp);
+    }
+    meta->file_length = header_size + new_data_len + footer_size;
+
+    header = minimafs_generate_file_header(meta, &header_size);
+    if (!header) goto cleanup;
+
+    total_size  = header_size + new_data_len + footer_size;
+    block_count = ((total_size + MINIMAFS_BLOCK_SIZE - 1) / MINIMAFS_BLOCK_SIZE);
+
+    new_start = block_alloc_run(drive->drive_number, block_count);
+    if (new_start == 0xFFFFFFFF) goto cleanup;
+
+    if (!odr_init(&reader, drive, entry.block_offset, old_header_size, old_data_len)) {
+        block_free_run(drive->drive_number, new_start, block_count);
+        new_start = 0xFFFFFFFF;
+        goto cleanup;
+    }
+    reader_inited = true;
+
+    block_buf = (uint8_t*)alloc_unzeroed(MINIMAFS_BLOCK_SIZE);
+    if (!block_buf) {
+        block_free_run(drive->drive_number, new_start, block_count);
+        new_start = 0xFFFFFFFF;
+        goto cleanup;
+    }
+
+    {
+        uint32_t seg = 0, seg_pos = 0, data_pos2 = 0;
+
+        for (uint32_t i = 0; i < block_count; i++) {
+            memset(block_buf, 0, MINIMAFS_BLOCK_SIZE);
+            uint32_t out_pos = 0;
+
+            while (out_pos < MINIMAFS_BLOCK_SIZE && seg < 4) {
+                uint32_t rem = MINIMAFS_BLOCK_SIZE - out_pos;
+
+                if (seg == 0) {
+                    uint32_t avail = header_size - seg_pos;
+                    uint32_t cp = rem < avail ? rem : avail;
+                    memcpy(block_buf + out_pos, header + seg_pos, cp);
+                    seg_pos += cp; out_pos += cp;
+                    if (seg_pos >= header_size) { seg = 1; seg_pos = 0; }
+
+                } else if (seg == 1) {
+                    if (reader.data_pos >= old_data_len) { seg = 2; seg_pos = 0; continue; }
+                    uint32_t avail = old_data_len - reader.data_pos;
+                    uint32_t cp = rem < avail ? rem : avail;
+                    uint32_t got = odr_read(&reader, block_buf + out_pos, cp);
+                    out_pos += got;
+                    if (reader.data_pos >= old_data_len) { seg = 2; seg_pos = 0; }
+
+                } else if (seg == 2) {
+                    if (data_pos2 >= data_len) { seg = 3; seg_pos = 0; continue; }
+                    uint32_t avail = data_len - data_pos2;
+                    uint32_t cp = rem < avail ? rem : avail;
+                    memcpy(block_buf + out_pos, (const uint8_t*)data + data_pos2, cp);
+                    data_pos2 += cp; out_pos += cp;
+                    if (data_pos2 >= data_len) { seg = 3; seg_pos = 0; }
+
+                } else {
+                    uint32_t avail = 5 - seg_pos;
+                    uint32_t cp = rem < avail ? rem : avail;
+                    memcpy(block_buf + out_pos, footer + seg_pos, cp);
+                    seg_pos += cp; out_pos += cp;
+                    if (seg_pos >= 5) seg = 4;
+                }
+            }
+
+            if (!minimafs_write_blocks(drive, new_start + i, 1, block_buf)) {
+                block_free_run(drive->drive_number, new_start, block_count);
+                new_start = 0xFFFFFFFF;
+                goto cleanup;
             }
         }
-
-        if (!minimafs_write_blocks(drive, new_start + i, 1, block_buf)) {
-            free_mem(block_buf); odr_free(&reader);
-            block_free_run(drive->drive_number, new_start, block_count);
-            free_mem(header); free_mem(pd); return false;
-        }
     }
-
-    free_mem(block_buf);
-    odr_free(&reader);
-    free_mem(header);
 
     if (entry.block_count > 0)
         block_free_run(drive->drive_number, entry.block_offset, entry.block_count);
@@ -2370,11 +2479,21 @@ bool minimafs_append_file(const char* path, const void* data, uint32_t data_len)
     pd->entries[idx].block_offset = new_start;
     pd->entries[idx].block_count  = block_count;
 
-    bool ok = minimafs_write_folder_desc(drive, pd);
-    free_mem(pd);
-    if (!ok) return false;
+    if (!minimafs_write_folder_desc(drive, pd)) goto cleanup;
 
     minimafs_refresh_storage_desc(drive);
     serial_write_str("MinimaFS: append complete\n");
-    return true;
+    result = true;
+
+    cleanup:
+    if (block_buf)      free_mem(block_buf);
+    if (reader_inited)  odr_free(&reader);
+    if (header)         free_mem(header);
+    if (meta)           free_mem(meta);
+    if (first)          free_mem(first);
+    if (pd)             free_mem(pd);
+    if (parent)         free_mem(parent);
+    if (filename)       free_mem(filename);
+    if (local_path)     free_mem(local_path);
+    return result;
 }

@@ -172,6 +172,11 @@ bool ac97_init(void) {
  * Call this AFTER the player is set up and ready to provide samples,
  * so the first buffer presented to the hardware contains real audio.
  */
+/*
+ * ac97_start — prime buffers with real audio and start DMA.
+ * Call this AFTER the player is set up and ready to provide samples,
+ * so the first buffer presented to the hardware contains real audio.
+ */
 void ac97_start(void) {
     if (!g_ac97_initialized) return;
 
@@ -184,12 +189,13 @@ void ac97_start(void) {
     /* Reset last valid index */
     g_last_valid = 0;
 
-    /* Prime all 32 buffers with real audio from the player */
-    for (int i = 0; i < AC97_BD_COUNT; i++) {
+    const uint8_t initial_buffers = 2;  /* matches player's front+back preload */
+
+    for (int i = 0; i < initial_buffers; i++) {
         audio_mix_streams(g_audio_buffers[i], AC97_FRAMES_PER_BUFFER);
         g_last_valid = (uint8_t)i;
-        port_outb(g_nabm_base + AC97_NABM_POLVI, g_last_valid);
     }
+    port_outb(g_nabm_base + AC97_NABM_POLVI, g_last_valid);
 
     /* Start DMA: RPBM bit */
     port_outb(g_nabm_base + AC97_NABM_POCR, AC97_POCR_RPBM);

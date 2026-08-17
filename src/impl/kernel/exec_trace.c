@@ -111,9 +111,29 @@ static void trace_print(const char* fmt, ...) {
 
     serial_write_str(buf);
 
-    if ((g_trace_lines % TRACE_YIELD_EVERY) == 0) {
-        asm volatile("sti; hlt; cli");
-    }
+    /*
+     * REMOVED: this used to do `asm volatile("sti; hlt; cli")` here as
+     * a "yield" every TRACE_YIELD_EVERY lines. That directly toggled
+     * the real CPU interrupt flag without ever touching g_int_stack /
+     * g_interrupts_enabled - the very audit state this file exists to
+     * maintain. Any caller that had legitimately disabled interrupts
+     * around a critical section (e.g. minimafs_write_blocks() wrapping
+     * ahci_write() in irq_save()/irq_restore() to keep AHCI command
+     * setup atomic) would have interrupts silently re-enabled out from
+     * under it the moment tracing crossed a 200-line boundary mid-call,
+     * with a real hlt potentially handing control to the scheduler and
+     * preempting the process while it still held g_ahci_lock and a
+     * half-built command table.
+     *
+     * serial_write_str() alone is already a bounded, non-blocking
+     * operation (it polls the UART TX-empty bit, which does not
+     * require interrupts to be enabled), so no yield is actually
+     * needed here for correctness - this was purely a debug-log
+     * throttle, and it must never touch IF. If a genuine cooperative
+     * yield is ever wanted here, use a bounded busy-spin (see
+     * ahci_sleep_ms()/minimafs_sleep_ms() for the established pattern)
+     * that does not depend on hlt or on the caller's interrupt state.
+     */
 }
 
 // ===========================================

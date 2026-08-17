@@ -225,16 +225,35 @@ void ac97_update(void) {
     }
 
     /*
-     * Fill ahead g_target_ahead buffers beyond what the HW is currently
-     * consuming, but keep a safety_gap so we never write INTO the buffer
-     * the hardware is reading right now.
+     * current_lead = how many already-queued buffers remain ahead of
+     * what hardware is currently playing (civ). We want to keep at
+     * least g_target_ahead buffers of headroom queued at all times.
+     *
+     * PREVIOUS BUG: the old check computed `dist` (distance from civ
+     * to the *candidate* next buffer) and broke out of the loop when
+     * dist was SMALL (<= safety_gap). That's backwards - dist is
+     * small exactly when the queue is nearly empty and most needs
+     * refilling. In practice this meant the fill-ahead loop broke on
+     * its very first iteration right after ac97_start() (dist == 2
+     * with only 2 buffers primed) and never filled another buffer for
+     * the rest of playback. Once hardware played past the last valid
+     * descriptor, the AC97_BD_BUP flag made it repeat the final buffer
+     * forever - that's the droning/helicopter artifact, and the
+     * "underrun" log messages are audio_mix_streams() correctly
+     * reporting that the player's decoded PCM was never being
+     * consumed to feed new hardware buffers.
      */
-    const uint8_t safety_gap = 2;
+    for (;;) {
+        uint8_t current_lead = (uint8_t)((g_last_valid + AC97_BD_COUNT - civ) % AC97_BD_COUNT);
+        if (current_lead >= g_target_ahead) break;   // already have enough headroom
 
-    for (uint8_t i = 0; i < g_target_ahead; i++) {
         uint8_t next = (g_last_valid + 1) % AC97_BD_COUNT;
-        uint8_t dist = (uint8_t)((next + AC97_BD_COUNT - civ) % AC97_BD_COUNT);
-        if (dist <= safety_gap) break;
+
+        /* Never let LVI catch up to / lap CIV - keep at least one
+         * buffer of physical separation so we're never writing into
+         * the descriptor the hardware is actively reading right now. */
+        uint8_t next_lead = (uint8_t)((next + AC97_BD_COUNT - civ) % AC97_BD_COUNT);
+        if (next_lead == 0) break;
 
         audio_mix_streams(g_audio_buffers[next], AC97_FRAMES_PER_BUFFER);
         g_last_valid = next;

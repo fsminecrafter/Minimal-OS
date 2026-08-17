@@ -10,7 +10,7 @@
 // ===========================================
 // These can be overridden by defining them before including audio.h
 #ifndef AUDIO_BUFFER_SIZE
-#define AUDIO_BUFFER_SIZE 1024  // frames per DMA buffer
+#define AUDIO_BUFFER_SIZE 8192  // frames per DMA buffer
 #endif
 
 #ifndef AUDIO_CHANNELS

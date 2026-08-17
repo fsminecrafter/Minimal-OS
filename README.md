@@ -93,7 +93,8 @@ sudo apt install -y \
   xorriso \
   grub-pc-bin \
   grub-common \
-  mtools
+  mtools \
+  qemu-system
 ```
 3. Run the included gcc / binutils installer
 ```

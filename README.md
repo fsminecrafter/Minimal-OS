@@ -58,3 +58,52 @@ Last synced 2026 - Mar 21 - 16:05
 - [ ] Simple Audio ! 
 - [x] System calls !! 
 - [x] File system !!! (MinimaFS)
+
+## Usage
+
+To run Minimal-OS (direct iso) download from github releases ( [Minimal-OS Downloads](https://github.com/fsminecrafter/Minimal-OS/releases) )
+Then after downloading the .iso file of any version use qemu-system-x86_64 which can be downloaded using the systems package manager or Mingw on windows.
+And before running the operating system create a disk file for it to use in the same directory as you are running from by using this command ```fallocate -l 256M sata256.img```
+Then run this command for the suitable configuration for current Minimal-OS support.
+```
+qemu-system-x86_64 -cdrom kernel.iso -m 1024M -boot d -d guest_errors,int,cpu_reset,unimp -serial -usb -device usb-kbd stdio \
+-audiodev pa,id=speaker -machine pcspk-audiodev=speaker  -audiodev pa,id=audio0 -device AC97,audiodev=audio0 -device ahci,id=ahci \
+-drive id=disk0,file=sata256.img,if=none,format=raw -device ide-hd,drive=disk0,bus=ahci.0
+```
+
+### Building from Source
+
+ 1. Download the source code, ```git clone https://github.com/fsminecrafter/Minimal-OS.git```
+ 2. Enter the folder and run the dependency install command (this one is for debian 13, Ubuntu 24.04/26.04 or at least tested on them)
+```
+sudo apt update
+sudo apt install -y \
+  build-essential \
+  bison \
+  flex \
+  libgmp3-dev \
+  libmpc-dev \
+  libmpfr-dev \
+  texinfo \
+  libisl-dev \
+  wget \
+  curl \
+  make \
+  nasm \
+  xorriso \
+  grub-pc-bin \
+  grub-common \
+  mtools
+```
+3. Run the included gcc / binutils installer
+```
+./build_gccbinutils.sh
+```
+4. Create a sata256.img file in root of Minimal-OS project folder.
+```
+fallocate -l 256M sata256.img
+```
+5. Compile and run using make
+```make run```
+If audio doesnt work use either
+```make run-sdl``` or ```make run-alsa```

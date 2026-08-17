@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "audio.h"
+#include "x86_64/global_audio_state.h"
 #include "x86_64/ac97_driver.h"
 #include "x86_64/pci.h"
 #include "x86_64/mmio.h"
@@ -126,7 +127,7 @@ bool ac97_init(void) {
 
     for (int i = 0; i < AC97_BD_COUNT; i++) {
         g_audio_buffers[i] =
-            (int16_t*)((uint8_t*)g_audio_buffer_base + i * AC97_BUFFER_BYTES);
+        (int16_t*)((uint8_t*)g_audio_buffer_base + i * AC97_BUFFER_BYTES);
 
         /* Zero-fill so silence plays before any real audio is queued */
         for (uint32_t s = 0; s < samples_per_buffer; s++) {
@@ -172,11 +173,6 @@ bool ac97_init(void) {
  * Call this AFTER the player is set up and ready to provide samples,
  * so the first buffer presented to the hardware contains real audio.
  */
-/*
- * ac97_start — prime buffers with real audio and start DMA.
- * Call this AFTER the player is set up and ready to provide samples,
- * so the first buffer presented to the hardware contains real audio.
- */
 void ac97_start(void) {
     if (!g_ac97_initialized) return;
 
@@ -201,6 +197,24 @@ void ac97_start(void) {
     port_outb(g_nabm_base + AC97_NABM_POCR, AC97_POCR_RPBM);
 
     serial_write_str("AC97: DMA started\n");
+}
+
+/*
+ * Returns true if the *next* call to audio_mix_streams() would produce
+ * real decoded audio rather than silence.
+ *
+ * This deliberately mirrors the exact exhaustion check
+ * audio_mix_streams() performs internally (pcm_position vs pcm_size,
+ * then back_buffer_ready) so ac97_update()'s fill-ahead loop can decide
+ * NOT to queue a buffer at all, instead of queuing a silent one and
+ * marking it valid — see the comment in ac97_update() for why that
+ * distinction matters.
+ */
+static inline bool ac97_player_has_data(void) {
+    audio_player_t* player = g_audio_state.player;
+    if (!player || !g_audio_state.playing || !player->playing) return false;
+    if (player->pcm_position < player->pcm_size) return true;
+    return player->back_buffer_ready;
 }
 
 void ac97_update(void) {
@@ -229,19 +243,39 @@ void ac97_update(void) {
      * what hardware is currently playing (civ). We want to keep at
      * least g_target_ahead buffers of headroom queued at all times.
      *
-     * PREVIOUS BUG: the old check computed `dist` (distance from civ
-     * to the *candidate* next buffer) and broke out of the loop when
-     * dist was SMALL (<= safety_gap). That's backwards - dist is
-     * small exactly when the queue is nearly empty and most needs
-     * refilling. In practice this meant the fill-ahead loop broke on
-     * its very first iteration right after ac97_start() (dist == 2
-     * with only 2 buffers primed) and never filled another buffer for
-     * the rest of playback. Once hardware played past the last valid
-     * descriptor, the AC97_BD_BUP flag made it repeat the final buffer
-     * forever - that's the droning/helicopter artifact, and the
-     * "underrun" log messages are audio_mix_streams() correctly
-     * reporting that the player's decoded PCM was never being
-     * consumed to feed new hardware buffers.
+     * PREVIOUS BUG (already fixed before this change): the old check
+     * computed `dist` backwards and broke out of the loop when the
+     * queue was nearly empty instead of nearly full.
+     *
+     * SECOND BUG (fixed here): even with that fix, this loop still
+     * called audio_mix_streams() and then UNCONDITIONALLY advanced
+     * g_last_valid/LVI for every buffer up to g_target_ahead, on every
+     * single PIT tick (~every 10ms). audio_mix_streams() only ever has
+     * one buffer's worth of headroom to hand out — the player keeps a
+     * front buffer (currently being drained) and a single back buffer
+     * that the background decode task (audio_player_update(), running
+     * as its own cooperatively-scheduled process) refills one buffer
+     * at a time. g_target_ahead is 4, so this loop would happily "fill"
+     * three more buffers than the player could possibly supply, get
+     * silence for all of them from audio_mix_streams()'s own underrun
+     * path, and still mark them valid and walk LVI past them anyway.
+     *
+     * Once hardware played through those silent buffers, AC97_BD_BUP
+     * made it repeat the last one it had over and over — that's the
+     * droning/"helicopter" artifact. And because LVI kept getting
+     * walked forward over silence instead of waiting for the decoder,
+     * real decoded audio that arrived later got queued behind a
+     * position playback had already reached — padding real time with
+     * silence and stretching the song out, which is the "everything
+     * sounds slow" symptom.
+     *
+     * Fix: stop advancing the ring the moment we know the very next
+     * fill would be silence, instead of queuing it as if it were real
+     * audio. LVI then stays tightly coupled to what's actually been
+     * decoded — CIV catches up naturally and this loop just tries
+     * again on the next tick, once audio_player_update() has had a
+     * chance to refill the back buffer, rather than racing arbitrarily
+     * far ahead of the decoder.
      */
     for (;;) {
         uint8_t current_lead = (uint8_t)((g_last_valid + AC97_BD_COUNT - civ) % AC97_BD_COUNT);
@@ -254,6 +288,10 @@ void ac97_update(void) {
          * the descriptor the hardware is actively reading right now. */
         uint8_t next_lead = (uint8_t)((next + AC97_BD_COUNT - civ) % AC97_BD_COUNT);
         if (next_lead == 0) break;
+
+        // Don't queue a buffer we already know will just be silence -
+        // wait for the decoder instead of racing ahead of it.
+        if (!ac97_player_has_data()) break;
 
         audio_mix_streams(g_audio_buffers[next], AC97_FRAMES_PER_BUFFER);
         g_last_valid = next;

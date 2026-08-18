@@ -70,7 +70,13 @@ static int16_t*   g_audio_buffers[AC97_BD_COUNT] = {0};
 static bool  g_ac97_initialized = false;
 static uint8_t g_last_valid  = 0;
 static bool  g_vra_supported = false;
-static uint8_t g_target_ahead = 4;
+
+/* Kept equal to AUDIO_RING_SIZE (audio.h) on purpose: the fill-ahead
+ * target here and the player's decode-ahead ring depth are two halves
+ * of the same contract. Letting them drift apart is exactly what
+ * caused the chronic underrun/helicopter bug - see the long comment
+ * in ac97_update() and the one above AUDIO_RING_SIZE in audio.h. */
+static uint8_t g_target_ahead = AUDIO_RING_SIZE;
 
 static inline uint16_t ac97_mixer_read(uint16_t reg) {
     return port_inw((uint16_t)(g_nam_base + reg));
@@ -171,7 +177,7 @@ bool ac97_init(void) {
 /*
  * ac97_start — prime buffers with real audio and start DMA.
  * Call this AFTER the player is set up and ready to provide samples,
- * so the first buffer presented to the hardware contains real audio.
+ * so the first buffers presented to the hardware contain real audio.
  */
 void ac97_start(void) {
     if (!g_ac97_initialized) return;
@@ -185,7 +191,13 @@ void ac97_start(void) {
     /* Reset last valid index */
     g_last_valid = 0;
 
-    const uint8_t initial_buffers = 2;  /* matches player's front+back preload */
+    /* Matches player's full-ring prefill in audio_player_play() - the
+     * player now prefills all AUDIO_RING_SIZE slots up front, so we
+     * can prime all AUDIO_RING_SIZE hardware buffers here too instead
+     * of stopping at 2. This is what actually gives playback its
+     * initial lead time; priming fewer buffers than the player has
+     * ready just throws away headroom for no reason. */
+    const uint8_t initial_buffers = AUDIO_RING_SIZE;
 
     for (int i = 0; i < initial_buffers; i++) {
         audio_mix_streams(g_audio_buffers[i], AC97_FRAMES_PER_BUFFER);
@@ -203,18 +215,22 @@ void ac97_start(void) {
  * Returns true if the *next* call to audio_mix_streams() would produce
  * real decoded audio rather than silence.
  *
- * This deliberately mirrors the exact exhaustion check
- * audio_mix_streams() performs internally (pcm_position vs pcm_size,
- * then back_buffer_ready) so ac97_update()'s fill-ahead loop can decide
- * NOT to queue a buffer at all, instead of queuing a silent one and
- * marking it valid — see the comment in ac97_update() for why that
- * distinction matters.
+ * Mirrors the exact ring-exhaustion check audio_mix_streams() performs
+ * internally (current slot ready+not-exhausted, else check the next
+ * slot) so ac97_update()'s fill-ahead loop can decide NOT to queue a
+ * buffer at all, instead of queuing a silent one and marking it valid.
  */
 static inline bool ac97_player_has_data(void) {
     audio_player_t* player = g_audio_state.player;
     if (!player || !g_audio_state.playing || !player->playing) return false;
-    if (player->pcm_position < player->pcm_size) return true;
-    return player->back_buffer_ready;
+
+    if (player->ring_ready[player->read_slot] &&
+        player->read_pos < player->ring_size[player->read_slot]) {
+        return true;
+        }
+
+        uint8_t next_slot = (uint8_t)((player->read_slot + 1) % AUDIO_RING_SIZE);
+    return player->ring_ready[next_slot];
 }
 
 void ac97_update(void) {
@@ -247,35 +263,23 @@ void ac97_update(void) {
      * computed `dist` backwards and broke out of the loop when the
      * queue was nearly empty instead of nearly full.
      *
-     * SECOND BUG (fixed here): even with that fix, this loop still
-     * called audio_mix_streams() and then UNCONDITIONALLY advanced
-     * g_last_valid/LVI for every buffer up to g_target_ahead, on every
-     * single PIT tick (~every 10ms). audio_mix_streams() only ever has
-     * one buffer's worth of headroom to hand out — the player keeps a
-     * front buffer (currently being drained) and a single back buffer
-     * that the background decode task (audio_player_update(), running
-     * as its own cooperatively-scheduled process) refills one buffer
-     * at a time. g_target_ahead is 4, so this loop would happily "fill"
-     * three more buffers than the player could possibly supply, get
-     * silence for all of them from audio_mix_streams()'s own underrun
-     * path, and still mark them valid and walk LVI past them anyway.
+     * SECOND BUG (also already fixed): this loop used to call
+     * audio_mix_streams() and then unconditionally advance g_last_valid
+     * even when the player had nothing real to give, marking silent
+     * buffers "valid" and racing far ahead of the decoder.
      *
-     * Once hardware played through those silent buffers, AC97_BD_BUP
-     * made it repeat the last one it had over and over — that's the
-     * droning/"helicopter" artifact. And because LVI kept getting
-     * walked forward over silence instead of waiting for the decoder,
-     * real decoded audio that arrived later got queued behind a
-     * position playback had already reached — padding real time with
-     * silence and stretching the song out, which is the "everything
-     * sounds slow" symptom.
-     *
-     * Fix: stop advancing the ring the moment we know the very next
-     * fill would be silence, instead of queuing it as if it were real
-     * audio. LVI then stays tightly coupled to what's actually been
-     * decoded — CIV catches up naturally and this loop just tries
-     * again on the next tick, once audio_player_update() has had a
-     * chance to refill the back buffer, rather than racing arbitrarily
-     * far ahead of the decoder.
+     * THIRD BUG (fixed by this change, in audio.h/audio.c): even after
+     * both of the above fixes, the player itself only ever kept 2
+     * buffers of decoded lookahead (front+back double-buffer) against
+     * a g_target_ahead of 4. That is a structural, not transient,
+     * shortfall - there was no scheduling delay or disk hiccup so small
+     * that it wouldn't outrun a 2-buffer cushion sooner or later, which
+     * is why the underrun log kept firing continuously rather than
+     * occasionally. The player now keeps AUDIO_RING_SIZE (4) buffers
+     * of lookahead, matching g_target_ahead exactly, and
+     * audio_player_update() can refill more than one slot per call to
+     * catch back up quickly after any delay - see the comments in
+     * audio.h (AUDIO_RING_SIZE) and audio.c (audio_player_update()).
      */
     for (;;) {
         uint8_t current_lead = (uint8_t)((g_last_valid + AC97_BD_COUNT - civ) % AC97_BD_COUNT);

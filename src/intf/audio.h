@@ -27,7 +27,7 @@ void audio_mix_streams(int16_t* out, uint32_t frames);
 
 /*
  * Audio Streaming System for MinimalOS
- * 
+ *
  * Supports:
  * - IMA ADPCM compression (4:1 ratio)
  * - Microsoft ADPCM compression (4:1 ratio)
@@ -69,11 +69,11 @@ typedef struct {
 typedef struct {
     char path[MINIMAFS_MAX_PATH];
     minimafs_file_handle_t* file_handle;
-    
+
     bool write_mode;
     uint32_t chunk_size;         // Bytes per chunk
     bool include_metadata;       // Include ADI header?
-    
+
     // Current state
     uint32_t current_offset;     // Current position in file
     uint32_t data_offset;   // absolute file offset of the first ADI audio byte
@@ -83,7 +83,7 @@ typedef struct {
     uint32_t prefetch_size;    // how many bytes are in prefetch_buf
     uint32_t prefetch_pos;     // how many have been consumed
     bool end_of_stream;
-    
+
     // ADI metadata (if audio file)
     adi_header_t adi_header;
     bool is_adi;
@@ -91,19 +91,19 @@ typedef struct {
 
 /**
  * Create a data stream for reading/writing files in chunks
- * 
+ *
  * @param path File path (e.g., "0:/music.adi")
  * @param write_mode true=write, false=read
  * @param chunk_size Bytes per chunk (e.g., 512, 1024, 4096)
  * @param include_metadata Read/write ADI header automatically
  * @return Stream handle or NULL on error
  */
-audio_datastream_t* streamfile(const char* path, bool write_mode, 
+audio_datastream_t* streamfile(const char* path, bool write_mode,
                                uint32_t chunk_size, bool include_metadata);
 
 /**
  * Read next chunk from stream
- * 
+ *
  * @param stream Stream handle
  * @param bytes_read Output: number of bytes actually read
  * @return Pointer to chunk data, or NULL on error/EOF
@@ -112,7 +112,7 @@ uint8_t* readstream(audio_datastream_t* stream, uint32_t* bytes_read);
 
 /**
  * Write chunk to stream
- * 
+ *
  * @param stream Stream handle
  * @param data Data to write
  * @param size Size of data
@@ -122,7 +122,7 @@ bool writestream(audio_datastream_t* stream, const uint8_t* data, uint32_t size)
 
 /**
  * Update stream position (advance to next chunk)
- * 
+ *
  * @param stream Stream handle
  * @return true if more data available
  */
@@ -149,7 +149,7 @@ void closestream(audio_datastream_t* stream);
 
 /**
  * Parse ADI header from file
- * 
+ *
  * @param path File path
  * @param header Output header structure
  * @return true on success
@@ -172,7 +172,7 @@ const char* adi_format_name(audio_format_t format);
 
 /**
  * Decode IMA ADPCM to PCM16
- * 
+ *
  * @param input Compressed IMA ADPCM data
  * @param input_size Size of compressed data
  * @param output Output PCM16 buffer (must be 4x input_size)
@@ -204,48 +204,72 @@ bool decode_flac(const uint8_t* input, uint32_t input_size,
 // AUDIO PLAYBACK
 // ===========================================
 
-    /* Double-buffer layout:
-     *   pcm_buffer[0 .. pcm_capacity-1]          = front (current_buffer == 0)
-     *   pcm_buffer[pcm_capacity .. 2*pcm_capacity-1] = back  (current_buffer == 1)
-     *
-     * The mixer (interrupt context) reads from the front buffer.
-     * The background process fills the back buffer.
-     *
-     * Handoff protocol (lock-free, single-producer / single-consumer):
-     *
-     *   back_buffer_ready  – written by background, read by mixer.
-     *                        TRUE  = back buffer has fresh decoded PCM.
-     *                        FALSE = back buffer is stale / being refilled.
-     *
-     *   needs_refill       – written by mixer, read by background.
-     *                        TRUE  = mixer just swapped to the back buffer;
-     *                                background should now refill the other one.
-     *                        FALSE = nothing to do yet.
-     *
-     *   back_buffer_size   – number of valid samples in the back buffer.
-     *                        Written by background before setting back_buffer_ready.
-     *                        Read by mixer when it switches buffers.
-     */
+/*
+ * Ring buffer depth: how many decoded audio buffers the player keeps
+ * ready ahead of what the mixer is currently draining.
+ *
+ * This must be deep enough to absorb normal scheduling jitter of the
+ * background decode task (audio_player_update(), a cooperatively
+ * scheduled process) PLUS the AHCI block read it occasionally triggers
+ * when a decode chunk crosses into a fresh disk block. The old design
+ * only ever kept 2 buffers ready (a strict front/back double-buffer),
+ * which left the mixer with essentially zero slack: a single missed
+ * scheduling slot, or one slightly slow disk read, was enough to starve
+ * playback entirely. That's what caused the chronic "[AUDIO] underrun"
+ * spam, the helicopter/droning artifact (AC97_BD_BUP repeating the last
+ * real buffer it had), and the song audibly taking far longer to finish
+ * than its real length. AC97's own fill-ahead target
+ * (g_target_ahead in ac97_driver.c) was already 4 buffers deep - the
+ * player just never had that much decoded audio available to give it.
+ *
+ * 4 is not an arbitrary choice: MinimaFS blocks are 4096 bytes, and the
+ * IMA-ADPCM decode chunk size is computed as pcm_capacity/2 bytes,
+ * which for a stereo buffer works out to exactly 1024 bytes - i.e.
+ * four decode chunks per disk block. A ring of 4 means one AHCI block
+ * read now refills the *entire* ring in one shot, instead of leaving
+ * the player perpetually one chunk-read away from running dry.
+ */
+#define AUDIO_RING_SIZE 8
 
 typedef struct {
     audio_datastream_t* stream;
     audio_format_t format;
-    int16_t* pcm_buffer;
-    uint32_t pcm_capacity;       /* samples per half-buffer (each side) */
-    uint32_t pcm_position;       /* read head inside the current (front) buffer */
-    uint32_t pcm_size;           /* valid sample count in the front buffer */
- 
-    volatile bool back_buffer_ready; /* background → mixer */
-    volatile bool needs_refill;      /* mixer → background */
-    uint32_t back_buffer_size;       /* valid samples in back buffer */
- 
+
+    int16_t* pcm_buffer;          /* AUDIO_RING_SIZE slots, each pcm_capacity samples, contiguous */
+    uint32_t pcm_capacity;        /* samples per slot (one hardware buffer's worth) */
+
+    /*
+     * Ring buffer state.
+     *
+     *   ring_ready[slot] - written by the background decode task,
+     *                      read by the mixer. true = slot holds fresh
+     *                      decoded PCM ready to play.
+     *   ring_size[slot]  - valid sample count in that slot. Only
+     *                      meaningful while ring_ready[slot] is true.
+     *
+     * Consumer (mixer, runs from PIT-interrupt context via
+     * audio_mix_streams()): drains read_slot from read_pos up to
+     * ring_size[read_slot], then clears ring_ready[read_slot] (freeing
+     * it for the producer), advances read_slot, and starts draining
+     * the next slot once it's ready.
+     *
+     * Producer (background task, audio_player_update()): walks
+     * forward from write_slot filling every slot that isn't
+     * ring_ready yet, so a single call can catch up on more than one
+     * slot at once if it fell behind.
+     */
+    volatile bool ring_ready[AUDIO_RING_SIZE];
+    uint32_t      ring_size[AUDIO_RING_SIZE];
+
+    uint8_t  read_slot;   /* slot the mixer is currently draining */
+    uint32_t read_pos;    /* position within read_slot */
+    uint8_t  write_slot;  /* next slot the decoder should try to fill */
+
     int adpcm_pred_l;
     int adpcm_step_l;
     int adpcm_pred_r;
     int adpcm_step_r;
- 
-    int current_buffer;          /* 0 = first half is front, 1 = second half is front */
- 
+
     uint8_t volume;              /* 0-100 */
     bool playing;
     bool loop;
@@ -253,7 +277,7 @@ typedef struct {
 
 /**
  * Create audio player for file
- * 
+ *
  * @param path Path to .adi file
  * @return Player handle or NULL on error
  */
@@ -301,7 +325,7 @@ void audio_player_destroy(audio_player_t* player);
 
 /**
  * Find substring in file
- * 
+ *
  * @param needle String to search for
  * @param path File path
  * @return Offset where found, or -1 if not found
@@ -310,9 +334,9 @@ int32_t findinfile(const char* needle, const char* path);
 
 /**
  * Split string and get value
- * 
+ *
  * Example: getvalfromsplit("Globalvol=80", "=", 2) returns "80"
- * 
+ *
  * @param str String to split
  * @param delimiter Delimiter character
  * @param index Index of value to return (1-based)
@@ -320,7 +344,7 @@ int32_t findinfile(const char* needle, const char* path);
  * @param output_size Size of output buffer
  * @return true on success
  */
-bool getvalfromsplit(const char* str, const char* delimiter, 
+bool getvalfromsplit(const char* str, const char* delimiter,
                      int index, char* output, size_t output_size);
 
 /**

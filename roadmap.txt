@@ -26,6 +26,18 @@ Fonts [X] !also a little limited for now!
 
 USB 1.1 [X]
 Keyboard [X]
-Simple Audio ! []
-System calls !! []
-File system !!! []
+Simple Audio ! [X]
+File system !!! [X]
+
+V 0.4.4X
+
+Multithreading And Multicore usage []
+Services manager []
+Syscalls and User layer  []
+
+V 0.4.5X
+
+Simple Desktop []
+Window Manager []
+MinimaFS file browser (within minimal-os) []
+Text editor []

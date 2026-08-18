@@ -55,9 +55,21 @@ Last synced 2026 - Mar 21 - 16:05
 
 - [x] USB 1.1 
 - [x] Keyboard
-- [ ] Simple Audio ! 
-- [x] System calls !! 
+- [x] Simple Audio ! 
 - [x] File system !!! (MinimaFS)
+
+#### V 0.4.4X
+
+- [ ] Multithreading And Multicore usage 
+- [ ] Services manager 
+- [ ] Syscalls and User layer  
+
+#### V 0.4.5X
+
+- [ ] Simple Desktop 
+- [ ] Window Manager 
+- [ ] MinimaFS file browser (within minimal-os) 
+- [ ] Text editor 
 
 ## Usage
 

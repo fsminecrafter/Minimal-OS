@@ -1,4 +1,4 @@
-; src/impl/x86_64/proc/context_switch.asm
+; src/modules/Etc/proc/context_switch.asm
 section .text
 global context_switch
 

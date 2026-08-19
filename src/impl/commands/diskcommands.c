@@ -256,13 +256,22 @@ void cmd_listroot_debug(int argc, const char** argv) {
 }
 
 // ===========================================
-// RECURSIVE LISTDISK COMMAND
+// RECURSIVE list COMMAND
 // ===========================================
 
 // Helper: print a single folder level, then recurse into subdirs
 // We copy subdir names before freeing folder, then recurse after
-void listdisk_recursive(const char* path, int indent) {
-    minimafs_drive_t* drive = get_drive(0);
+static char g_current_directory[MINIMAFS_MAX_PATH] = "0:/";
+static char g_resolved_path[MINIMAFS_MAX_PATH];
+static char g_list_local_path[MINIMAFS_MAX_PATH];
+static bool fs_resolve_path(const char* input, char* resolved);
+
+const char* fs_get_current_directory(void) {
+    return g_current_directory;
+}
+
+void list_recursive(uint8_t drive_number, const char* path, int indent) {
+    minimafs_drive_t* drive = get_drive(drive_number);
     if (!drive || !drive->mounted) return;
 
     // Heap-allocate: this is recursive so each level would add ~6KB to stack
@@ -287,7 +296,7 @@ void listdisk_recursive(const char* path, int indent) {
     uint32_t subdir_count = 0;
 
     if (!subdirs) {
-        serial_write_str("listdisk_recursive: OOM allocating subdirs buffer\n");
+        serial_write_str("list_recursive: OOM allocating subdirs buffer\n");
         free_mem(folder);
         return;
     }
@@ -317,26 +326,72 @@ void listdisk_recursive(const char* path, int indent) {
 
     // Recurse into subdirs with folder already freed
     for (uint32_t i = 0; i < subdir_count; i++) {
-        listdisk_recursive(subdirs[i], indent + 1);
+        list_recursive(drive_number, subdirs[i], indent + 1);
     }
 
     free_mem(subdirs);
 }
 
-void cmd_listdisk(int argc, const char** argv) {
-    serial_write_str("\n=== LISTDISK ===\n");
+void cmd_list(int argc, const char** argv) {
+    serial_write_str("\n=== list ===\n");
 
-    minimafs_drive_t* drive = get_drive(0);
+    const char* requested_path = "";
+    bool recursive = false;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--recursive") == 0 ||
+            strcmp(argv[i], "--recurvesive") == 0) {
+            recursive = true;
+        } else if (*requested_path == '\0') {
+            requested_path = argv[i];
+        }
+    }
+    if (!fs_resolve_path(requested_path, g_resolved_path)) {
+        graphics_write_textr("list: invalid path\n");
+        return;
+    }
+
+    uint8_t drive_number;
+    if (!minimafs_parse_path(g_resolved_path, &drive_number, g_list_local_path)) {
+        graphics_write_textr("list: invalid path\n");
+        return;
+    }
+
+    minimafs_drive_t* drive = get_drive(drive_number);
     if (!drive || !drive->mounted) {
-        serial_write_str("ERROR: Drive 0 not mounted!\n");
+        serial_write_str("ERROR: Drive not mounted!\n");
         graphics_write_textr("Drive not mounted!\n");
         return;
     }
 
-    listdisk_recursive("/", 0);
+    if (!minimafs_is_dir(g_resolved_path)) {
+        graphics_write_textr("list: not a directory\n");
+        return;
+    }
 
-    serial_write_str("=== LISTDISK DONE ===\n\n");
-    graphics_write_textr("Disk listing complete.\n");
+    if (recursive) {
+        list_recursive(drive_number, g_list_local_path, 0);
+        serial_write_str("=== list DONE ===\n\n");
+        return;
+    }
+
+    minimafs_dir_entry_t* entries = (minimafs_dir_entry_t*)alloc(
+        MINIMAFS_MAX_ROOT_ENTRIES * sizeof(minimafs_dir_entry_t));
+    if (!entries) {
+        graphics_write_textr("list: out of memory\n");
+        return;
+    }
+
+    uint32_t count = minimafs_list_dir(g_resolved_path, entries,
+                                       MINIMAFS_MAX_ROOT_ENTRIES);
+    for (uint32_t i = 0; i < count; i++) {
+        graphics_write_textr(entries[i].name);
+        if (entries[i].type == MINIMAFS_TYPE_DIR)
+            graphics_write_textr(" [DIR]");
+        graphics_write_textr("\n");
+    }
+    free_mem(entries);
+
+    serial_write_str("=== list DONE ===\n\n");
 }
 
 static uint8_t parse_u8(const char* s, uint8_t def) {
@@ -349,6 +404,212 @@ static uint8_t parse_u8(const char* s, uint8_t def) {
     if (val > 255) val = 255;
     return (uint8_t)val;
 }
+
+static bool fs_append_segment(char* path, size_t* length, const char* segment) {
+    size_t segment_length = strlen(segment);
+    if (*length + segment_length + 2 >= MINIMAFS_MAX_PATH) return false;
+    if (*length > 1) path[(*length)++] = '/';
+    memcpy(path + *length, segment, segment_length);
+    *length += segment_length;
+    path[*length] = '\0';
+    return true;
+}
+
+static void fs_remove_last_segment(char* path, size_t* length) {
+    if (*length <= 1) {
+        *length = 1;
+        path[1] = '\0';
+        return;
+    }
+    while (*length > 1 && path[*length - 1] != '/') (*length)--;
+    if (*length > 1) (*length)--;
+    path[*length] = '\0';
+}
+
+static bool fs_resolve_path(const char* input, char* resolved) {
+    if (!input || !resolved) return false;
+
+    static char base_local[MINIMAFS_MAX_PATH];
+    static char input_local[MINIMAFS_MAX_PATH];
+    static char combined[MINIMAFS_MAX_PATH * 2];
+    static char normalized[MINIMAFS_MAX_PATH];
+    static char segment[MINIMAFS_MAX_FILENAME];
+    uint8_t drive_number = 0;
+
+    const char* effective_input = *input ? input : g_current_directory;
+
+    if (strchr(effective_input, ':')) {
+        if (!minimafs_parse_path(effective_input, &drive_number, input_local)) return false;
+        combined[0] = '\0';
+        strncpy(combined, input_local, sizeof(combined) - 1);
+    } else {
+        if (!minimafs_parse_path(g_current_directory, &drive_number, base_local)) return false;
+        if (effective_input[0] == '/') {
+            snprintf(combined, sizeof(combined), "%s", effective_input);
+        } else {
+            snprintf(combined, sizeof(combined), "%s/%s", base_local, effective_input);
+        }
+    }
+
+    normalized[0] = '/';
+    normalized[1] = '\0';
+    size_t normalized_length = 1;
+    char* cursor = combined;
+    while (*cursor == '/') cursor++;
+
+    while (*cursor) {
+        size_t segment_length = 0;
+        while (*cursor && *cursor != '/') {
+            if (segment_length + 1 >= sizeof(segment)) return false;
+            segment[segment_length++] = *cursor++;
+        }
+        segment[segment_length] = '\0';
+        while (*cursor == '/') cursor++;
+
+        if (segment_length == 0 || strcmp(segment, ".") == 0) continue;
+        if (strcmp(segment, "..") == 0) {
+            fs_remove_last_segment(normalized, &normalized_length);
+        } else if (!fs_append_segment(normalized, &normalized_length, segment)) {
+            return false;
+        }
+    }
+
+    snprintf(resolved, MINIMAFS_MAX_PATH, "%u:%s", drive_number, normalized);
+    return true;
+}
+
+static bool fs_set_directory_hidden(const char* path, bool hidden) {
+    static char local_path[MINIMAFS_MAX_PATH];
+    static char parent[MINIMAFS_MAX_PATH];
+    static char dirname[MINIMAFS_MAX_FILENAME];
+    uint8_t drive_number;
+
+    if (!minimafs_parse_path(path, &drive_number, local_path)) return false;
+    minimafs_drive_t* drive = get_drive(drive_number);
+    if (!drive) return false;
+
+    const char* slash = strrchr(local_path, '/');
+    if (!slash) {
+        parent[0] = '\0';
+        strncpy(dirname, local_path, sizeof(dirname) - 1);
+    } else {
+        size_t parent_length = (size_t)(slash - local_path);
+        if (parent_length >= sizeof(parent)) return false;
+        memcpy(parent, local_path, parent_length);
+        parent[parent_length] = '\0';
+        strncpy(dirname, slash + 1, sizeof(dirname) - 1);
+    }
+    dirname[sizeof(dirname) - 1] = '\0';
+
+    minimafs_folder_desc_t* descriptor =
+        (minimafs_folder_desc_t*)alloc(sizeof(minimafs_folder_desc_t));
+    if (!descriptor || !minimafs_read_folder_desc(drive, parent, descriptor)) {
+        if (descriptor) free_mem(descriptor);
+        return false;
+    }
+
+    bool found = false;
+    for (uint32_t i = 0; i < descriptor->entry_count; i++) {
+        if (strcmp(descriptor->entries[i].name, dirname) == 0 &&
+            descriptor->entries[i].type == MINIMAFS_TYPE_DIR) {
+            descriptor->entries[i].hidden = hidden;
+            found = true;
+            break;
+        }
+    }
+
+    bool result = found && minimafs_write_folder_desc(drive, descriptor);
+    free_mem(descriptor);
+    return result;
+}
+
+void cmd_cd(int argc, const char** argv) {
+    if (argc < 2) {
+        graphics_write_textr(g_current_directory);
+        graphics_write_textr("\n");
+        return;
+    }
+
+    if (!fs_resolve_path(argv[1], g_resolved_path) || !minimafs_is_dir(g_resolved_path)) {
+        graphics_write_textr("cd: directory not found: ");
+        graphics_write_textr(argv[1]);
+        graphics_write_textr("\n");
+        return;
+    }
+
+    strncpy(g_current_directory, g_resolved_path, sizeof(g_current_directory) - 1);
+    g_current_directory[sizeof(g_current_directory) - 1] = '\0';
+    graphics_write_textr(g_current_directory);
+    graphics_write_textr("\n");
+}
+
+void cmd_mdr(int argc, const char** argv) {
+    if (argc < 2) {
+        graphics_write_textr("Usage: mdr <directory> [--hidden]\n");
+        return;
+    }
+
+    bool hidden = false;
+    for (int i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "--hidden") == 0) hidden = true;
+    }
+
+    if (!fs_resolve_path(argv[1], g_resolved_path) || !minimafs_mkdir(g_resolved_path)) {
+        graphics_write_textr("mdr: could not create directory\n");
+        return;
+    }
+    if (hidden && !fs_set_directory_hidden(g_resolved_path, true)) {
+        graphics_write_textr("mdr: directory created but hidden flag failed\n");
+        return;
+    }
+    graphics_write_textr("Directory created: ");
+    graphics_write_textr(g_resolved_path);
+    graphics_write_textr("\n");
+}
+
+void cmd_insert(int argc, const char** argv) {
+    if (argc < 3) {
+        graphics_write_textr("Usage: insert <file> \"text\"\n");
+        return;
+    }
+
+    if (!fs_resolve_path(argv[1], g_resolved_path) || minimafs_is_dir(g_resolved_path)) {
+        graphics_write_textr("insert: invalid file path\n");
+        return;
+    }
+
+    minimafs_file_handle_t* existing = minimafs_open(g_resolved_path, true);
+    if (existing) {
+        minimafs_close(existing);
+        if (!minimafs_delete_file(g_resolved_path)) {
+            graphics_write_textr("insert: could not replace file\n");
+            return;
+        }
+    }
+    if (!minimafs_create_file(g_resolved_path, "text", "txt")) {
+        graphics_write_textr("insert: could not create file\n");
+        return;
+    }
+
+    minimafs_file_handle_t* file = minimafs_open(g_resolved_path, false);
+    if (!file || minimafs_write(file, argv[2], (uint32_t)strlen(argv[2])) != strlen(argv[2])) {
+        if (file) minimafs_close(file);
+        graphics_write_textr("insert: write failed\n");
+        return;
+    }
+    minimafs_close(file);
+    graphics_write_textr("Inserted text into ");
+    graphics_write_textr(g_resolved_path);
+    graphics_write_textr("\n");
+}
+
+void register_fs_navigation_commands(void) {
+    command_register("cd", cmd_cd);
+    command_register("mdr", cmd_mdr);
+    command_register("insert", cmd_insert);
+}
+
+REGISTER_COMMAND(register_fs_navigation_commands);
 
 void cmd_mount(int argc, const char** argv) {
     minimafs_disk_device_t* device;
@@ -398,8 +659,9 @@ void cmd_initdisk(int argc, const char** argv) {
     initializeminimafs(drive);
 }
 
-void register_listdisk(void) {
-    command_register("listdisk", cmd_listdisk);
+void register_list(void) {
+    command_register("list", cmd_list);
+    command_register("ls", cmd_list);
 }
 
 void register_format_debug(void) {
@@ -408,6 +670,7 @@ void register_format_debug(void) {
 
 void register_listroot_debug(void) {
     command_register("listroot", cmd_listroot_debug);
+    command_register("lsroot", cmd_listroot_debug);
 }
 
 void register_mount(void) {
@@ -503,7 +766,7 @@ void cmd_createmusicfile(int argc, const char** argv) {
 }
 
 void register_createmusicfile(void) {
-    command_register("createmusicfile", cmd_createmusicfile);
+    command_register("importmusic", cmd_createmusicfile);
 }
 
 REGISTER_COMMAND(register_createmusicfile);
@@ -523,7 +786,13 @@ void cmd_read(int argc, const char** argv) {
         return;
     }
 
-    const char* path = argv[1];
+    if (!fs_resolve_path(argv[1], g_resolved_path) ||
+        minimafs_is_dir(g_resolved_path)) {
+        graphics_write_textr("read: path is not a file\n");
+        return;
+    }
+
+    const char* path = g_resolved_path;
     bool show_metadata = (argc >= 3 && strcmp(argv[2], "--metadata") == 0);
 
     serial_write_str("read: opening '");
@@ -651,11 +920,12 @@ void cmd_read(int argc, const char** argv) {
 
 void register_read(void) {
     command_register("read", cmd_read);
+    command_register("rd", cmd_read);
 }
 
 REGISTER_COMMAND(register_initdisk);
 REGISTER_COMMAND(register_mount);
 REGISTER_COMMAND(register_format_debug);
 REGISTER_COMMAND(register_listroot_debug);
-REGISTER_COMMAND(register_listdisk);
+REGISTER_COMMAND(register_list);
 REGISTER_COMMAND(register_read);

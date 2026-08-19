@@ -1574,6 +1574,15 @@ bool minimafs_mkdir(const char* path) {
         free_mem(parent_desc); return false;
     }
 
+    for (uint32_t i = 0; i < parent_desc->entry_count; i++) {
+        if (strcmp(parent_desc->entries[i].name, dirname) == 0) {
+            bool already_directory =
+                parent_desc->entries[i].type == MINIMAFS_TYPE_DIR;
+            free_mem(parent_desc);
+            return already_directory;
+        }
+    }
+
     uint32_t dir_block = block_alloc(drive_num);
     if (dir_block == 0xFFFFFFFF) {
         serial_write_str("MinimaFS: No free blocks\n");
@@ -1720,7 +1729,7 @@ bool minimafs_exists(const char* path) {
 
 bool minimafs_is_dir(const char* path) {
     uint8_t drive_num;
-    char local_path[MINIMAFS_MAX_PATH];
+    static char local_path[MINIMAFS_MAX_PATH];
     if (!minimafs_parse_path(path, &drive_num, local_path)) return false;
 
     minimafs_drive_t* drive = get_drive(drive_num);
@@ -1728,8 +1737,8 @@ bool minimafs_is_dir(const char* path) {
 
     if (local_path[0]=='\0' || (local_path[0]=='/'&&local_path[1]=='\0')) return true;
 
-    char filename[MINIMAFS_MAX_FILENAME];
-    char parent[MINIMAFS_MAX_PATH];
+    static char filename[MINIMAFS_MAX_FILENAME];
+    static char parent[MINIMAFS_MAX_PATH];
     minimafs_split_local_path(local_path, parent, filename);
 
     /* HEAP – was on stack (crash!) */

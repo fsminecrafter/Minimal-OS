@@ -73,10 +73,37 @@ void command_execute(const char* input) {
 
     char* argv[32] = { 0 };
     int argc = 0;
-    char* tok = strtok(buffer, " ");
-    while (tok && argc < 32) {
-        argv[argc++] = tok;
-        tok = strtok(NULL, " ");
+    char* cursor = buffer;
+    while (*cursor && argc < 32) {
+        while (*cursor == ' ' || *cursor == '\t') cursor++;
+        if (!*cursor) break;
+
+        argv[argc++] = cursor;
+        char* output = cursor;
+        bool quoted = false;
+        char quote = '\0';
+
+        while (*cursor) {
+            if (quoted) {
+                if (*cursor == quote) {
+                    quoted = false;
+                } else {
+                    *output++ = *cursor;
+                }
+            } else if (*cursor == '"' || *cursor == '\'') {
+                quoted = true;
+                quote = *cursor;
+            } else if (*cursor == ' ' || *cursor == '\t') {
+                break;
+            } else {
+                *output++ = *cursor;
+            }
+            cursor++;
+        }
+
+        if (*cursor) cursor++;
+        *output = '\0';
+        while (*cursor == ' ' || *cursor == '\t') cursor++;
     }
 
     if (argc == 0) return;

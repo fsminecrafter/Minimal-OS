@@ -1,4 +1,4 @@
-// File: src/impl/x86_64/keyboard_input.c
+// File: src/modules/Etc/handlers/keyboardhandler.c
 
 #include "print.h"
 #include "keyboardhandler.h"

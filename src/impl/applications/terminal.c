@@ -15,6 +15,7 @@
 #include "minimafshandler.h"
 
 void usb_keyboard_update_task(void);
+extern const char* fs_get_current_directory(void);
 
 // ===========================================
 // TERMINAL STATE
@@ -43,7 +44,9 @@ void cursorupdater(void) {
 }
 
 void terminalPrompt(void) {
-    graphics_write_textr("Computer@local:~$ ");
+    graphics_write_textr("Computer@local-");
+    graphics_write_textr(fs_get_current_directory());
+    graphics_write_textr("$ ");
 }
 
 // ===========================================

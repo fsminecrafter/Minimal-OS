@@ -15,13 +15,29 @@ find roadmap in roadmap.txt or below (might be old or un-synced!)
 * ```initdisk``` [Index] Searches and activates the disk(s) available
 * ```format``` [Index] Formats the Selected disk to MinimaFS
 * ```mount``` [Index] Mounts the selected disk
-* ```createmusicfile``` Takes the music.wav from `src/resources` and puts it on disk as music.adi
+* ```importmusic``` Takes the music.wav from `src/resources` and puts it on disk as music.adi
 * ```play``` [File path] Plays `.adi` files from the disk.
   * ```stop``` Stops the playing of music / audio
   * ```pause``` toggle pause and unpause of the music / audio
   * ```volume``` [0 - 100] Sets the system volume
-* ```read``` (--metadata) Reads a file and outputs it to the terminal
+* ```read```, ```rd``` (--metadata) Reads a file and outputs it to the terminal
 * ```listroot``` list the root of the disk
+* ```list```, ```ls``` [Path] (--recurvesive) lists the current or entered path.
+* ```cd``` [Path] Change the current directory.
+* ```mdr``` [Path + Folder Name] Creates a folder at the entered path.
+* ```insert``` [File Path] [Text] Creates a new file with the contents of [Text].
+
+#### Path formatting
+
+0:/Dir/example.txt
+
+0: is the disk
+
+0:/ is the root of that disk or the top directory.
+
+0:/Dir is a folder inside disk 0
+
+0:/Dir/example.txt is a file with .txt suffix which is called "example"
 
 </details>
 

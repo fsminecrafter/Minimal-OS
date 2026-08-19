@@ -52,7 +52,7 @@ src/resources/%.o: src/resources/%.wav
 
 .PHONY: run
 run: build-x86_64
-	qemu-system-x86_64 -cdrom dist/x86_64/kernel.iso -m 1024M -boot d -d guest_errors,int,cpu_reset,unimp -D qemu.log -serial -usb -device usb-kbd stdio -audiodev pa,id=speaker -machine pcspk-audiodev=speaker  -audiodev pa,id=audio0 -device AC97,audiodev=audio0 -device ahci,id=ahci -drive id=disk0,file=sata256.img,if=none,format=raw -device ide-hd,drive=disk0,bus=ahci.0
+	qemu-system-x86_64 -cdrom dist/x86_64/kernel.iso -m 1024M -boot d -d guest_errors,int,cpu_reset,unimp -D qemu.log -serial stdio -usb -device usb-kbd -audiodev pa,id=speaker -machine pcspk-audiodev=speaker  -audiodev pa,id=audio0 -device AC97,audiodev=audio0 -device ahci,id=ahci -drive id=disk0,file=sata256.img,if=none,format=raw -device ide-hd,drive=disk0,bus=ahci.0
 
 .PHONY: run-audio
 run-audio: build-x86_64
@@ -81,3 +81,11 @@ run-de: build-x86_64
 .PHONY: run-dex
 run-dex: build-x86_64
 	qemu-system-x86_64 -cdrom dist/x86_64/kernel.iso -m 1024M -boot d -d guest_errors,int,cpu_reset,unimp -D qemu.log --no-reboot -serial stdio -S -s -usb -device usb-kbd
+
+.PHONY: ci-test
+ci-test:
+	bash tools/debug/ci_test.sh
+
+.PHONY: ci-interact
+ci-interact:
+	bash tools/debug/ci_interact.sh

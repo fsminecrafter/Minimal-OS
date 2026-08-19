@@ -800,6 +800,15 @@ bool usb_init(void) {
     return false;
 }
 
+static const usb_hw_driver_t g_uhci_driver = {
+    .name = "UHCI",
+    .init = usb_init
+};
+
+const usb_hw_driver_t* uhci_get_driver(void) {
+    return &g_uhci_driver;
+}
+
 // ===========================================
 // INTERRUPT TRANSFERS
 // ===========================================

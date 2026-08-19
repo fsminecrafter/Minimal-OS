@@ -2,6 +2,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include "x86_64/audio_hw.h"
 
 typedef struct {
     int16_t* pcm;
@@ -18,3 +19,8 @@ void ac97_update(void);
 void ac97_kick(void);
 void ac97_start(void);
 void ac97_set_sample_rate(uint32_t rate_hz);
+
+// Returns the audio_hw_driver_t vtable for registration with
+// audio_manager_register_driver(). This is the only symbol from this
+// file the rest of the kernel (outside audio.c) should ever need.
+const audio_hw_driver_t* ac97_get_driver(void);

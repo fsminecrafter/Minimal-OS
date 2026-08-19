@@ -2,6 +2,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include "x86_64/gpu_hw.h"
 
 #define PCI_NUM_BARS 6
 
@@ -42,3 +43,9 @@ int pci_get_device_count(void);
 pci_device_t* pci_find_device(uint16_t vendor_id, uint16_t device_id);
 pci_device_t* pci_find_class(uint8_t class_code, uint8_t subclass);
 void pci_enable_io_busmaster(pci_device_t* dev);
+
+// Returns the gpu_hw_driver_t vtable for registration with
+// gpu_manager_register_driver(). Prefer this + gpu_manager_init()
+// over calling initializeGraphicsDevice() directly - see the comment
+// above gpu_bochs_vbe_init() in pci.c for why.
+const gpu_hw_driver_t* gpu_bochs_vbe_get_driver(void);

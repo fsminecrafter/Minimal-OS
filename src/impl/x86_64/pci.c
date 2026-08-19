@@ -3,6 +3,8 @@
 #include "serial.h"
 #include "x86_64/pci.h"
 #include "x86_64/gpu.h"
+#include "x86_64/gpu_hw.h"
+#include "x86_64/pci_manager.h"
 #include "x86_64/mmio.h"
 #include "x86_64/port.h"
 #include "x86_64/allocator.h"
@@ -41,10 +43,10 @@ uint32_t pci_read_config_dword(uint8_t bus, uint8_t device, uint8_t function, ui
     if (offset & 3) return 0xFFFFFFFF; // must be dword aligned
 
     uint32_t address = (1U << 31)
-                     | ((uint32_t)bus << 16)
-                     | ((uint32_t)device << 11)
-                     | ((uint32_t)function << 8)
-                     | (offset & 0xFC);
+    | ((uint32_t)bus << 16)
+    | ((uint32_t)device << 11)
+    | ((uint32_t)function << 8)
+    | (offset & 0xFC);
 
     pci_write_address(address);
     return port_inl(PCI_CONFIG_DATA);
@@ -55,10 +57,10 @@ void pci_write_config_dword(uint8_t bus, uint8_t device, uint8_t function, uint8
     if (offset & 3) return;
 
     uint32_t address = (1U << 31)
-                     | ((uint32_t)bus << 16)
-                     | ((uint32_t)device << 11)
-                     | ((uint32_t)function << 8)
-                     | (offset & 0xFC);
+    | ((uint32_t)bus << 16)
+    | ((uint32_t)device << 11)
+    | ((uint32_t)function << 8)
+    | (offset & 0xFC);
 
     pci_write_address(address);
     port_outl(PCI_CONFIG_DATA, value);
@@ -99,11 +101,11 @@ static inline uint32_t mmio_read32(volatile void* base, uint32_t offset) {
 uint32_t pci_config_read(uint8_t bus, uint8_t device, uint8_t function, uint8_t offset) {
     // Align offset to 4 bytes
     uint32_t address = (1U << 31)               // Enable bit
-        | ((uint32_t)bus << 16)
-        | ((uint32_t)device << 11)
-        | ((uint32_t)function << 8)
-        | (offset & 0xFC);                      // Offset lower 2 bits zeroed
-    
+    | ((uint32_t)bus << 16)
+    | ((uint32_t)device << 11)
+    | ((uint32_t)function << 8)
+    | (offset & 0xFC);                      // Offset lower 2 bits zeroed
+
     pci_write_address(address);
     return pci_read_data();
 }
@@ -152,7 +154,7 @@ pci_device_t* pci_find_device(uint16_t vendor_id, uint16_t device_id) {
         if (pci_devices[i].vendor_id == vendor_id &&
             pci_devices[i].device_id == device_id) {
             return &pci_devices[i];
-        }
+            }
     }
     return NULL;
 }
@@ -162,7 +164,7 @@ pci_device_t* pci_find_class(uint8_t class_code, uint8_t subclass) {
         if (pci_devices[i].class_code == class_code &&
             pci_devices[i].subclass == subclass) {
             return &pci_devices[i];
-        }
+            }
     }
     return NULL;
 }
@@ -237,6 +239,11 @@ void pci_enumerate_bus(uint8_t bus) {
                 }
             }
 
+            // Let any registered pci_class_driver_t auto-attach to this
+            // device (opt-in - see pci_manager.h; no-op if nothing has
+            // registered for this class/subclass).
+            pci_manager_notify(dev);
+
             // Handle PCI-to-PCI bridge: recursively enumerate secondary bus
             if (class_code == 0x06 && subclass == 0x04) {
                 uint8_t secondary_bus = (pci_config_read(bus, device, function, 0x18) >> 8) & 0xFF;
@@ -286,9 +293,50 @@ void initializeGraphicsDevice() {
 
     if (!gpu_pci) {
         serial_write_str("No GPU device found.\n");
-        
+
     }
     gpu_initialize_g(&gpu, gpu_pci, 1080, 720);
+}
+
+/* ============================================================
+ * gpu_hw_driver_t adapter (Bochs/VBE)
+ *
+ * This is the entry point gpu_manager.h actually calls. It does the
+ * same PCI class-0x03 lookup as initializeGraphicsDevice() above, but
+ * - unlike that function - returns false and does NOT touch the GPU
+ * when no display controller is present. initializeGraphicsDevice()
+ * unconditionally calls gpu_initialize_g(&gpu, NULL, ...) when no
+ * device is found, which reaches gpu_clear()'s PANIC("framebuffer
+ * NULL") once execution gets past the early gpu_init() failure -
+ * kept as-is above for any existing direct callers, but this driver
+ * is the safe path main.c should use going forward.
+ * ============================================================ */
+
+static bool gpu_bochs_vbe_init(void) {
+    pci_device_t* gpu_pci = NULL;
+    for (int i = 0; i < pci_device_count; i++) {
+        if (pci_devices[i].class_code == 0x03) {
+            gpu_pci = &pci_devices[i];
+            break;
+        }
+    }
+
+    if (!gpu_pci) {
+        serial_write_str("GPU (Bochs/VBE): no PCI display controller found\n");
+        return false;
+    }
+
+    gpu_initialize_g(&gpu, gpu_pci, 1080, 720);
+    return true;
+}
+
+static const gpu_hw_driver_t gpu_bochs_vbe_driver = {
+    .name = "Bochs/VBE",
+    .init = gpu_bochs_vbe_init,
+};
+
+const gpu_hw_driver_t* gpu_bochs_vbe_get_driver(void) {
+    return &gpu_bochs_vbe_driver;
 }
 
 void print_pci_devices() {
@@ -307,7 +355,7 @@ void print_pci_devices() {
             print_uint64_hex(dev->device_id);
             print_str("\n");
         }
-        print_uint64_dec(pci_device_count);   
+        print_uint64_dec(pci_device_count);
     }
     for (int i = 0; i < pci_device_count; i++) {
         pci_device_t* dev = &pci_devices[i];

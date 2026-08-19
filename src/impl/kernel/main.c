@@ -1,45 +1,27 @@
 #include "print.h"
-#include "x86_64/rtc.h"
 #include "x86_64/commandhandler.h"
 #include "x86_64/multiboot2parse.h"
 #include "x86_64/startuproutine.h"
-#include "x86_64/allocator.h"
-#include "proc_example.h"
 #include "x86_64/proc.h"
-#include "panic.h"
-#include "keyboard.h"
-#include "keyboardhandler.h"
 #include "x86_64/scheduler.h"
-#include "x86_64/pci.h"
+#include "x86_64/idt.h"
 #include "x86_64/gpu.h"
+#include "x86_64/gpu_manager.h"
 #include "time.h"
-#include "x86_64/memoryscanner.h"
-#include "string.h"
 #include "prochandler.h"
 #include "usb/uhci.h"
+#include "x86_64/usb_manager.h"
 #include "x86_64/globaldatatable.h"
+#include "x86_64/exec_trace.h"
 #include "serial.h"
 
-#include "x86_64/ac97_driver.h"
 #include "audio.h"
-
-#include "keyboard/unifiedkeyboardbridge.h"
-
-//Applications
-
-#include "applications/terminal.h"
+#include "keyboard/usbkeyboard.h"
 #include "keyboard/swedishKeyboard.h"
 #include "keyboard/usKeyboard.h"
-
-//MinimaFS
-
-#include "x86_64/minimafs.h"
+#include "applications/terminal.h"
 #include "x86_64/ahci.h"
-
-#include "x86_64/exec_trace.h"
-
-//Audio
-
+#include "x86_64/storage_manager.h"
 #include "x86_64/global_audio_state.h"
 
 void busy(void) {
@@ -104,54 +86,51 @@ void kernel_main(uint64_t mb2_info_addr) {
 
     pci_enumerate_all();
 
-    if (usb_init()) {
+    // Registers every built-in usb_hw_driver_t with usb_manager and
+    // brings up whichever host controller is actually present. See
+    // usb_manager.h / usb_hw.h for the module interface.
+    usb_manager_register_driver(uhci_get_driver());
+    if (usb_manager_init()) {
         serial_write_str("USB keyboard available!\n");
     } else {
         serial_write_str("Falling back to PS/2\n");
     }
 
-    /*
-     * NOTE: terminal_init_keyboard() used to be called here AND again
-     * inside terminal_program_entry() a little further down. That
-     * double call was redundant (harmless, but wasteful - it re-runs
-     * usb_keyboard_init()/layout load/callback registration and
-     * re-logs USB-vs-PS/2 detection a second time) so it has been
-     * removed from here; terminal_program_entry() is the single place
-     * that now initializes the keyboard, right before the terminal
-     * actually needs it.
-     *
-     * This was NOT the cause of the intermittent PS/2 fallback -
-     * terminal_init_keyboard() never touches the USB host controller's
-     * enumeration state, only this driver's own HID-report processing
-     * state. The real cause was sleep() silently no-op'ing during
-     * usb_init()'s enumeration because no process exists yet at this
-     * point in boot - see the fix and comment in scheduler.c's
-     * sleep().
-     */
-
-    initializeGraphicsDevice();
+    // Registers every built-in gpu_hw_driver_t with gpu_manager and
+    // initializes whichever one is actually present. See
+    // gpu_manager.h / gpu_hw.h for the module interface.
+    gpu_manager_register_driver(gpu_bochs_vbe_get_driver());
+    if (!gpu_manager_init()) {
+        serial_write_str("No display driver available - continuing headless\n");
+    }
     const char* proc_list[32];
     getprocslistNames(proc_list, 32);
     serial_write_str(proc_list[0]);
 
     datetime_t dt;
 
-    dt.year = 2025;
-    dt.month = 5;
-    dt.day = 7;
-    dt.hour = 15;
-    dt.minute = 45;
+    dt.year = 2026;
+    dt.month = 8;
+    dt.day = 19;
+    dt.hour = 18;
+    dt.minute = 50;
     dt.second = 30;
 
     time_set_datetime(&dt);
 
+    // Registers every built-in audio_hw_driver_t with audio_manager
+    // and initializes whichever one is actually present. See
+    // audio_manager.h / audio_hw.h for the module interface.
     audio_init();
 
-    // Initialize hardware driver (AC97)
-    if (!ac97_init()) {
-        serial_write_str("ERROR: Audio hardware not found!\n");
-        return;
+    // Register AHCI storage driver and initialize storage manager
+    storage_manager_register_driver(ahci_get_storage_driver());
+    if (storage_manager_init()) {
+        serial_write_str("Storage manager initialized\n");
+    } else {
+        serial_write_str("No storage driver found\n");
     }
+
     sti();
     createProcess("busy", busy);
     createProcess("kernelaudio", audioupdate);

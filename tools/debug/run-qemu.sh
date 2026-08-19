@@ -30,7 +30,7 @@ echo "[INFO] Starting QEMU..."
 qemu-system-x86_64 \
   -cdrom "$KERNEL_ISO" \
   -S -gdb tcp::$PORT \
-  -m 512M \
+  -m 1024M \
   -serial stdio \
   -no-reboot \
   -no-shutdown &

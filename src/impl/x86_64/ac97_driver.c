@@ -5,7 +5,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "audio.h"
-#include "x86_64/global_audio_state.h"
+#include "x86_64/audio_manager.h"
 #include "x86_64/ac97_driver.h"
 #include "x86_64/pci.h"
 #include "x86_64/mmio.h"
@@ -200,7 +200,7 @@ void ac97_start(void) {
     const uint8_t initial_buffers = AUDIO_RING_SIZE;
 
     for (int i = 0; i < initial_buffers; i++) {
-        audio_mix_streams(g_audio_buffers[i], AC97_FRAMES_PER_BUFFER);
+        audio_manager_pull_samples(g_audio_buffers[i], AC97_FRAMES_PER_BUFFER);
         g_last_valid = (uint8_t)i;
     }
     port_outb(g_nabm_base + AC97_NABM_POLVI, g_last_valid);
@@ -221,16 +221,7 @@ void ac97_start(void) {
  * buffer at all, instead of queuing a silent one and marking it valid.
  */
 static inline bool ac97_player_has_data(void) {
-    audio_player_t* player = g_audio_state.player;
-    if (!player || !g_audio_state.playing || !player->playing) return false;
-
-    if (player->ring_ready[player->read_slot] &&
-        player->read_pos < player->ring_size[player->read_slot]) {
-        return true;
-        }
-
-        uint8_t next_slot = (uint8_t)((player->read_slot + 1) % AUDIO_RING_SIZE);
-    return player->ring_ready[next_slot];
+    return audio_manager_has_data();
 }
 
 void ac97_update(void) {
@@ -297,7 +288,7 @@ void ac97_update(void) {
         // wait for the decoder instead of racing ahead of it.
         if (!ac97_player_has_data()) break;
 
-        audio_mix_streams(g_audio_buffers[next], AC97_FRAMES_PER_BUFFER);
+        audio_manager_pull_samples(g_audio_buffers[next], AC97_FRAMES_PER_BUFFER);
         g_last_valid = next;
         port_outb(g_nabm_base + AC97_NABM_POLVI, g_last_valid);
     }
@@ -313,7 +304,7 @@ void ac97_kick(void) {
 
     g_last_valid = 0;
     for (int i = 0; i < AC97_BD_COUNT; i++) {
-        audio_mix_streams(g_audio_buffers[i], AC97_FRAMES_PER_BUFFER);
+        audio_manager_pull_samples(g_audio_buffers[i], AC97_FRAMES_PER_BUFFER);
         g_last_valid = (uint8_t)i;
     }
 
@@ -333,4 +324,28 @@ void ac97_set_sample_rate(uint32_t rate_hz) {
     serial_write_str("AC97: DAC rate=");
     serial_write_dec(rate_hz);
     serial_write_str(" Hz\n");
+}
+
+/* ============================================================
+ * audio_hw_driver_t registration
+ *
+ * This is the ONLY place ac97_driver.c exposes itself to the rest of
+ * the kernel as "an audio device". audio.c never calls ac97_init()
+ * etc. by name - it registers this struct with audio_manager and the
+ * manager calls through the function pointers instead. Adding a
+ * second sound chip means writing another one of these, not editing
+ * audio.c.
+ * ============================================================ */
+
+static const audio_hw_driver_t ac97_driver = {
+    .name            = "AC97",
+    .init            = ac97_init,
+    .start           = ac97_start,
+    .update          = ac97_update,
+    .set_sample_rate = ac97_set_sample_rate,
+    .shutdown        = NULL,   /* no controlled power-down path yet */
+};
+
+const audio_hw_driver_t* ac97_get_driver(void) {
+    return &ac97_driver;
 }

@@ -5,6 +5,7 @@
 #include "x86_64/commandhandler.h"
 #include "x86_64/commandreg.h"
 #include "x86_64/ac97_driver.h"
+#include "x86_64/audio_manager.h"
 #include "graphics.h"
 #include "x86_64/exec_trace.h"
 #include "x86_64/global_audio_state.h"
@@ -153,12 +154,41 @@ static const uint8_t* audio_find_bytes(const uint8_t* haystack, uint32_t haystac
                                         * Hardware bridge
                                         * ============================================================ */
 
+                                       /* Reports whether the next pull would return real decoded
+                                        * audio rather than silence. Registered with audio_manager so a
+                                        * driver can decide not to queue a "valid" buffer that's
+                                        * actually silence, without ever looking at audio_player_t
+                                        * itself - only audio.c is allowed to know that struct. */
+                                       static bool audio_has_data_ready(void) {
+                                           audio_player_t* player = g_audio_state.player;
+                                           if (!player || !g_audio_state.playing || !player->playing) return false;
+
+                                           if (player->ring_ready[player->read_slot] &&
+                                               player->read_pos < player->ring_size[player->read_slot]) {
+                                               return true;
+                                               }
+
+                                               uint8_t next_slot = (uint8_t)((player->read_slot + 1) % AUDIO_RING_SIZE);
+                                           return player->ring_ready[next_slot];
+                                       }
+
                                        void audio_init(void) {
-                                           ac97_init();
+                                           audio_manager_set_mix_callback(audio_mix_streams);
+                                           audio_manager_set_ready_callback(audio_has_data_ready);
+
+                                           /* Register every audio driver this build supports. To add a
+                                            * second sound chip, write its driver.c (implementing
+                                            * audio_hw_driver_t) and add one more line here - nothing
+                                            * else in this file, or anywhere else, needs to change. */
+                                           audio_manager_register_driver(ac97_get_driver());
+
+                                           if (!audio_manager_init()) {
+                                               serial_write_str("[AUDIO] No working audio driver found\n");
+                                           }
                                        }
 
                                        void audio_update(void) {
-                                           ac97_update();
+                                           audio_manager_update();
                                        }
 
                                        /* ============================================================
@@ -865,7 +895,7 @@ static const uint8_t* audio_find_bytes(const uint8_t* haystack, uint32_t haystac
 
                                                                                                                 /* Set sample rate BEFORE priming buffers */
                                                                                                                 if (player->stream->adi_header.sample_rate != 0) {
-                                                                                                                    ac97_set_sample_rate(player->stream->adi_header.sample_rate);
+                                                                                                                    audio_manager_set_sample_rate(player->stream->adi_header.sample_rate);
                                                                                                                 }
 
                                                                                                                 /*
@@ -910,7 +940,7 @@ static const uint8_t* audio_find_bytes(const uint8_t* haystack, uint32_t haystac
                                                                                                                 player->playing        = true;
 
                                                                                                                 /* Start DMA — primes all AC97 HW buffers from the player's ring */
-                                                                                                                ac97_start();
+                                                                                                                audio_manager_start();
 
                                                                                                                 serial_write_str("[PLAYER] Playback started\n");
                                                                                                             }

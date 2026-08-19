@@ -712,6 +712,40 @@ ahci_drive_t* ahci_get_drive(ahci_controller_t* ctrl, uint8_t index) {
     return &ctrl->drives[index];
 }
 
+/* ============================================================
+ * storage_hw_driver_t registration
+ *
+ * Expose AHCI as a storage_hw_driver_t so the generic storage
+ * manager can bring it up without callers calling ahci_init()
+ * directly.
+ * ============================================================ */
+
+static bool ahci_storage_init(void) {
+    pci_device_t* pci = ahci_find_controller();
+    if (!pci) {
+        serial_write_str("AHCI: No AHCI controller found\n");
+        return false;
+    }
+
+    ahci_controller_t* ctrl = ahci_init(pci);
+    if (!ctrl) return false;
+
+    uint8_t drives = ahci_probe_ports(ctrl);
+    serial_write_str("AHCI: storage init complete, drives=");
+    serial_write_dec(drives);
+    serial_write_str("\n");
+    return drives > 0;
+}
+
+static const storage_hw_driver_t ahci_storage_driver = {
+    .name = "AHCI",
+    .init = ahci_storage_init,
+};
+
+const storage_hw_driver_t* ahci_get_storage_driver(void) {
+    return &ahci_storage_driver;
+}
+
 // ===========================================
 // I/O OPERATIONS
 // ===========================================

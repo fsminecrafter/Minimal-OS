@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "x86_64/pci.h"
+#include "x86_64/storage_hw.h"
 
 /*
  * AHCI (Advanced Host Controller Interface) Driver
@@ -206,5 +207,10 @@ ahci_drive_t* ahci_get_drive(ahci_controller_t* ctrl, uint8_t index);
  * @return PCI device or NULL if not found
  */
 pci_device_t* ahci_find_controller(void);
+
+// Returns the storage_hw_driver_t vtable for registration with
+// storage_manager_register_driver(). This is the preferred way for
+// new code to reach AHCI drives generically - see storage_hw.h.
+const storage_hw_driver_t* ahci_get_storage_driver(void);
 
 #endif // AHCI_H

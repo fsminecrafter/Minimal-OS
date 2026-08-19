@@ -4,17 +4,21 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "x86_64/minimafs.h"
+#include "x86_64/audio_hw.h"
 
 // ===========================================
 // AUDIO CONFIG DEFAULTS
 // ===========================================
-// These can be overridden by defining them before including audio.h
+// These default to the shared driver/core contract in audio_hw.h so a
+// hardware driver's fill-ahead depth can never silently drift out of
+// sync with how deep a ring the player actually keeps filled. Override
+// before including audio.h only if you know what you're doing.
 #ifndef AUDIO_BUFFER_SIZE
-#define AUDIO_BUFFER_SIZE 8192  // frames per DMA buffer
+#define AUDIO_BUFFER_SIZE AUDIO_HW_BUFFER_FRAMES
 #endif
 
 #ifndef AUDIO_CHANNELS
-#define AUDIO_CHANNELS 2         // stereo
+#define AUDIO_CHANNELS AUDIO_HW_CHANNELS
 #endif
 
 // ===========================================
@@ -229,7 +233,7 @@ bool decode_flac(const uint8_t* input, uint32_t input_size,
  * read now refills the *entire* ring in one shot, instead of leaving
  * the player perpetually one chunk-read away from running dry.
  */
-#define AUDIO_RING_SIZE 8
+#define AUDIO_RING_SIZE AUDIO_HW_RING_SIZE
 
 typedef struct {
     audio_datastream_t* stream;

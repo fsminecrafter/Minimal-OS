@@ -8,6 +8,7 @@
 #include "string.h"
 #include "x86_64/allocator.h"
 #include "serial.h"
+#include "x86_64/safeints.h"
 
 #define SCHED_DEBUG 0   // 0 = off, 1 = important, 2 = verbose
 
@@ -110,8 +111,49 @@ static process_t* find_next_ready_process() {
         return NULL;
 }
 
-// Main scheduling function
+/*
+ * Main scheduling function
+ *
+ * SAFETY NOTE (interrupt reentrancy):
+ *
+ * This function is called both from interrupt context (scheduler_tick(),
+ * invoked from the PIT ISR, where the CPU has already cleared IF via the
+ * IDT interrupt gate) AND from ordinary process context with interrupts
+ * enabled (sleep(), process_exit()). Everything from the top of this
+ * function up until context_switch() is called walks and mutates the
+ * single global proc_list_head list (the zombie/terminated cleanup pass
+ * frees process_t nodes; find_next_ready_process() walks the list;
+ * current_process is read and written).
+ *
+ * If a PIT tick fires *while* a non-interrupt-context caller (e.g. a
+ * process that just called sleep()) is partway through that walk, the
+ * nested scheduler_tick() -> schedule() call runs its OWN cleanup pass
+ * over the very same list - potentially freeing the exact process_t node
+ * the outer call's `curr`/`prev`/`next` locals are still pointing at.
+ * When the outer call eventually resumes (its kernel stack may not be
+ * revisited until many other processes have run and reused that freed
+ * heap block), it dereferences a stale pointer into now-unrelated
+ * memory - this is exactly the "#GP reading curr->state" / triple-fault
+ * signature seen when a long run of AHCI writes (which intentionally
+ * re-enable interrupts around each ahci_write() call so the PIT can
+ * keep ticking during DMA waits - see minimafs_write_blocks()) causes
+ * scheduler_tick() to fire very frequently while other processes are
+ * mid-sleep()/mid-schedule().
+ *
+ * Fix: bracket the whole non-context-switching portion of this function
+ * with irq_save()/irq_restore() (safeints.h), the same idiom already
+ * used around ahci_write() elsewhere in the kernel. This is a no-op
+ * when called from interrupt context (IF is already 0, so irq_save()
+ * doesn't disable anything and irq_restore() won't re-enable anything
+ * it didn't disable) and actually closes the reentrancy window when
+ * called from process context. irq_restore() is called before
+ * context_switch() so that, if we do switch away, the interrupt-enabled
+ * state gets correctly captured in the outgoing process's saved RFLAGS
+ * (regs[8]) rather than incorrectly staying "disabled" forever once
+ * that process resumes.
+ */
 void schedule() {
+    uint64_t sched_flags = irq_save(__FILE__, __func__, __LINE__);
 
     // Clean up ZOMBIE or TERMINATED processes
     process_t* prev = NULL;
@@ -158,6 +200,7 @@ void schedule() {
         current_process = find_next_ready_process();
         if (!current_process) {
             serial_write_str("No processes to schedule\n");
+            irq_restore(sched_flags, __FILE__, __func__, __LINE__);
             PANIC("No processes to schedule, but scheduler called");
         }
         current_process->state = PROCESS_RUNNING;
@@ -165,6 +208,7 @@ void schedule() {
         serial_write_str("Starting first process: ");
         serial_write_str(current_process->name);
         serial_write_str("\n");
+        irq_restore(sched_flags, __FILE__, __func__, __LINE__);
         return;
     }
 
@@ -175,11 +219,13 @@ void schedule() {
         // No runnable processes - idle
         serial_write_str("No runnable processes - idle\n");
         idle_cycles++;
+        irq_restore(sched_flags, __FILE__, __func__, __LINE__);
         return;
     }
 
     if (next == current_process) {
         // Same process continues running
+        irq_restore(sched_flags, __FILE__, __func__, __LINE__);
         return;
     }
 
@@ -204,6 +250,10 @@ void schedule() {
         serial_write_str(next->name);
         serial_write_str("\n");
     }
+
+    // Restore interrupt-enable state BEFORE the switch so it's captured
+    // correctly in `old`'s saved RFLAGS (see the big comment above).
+    irq_restore(sched_flags, __FILE__, __func__, __LINE__);
 
     context_switch(old, next);
 }

@@ -29,6 +29,14 @@ static char input_buffer[INPUT_BUFFER_SIZE];
 static uint16_t input_pos = 0;
 static bool command_ready = false;
 
+// True while a command process launched via command_execute_async() is
+// running. While this is true:
+//   - the prompt/input line is not shown (terminal_update() brings it
+//     back once the command process finishes)
+//   - ordinary keystrokes are ignored by terminal_keyboard_callback()
+//   - Ctrl+C kills the running command process instead of editing input
+static bool g_command_running = false;
+
 // ===========================================
 // TERMINAL RENDERING
 // ===========================================
@@ -70,6 +78,39 @@ void terminal_keyboard_callback(uint8_t scancode, char character, bool pressed) 
         serial_write_hex((uint8_t)character);
     }
     serial_write_str("'\n");
+
+    /*
+     * Ctrl+C (ETX, 0x03). The active keyboard layout's ctrl layer already
+     * translates Ctrl+C into this control character for us (see
+     * usKeyboard.h / swedishKeyboard.h's .ctrl[USB_KEY_C] entry), so
+     * there's no need to separately track the ctrl modifier here.
+     *
+     * While a command process is running, this kills it instead of being
+     * treated as input. When nothing is running it just clears whatever
+     * is currently typed, same spirit as the existing ESC handling below.
+     */
+    if (character == 0x03) {
+        if (g_command_running) {
+            serial_write_str("Terminal: Ctrl+C - killing running command\n");
+            command_kill_running();
+            graphics_write_textr("^C\n");
+        } else {
+            input_pos = 0;
+            input_buffer[0] = '\0';
+            graphics_write_textr("^C\n");
+            terminalPrompt();
+        }
+        return;
+    }
+
+    /*
+     * While a command is running, the input line/prompt is gone (see
+     * terminal_update()) - there's nowhere for other keystrokes to go, so
+     * ignore them until the command finishes or is killed above.
+     */
+    if (g_command_running) {
+        return;
+    }
     
     // Handle special keys
     switch (scancode) {
@@ -187,11 +228,34 @@ void terminal_process_command(const char* cmd) {
     serial_write_str("Terminal: Processing command: '");
     serial_write_str(cmd);
     serial_write_str("'\n");
-    
-    // Use existing command system
-    command_execute(cmd);
-    
-    terminalPrompt();
+
+    /*
+     * Set this before actually launching. usb_poll() (and therefore
+     * terminal_keyboard_callback()) runs from inside the PIT interrupt
+     * handler, so a key event can land at any point between here and the
+     * process actually being created. Marking "running" first ensures
+     * such an event sees input already blocked rather than racing to
+     * submit another command against a launch that hasn't finished.
+     */
+    g_command_running = true;
+
+    uint64_t pid = command_execute_async(cmd);
+    if (pid == 0) {
+        /*
+         * Nothing was launched (unknown command, empty input, or a
+         * command was somehow already running) - command_execute_async()
+         * already printed any relevant message. Nothing to wait for.
+         */
+        g_command_running = false;
+        terminalPrompt();
+        return;
+    }
+
+    /*
+     * On success, the prompt is intentionally NOT printed here -
+     * terminal_update() prints it once the spawned command process has
+     * actually finished (see below).
+     */
 }
 
 // ===========================================
@@ -203,11 +267,31 @@ void terminal_update(void) {
         
         // Process pending command
         if (command_ready) {
-            terminal_process_command(input_buffer);
+            if (!g_command_running) {
+                terminal_process_command(input_buffer);
+            }
+            /*
+             * If a command is already running, drop this submission
+             * rather than queueing it. terminal_keyboard_callback()
+             * already blocks input while g_command_running is true, so
+             * this branch shouldn't normally be reachable - kept only as
+             * a safety net.
+             */
             input_pos = 0;
             input_buffer[0] = '\0';
             command_ready = false;
         }
+
+        // Notice when the in-flight command process has finished and
+        // bring the prompt back.
+        if (g_command_running) {
+            command_poll_running();
+            if (!command_is_running()) {
+                g_command_running = false;
+                terminalPrompt();
+            }
+        }
+
         sleep(10);
     }
 }

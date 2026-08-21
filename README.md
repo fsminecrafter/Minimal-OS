@@ -35,7 +35,7 @@ find roadmap in roadmap.txt or below (might be old or un-synced!)
 
 #### Keyboard related commands
 * ```kbrlayout``` Handles kbr layout stuff.
-* ```set``` [inbuiltlayout | kbr file path] sets the current and default keyboard layout.
+  * ```set``` [inbuiltlayout | kbr file path] sets the current and default keyboard layout.
 
 -------------------------------------------------------
 

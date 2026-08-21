@@ -12,20 +12,32 @@ find roadmap in roadmap.txt or below (might be old or un-synced!)
 * ```help``` List all available commands
 * ```echo``` [Text] Echoes text back to terminal
 * ```memsize``` Returns the size of available memory in MB
-* ```initdisk``` [Index] Searches and activates the disk(s) available
-* ```format``` [Index] Formats the Selected disk to MinimaFS
-* ```mount``` [Index] Mounts the selected disk
-* ```importmusic``` Takes the music.wav from `src/resources` and puts it on disk as music.adi
+-------------------------------------------------------
+#### Audio related commands
 * ```play``` [File path] Plays `.adi` files from the disk.
-  * ```stop``` Stops the playing of music / audio
-  * ```pause``` toggle pause and unpause of the music / audio
-  * ```volume``` [0 - 100] Sets the system volume
-* ```read```, ```rd``` (--metadata) Reads a file and outputs it to the terminal
+* ```stop``` Stops the playing of music / audio
+* ```pause``` toggle pause and unpause of the music / audio
+* ```volume``` [0 - 100] Sets the system volume
+-------------------------------------------------------
+#### MinimaFS related commands
 * ```listroot``` list the root of the disk
 * ```list```, ```ls``` [Path] (--recurvesive) lists the current or entered path.
 * ```cd``` [Path] Change the current directory.
 * ```mdr``` [Path + Folder Name] Creates a folder at the entered path.
 * ```insert``` [File Path] [Text] Creates a new file with the contents of [Text].
+* ```read```, ```rd``` (--metadata) Reads a file and outputs it to the terminal
+* ```initdisk``` [Index] Searches and activates the disk(s) available
+* ```format``` [Index] Formats the Selected disk to MinimaFS
+* ```mount``` [Index] Mounts the selected disk
+* ```importmusic``` Takes the music.wav from `src/resources` and puts it on disk as music.adi
+
+-------------------------------------------------------
+
+#### Keyboard related commands
+* ```kbrlayout``` Handles kbr layout stuff.
+* ```set``` [inbuiltlayout | kbr file path] sets the current and default keyboard layout.
+
+-------------------------------------------------------
 
 #### Path formatting
 

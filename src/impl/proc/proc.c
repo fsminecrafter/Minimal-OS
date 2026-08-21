@@ -5,6 +5,7 @@
 #include "x86_64/allocator.h"
 #include "time.h"
 #include "panic.h"
+#include "x86_64/safeints.h"
 
 extern uint64_t pml4_phys_addr;
 
@@ -178,8 +179,22 @@ process_t* proc_create(const char* file_name, void (*entry_point)()) {
 	proc->regs[7] = (uint64_t)proc_trampoline;     // RIP
 	proc->regs[8] = 0x202;                         // RFLAGS (IF=1, reserved bit 1)
 
+	/*
+	 * proc_list_head is the same global list schedule()'s
+	 * zombie/terminated cleanup pass walks and mutates (see the long
+	 * comment on schedule() in scheduler.c). Prepending here is a
+	 * read-modify-write of proc_list_head + proc->next; if a PIT tick
+	 * preempts createProcess() between these two lines with a
+	 * half-updated list, a concurrent schedule() call could walk a
+	 * torn list. Protect it the same way, with irq_save()/irq_restore()
+	 * - a no-op if we're already in interrupt context, and a real
+	 * (brief) critical section if called from process context.
+	 */
+	uint64_t proc_list_flags = irq_save(__FILE__, __func__, __LINE__);
 	proc->next = proc_list_head;
 	proc_list_head = proc;
+	irq_restore(proc_list_flags, __FILE__, __func__, __LINE__);
+
 	return proc;
 }
 

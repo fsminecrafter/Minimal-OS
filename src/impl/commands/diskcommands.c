@@ -17,6 +17,17 @@
 // FORMAT COMMAND
 // ===========================================
 
+/*
+ * MinimaFS's block allocation bitmap (MINIMAFS_BITMAP_SIZE in minimafs.c)
+ * can only address 8192*8 = 65536 blocks. At the fixed 4KB block size
+ * that's a hard ceiling of 256 MB - trying to format anything larger
+ * will make minimafs_format() itself refuse ("Drive too large for
+ * bitmap"). Clamp to that here so we fail predictably with a clear
+ * message instead of silently truncating inside minimafs_format().
+ */
+#define DISKCMD_MAX_FORMAT_SIZE (256ULL * 1024 * 1024)
+#define DISKCMD_FALLBACK_SIZE   (128ULL * 1024 * 1024)
+
 void cmd_format_debug(int argc, const char** argv) {
     serial_write_str("\n=== FORMAT DEBUG ===\n");
     graphics_write_textr("Formatting drive...\n");
@@ -35,9 +46,44 @@ void cmd_format_debug(int argc, const char** argv) {
         minimafs_unmount(0);
     }
 
-    uint64_t size = 128ULL * 1024 * 1024;  // 128 MB
+    // Pull the real capacity from the underlying AHCI drive instead of
+    // hardcoding 128MB. ahci_identify() (called during ahci_probe_ports())
+    // already populated sectors/sector_size for us.
+    uint64_t size;
+    ahci_drive_t* ahci_drive = device->ahci_drive;
+
+    if (ahci_drive && ahci_drive->sectors > 0 && ahci_drive->sector_size > 0) {
+        size = (uint64_t)ahci_drive->sectors * (uint64_t)ahci_drive->sector_size;
+
+        serial_write_str("Detected disk size: ");
+        serial_write_dec((uint32_t)(size / (1024 * 1024)));
+        serial_write_str(" MB (");
+        serial_write_dec(ahci_drive->sectors);
+        serial_write_str(" sectors x ");
+        serial_write_dec(ahci_drive->sector_size);
+        serial_write_str(" bytes)\n");
+
+        if (size > DISKCMD_MAX_FORMAT_SIZE) {
+            serial_write_str("WARNING: Disk larger than MinimaFS bitmap can address, "
+                              "clamping to 256 MB\n");
+            graphics_write_textr("Disk larger than supported; using 256 MB\n");
+            size = DISKCMD_MAX_FORMAT_SIZE;
+        }
+    } else {
+        serial_write_str("WARNING: Could not detect drive size (no AHCI drive info), "
+                          "falling back to 128 MB\n");
+        graphics_write_textr("Could not detect disk size; using 128 MB\n");
+        size = DISKCMD_FALLBACK_SIZE;
+    }
 
     serial_write_str("Calling minimafs_format...\n");
+    if (!minimafs_format(device, size, 0, "maindisk")) {
+        graphics_write_textr("ERROR: Formatting failed!\n");
+        serial_write_str("ERROR: minimafs_format returned false\n");
+        return;
+    }
+
+    graphics_write_textr("Format OK. Mounting...\n");
     if (!minimafs_format(device, size, 0, "maindisk")) {
         graphics_write_textr("ERROR: Formatting failed!\n");
         serial_write_str("ERROR: minimafs_format returned false\n");

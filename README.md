@@ -1,5 +1,5 @@
 # Minimal-OS
-A os made in mostly C and is the most minimal ever made.
+Is a OS made in C and Assembly made for x86_64 processors, It currently runs with 1024MB (I havent tested lower yet)
 
 find roadmap in roadmap.txt or below (might be old or un-synced!)
 

@@ -4,29 +4,39 @@
 #include <stdint.h>
 #include "x86_64/tss.h"
 
-extern struct tss_struct_t tss_struct;
+#define GDT_SELECTOR_NULL      0x00
+#define GDT_SELECTOR_CS_KERNEL 0x08   // unchanged - idt.c already builds gates against this
+#define GDT_SELECTOR_DS_KERNEL 0x10
 
-#define GDT_SELECTOR_TSS          0x28    // entry 5 << 3, TSS descriptor spans 5 and 6
-#define TSS_SELECTOR              GDT_SELECTOR_TSS
-// GDT selectors (offsets into the GDT table, shifted left by 3 bits for the selector)
-#define GDT_SELECTOR_NULL         0x00  // Null descriptor (mandatory first entry)
-#define GDT_SELECTOR_CS_KERNEL    0x08  // Kernel code segment selector (2nd entry, index=1)
-#define GDT_SELECTOR_DS_KERNEL    0x10  // Kernel data segment selector (3rd entry, index=2)
-#define GDT_SELECTOR_TSS_LOW      0x18  // TSS descriptor low part (4th entry, index=3)
-#define GDT_SELECTOR_TSS_HIGH     0x20  // TSS descriptor high part (5th entry, index=4)
+// One 16-byte TSS descriptor per core, right after the fixed
+// null/code/data entries. Replaces the old fixed
+// _TSS/_TSS_LOW/_TSS_HIGH constants, which predate there being more
+// than one core to have a TSS each.
+#define GDT_TSS_SELECTOR(cpu) (0x18 + (cpu) * 16)
+#define GDT_SELECTOR_TSS      GDT_TSS_SELECTOR(0)
 
-// IDT gate types and flags for interrupt gates
-#define IDT_GATE_TYPE_INTERRUPT   0x0E  // Interrupt Gate type (32-bit or 64-bit)
-#define IDT_GATE_TYPE_TRAP        0x0F  // Trap Gate type
-#define IDT_GATE_PRESENT          0x80  // Present flag
-#define IDT_GATE_DPL0             0x00  // Descriptor privilege level 0 (kernel)
-#define IDT_GATE_DPL3             0x60  // Descriptor privilege level 3 (user)
+#define IDT_GATE_TYPE_INTERRUPT 0x0E
+#define IDT_GATE_TYPE_TRAP      0x0F
+#define IDT_GATE_PRESENT        0x80
+#define IDT_GATE_DPL0           0x00
+#define IDT_GATE_DPL3           0x60
 
-// Compose flags for a typical interrupt gate
-#define IDT_INTERRUPT_GATE_FLAGS  (IDT_GATE_PRESENT | IDT_GATE_DPL0 | IDT_GATE_TYPE_INTERRUPT)
+#define IDT_INTERRUPT_GATE_FLAGS (IDT_GATE_PRESENT | IDT_GATE_DPL0 | IDT_GATE_TYPE_INTERRUPT)
 
-
+// Builds the real GDT (previously just the 2-entry stub in main.asm)
+// plus one TSS per MAX_CPUS core, and loads it on the BSP. Call once,
+// early in kernel_main(), BEFORE idt_init() - the double-fault gate
+// idt_init() installs uses IST1, which requires a valid TSS already
+// loaded via ltr() or it's undefined behaviour the moment a double
+// fault actually happens.
 void gdt_init(void);
+
+// Loads the shared GDT and this core's own TSS selector. Called by
+// every AP right after reaching long mode (see ap_entry_c()).
+void gdt_load_this_cpu(uint32_t cpu_id);
+
+tss_entry_t* gdt_get_tss(uint32_t cpu_id);
+
 void ltr(uint16_t sel);
 
 #endif

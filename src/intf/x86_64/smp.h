@@ -2,30 +2,31 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "x86_64/proc.h"
+#include "x86_64/multiboot2parse.h"
 
 #define MAX_CPUS 16
 
 typedef struct {
-    uint32_t   cpu_id;      // logical index 0..MAX_CPUS-1
-    uint32_t   lapic_id;    // hardware APIC ID (Phase 3)
-    bool       online;      // true once this core has entered the scheduler
+    uint32_t   cpu_id;
+    uint32_t   lapic_id;
+    bool       online;
     process_t* current_process;
     process_t* idle_process;
 } cpu_local_t;
 
 extern cpu_local_t g_cpus[MAX_CPUS];
-
-// Number of cores currently known to be running. Stays 1 until Phase 3
-// (real AP bring-up) is implemented.
 extern volatile uint32_t g_cpu_count;
 
-// Logical id of the calling core.
-//
-// Phase 3 will replace this with a read of the Local APIC ID register
-// (or a per-core %gs-relative variable set up during AP entry). Until
-// then there is exactly one core: the BSP, always id 0.
 uint32_t smp_current_cpu_id(void);
-
-// Zero and reset per-CPU bookkeeping, mark the BSP online. Call once,
-// very early in kernel_main(), before any process is created.
 void smp_init_bsp(void);
+
+// Brings up every AP reported by ACPI's MADT. Call after
+// smp_init_bsp(), gdt_init(), idt_init(), and startroutine() (needs a
+// running PIT for INIT/SIPI timing). Returns cores online afterwards
+// (including BSP); returns 1 and leaves the kernel single-core if
+// ACPI/LAPIC init fails.
+uint32_t smp_start_aps(multiboot2_info_t* mb_info);
+
+// Entry point for every AP once it reaches 64-bit long mode - see
+// ap_trampoline.asm. Never returns.
+void ap_entry_c(uint32_t cpu_id) __attribute__((noreturn));

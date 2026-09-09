@@ -64,6 +64,7 @@ void usb_keyboard_update_task(void) {
 
 void kernel_main(uint64_t mb2_info_addr) {
     smp_init_bsp();
+    gdt_init();
     multiboot2_info_t* mb_info = (multiboot2_info_t*)mb2_info_addr;
     uint64_t total_ram_bytes = get_total_memory(mb_info);
     print_clear();
@@ -124,6 +125,8 @@ void kernel_main(uint64_t mb2_info_addr) {
     } else {
         serial_write_str("No storage driver found\n");
     }
+
+    smp_start_aps(mb_info);
 
     sti();
     createProcess("busy", busy);

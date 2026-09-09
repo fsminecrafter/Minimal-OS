@@ -10,11 +10,14 @@ module_asm_object_files := $(patsubst src/modules/%.asm, build/modules/%.o, $(mo
 impl_c_source_files := $(shell find src/impl -name '*.c')
 impl_c_object_files := $(patsubst src/impl/%.c, build/impl/%.o, $(impl_c_source_files))
 
-impl_asm_source_files := $(shell find src/impl -name '*.asm')
+impl_asm_source_files := $(filter-out src/impl/boot/ap_trampoline.asm, $(shell find src/impl -name '*.asm'))
 impl_asm_object_files := $(patsubst src/impl/%.asm, build/impl/%.o, $(impl_asm_source_files))
 
+ap_trampoline_bin := build/impl/boot/ap_trampoline.bin
+ap_trampoline_object := build/impl/boot/ap_trampoline.o
+
 source_object_files := $(module_c_object_files) $(module_asm_object_files) \
-	$(impl_c_object_files) $(impl_asm_object_files)
+	$(impl_c_object_files) $(impl_asm_object_files) $(ap_trampoline_object)
 
 audio_wav_files := $(shell find src/resources -name '*.wav')
 audio_obj_files_src := $(shell find src/resources -name '*.o')
@@ -36,6 +39,13 @@ build/impl/%.o: src/impl/%.c
 build/impl/%.o: src/impl/%.asm
 	mkdir -p $(dir $@)
 	nasm -f elf64 $< -o $@
+
+$(ap_trampoline_bin): src/impl/boot/ap_trampoline.asm
+	mkdir -p $(dir $@)
+	nasm -f bin $< -o $@
+
+$(ap_trampoline_object): $(ap_trampoline_bin)
+	objcopy -I binary -O elf64-x86-64 -B i386 $< $@
 
 build/resources/%.o: src/resources/%.wav
 	mkdir -p $(dir $@)

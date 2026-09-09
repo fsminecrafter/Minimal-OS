@@ -5,6 +5,7 @@
 #include "x86_64/gpu_hw.h"
 
 #define PCI_NUM_BARS 6
+#define PCI_MAX_DEVICES 64
 
 typedef enum {
     PCI_BAR_UNUSED = 0,
@@ -25,6 +26,9 @@ typedef struct {
     uint32_t bar[PCI_NUM_BARS];              // Store BAR addresses
     pci_bar_type_t bar_type[PCI_NUM_BARS];  // IO or MEM type per BAR
 } pci_device_t;
+
+extern pci_device_t pci_devices[PCI_MAX_DEVICES];
+extern int pci_device_count;
 
 
 static inline void pci_write_address(uint32_t address);

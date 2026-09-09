@@ -9,6 +9,7 @@
 #include "x86_64/exec_trace.h"
 #include "x86_64/lapic.h"
 #include "x86_64/lapic_timer.h"
+#include "x86_64/smp.h"
 
 #define IDT_IRQ0_TIMER 0x20
 #define IDT_IRQ1_KEYBOARD 0x21
@@ -75,6 +76,8 @@ void idt_reload() {
 }
 
 void idt_handler_keyboard() {
+	smp_assert_master_core("PS/2 keyboard IRQ1");
+
 	if (idt_handler_keyboard_user != NULL) {
 		idt_handler_keyboard_user();
 	}

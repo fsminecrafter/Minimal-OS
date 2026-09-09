@@ -11,11 +11,14 @@
 #include "string.h"
 #include "time.h"
 
+#include "panic.h"
+
 cpu_local_t g_cpus[MAX_CPUS];
 volatile uint32_t g_cpu_count = 1;
 
 static uint32_t g_apic_id_to_cpu[MAX_CPUS];
 static uint32_t g_bsp_apic_id = 0;
+static volatile bool g_bsp_lapic_ready = false;
 
 typedef struct __attribute__((packed)) {
     uint64_t pml4_phys;
@@ -38,6 +41,8 @@ extern struct IdtPtr idt_ptr;     // from idt.c - shared across every core
  * ever shows up hot.
  */
 uint32_t smp_current_cpu_id(void) {
+    if (!g_bsp_lapic_ready) return SMP_MASTER_CPU_ID;
+
     uint32_t apic_id = lapic_get_id();
     for (uint32_t i = 0; i < g_cpu_count; i++) {
         if (g_apic_id_to_cpu[i] == apic_id) return i;
@@ -46,6 +51,7 @@ uint32_t smp_current_cpu_id(void) {
 }
 
 void smp_init_bsp(void) {
+    g_bsp_lapic_ready = false;
     for (uint32_t i = 0; i < MAX_CPUS; i++) {
         g_cpus[i] = (cpu_local_t){ .cpu_id = i };
         g_apic_id_to_cpu[i] = 0;
@@ -60,6 +66,24 @@ void smp_init_bsp(void) {
 static void busy_wait_ms(uint32_t ms) {
     uint64_t start = time_get_uptime_ms();
     while ((time_get_uptime_ms() - start) < ms) asm volatile("pause");
+}
+
+void smp_assert_master_core(const char* subsystem) {
+    if (smp_is_master_core()) return;
+
+    serial_write_str("SMP: FATAL - '");
+    serial_write_str(subsystem ? subsystem : "(unknown)");
+    serial_write_str("' ran on non-master core ");
+    serial_write_dec(smp_current_cpu_id());
+    serial_write_str(" (master is cpu ");
+    serial_write_dec((uint32_t)SMP_MASTER_CPU_ID);
+    serial_write_str(") - this subsystem shares unlocked global state "
+                      "and is not yet safe for multi-core delivery. "
+                      "This means an IRQ got routed somewhere it "
+                      "shouldn't have (e.g. a stray IOAPIC redirection "
+                      "entry) - fix the routing, do not remove this "
+                      "check.\n");
+    PANIC("legacy IRQ subsystem ran off the master core");
 }
 
 static void busy_wait_us_approx(uint32_t us) {
@@ -83,6 +107,7 @@ uint32_t smp_start_aps(multiboot2_info_t* mb_info) {
         serial_write_str("SMP: LAPIC init failed - staying single-core\n");
         return g_cpu_count;
     }
+    g_bsp_lapic_ready = true;
     g_bsp_apic_id        = lapic_get_id();
     g_apic_id_to_cpu[0]  = g_bsp_apic_id;
 

@@ -8,6 +8,7 @@
 #include "time.h"
 #include "panic.h"
 #include "usb/usb_stack.h"
+#include "x86_64/smp.h"
 
 // PIT ports
 #define PIT_COMMAND_PORT 0x43
@@ -41,6 +42,8 @@ void pit_init(uint32_t frequency) {
 }
 
 void pit_irq_handler() {
+    smp_assert_master_core("PIT (time/usb/audio/scheduler-legacy)");
+
     pit_ticks++;
     
     // Update system time

@@ -81,8 +81,8 @@ uint32_t pci_read_data(void)
     return ret;
 }
 
-#define MAX_PCI_DEVICES 64
-pci_device_t pci_devices[MAX_PCI_DEVICES];
+#define MAX_PCI_DEVICES PCI_MAX_DEVICES
+pci_device_t pci_devices[PCI_MAX_DEVICES];
 int pci_device_count = 0;
 
 bool pci_device_present(uint8_t bus, uint8_t device, uint8_t function) {

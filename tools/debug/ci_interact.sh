@@ -68,7 +68,7 @@ write_junit_header() {
     cat > "$JUNIT_OUT" <<EOF
 <?xml version="1.0" encoding="utf-8"?>
 <testsuites>
-  <testsuite name="ci-interact" tests="6">
+    <testsuite name="ci-interact" tests="8">
 EOF
 }
 
@@ -114,7 +114,7 @@ write_junit_header
 wait_for() {
     local pattern="$1"; local timeout_sec="$2"; local seen=0
     for i in $(seq 1 $timeout_sec); do
-        if grep -q "$pattern" "$SERIAL_OUT" 2>/dev/null; then
+        if grep -Eq "$pattern" "$SERIAL_OUT" 2>/dev/null; then
             seen=1
             break
         fi
@@ -152,6 +152,10 @@ CMDS+=("createmusicfile")
 REGS+=("createmusicfile: write complete|music.adi written|Done music file created")
 CMDS+=("memsize")
 REGS+=("Executing\.\.\.|Converting\.\.\.")
+CMDS+=("clear")
+REGS+=("clear: done")
+CMDS+=("info")
+REGS+=("CPU name:|Core amount:|RAM amount:")
 
 for idx in "${!CMDS[@]}"; do
     cmd="${CMDS[$idx]}"

@@ -92,7 +92,7 @@ Last synced 2026 - Aug 18 - 9:47
 
 #### V 0.4.4X
 
-- [ ] Multithreading And Multicore usage 
+- [X] Multithreading And Multicore usage 
 - [ ] Services manager 
 - [ ] Syscalls and User layer
 - [ ] .prg executable file

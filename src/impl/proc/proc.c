@@ -190,9 +190,17 @@ process_t* proc_create(const char* file_name, void (*entry_point)()) {
 	 * - a no-op if we're already in interrupt context, and a real
 	 * (brief) critical section if called from process context.
 	 */
-	uint64_t proc_list_flags = irq_save(__FILE__, __func__, __LINE__);
+	/*
+	 * proc_list_head is the same global list schedule()'s
+	 * zombie/terminated cleanup pass walks and mutates. Now protected
+	 * with the real cross-core scheduler_lock() (spinlock.h) instead
+	 * of plain irq_save() — cli() alone doesn't stop a second physical
+	 * core from touching this list at the same time.
+	 */
+	uint64_t proc_list_flags = scheduler_lock();
 	proc->next = proc_list_head;
 	proc_list_head = proc;
+	scheduler_unlock(proc_list_flags);
 	irq_restore(proc_list_flags, __FILE__, __func__, __LINE__);
 
 	return proc;

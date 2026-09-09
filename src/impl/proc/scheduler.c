@@ -2,6 +2,7 @@
 #include <stddef.h>
 #include <stdbool.h>
 #include "x86_64/proc.h"
+#include "x86_64/scheduler.h"
 #include "time.h"
 #include "panic.h"
 #include "print.h"
@@ -9,13 +10,11 @@
 #include "x86_64/allocator.h"
 #include "serial.h"
 #include "x86_64/safeints.h"
+#include "x86_64/spinlock.h"
 
 #define SCHED_DEBUG 0   // 0 = off, 1 = important, 2 = verbose
 
 bool scheduler_on = false;
-
-// The currently running process
-process_t* current_process = NULL;
 
 // Linked list of processes
 extern process_t* proc_list_head;
@@ -26,6 +25,19 @@ extern void context_switch(process_t* current, process_t* next);
 // Statistics
 static uint64_t total_context_switches = 0;
 static uint64_t idle_cycles = 0;
+
+// Real cross-core lock guarding proc_list_head + current_process
+// transitions. See spinlock.h for why cli() alone isn't enough once a
+// second physical core exists.
+static spinlock_t g_sched_lock = SPINLOCK_INIT;
+
+uint64_t scheduler_lock(void) {
+    return spinlock_acquire(&g_sched_lock);
+}
+
+void scheduler_unlock(uint64_t flags) {
+    spinlock_release(&g_sched_lock, flags);
+}
 
 // Call to yield current process (mark ready)
 void ready() {
@@ -112,48 +124,22 @@ static process_t* find_next_ready_process() {
 }
 
 /*
- * Main scheduling function
+ * Main scheduling function.
  *
- * SAFETY NOTE (interrupt reentrancy):
+ * SAFETY NOTE (reentrancy AND cross-core safety):
  *
- * This function is called both from interrupt context (scheduler_tick(),
- * invoked from the PIT ISR, where the CPU has already cleared IF via the
- * IDT interrupt gate) AND from ordinary process context with interrupts
- * enabled (sleep(), process_exit()). Everything from the top of this
- * function up until context_switch() is called walks and mutates the
- * single global proc_list_head list (the zombie/terminated cleanup pass
- * frees process_t nodes; find_next_ready_process() walks the list;
- * current_process is read and written).
- *
- * If a PIT tick fires *while* a non-interrupt-context caller (e.g. a
- * process that just called sleep()) is partway through that walk, the
- * nested scheduler_tick() -> schedule() call runs its OWN cleanup pass
- * over the very same list - potentially freeing the exact process_t node
- * the outer call's `curr`/`prev`/`next` locals are still pointing at.
- * When the outer call eventually resumes (its kernel stack may not be
- * revisited until many other processes have run and reused that freed
- * heap block), it dereferences a stale pointer into now-unrelated
- * memory - this is exactly the "#GP reading curr->state" / triple-fault
- * signature seen when a long run of AHCI writes (which intentionally
- * re-enable interrupts around each ahci_write() call so the PIT can
- * keep ticking during DMA waits - see minimafs_write_blocks()) causes
- * scheduler_tick() to fire very frequently while other processes are
- * mid-sleep()/mid-schedule().
- *
- * Fix: bracket the whole non-context-switching portion of this function
- * with irq_save()/irq_restore() (safeints.h), the same idiom already
- * used around ahci_write() elsewhere in the kernel. This is a no-op
- * when called from interrupt context (IF is already 0, so irq_save()
- * doesn't disable anything and irq_restore() won't re-enable anything
- * it didn't disable) and actually closes the reentrancy window when
- * called from process context. irq_restore() is called before
- * context_switch() so that, if we do switch away, the interrupt-enabled
- * state gets correctly captured in the outgoing process's saved RFLAGS
- * (regs[8]) rather than incorrectly staying "disabled" forever once
- * that process resumes.
+ * Everything from the top of this function up until context_switch()
+ * is called walks/mutates the single global proc_list_head list, and
+ * (with SMP) reads/writes this core's current_process slot. That
+ * needs protecting both against this core's own PIT-interrupt-driven
+ * scheduler_tick() reentering mid-walk, AND against another physical
+ * core doing the exact same thing at the exact same instant.
+ * scheduler_lock()/scheduler_unlock() (a real spinlock, not just
+ * cli/sti - see spinlock.h) cover both cases; it's released BEFORE
+ * context_switch() so we never hold a lock across a stack switch.
  */
 void schedule() {
-    uint64_t sched_flags = irq_save(__FILE__, __func__, __LINE__);
+    uint64_t sched_flags = scheduler_lock();
 
     // Clean up ZOMBIE or TERMINATED processes
     process_t* prev = NULL;
@@ -200,7 +186,7 @@ void schedule() {
         current_process = find_next_ready_process();
         if (!current_process) {
             serial_write_str("No processes to schedule\n");
-            irq_restore(sched_flags, __FILE__, __func__, __LINE__);
+            scheduler_unlock(sched_flags);
             PANIC("No processes to schedule, but scheduler called");
         }
         current_process->state = PROCESS_RUNNING;
@@ -208,7 +194,7 @@ void schedule() {
         serial_write_str("Starting first process: ");
         serial_write_str(current_process->name);
         serial_write_str("\n");
-        irq_restore(sched_flags, __FILE__, __func__, __LINE__);
+        scheduler_unlock(sched_flags);
         return;
     }
 
@@ -219,13 +205,13 @@ void schedule() {
         // No runnable processes - idle
         serial_write_str("No runnable processes - idle\n");
         idle_cycles++;
-        irq_restore(sched_flags, __FILE__, __func__, __LINE__);
+        scheduler_unlock(sched_flags);
         return;
     }
 
     if (next == current_process) {
         // Same process continues running
-        irq_restore(sched_flags, __FILE__, __func__, __LINE__);
+        scheduler_unlock(sched_flags);
         return;
     }
 
@@ -251,21 +237,17 @@ void schedule() {
         serial_write_str("\n");
     }
 
-    // Restore interrupt-enable state BEFORE the switch so it's captured
-    // correctly in `old`'s saved RFLAGS (see the big comment above).
-    irq_restore(sched_flags, __FILE__, __func__, __LINE__);
+    // Release BEFORE the switch so it's captured correctly in `old`'s
+    // saved RFLAGS, and so we never hold the lock across a stack swap.
+    scheduler_unlock(sched_flags);
 
     context_switch(old, next);
 }
 
 /*
- * Busy-wait sleep used only when there is no current_process yet (i.e.
- * before the scheduler has ever run - see the comment in sleep() below
- * for why this matters). Bounded, guaranteed-terminating: polls the
- * uptime clock if it's advancing, otherwise falls back to a fixed nop
- * spin. Mirrors the pattern already used by ahci_sleep_ms() /
- * minimafs_sleep_ms() for exactly the same reason - it must never rely
- * on hlt or on anything that could fail to return.
+ * Busy-wait sleep used only when there is no current_process yet.
+ * Bounded and guaranteed-terminating - see the identical pattern in
+ * ahci_sleep_ms()/minimafs_sleep_ms() for why it never uses hlt.
  */
 static void sleep_busy_wait_ms(uint64_t milliseconds) {
     if (milliseconds == 0) return;
@@ -292,30 +274,6 @@ void sleep(uint64_t milliseconds) {
     if (milliseconds == 0) return;
 
     if (!current_process) {
-        /*
-         * No process context yet. This is not a rare edge case: it is
-         * exactly the situation during early boot, before
-         * schedulerInit()/the first schedule() has ever run - which
-         * covers all of usb_init()'s device enumeration
-         * (uhci_control_transfer()'s completion poll, the
-         * "wait for device to stabilize" delay, the post-SET_ADDRESS
-         * recovery delay, etc.), since createProcess() isn't called
-         * until after USB, keyboard, GPU, and audio init have already
-         * completed in kernel_main().
-         *
-         * The old behaviour here was `if (!current_process) return;`
-         * - silently skipping the wait entirely. That turned every
-         * "wait N ms" call during USB enumeration into a no-op, making
-         * enumeration timing purely dependent on how fast the
-         * surrounding code happened to run on a given boot. That is
-         * exactly why the USB keyboard was intermittently not fully
-         * enumerated/configured in time and the code fell back to
-         * PS/2 - roughly one boot in every handful, depending on host
-         * scheduling jitter under QEMU.
-         *
-         * Do a real, bounded busy-wait instead so callers outside any
-         * process context still get an actual delay.
-         */
         sleep_busy_wait_ms(milliseconds);
         return;
     }
@@ -332,12 +290,7 @@ void sleep(uint64_t milliseconds) {
         serial_write_str(" ms\n");
     }
 
-    // Mark as waiting and switch to another process
     schedule();
-
-    // When we return here, this process has been woken up and rescheduled
-    // The state was changed to READY/RUNNING by wake_sleeping_processes()
-    // Just return - we're done sleeping!
 
     if (SCHED_DEBUG >= 2) {
         serial_write_str("[WAKE-UP] ");
@@ -347,12 +300,11 @@ void sleep(uint64_t milliseconds) {
 }
 
 static int tick_counter = 0;
-static const int TICKS_PER_SCHEDULE = 10;  // Schedule every 10 ticks
+static const int TICKS_PER_SCHEDULE = 10;
 
-// Timer-based scheduler trigger (called from PIT)
 void scheduler_tick() {
     if (!scheduler_on) {
-        return; // Prevent re-entrancy
+        return;
     }
 
     wake_sleeping_processes();
@@ -364,27 +316,17 @@ void scheduler_tick() {
 
     tick_counter++;
 
-    // Schedule every N ticks (time slice)
     if (tick_counter >= TICKS_PER_SCHEDULE) {
         tick_counter = 0;
-
-        process_t* last = current_process;
         schedule();
-
-        // Only print if we actually switched
-        if (last != current_process && current_process) {
-            // Already printed in schedule()
-        }
     }
 }
 
-// Get scheduler statistics
 void scheduler_get_stats(uint64_t* switches, uint64_t* idle) {
     if (switches) *switches = total_context_switches;
     if (idle) *idle = idle_cycles;
 }
 
-// Print scheduler statistics
 void scheduler_print_stats() {
     print_str("=== Scheduler Statistics ===\n");
     print_str("Context switches: ");
@@ -393,7 +335,6 @@ void scheduler_print_stats() {
     print_uint64_dec(idle_cycles);
     print_str("\n");
 
-    // Count processes by state
     int ready = 0, running = 0, waiting = 0, zombie = 0;
     for (process_t* p = proc_list_head; p != NULL; p = p->next) {
         switch (p->state) {
@@ -425,12 +366,8 @@ void process_exit(void) {
     serial_write_str(current_process->name);
     serial_write_str("\n");
 
-    // Mark as terminated (scheduler will clean it up)
     current_process->state = PROCESS_TERMINATED;
-
-    // Force a reschedule
     schedule();
 
-    // We should NEVER return here
     PANIC("process_exit() returned!");
 }

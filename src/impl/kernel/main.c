@@ -23,6 +23,8 @@
 #include "x86_64/ahci.h"
 #include "x86_64/storage_manager.h"
 #include "x86_64/global_audio_state.h"
+#include "x86_64/smp.h"
+
 
 void busy(void) {
     serial_write_str("Busy process\n");
@@ -61,6 +63,7 @@ void usb_keyboard_update_task(void) {
 }
 
 void kernel_main(uint64_t mb2_info_addr) {
+    smp_init_bsp();
     multiboot2_info_t* mb_info = (multiboot2_info_t*)mb2_info_addr;
     uint64_t total_ram_bytes = get_total_memory(mb_info);
     print_clear();
@@ -107,16 +110,7 @@ void kernel_main(uint64_t mb2_info_addr) {
     getprocslistNames(proc_list, 32);
     serial_write_str(proc_list[0]);
 
-    datetime_t dt;
-
-    dt.year = 2026;
-    dt.month = 8;
-    dt.day = 19;
-    dt.hour = 18;
-    dt.minute = 50;
-    dt.second = 30;
-
-    time_set_datetime(&dt);
+    time_set_from_str("2026-08-19 18:50:30");
 
     // Registers every built-in audio_hw_driver_t with audio_manager
     // and initializes whichever one is actually present. See

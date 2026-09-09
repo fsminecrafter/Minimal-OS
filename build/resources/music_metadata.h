@@ -1,4 +1,4 @@
-// Audio metadata for /workspaces/Minimal-OS/build/resources/music.o
+// Audio metadata for /mnt/wdc-drive/Minimal-OS/build/resources/music.o
 #define AUDIO_FORMAT "IADPCM"
 #define AUDIO_LENGTH 44
 #define AUDIO_DATALEN 2115994

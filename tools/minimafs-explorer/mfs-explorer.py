@@ -154,6 +154,77 @@ def parse_entries(block_text):
     return entries
 
 
+def parse_folder_entry_line(line):
+    """Parse a newer folder.desc line like:
+    ENTRY:etc,DIR,BLOCK:3,COUNT:1,HIDDEN:0
+    """
+    line = line.strip()
+    if not line.startswith("ENTRY:"):
+        return None
+
+    body = line[len("ENTRY:"):]
+    if not body:
+        return None
+
+    name_part, _, rest = body.partition(",")
+    name = name_part.strip()
+    if not name:
+        return None
+
+    entry = {
+        "name": name,
+        "type": "FILE",
+        "block": 0,
+        "count": 1,
+        "hidden": False,
+    }
+
+    for token in rest.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if token in ("DIR", "FILE"):
+            entry["type"] = token
+        elif token.startswith("BLOCK:"):
+            entry["block"] = safe_int(token.split(":", 1)[1], 0)
+        elif token.startswith("COUNT:"):
+            entry["count"] = safe_int(token.split(":", 1)[1], 1)
+        elif token.startswith("HIDDEN:"):
+            val = token.split(":", 1)[1].strip()
+            entry["hidden"] = val not in ("0", "False", "false")
+
+    return entry
+
+
+def parse_folder_desc(block_text):
+    """Parse the newer folder descriptor format used by MinimaFS.
+
+    Example:
+    FOLDER:/
+    ENTRIES:2
+    ENTRY:etc,DIR,BLOCK:3,COUNT:1,HIDDEN:0
+    ENTRY:hello.txt,FILE,BLOCK:8,COUNT:1,HIDDEN:0
+    @END
+    """
+    result = {"path": "", "entries": []}
+    for raw in block_text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("FOLDER:"):
+            result["path"] = line[len("FOLDER:"):].strip()
+        elif line.startswith("ENTRIES:"):
+            result["entry_count"] = safe_int(line[len("ENTRIES:"):], 0)
+        elif line.startswith("ENTRY:"):
+            parsed = parse_folder_entry_line(line)
+            if parsed:
+                result["entries"].append(parsed)
+        elif line.startswith("@END"):
+            break
+
+    return result
+
+
 def extract_data(block_text):
     if "@DATA@" not in block_text:
         return ""
@@ -441,6 +512,22 @@ class App:
         self.nodes.clear()
 
         root = self.tree.insert("", "end", text="Drive")
+        folder_nodes = {"/": root}
+
+        def make_entry_node(parent_node, name, block, file_type, filelen, folder_path):
+            node = self.tree.insert(parent_node, "end", text=name)
+            self.nodes[node] = {
+                "block": block,
+                "entry": {
+                    "FILENAME": name,
+                    "FILETYPE": file_type,
+                    "FILELEN": str(filelen),
+                    "CREATEDDATE": "",
+                    "LASTCHANGED": "",
+                    "PARENTFOLDER": folder_path,
+                }
+            }
+            return node
 
         for i in range(min(self.total_blocks, MAX_SCAN_BLOCKS)):
             b = read_block(self.file, i)
@@ -450,20 +537,60 @@ class App:
 
             t = b.decode(errors="ignore")
 
-            if "@HEADER@" not in t:
+            if "@HEADER@" in t:
+                entries = parse_entries(t)
+                for e in entries:
+                    name = e.get("FILENAME", f"blk_{i}")
+                    node = self.tree.insert(root, "end", text=f"{name} (blk {i})")
+                    self.nodes[node] = {
+                        "block": i,
+                        "entry": e
+                    }
                 continue
 
-            entries = parse_entries(t)
+            if "FOLDER:" in t or "ENTRY:" in t:
+                folder = parse_folder_desc(t)
+                if not folder.get("entries"):
+                    continue
 
-            for e in entries:
-                name = e.get("FILENAME", f"blk_{i}")
+                folder_path = folder.get("path") or "/"
+                if folder_path == "":
+                    folder_path = "/"
+                if folder_path not in folder_nodes:
+                    parent_path = "/"
+                    if folder_path != "/":
+                        parent_path = folder_path.rsplit("/", 1)[0] if "/" in folder_path.rsplit("/", 1)[0] else "/"
+                    parent_node = folder_nodes.get(parent_path, root)
+                    display_name = folder_path.strip("/") or "Root"
+                    folder_nodes[folder_path] = self.tree.insert(parent_node, "end", text=display_name)
 
-                node = self.tree.insert(root, "end", text=f"{name} (blk {i})")
+                folder_node = folder_nodes[folder_path]
 
-                self.nodes[node] = {
-                    "block": i,
-                    "entry": e
-                }
+                for e in folder["entries"]:
+                    name = e.get("name", f"blk_{i}")
+                    kind = (e.get("type", "FILE") or "FILE").upper()
+                    block = e.get("block", i)
+                    filelen = max(1, e.get("count", 1) * BLOCK_SIZE)
+
+                    if kind == "DIR":
+                        child_path = name if folder_path == "/" else f"{folder_path.rstrip('/')}/{name}"
+                        child_node = folder_nodes.get(child_path)
+                        if child_node is None:
+                            child_node = self.tree.insert(folder_node, "end", text=name)
+                            folder_nodes[child_path] = child_node
+                        self.nodes.setdefault(child_node, {
+                            "block": block,
+                            "entry": {
+                                "FILENAME": name,
+                                "FILETYPE": "dir",
+                                "FILELEN": str(filelen),
+                                "CREATEDDATE": "",
+                                "LASTCHANGED": "",
+                                "PARENTFOLDER": folder_path,
+                            }
+                        })
+                    else:
+                        make_entry_node(folder_node, name, block, "file", filelen, folder_path)
 
         debug(self.log, "Filesystem loaded")
 

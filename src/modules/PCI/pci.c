@@ -295,7 +295,7 @@ void initializeGraphicsDevice() {
         serial_write_str("No GPU device found.\n");
 
     }
-    gpu_initialize_g(&gpu, gpu_pci, 1080, 720);
+    gpu_initialize_g(&gpu, gpu_pci, GPU_DEFAULT_WIDTH, GPU_DEFAULT_HEIGHT);
 }
 
 /* ============================================================
@@ -326,7 +326,7 @@ static bool gpu_bochs_vbe_init(void) {
         return false;
     }
 
-    gpu_initialize_g(&gpu, gpu_pci, 1080, 720);
+    gpu_initialize_g(&gpu, gpu_pci, GPU_DEFAULT_WIDTH, GPU_DEFAULT_HEIGHT);
     return true;
 }
 

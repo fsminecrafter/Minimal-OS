@@ -185,6 +185,20 @@ bool gpu_init(gpu_device_t* gpu, pci_device_t* pci_dev, uint32_t width, uint32_t
     return true;
 }
 
+bool gpu_set_resolution(gpu_device_t* gpu, uint32_t width, uint32_t height) {
+    if (!gpu || !gpu->pci_dev || width == 0 || height == 0 || width > 8192 || height > 8192) {
+        return false;
+    }
+    if (gpu->width == width && gpu->height == height) {
+        return true;
+    }
+    gpu_set_vbe_mode(width, height, 32);
+    gpu->width = width;
+    gpu->height = height;
+    gpu->pitch = width * gpu->bpp;
+    return true;
+}
+
 
 void gpu_put_pixel(gpu_device_t* gpu, uint32_t x, uint32_t y, uint32_t color) {
     if (!gpu || !gpu->fb) {

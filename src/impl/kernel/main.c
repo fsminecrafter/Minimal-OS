@@ -64,6 +64,7 @@ void usb_keyboard_update_task(void) {
 }
 
 void kernel_main(uint64_t mb2_info_addr) {
+    serial_init();
     smp_init_bsp();
     gdt_init();
     multiboot2_info_t* mb_info = (multiboot2_info_t*)mb2_info_addr;

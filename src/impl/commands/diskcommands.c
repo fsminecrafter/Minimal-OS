@@ -150,6 +150,8 @@ void cmd_format_debug(int argc, const char** argv) {
     p += sprintf(p, "hostname=MinimalDevice\n");
     p += sprintf(p, "drive=%u\n",       (unsigned int)drive->drive_number);
     p += sprintf(p, "fs=MinimaFS\n");
+    p += sprintf(p, "DisplayWidth=1280\n");
+    p += sprintf(p, "DisplayHeight=720\n");
     /* Default keyboard layout selector. May be a built-in name (e.g.
      * "US", "SE") or a path to a .kbr file (e.g. "0:/kbr/german.kbr").
      * Change with the 'kbrlayout set <name|path>' terminal command,

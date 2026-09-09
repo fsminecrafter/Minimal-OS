@@ -13,6 +13,7 @@
 
 #include "vgaterm.h"
 #include "minimafshandler.h"
+#include "systeminfo.h"
 
 void usb_keyboard_update_task(void);
 extern const char* fs_get_current_directory(void);
@@ -375,25 +376,6 @@ void terminal_program_entry(void) {
     // Start cursor updater process
     serial_write_str("Terminal: Starting cursor process...\n");
     process_t* cursor_process = createProcess("cursorupdater", cursorupdater);
-    
-    // Display welcome message
-    graphics_write_textr("========================================\n");
-    graphics_write_textr("  Welcome to MinimalOS Terminal!\n");
-    graphics_write_textr("========================================\n\n");
-    
-    graphics_write_textr("System: ");
-    graphics_write_textr(datetime_str_readable());
-    graphics_write_textr("\n");
-    
-    graphics_write_textr("Uptime: ");
-    graphics_write_textr(uptime_str_human());
-    graphics_write_textr("\n\n");
-    
-    // Keyboard status was already printed by terminal_init_keyboard()
-    graphics_write_textr("Type a command and press Enter.\n");
-    graphics_write_textr("Type 'help' for available commands.\n\n");
-    
-    serial_write_str("=== TERMINAL READY ===\n");
 
     if (vgaterm_ask_yn("Mount disk?", true)) {
         vgaterm_print("Mounting disk...\n");
@@ -406,6 +388,9 @@ void terminal_program_entry(void) {
             int success = mountdrive(device, 0);
             if (success == 1) {
                 vgaterm_print("Mount succeded.\n");
+                if (systeminfo_load_saved_resolution()) {
+                    vgaterm_print("Loaded saved display resolution.\n");
+                }
             }else if (success == 2) {
                 vgaterm_print("/cr255g0b0/MinimaFS: Drive already mounted/cr255g255b255/\n");
             }else if (success == 3) {
@@ -428,6 +413,25 @@ void terminal_program_entry(void) {
         }
         }
     }
+    
+    // Display welcome message
+    graphics_write_textr("========================================\n");
+    graphics_write_textr("  Welcome to MinimalOS Terminal!\n");
+    graphics_write_textr("========================================\n\n");
+    
+    graphics_write_textr("System: ");
+    graphics_write_textr(datetime_str_readable());
+    graphics_write_textr("\n");
+    
+    graphics_write_textr("Uptime: ");
+    graphics_write_textr(uptime_str_human());
+    graphics_write_textr("\n\n");
+    
+    // Keyboard status was already printed by terminal_init_keyboard()
+    graphics_write_textr("Type a command and press Enter.\n");
+    graphics_write_textr("Type 'help' for available commands.\n\n");
+    
+    serial_write_str("=== TERMINAL READY ===\n");
 
     terminalPrompt();
     createProcess("terminal_update", terminal_update);

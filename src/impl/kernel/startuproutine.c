@@ -82,8 +82,6 @@ void startroutine(uint64_t total_ram_bytes) {
     allocator_init((void*)heap_start, uintheapsize);
     pmm_init((void*)0x1000000, 0x4000000);  // Start at 16MB instead
     print_str("PIT working!\n");
-    print_str("Init serial\n");
-    serial_init();
     print_str("Init MMIO subsystem\n");
     extern void mmio_init(void);
     mmio_init();

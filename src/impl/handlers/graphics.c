@@ -397,6 +397,8 @@ void graphics_terminal_scroll(void) {
     uint32_t rows = g_terminal.rows;
     uint32_t cols = g_terminal.cols;
 
+    if (rows == 0 || cols == 0) return;
+
     // Shift the character buffer up by one row
     for (uint32_t row = 1; row < rows && row < TERM_MAX_ROWS; row++) {
         for (uint32_t col = 0; col < cols && col < TERM_MAX_COLS; col++) {
@@ -407,12 +409,30 @@ void graphics_terminal_scroll(void) {
     // Clear the last row in the buffer
     if (rows > 0) term_buf_clear_row(rows - 1);
 
-    // Redraw all rows from the character buffer
-    for (uint32_t row = 0; row < rows && row < TERM_MAX_ROWS; row++) {
-        for (uint32_t col = 0; col < cols && col < TERM_MAX_COLS; col++) {
-            term_cell_t* cell = &g_term_buf[row][col];
-            color_t fg = {cell->r, cell->g, cell->b, 0xFF};
-            graphics_terminal_putchar(cell->ch, col, row, fg, g_terminal.bg_color);
+    // The framebuffer already contains the rendered rows. Move pixels by one
+    // character row instead of rasterizing every glyph on every scroll.
+    uint32_t pixel_width = cols * g_terminal.char_width;
+    uint32_t pixel_height = rows * g_terminal.char_height;
+    uint32_t row_bytes = pixel_width * sizeof(uint32_t);
+    volatile uint8_t* framebuffer = (volatile uint8_t*)g_gpu->fb;
+    uint32_t pitch = g_gpu->pitch;
+
+    for (uint32_t y = g_terminal.char_height; y < pixel_height; y++) {
+        volatile uint8_t* dst = framebuffer + (y - g_terminal.char_height) * pitch;
+        volatile uint8_t* src = framebuffer + y * pitch;
+        for (uint32_t byte = 0; byte < row_bytes; byte++) {
+            dst[byte] = src[byte];
+        }
+    }
+
+    uint32_t background = 0xFF000000 |
+        ((uint32_t)g_terminal.bg_color.r << 16) |
+        ((uint32_t)g_terminal.bg_color.g << 8) |
+        g_terminal.bg_color.b;
+    for (uint32_t y = pixel_height - g_terminal.char_height; y < pixel_height; y++) {
+        volatile uint32_t* row = (volatile uint32_t*)(framebuffer + y * pitch);
+        for (uint32_t x = 0; x < pixel_width; x++) {
+            row[x] = background;
         }
     }
 

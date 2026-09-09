@@ -12,7 +12,13 @@ typedef struct {
     uint8_t bpp;              // bytes per pixel (likely 4 for 32-bit)
 } gpu_device_t;
 
+extern gpu_device_t gpu;
+
+#define GPU_DEFAULT_WIDTH  1280
+#define GPU_DEFAULT_HEIGHT 720
+
 bool gpu_init(gpu_device_t* gpu, pci_device_t* pci_dev, uint32_t width, uint32_t height);
+bool gpu_set_resolution(gpu_device_t* gpu, uint32_t width, uint32_t height);
 void gpu_put_pixel(gpu_device_t* gpu, uint32_t x, uint32_t y, uint32_t color);
 void gpu_clear(gpu_device_t* gpu, uint32_t color);
 void gpu_test(gpu_device_t* gpu, pci_device_t* pci_dev, uint32_t width, uint32_t height);

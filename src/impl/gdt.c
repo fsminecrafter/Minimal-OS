@@ -1,7 +1,6 @@
 #include "x86_64/gdt.h"
 #include "x86_64/tss.h"
 #include "x86_64/smp.h"
-#include "x86_64/allocator.h"
 #include "string.h"
 #include "serial.h"
 #include "panic.h"
@@ -43,6 +42,7 @@ typedef struct __attribute__((packed)) {
 static uint64_t   g_gdt[GDT_TOTAL_QWORDS] __attribute__((aligned(16)));
 static gdt_ptr_t   g_gdt_ptr;
 static tss_entry_t g_tss[MAX_CPUS] __attribute__((aligned(16)));
+static uint8_t     g_tss_stacks[MAX_CPUS][4096] __attribute__((aligned(16)));
 
 static void gdt_set_entry(int index, uint8_t access, uint8_t flags) {
     gdt_entry_t e = {0};
@@ -98,13 +98,8 @@ void gdt_init(void) {
     gdt_set_entry(2, ACC_PRESENT | ACC_CODEDATA | ACC_RW,            0xC); // 0x10: data
 
     for (int i = 0; i < MAX_CPUS; i++) {
-        // Per-core double-fault (IST1) stack. Previously every core
-        // would have shared main.asm's single static
-        // double_fault_stack - two cores double-faulting at once
-        // would have stomped each other's register dump.
-        void* df_stack = alloc(4096);
-        if (!df_stack) PANIC("gdt_init: OOM allocating per-CPU IST1 stack");
-        g_tss[i].ist[0] = (uint64_t)df_stack + 4096;
+        // GDT setup runs before the heap allocator is initialized.
+        g_tss[i].ist[0] = (uint64_t)&g_tss_stacks[i][4096];
         gdt_set_tss(i, &g_tss[i]);
     }
 

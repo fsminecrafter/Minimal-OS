@@ -110,6 +110,29 @@ static const acpi_rsdp_t* find_mb2_rsdp(multiboot2_info_t* mb_info) {
     return new_rsdp ? new_rsdp : old_rsdp;
 }
 
+static const acpi_rsdp_t* find_legacy_rsdp(void) {
+    uint32_t ebda_segment = *(volatile uint16_t*)(uintptr_t)0x40E;
+    uintptr_t ebda = (uintptr_t)ebda_segment << 4;
+
+    for (uintptr_t address = ebda; address < ebda + 0x400; address += 16) {
+        const acpi_rsdp_t* candidate = (const acpi_rsdp_t*)address;
+        if (strncmp(candidate->signature, "RSD PTR ", 8) == 0 &&
+            acpi_checksum(candidate, 20) == 0) {
+            return candidate;
+        }
+    }
+
+    for (uintptr_t address = 0xE0000; address < 0x100000; address += 16) {
+        const acpi_rsdp_t* candidate = (const acpi_rsdp_t*)address;
+        if (strncmp(candidate->signature, "RSD PTR ", 8) == 0 &&
+            acpi_checksum(candidate, 20) == 0) {
+            return candidate;
+        }
+    }
+
+    return NULL;
+}
+
 static const acpi_sdt_header_t* find_table(const acpi_rsdp_t* rsdp, const char* signature) {
     if (!rsdp) return NULL;
 
@@ -144,12 +167,12 @@ bool acpi_init(multiboot2_info_t* mb_info) {
 
     const acpi_rsdp_t* rsdp = find_mb2_rsdp(mb_info);
     if (!rsdp) {
-        // If this fires, your bootloader isn't handing multiboot2 the
-        // ACPI tag by default - GRUB2 normally does. header.asm may
-        // need an explicit "information request" tag for types 14/15
-        // if you're using a minimal/custom loader.
-        serial_write_str("ACPI: No RSDP tag from bootloader\n");
-        return false;
+        serial_write_str("ACPI: No RSDP tag; scanning BIOS ACPI areas\n");
+        rsdp = find_legacy_rsdp();
+        if (!rsdp) {
+            serial_write_str("ACPI: RSDP not found\n");
+            return false;
+        }
     }
 
     if (acpi_checksum(rsdp, 20) != 0) {

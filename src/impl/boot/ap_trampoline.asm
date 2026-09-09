@@ -39,7 +39,7 @@ protected_mode_entry:
     mov ss, ax
 
     mov eax, cr4
-    or eax, (1 << 5)       ; PAE
+    or eax, (1 << 5) | (1 << 9) | (1 << 10) ; PAE + OSFXSR + OSXMMEXCPT
     mov cr4, eax
 
     mov eax, [mailbox_pml4]

@@ -16,8 +16,10 @@ typedef struct {
 
 extern cpu_local_t g_cpus[MAX_CPUS];
 extern volatile uint32_t g_cpu_count;
+extern volatile uint32_t g_online_cpu_count;
 
 uint32_t smp_current_cpu_id(void);
+uint32_t smp_online_cpu_count(void);
 void smp_init_bsp(void);
 
 // Brings up every AP reported by ACPI's MADT. Call after

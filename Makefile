@@ -1,6 +1,8 @@
 CC := $(HOME)/cross/bin/x86_64-elf-gcc
 LD := $(HOME)/cross/bin/x86_64-elf-ld
 
+.DEFAULT_GOAL := build-x86_64
+
 module_c_source_files := $(shell find src/modules -name '*.c')
 module_c_object_files := $(patsubst src/modules/%.c, build/modules/%.o, $(module_c_source_files))
 
@@ -45,7 +47,10 @@ $(ap_trampoline_bin): src/impl/boot/ap_trampoline.asm
 	nasm -f bin $< -o $@
 
 $(ap_trampoline_object): $(ap_trampoline_bin)
-	objcopy -I binary -O elf64-x86-64 -B i386 $< $@
+	objcopy -I binary -O elf64-x86-64 -B i386 \
+		--redefine-sym _binary_build_impl_boot_ap_trampoline_bin_start=_binary_ap_trampoline_bin_start \
+		--redefine-sym _binary_build_impl_boot_ap_trampoline_bin_end=_binary_ap_trampoline_bin_end \
+		$< $@
 
 build/resources/%.o: src/resources/%.wav
 	mkdir -p $(dir $@)

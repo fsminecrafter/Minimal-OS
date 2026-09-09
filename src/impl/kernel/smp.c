@@ -1,6 +1,7 @@
 #include "x86_64/smp.h"
 #include "x86_64/acpi.h"
 #include "x86_64/lapic.h"
+#include "x86_64/lapic_timer.h"
 #include "x86_64/ioapic.h"
 #include "x86_64/ap_trampoline.h"
 #include "x86_64/gdt.h"
@@ -166,6 +167,7 @@ uint32_t smp_start_aps(multiboot2_info_t* mb_info) {
     return g_cpu_count;
 }
 
+void ap_entry_c(uint32_t cpu_id) __attribute__((__noreturn__));
 void ap_entry_c(uint32_t cpu_id) {
     gdt_load_this_cpu(cpu_id);
     idt_load(&idt_ptr);   // shares the BSP's single IDT - fine, entries only encode handler addr/selector
@@ -173,20 +175,43 @@ void ap_entry_c(uint32_t cpu_id) {
 
     g_cpus[cpu_id].current_process = NULL;
     g_cpus[cpu_id].idle_process    = NULL;
-    g_cpus[cpu_id].online          = true;
+
+    /*
+     * Give this core its own periodic scheduler tick via the LAPIC
+     * timer, instead of leaving it as a permanent hlt loop. Done BEFORE
+     * marking the core online: smp_start_aps() waits for
+     * g_cpus[cpu_id].online before sending the next AP's SIPI, so this
+     * keeps every core's one-time setup - including the lazy MMIO
+     * mapping inside lapic_timer_init() - serialized the same way
+     * lapic_init() above already relies on being serialized. Do not
+     * move this after the "online = true" line.
+     *
+     * initial_count/divide are NOT calibrated against a real time
+     * reference yet (no per-core calibration path exists) - this just
+     * gives each AP *a* recurring interrupt so scheduler_tick() runs
+     * here at all. Good enough to stop these cores being permanently
+     * idle; revisit with proper calibration (e.g. against the PIT, the
+     * way pit_init()'s divisor is derived) if per-core tick accuracy
+     * ever matters for real workloads.
+     */
+    if (!lapic_timer_init(LAPIC_TIMER_VECTOR, 10000000, 3)) {
+        serial_write_str("SMP: cpu failed to start LAPIC timer - "
+                          "scheduler_tick() will never run on this core\n");
+    }
+
+    g_cpus[cpu_id].online = true;
 
     serial_write_str("SMP: cpu online\n");
     asm volatile("sti");
 
     /*
-     * No per-core scheduler entry exists yet - proc_list_head and
-     * schedule() are still a single cross-core-locked list (see
-     * scheduler_lock()/scheduler_unlock() in scheduler.c, which is
-     * already SMP-safe). This core idles on hlt until PIT interrupts
-     * are actually routed to it (item 7 - IOAPIC IRQ routing, not
-     * done here) and scheduler_tick() starts firing here too.
-     * Until then this is a genuinely idle extra core, not yet a
-     * useful one - the next real step after this boots cleanly.
+     * This core's scheduler_tick() now arrives via its own LAPIC timer
+     * interrupt (lapic_timer_irq_handler(), lapic_timer.c), which goes
+     * through the same cross-core scheduler_lock() every other tick
+     * path already uses (scheduler.c). IOAPIC routing for shared legacy
+     * devices (PIT/keyboard) is still not done - this core will never
+     * see those - but it's no longer a dead hlt loop: it now actually
+     * participates in running READY processes off proc_list_head.
      */
     for (;;) asm volatile("hlt");
 }

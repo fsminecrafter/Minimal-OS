@@ -7,6 +7,8 @@
 #include "panic.h"
 #include "print.h"
 #include "x86_64/exec_trace.h"
+#include "x86_64/lapic.h"
+#include "x86_64/lapic_timer.h"
 
 #define IDT_IRQ0_TIMER 0x20
 #define IDT_IRQ1_KEYBOARD 0x21
@@ -26,6 +28,25 @@
 void (*idt_handler_pit_user)() = NULL;
 extern void idt_handler_pit_wrapped();
 extern void idt_handler_doublefault_wrapped();
+extern void isr_spurious();
+extern void lapic_timer_irq_handler_wrapped();
+
+extern void isr0();  extern void isr1();  extern void isr2();  extern void isr3();
+extern void isr4();  extern void isr5();  extern void isr6();  extern void isr7();
+extern void isr9();  extern void isr10(); extern void isr11(); extern void isr12();
+extern void isr13(); extern void isr14(); extern void isr15(); extern void isr16();
+extern void isr17(); extern void isr18(); extern void isr19(); extern void isr20();
+extern void isr21(); extern void isr22(); extern void isr23(); extern void isr24();
+extern void isr25(); extern void isr26(); extern void isr27(); extern void isr28();
+extern void isr29(); extern void isr30(); extern void isr31();
+
+static void (*const isr_stub_table[32])() = {
+    isr0,  isr1,  isr2,  isr3,  isr4,  isr5,  isr6,  isr7,
+    NULL /* 8: keeps idt_handler_doublefault_wrapped, installed separately */,
+    isr9,  isr10, isr11, isr12, isr13, isr14, isr15, isr16,
+    isr17, isr18, isr19, isr20, isr21, isr22, isr23, isr24,
+    isr25, isr26, isr27, isr28, isr29, isr30, isr31,
+};
 
 
 struct IdtEntry {
@@ -81,9 +102,28 @@ void idt_init() {
 	
 	idt_ptr.limit = (sizeof(struct IdtEntry) * 256) - 1;
 	idt_ptr.base = (uint64_t) &idt;
+
+	// General CPU exceptions (0-31), except 8 (double fault, handled below
+	// with its own IST1 stack). Previously left as zeroed/absent gates -
+	// any of these firing was an immediate triple fault with no diagnostic.
+	for (int v = 0; v < 32; v++) {
+		if (v == 8 || !isr_stub_table[v]) continue;
+		idt_set_entry(v, (uint64_t)isr_stub_table[v], GDT_SELECTOR_CS_KERNEL,
+		              IDT_ENTRY_TYPE_INTERRUPT, 0);
+	}
+
 	idt_set_entry(8, (uint64_t)idt_handler_doublefault_wrapped, GDT_SELECTOR_CS_KERNEL, IDT_ENTRY_TYPE_INTERRUPT, 1);
 	idt_set_entry(IDT_IRQ1_KEYBOARD, (uint64_t) idt_handler_keyboard_wrapped, GDT_SELECTOR_CS_KERNEL, IDT_ENTRY_TYPE_INTERRUPT, 0);
 	idt_set_entry(IDT_IRQ0_TIMER,    (uint64_t) idt_handler_pit_wrapped,      GDT_SELECTOR_CS_KERNEL, IDT_ENTRY_TYPE_INTERRUPT, 0);
+
+	// Spurious LAPIC vector - see isr_spurious in idt_isr.asm for why it
+	// must never EOI. Only matters once LAPIC is in use (SMP), but install
+	// it unconditionally so it's never a null gate.
+	idt_set_entry(LAPIC_SPURIOUS_VECTOR, (uint64_t)isr_spurious, GDT_SELECTOR_CS_KERNEL, IDT_ENTRY_TYPE_INTERRUPT, 0);
+
+	// Per-core scheduler tick, driven by each core's own LAPIC timer.
+	// See lapic_timer_init() / ap_entry_c() in smp.c.
+	idt_set_entry(LAPIC_TIMER_VECTOR, (uint64_t)lapic_timer_irq_handler_wrapped, GDT_SELECTOR_CS_KERNEL, IDT_ENTRY_TYPE_INTERRUPT, 0);
 
 	idt_load(&idt_ptr);
 	

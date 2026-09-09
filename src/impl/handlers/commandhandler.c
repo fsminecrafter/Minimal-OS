@@ -7,6 +7,7 @@
 #include "serial.h"
 #include "prochandler.h"
 #include "x86_64/proc.h"
+#include "x86_64/scheduler.h"
 
 extern void (*__start_command_ctors)(void);
 extern void (*__stop_command_ctors)(void);

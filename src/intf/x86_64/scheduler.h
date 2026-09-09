@@ -25,7 +25,7 @@ void scheduler_tick(void);
 void ready(void);
 void schedulerInit();
 // Exits current process.
-void process_exit(void);
+void process_exit(void) __attribute__((__noreturn__));
 
 // Sleep/wake functions
 void sleep(uint64_t milliseconds);

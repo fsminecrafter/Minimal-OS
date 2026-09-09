@@ -3,6 +3,7 @@ BITS 64
 extern idt_handler_keyboard
 extern idt_handler_pit
 extern idt_handler_doublefault
+extern lapic_timer_irq_handler
 
 global idt_load
 
@@ -56,3 +57,4 @@ global %1_wrapped
 WRAPPED_HANDLER idt_handler_keyboard
 WRAPPED_HANDLER idt_handler_pit
 WRAPPED_HANDLER idt_handler_doublefault
+WRAPPED_HANDLER lapic_timer_irq_handler

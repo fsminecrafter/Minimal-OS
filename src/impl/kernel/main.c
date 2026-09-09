@@ -5,6 +5,7 @@
 #include "x86_64/proc.h"
 #include "x86_64/scheduler.h"
 #include "x86_64/idt.h"
+#include "x86_64/gdt.h"
 #include "x86_64/gpu.h"
 #include "x86_64/gpu_manager.h"
 #include "time.h"

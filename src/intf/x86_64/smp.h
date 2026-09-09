@@ -29,4 +29,4 @@ uint32_t smp_start_aps(multiboot2_info_t* mb_info);
 
 // Entry point for every AP once it reaches 64-bit long mode - see
 // ap_trampoline.asm. Never returns.
-void ap_entry_c(uint32_t cpu_id) __attribute__((noreturn));
+void ap_entry_c(uint32_t cpu_id) __attribute__((__noreturn__));

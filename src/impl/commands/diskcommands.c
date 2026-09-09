@@ -735,6 +735,141 @@ void register_initdisk(void) {
     command_register("initdisk", cmd_initdisk);
 }
 
+// ===========================================
+// REMOVE (rm) COMMAND
+// ===========================================
+//
+// Usage: remove <path> [-r|--recursive]
+//        rm     <path> [-r|--recursive]
+//
+// Plain files, and empty directories, are removed directly. A
+// non-empty directory requires -r/--recursive, which walks the tree
+// depth-first (children before the directory itself, since
+// minimafs_rmdir() refuses to remove a non-empty folder.desc) and
+// deletes everything underneath before removing the directory.
+
+// Recursively removes `path` (a fully-resolved "N:/..." path) and
+// everything under it. Heap-allocates its working buffers (dir
+// entries + child-path buffer) rather than using the stack, since this
+// function recurses with directory depth and the kernel stack is only
+// 4KB per process - same pattern used by list_recursive() and
+// minimafs_scan_directory() elsewhere in this codebase.
+static bool remove_recursive(const char* path) {
+    if (!minimafs_is_dir(path)) {
+        return minimafs_delete_file(path);
+    }
+
+    minimafs_dir_entry_t* entries = (minimafs_dir_entry_t*)alloc(
+        MINIMAFS_MAX_ROOT_ENTRIES * sizeof(minimafs_dir_entry_t));
+    if (!entries) {
+        serial_write_str("remove_recursive: OOM allocating entries\n");
+        return false;
+    }
+
+    uint32_t count = minimafs_list_dir(path, entries, MINIMAFS_MAX_ROOT_ENTRIES);
+
+    char* child_path = (char*)alloc_unzeroed(MINIMAFS_MAX_PATH);
+    if (!child_path) {
+        serial_write_str("remove_recursive: OOM allocating child_path\n");
+        free_mem(entries);
+        return false;
+    }
+
+    bool ok = true;
+    size_t path_len = strlen(path);
+
+    for (uint32_t i = 0; i < count && ok; i++) {
+        // `path` may or may not already end in '/' (root is "N:/",
+        // everything else is "N:/foo" with no trailing slash) - handle
+        // both without producing a double slash.
+        if (path_len > 0 && path[path_len - 1] == '/') {
+            snprintf(child_path, MINIMAFS_MAX_PATH, "%s%s", path, entries[i].name);
+        } else {
+            snprintf(child_path, MINIMAFS_MAX_PATH, "%s/%s", path, entries[i].name);
+        }
+
+        if (!remove_recursive(child_path)) {
+            serial_write_str("remove_recursive: failed to remove ");
+            serial_write_str(child_path);
+            serial_write_str("\n");
+            ok = false;
+        }
+    }
+
+    free_mem(child_path);
+    free_mem(entries);
+
+    if (!ok) return false;
+
+    return minimafs_rmdir(path);
+}
+
+void cmd_remove(int argc, const char** argv) {
+    bool recursive = false;
+    const char* requested_path = NULL;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-r") == 0 || strcmp(argv[i], "--recursive") == 0) {
+            recursive = true;
+        } else if (!requested_path) {
+            requested_path = argv[i];
+        }
+    }
+
+    if (!requested_path) {
+        graphics_write_textr("Usage: remove <path> [-r|--recursive]\n");
+        return;
+    }
+
+    if (!fs_resolve_path(requested_path, g_resolved_path)) {
+        graphics_write_textr("remove: invalid path\n");
+        return;
+    }
+
+    // Refuse to touch a drive's root. Resolved paths look like
+    // "N:/..." - root is exactly "N:/" (empty local path). Recursing
+    // into this would delete the entire drive's contents; minimafs_rmdir()
+    // already refuses to remove the root folder.desc itself, but by the
+    // time we got there in a recursive delete everything else would
+    // already be gone, which is not something to do silently.
+    const char* colon = strchr(g_resolved_path, ':');
+    if (colon && colon[1] == '/' && colon[2] == '\0') {
+        graphics_write_textr("remove: refusing to remove drive root\n");
+        return;
+    }
+
+    if (!minimafs_exists(g_resolved_path)) {
+        graphics_write_textr("remove: no such file or directory: ");
+        graphics_write_textr(requested_path);
+        graphics_write_textr("\n");
+        return;
+    }
+
+    bool ok;
+    if (minimafs_is_dir(g_resolved_path)) {
+        if (recursive) {
+            ok = remove_recursive(g_resolved_path);
+        } else {
+            ok = minimafs_rmdir(g_resolved_path);
+            if (!ok) {
+                graphics_write_textr("remove: directory not empty (use -r to remove recursively)\n");
+                return;
+            }
+        }
+    } else {
+        ok = minimafs_delete_file(g_resolved_path);
+    }
+
+    if (ok) {
+        graphics_write_textr("Removed: ");
+        graphics_write_textr(requested_path);
+        graphics_write_textr("\n");
+    } else {
+        graphics_write_textr("remove: failed to remove ");
+        graphics_write_textr(requested_path);
+        graphics_write_textr("\n");
+    }
+}
 
 // ===========================================
 // CREATE MUSIC FILE COMMAND
@@ -977,6 +1112,12 @@ void register_read(void) {
     command_register("rd", cmd_read);
 }
 
+void register_remove(void) {
+    command_register("remove", cmd_remove);
+    command_register("rm", cmd_remove);
+}
+
+REGISTER_COMMAND(register_remove);
 REGISTER_COMMAND(register_initdisk);
 REGISTER_COMMAND(register_mount);
 REGISTER_COMMAND(register_format_debug);

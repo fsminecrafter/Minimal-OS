@@ -30,6 +30,8 @@ find roadmap in roadmap.txt or below (might be old or un-synced!)
 * ```format``` [Index] Formats the Selected disk to MinimaFS
 * ```mount``` [Index] Mounts the selected disk
 * ```importmusic``` Takes the music.wav from `src/resources` and puts it on disk as music.adi
+* ```remove```, ```rm``` [path] (-r | --recursive) Removes the targeted file or folder.
+* ```sleep``` [Seconds | milliseconds"ms"] sleeps for an set amount of seconds or millieseconds.
 
 -------------------------------------------------------
 

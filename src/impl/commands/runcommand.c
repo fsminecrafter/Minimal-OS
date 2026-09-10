@@ -31,6 +31,21 @@ static uint32_t run_read_u32(const uint8_t* p) {
            ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
+static const char* run_normalize_path(const char* input, char* normalized,
+                                      size_t normalized_size) {
+    if (!input || !normalized || normalized_size == 0) return NULL;
+
+    while (input[0] == '.' && input[1] == '/') input += 2;
+    if (strchr(input, ':')) {
+        if (strlen(input) >= normalized_size) return NULL;
+        strcpy(normalized, input);
+    } else {
+        if (snprintf(normalized, normalized_size, "0:/%s", input) >=
+            (int)normalized_size) return NULL;
+    }
+    return normalized;
+}
+
 static bool run_extract_main_elf(const char* path, uint8_t** elf_data,
                                  uint32_t* elf_size) {
     minimafs_file_handle_t* file = minimafs_open(path, true);
@@ -147,13 +162,20 @@ void cmd_run(int argc, const char** argv) {
         return;
     }
 
+    char path[MINIMAFS_MAX_PATH];
+    const char* run_path = run_normalize_path(argv[1], path, sizeof(path));
+    if (!run_path) {
+        graphics_write_textr("run: invalid path\n");
+        return;
+    }
+
     elf_loaded_image_t image;
     uint8_t* elf_data = NULL;
     uint32_t elf_size = 0;
-    if (!run_extract_main_elf(argv[1], &elf_data, &elf_size) ||
+    if (!run_extract_main_elf(run_path, &elf_data, &elf_size) ||
         !elf_load_buffer(elf_data, elf_size, &image)) {
         graphics_write_textr("run: failed to load ");
-        graphics_write_textr(argv[1]);
+        graphics_write_textr(run_path);
         graphics_write_textr("\n");
         return;
     }
@@ -187,7 +209,7 @@ void cmd_run(int argc, const char** argv) {
     }
 
     char procname[96];
-    snprintf(procname, sizeof(procname), "%s#%d", argv[1], slot);
+    snprintf(procname, sizeof(procname), "%s#%d", run_path, slot);
 
     process_t* proc = createProcess(procname, run_process_trampoline);
     if (!proc) {
@@ -201,7 +223,7 @@ void cmd_run(int argc, const char** argv) {
     }
 
     graphics_write_textr("Started: ");
-    graphics_write_textr(argv[1]);
+    graphics_write_textr(run_path);
     graphics_write_textr(" (PID ");
     graphics_write_textr_udec(proc->pid);
     graphics_write_textr(")\n");

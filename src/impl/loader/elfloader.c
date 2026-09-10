@@ -48,6 +48,7 @@ bool elf_load_buffer(uint8_t* filebuf, uint32_t file_size,
     }
 
     Elf64_Phdr* phdrs = (Elf64_Phdr*)(filebuf + eh->e_phoff);
+    uint64_t entry_offset = eh->e_entry;
 
     // Compute total image span from PT_LOAD segments. Segments must
     // already be base-0 relative - see sdk/link.ld.
@@ -85,6 +86,12 @@ bool elf_load_buffer(uint8_t* filebuf, uint32_t file_size,
 
     if (image_end == 0 || image_end > ELF_MAX_IMAGE_SIZE) {
         serial_write_str("ELF: image empty or too large\n");
+        free_mem(filebuf);
+        return false;
+    }
+
+    if (entry_offset >= image_end) {
+        serial_write_str("ELF: entry point outside image\n");
         free_mem(filebuf);
         return false;
     }
@@ -139,7 +146,7 @@ bool elf_load_buffer(uint8_t* filebuf, uint32_t file_size,
 
     out->base        = base;
     out->image_size  = image_end;
-    out->entry_point = (uint64_t)(uintptr_t)base + eh->e_entry;
+    out->entry_point = (uint64_t)(uintptr_t)base + entry_offset;
 
     serial_write_str("ELF: loaded buffer base=0x"); serial_write_hex((uint64_t)(uintptr_t)base);
     serial_write_str(" size="); serial_write_dec(image_end);

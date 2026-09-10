@@ -390,7 +390,7 @@ class App:
         
         self.tree = ttk.Treeview(left_frame, height=30)
         self.tree.bind("<<TreeviewSelect>>", self.on_select)
-        self.tree.bind("<Button-3>", self.on_right_click)
+        self.tree.bind("<ButtonRelease-3>", self.on_right_click)
         self.tree.bind("<ButtonPress-1>", self.on_tree_press)
         self.tree.bind("<B1-Motion>", self.on_tree_motion)
         self.tree.bind("<ButtonRelease-1>", self.on_tree_release)
@@ -819,7 +819,14 @@ class App:
         return header + content + b"@END\n"
 
     def on_external_drop(self, event):
-        target = self.tree.identify("item", event.x, event.y)
+        if hasattr(event, "x_root") and hasattr(event, "y_root"):
+            x = event.x_root - self.tree.winfo_rootx()
+            y = event.y_root - self.tree.winfo_rooty()
+        else:
+            x = getattr(event, "x", 0)
+            y = getattr(event, "y", 0)
+
+        target = self.tree.identify("item", x, y)
         target_info = self.nodes.get(target, {})
         target_path = target_info.get("entry", {}).get("PATH", "/") if target else "/"
         if target and target_info.get("entry", {}).get("FILETYPE") != "dir":
@@ -1132,8 +1139,10 @@ class App:
             menu.add_command(label="Cut", command=self.cut_file)
             menu.add_command(label="Paste", command=self.paste_file)
             menu.add_separator()
-            menu.add_command(label="Delete (Zero Block)", command=self.delete_file)
-            menu.post(event.x_root, event.y_root)
+            menu.add_command(label="Delete", command=self.delete_file)
+            menu.tk_popup(event.x_root, event.y_root)
+            menu.grab_release()
+        return "break"
 
     def show_text_context_menu(self, event):
         menu = tk.Menu(self.root, tearoff=0)
@@ -1177,14 +1186,42 @@ class App:
             return
 
         if self.current_file:
-            name = self.current_file["entry"].get("FILENAME", "unknown")
-            result = messagebox.askyesno("Delete", f"Permanently delete '{name}'? This will zero the block.")
+            entry = self.current_file["entry"]
+            name = entry.get("FILENAME", "unknown")
+            result = messagebox.askyesno("Delete", f"Permanently delete '{name}'? This will remove it from the filesystem.")
             if result:
                 block = self.current_block
-                # Zero out the block
-                self.write_block(block, b'\x00' * BLOCK_SIZE)
-                debug(self.log, f"✓ Deleted and zeroed block {block}: {name}")
-                messagebox.showinfo("Deleted", f"File '{name}' has been deleted and block {block} zeroed.")
+
+                parent_path = self.normalize_path(entry.get("PARENTFOLDER", "/"))
+                descriptor, _ = self.folder_descriptor(parent_path)
+                if descriptor is not None:
+                    removed = next(
+                        (child for child in descriptor["entries"]
+                         if child.get("name") == name),
+                        None,
+                    )
+                    if removed is None:
+                        messagebox.showerror("Delete", f"'{name}' was not found in {parent_path}")
+                        return
+                    if removed.get("type", "FILE").upper() == "DIR":
+                        child_descriptor, _ = self.folder_descriptor(
+                            self.normalize_path(parent_path + "/" + name)
+                        )
+                        if child_descriptor and child_descriptor.get("entries"):
+                            messagebox.showwarning("Delete", "The directory is not empty")
+                            return
+                    descriptor["entries"].remove(removed)
+                    self.write_folder_descriptor(descriptor)
+                    block = removed.get("block", block)
+                    block_count = max(1, removed.get("count", 1))
+                else:
+                    block_count = 1
+
+                for offset in range(block_count):
+                    self.write_block(block + offset, b'\x00' * BLOCK_SIZE)
+
+                debug(self.log, f"✓ Deleted {name} and cleared {block_count} block(s) starting at {block}")
+                messagebox.showinfo("Deleted", f"File '{name}' was removed from the filesystem.")
                 self.load_fs()  # Reload filesystem
                 self.text.config(state="normal")
                 self.text.delete("1.0", tk.END)

@@ -6,7 +6,7 @@
 #include "x86_64/commandhandler.h"
 #include "x86_64/commandreg.h"
 #include "x86_64/allocator.h"
-#include "x86_64/elfloader.h"
+#include "x86_64/loader/elfloader.h"
 #include "x86_64/spinlock.h"
 #include "x86_64/minimafs.h"
 #include "prochandler.h"

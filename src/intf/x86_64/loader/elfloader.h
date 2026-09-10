@@ -77,6 +77,10 @@ typedef struct {
 // there is no per-process paging to honor any other link address.
 bool elf_load_file(const char* path, elf_loaded_image_t* out);
 
+/* Takes ownership of file_data and frees it on success or failure. */
+bool elf_load_buffer(uint8_t* file_data, uint32_t file_size,
+                     elf_loaded_image_t* out);
+
 // Frees the memory owned by a previously loaded image. Do NOT call
 // this while a process is still executing code from the image.
 void elf_unload(elf_loaded_image_t* image);

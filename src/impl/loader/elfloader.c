@@ -8,34 +8,13 @@
 #define ELF_MAX_PHNUM       64
 #define ELF_MAX_IMAGE_SIZE  (64u * 1024 * 1024)
 
-bool elf_load_file(const char* path, elf_loaded_image_t* out) {
-    if (!path || !out) return false;
+bool elf_load_buffer(uint8_t* filebuf, uint32_t file_size,
+                     elf_loaded_image_t* out) {
+    if (!filebuf || !out) return false;
     memset(out, 0, sizeof(*out));
 
-    minimafs_file_handle_t* f = minimafs_open(path, true);
-    if (!f) {
-        serial_write_str("ELF: cannot open "); serial_write_str(path); serial_write_str("\n");
-        return false;
-    }
-
-    uint32_t file_size = minimafs_size(f);
     if (file_size < sizeof(Elf64_Ehdr) || file_size > ELF_MAX_FILE_SIZE) {
         serial_write_str("ELF: bad file size\n");
-        minimafs_close(f);
-        return false;
-    }
-
-    uint8_t* filebuf = (uint8_t*)alloc_unzeroed(file_size);
-    if (!filebuf) {
-        serial_write_str("ELF: OOM reading file\n");
-        minimafs_close(f);
-        return false;
-    }
-
-    uint32_t got = minimafs_read(f, filebuf, file_size);
-    minimafs_close(f);
-    if (got != file_size) {
-        serial_write_str("ELF: short read\n");
         free_mem(filebuf);
         return false;
     }
@@ -162,13 +141,39 @@ bool elf_load_file(const char* path, elf_loaded_image_t* out) {
     out->image_size  = image_end;
     out->entry_point = (uint64_t)(uintptr_t)base + eh->e_entry;
 
-    serial_write_str("ELF: loaded '"); serial_write_str(path);
-    serial_write_str("' base=0x"); serial_write_hex((uint64_t)(uintptr_t)base);
+    serial_write_str("ELF: loaded buffer base=0x"); serial_write_hex((uint64_t)(uintptr_t)base);
     serial_write_str(" size="); serial_write_dec(image_end);
     serial_write_str(" entry=0x"); serial_write_hex(out->entry_point);
     serial_write_str("\n");
 
     return true;
+}
+
+bool elf_load_file(const char* path, elf_loaded_image_t* out) {
+    if (!path || !out) return false;
+
+    minimafs_file_handle_t* f = minimafs_open(path, true);
+    if (!f) {
+        serial_write_str("ELF: cannot open "); serial_write_str(path); serial_write_str("\n");
+        return false;
+    }
+
+    uint32_t file_size = minimafs_size(f);
+    uint8_t* filebuf = (uint8_t*)alloc_unzeroed(file_size);
+    if (!filebuf) {
+        serial_write_str("ELF: OOM reading file\n");
+        minimafs_close(f);
+        return false;
+    }
+
+    uint32_t got = minimafs_read(f, filebuf, file_size);
+    minimafs_close(f);
+    if (got != file_size) {
+        serial_write_str("ELF: short read\n");
+        free_mem(filebuf);
+        return false;
+    }
+    return elf_load_buffer(filebuf, file_size, out);
 }
 
 void elf_unload(elf_loaded_image_t* image) {

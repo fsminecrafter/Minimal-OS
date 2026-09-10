@@ -7,6 +7,7 @@
 #include "x86_64/commandreg.h"
 #include "x86_64/allocator.h"
 #include "x86_64/loader/elfloader.h"
+#include "x86_64/runfile.h"
 #include "x86_64/spinlock.h"
 #include "x86_64/minimafs.h"
 #include "prochandler.h"
@@ -24,6 +25,58 @@ typedef struct {
 
 static run_launch_slot_t g_run_launches[RUN_MAX_LAUNCHES];
 static spinlock_t g_run_launch_lock = SPINLOCK_INIT;
+
+static uint32_t run_read_u32(const uint8_t* p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static bool run_extract_main_elf(const char* path, uint8_t** elf_data,
+                                 uint32_t* elf_size) {
+    minimafs_file_handle_t* file = minimafs_open(path, true);
+    if (!file) return false;
+
+    uint32_t archive_size = minimafs_size(file);
+    uint8_t* archive = (uint8_t*)alloc_unzeroed(archive_size);
+    if (!archive) { minimafs_close(file); return false; }
+
+    bool ok = minimafs_read(file, archive, archive_size) == archive_size;
+    minimafs_close(file);
+    if (!ok || archive_size < MINIMALOS_RUN_HEADER_SIZE ||
+        memcmp(archive, MINIMALOS_RUN_MAGIC, MINIMALOS_RUN_MAGIC_SIZE) != 0 ||
+        run_read_u32(archive + 8) != MINIMALOS_RUN_VERSION) {
+        free_mem(archive);
+        return false;
+    }
+
+    uint32_t count = run_read_u32(archive + 12);
+    if (count == 0 || count > (archive_size - MINIMALOS_RUN_HEADER_SIZE) /
+        MINIMALOS_RUN_ENTRY_SIZE) {
+        free_mem(archive);
+        return false;
+    }
+    uint32_t table_size = MINIMALOS_RUN_HEADER_SIZE + count * MINIMALOS_RUN_ENTRY_SIZE;
+
+    for (uint32_t i = 0; i < count; i++) {
+        const uint8_t* entry = archive + MINIMALOS_RUN_HEADER_SIZE + i * MINIMALOS_RUN_ENTRY_SIZE;
+        uint32_t offset = run_read_u32(entry + MINIMALOS_RUN_NAME_SIZE);
+        uint32_t size = run_read_u32(entry + MINIMALOS_RUN_NAME_SIZE + 4);
+        if (strncmp((const char*)entry, "main.elf", 8) != 0 || entry[8] != '\0' ||
+            offset < table_size || offset > archive_size ||
+            size > archive_size - offset) continue;
+
+        uint8_t* extracted = (uint8_t*)alloc_unzeroed(size);
+        if (!extracted) break;
+        memcpy(extracted, archive + offset, size);
+        free_mem(archive);
+        *elf_data = extracted;
+        *elf_size = size;
+        return true;
+    }
+
+    free_mem(archive);
+    return false;
+}
 
 /*
  * Slot lookup is keyed off the process's own name ("<path>#<slot>",
@@ -90,17 +143,17 @@ static void run_process_trampoline(void) {
 
 void cmd_run(int argc, const char** argv) {
     if (argc < 2) {
-        graphics_write_textr("Usage: run <path-to.run>\n");
+        graphics_write_textr("Usage: run <path-to.run-file>\n");
         return;
     }
 
-    char elf_path[MINIMAFS_MAX_PATH];
-    snprintf(elf_path, sizeof(elf_path), "%s/main.elf", argv[1]);
-
     elf_loaded_image_t image;
-    if (!elf_load_file(elf_path, &image)) {
+    uint8_t* elf_data = NULL;
+    uint32_t elf_size = 0;
+    if (!run_extract_main_elf(argv[1], &elf_data, &elf_size) ||
+        !elf_load_buffer(elf_data, elf_size, &image)) {
         graphics_write_textr("run: failed to load ");
-        graphics_write_textr(elf_path);
+        graphics_write_textr(argv[1]);
         graphics_write_textr("\n");
         return;
     }

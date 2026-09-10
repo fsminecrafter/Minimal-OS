@@ -1,3 +1,4 @@
+// src/intf/x86_64/proc.h
 #ifndef PROC_H
 #define PROC_H
 
@@ -49,6 +50,21 @@ typedef struct process {
     // without updating that assembly to match. Adding a field after
     // all of them is safe.
     void (*entry_point)();
+
+    // ===========================================
+    // PER-CPU MLFQ SCHEDULER FIELDS
+    // ===========================================
+    // Appended here for the same reason entry_point is last: nothing
+    // above this line may move without touching context_switch.asm.
+    // These are only ever read/written by scheduler.c (and its
+    // dequeue/enqueue helpers called from proc.c / prochandler.c) -
+    // see scheduler.h.
+    uint32_t sched_level;        // MLFQ level: SCHED_LEVEL_INTERACTIVE..BACKGROUND
+    uint32_t sched_cpu;          // Which per-CPU run queue this process belongs to
+    uint32_t sched_ticks_used;   // Ticks consumed in the current dispatch, for demotion
+    struct process* rq_next;     // Intrusive next pointer for the per-CPU ready queue.
+                                  // Deliberately separate from `next` above, which
+                                  // remains the global creation/cleanup list link.
 } process_t;
 
 // Global process list head (defined in proc.c)

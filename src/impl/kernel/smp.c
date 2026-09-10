@@ -1,3 +1,4 @@
+// src/impl/kernel/smp.c
 #include "x86_64/smp.h"
 #include "x86_64/acpi.h"
 #include "x86_64/lapic.h"
@@ -212,7 +213,30 @@ void ap_entry_c(uint32_t cpu_id) {
 
     serial_write_str("SMP: cpu online\n");
 
-    // Process queues are still BSP-owned; keep APs online but idle until
-    // per-core scheduling is implemented.
+    /*
+     * Start this core's own periodic tick so scheduler_tick() actually
+     * runs here. Previously this core just sat in `hlt` forever with
+     * interrupts still disabled from the trampoline's initial `cli` -
+     * nothing, timer or otherwise, could ever wake it, so the per-CPU
+     * run queue it was just given a slot in (see
+     * scheduler_enqueue_new()/scheduler_rebalance() in scheduler.c)
+     * had no way to ever get drained.
+     *
+     * The initial count here is NOT calibrated against a real time
+     * reference - no per-core microsecond timer is wired up yet (see
+     * busy_wait_us_approx() above) - matching the disclaimer already
+     * on lapic_timer_init()'s declaration. It only needs to be
+     * "frequent enough" for this core to notice new work, demote/
+     * rebalance, and wake its own sleepers in a timely way; getting
+     * the absolute frequency wrong just changes how long this core's
+     * slice of the MLFQ quantum is in wall-clock time, not whether
+     * the scheduler behaves correctly.
+     */
+    lapic_timer_init(LAPIC_TIMER_VECTOR, 0x100000, 3 /* divide by 16 */);
+    asm volatile("sti" ::: "memory");
+
+    // Idle here just means "nothing on this core's run queue right
+    // now" - hlt lets the next timer interrupt (or a future rebalance
+    // donating this core a process) wake it instead of spinning.
     for (;;) asm volatile("hlt");
 }

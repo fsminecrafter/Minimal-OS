@@ -1,3 +1,4 @@
+// src/impl/handlers/prochandler.c
 #include "x86_64/scheduler.h"
 #include "x86_64/proc.h"
 #include "x86_64/gpu.h"
@@ -86,8 +87,13 @@ bool killProcess(uint64_t pid) {
         return false;
     }
     
-    // Mark as zombie (scheduler will clean up)
+    // Mark as zombie (scheduler will clean up) and pull it out of
+    // whatever per-CPU run queue it's currently sitting in - see the
+    // comment on scheduler_dequeue() in scheduler.h for why this can't
+    // just be left to happen lazily anymore now that queues are
+    // per-CPU linked lists rather than one global list scan.
     proc->state = PROCESS_ZOMBIE;
+    scheduler_dequeue(proc);
     
     serial_write_str("[PROC] Killed process: ");
     serial_write_str(proc->name);
@@ -168,6 +174,11 @@ bool pauseProcess(uint64_t pid) {
     
     // Save old state in case we need it (not used currently)
     proc->state = PROCESS_PAUSED;
+    // Take it off its per-CPU run queue so schedule() can never pick
+    // it back up while paused - previously PROCESS_PAUSED was only
+    // ever filtered out by the old single global-list scan; with
+    // per-CPU queues it has to be actively removed instead.
+    scheduler_dequeue(proc);
     
     serial_write_str("[PROC] Paused process: ");
     serial_write_str(proc->name);
@@ -204,8 +215,13 @@ bool unpauseProcess(uint64_t pid) {
         return false;
     }
     
-    // Set to READY so scheduler picks it up
+    // Set to READY so scheduler picks it up, and put it back on the
+    // same core's run queue it was already assigned to (see
+    // scheduler_enqueue_existing() - unlike scheduler_enqueue_new()
+    // this doesn't pick a fresh least-loaded core, it just resumes
+    // where it was).
     proc->state = PROCESS_READY;
+    scheduler_enqueue_existing(proc);
     
     serial_write_str("[PROC] Unpaused process: ");
     serial_write_str(proc->name);
@@ -265,6 +281,10 @@ void printProcessInfo(process_t* proc) {
         default:                 serial_write_str("UNKNOWN"); break;
     }
     
+    serial_write_str("\n  CPU:   ");
+    serial_write_dec(proc->sched_cpu);
+    serial_write_str("\n  Level: ");
+    serial_write_dec(proc->sched_level);
     serial_write_str("\n  Entry Point: 0x");
     serial_write_hex(proc->regs[7]);
     serial_write_str("\n  Stack Pointer: 0x");
@@ -277,7 +297,7 @@ void listAllProcesses(void) {
     serial_write_str("========================================\n");
     serial_write_str("         PROCESS LIST\n");
     serial_write_str("========================================\n");
-    serial_write_str(" PID | State    | Name\n");
+    serial_write_str(" PID | State    | CPU | Lvl | Name\n");
     serial_write_str("----------------------------------------\n");
     
     int count = 0;
@@ -305,6 +325,10 @@ void listAllProcesses(void) {
         }
         
         serial_write_str(" | ");
+        serial_write_dec(proc->sched_cpu);
+        serial_write_str("   | ");
+        serial_write_dec(proc->sched_level);
+        serial_write_str("   | ");
         serial_write_str(proc->name);
         serial_write_str("\n");
     }

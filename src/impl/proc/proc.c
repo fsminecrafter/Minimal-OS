@@ -1,3 +1,4 @@
+// src/impl/proc/proc.c
 #include <stdint.h>
 #include <stddef.h>
 #include "x86_64/proc.h"
@@ -179,22 +180,16 @@ process_t* proc_create(const char* file_name, void (*entry_point)()) {
 	proc->regs[7] = (uint64_t)proc_trampoline;     // RIP
 	proc->regs[8] = 0x202;                         // RFLAGS (IF=1, reserved bit 1)
 
+	// proc->sched_level/sched_cpu/sched_ticks_used/rq_next are already
+	// zeroed by memset_p() above; scheduler_enqueue_new() below sets
+	// them properly and is what actually makes this process visible to
+	// any core's dispatch loop.
+
 	/*
 	 * proc_list_head is the same global list schedule()'s
-	 * zombie/terminated cleanup pass walks and mutates (see the long
-	 * comment on schedule() in scheduler.c). Prepending here is a
-	 * read-modify-write of proc_list_head + proc->next; if a PIT tick
-	 * preempts createProcess() between these two lines with a
-	 * half-updated list, a concurrent schedule() call could walk a
-	 * torn list. Protect it the same way, with irq_save()/irq_restore()
-	 * - a no-op if we're already in interrupt context, and a real
-	 * (brief) critical section if called from process context.
-	 */
-	/*
-	 * proc_list_head is the same global list schedule()'s
-	 * zombie/terminated cleanup pass walks and mutates. Now protected
+	 * zombie/terminated cleanup pass walks and mutates. Protected
 	 * with the real cross-core scheduler_lock() (spinlock.h) instead
-	 * of plain irq_save() — cli() alone doesn't stop a second physical
+	 * of plain irq_save() - cli() alone doesn't stop a second physical
 	 * core from touching this list at the same time.
 	 */
 	uint64_t proc_list_flags = scheduler_lock();
@@ -203,12 +198,21 @@ process_t* proc_create(const char* file_name, void (*entry_point)()) {
 	scheduler_unlock(proc_list_flags);
 	irq_restore(proc_list_flags, __FILE__, __func__, __LINE__);
 
+	// Places this process on some core's per-CPU ready queue - it is
+	// NOT actually schedulable until this runs. See scheduler.c.
+	scheduler_enqueue_new(proc);
+
 	return proc;
 }
 
 void kill(process_t* proc) {
 	if (!proc) return;
 	proc->state = PROCESS_ZOMBIE;
+	// Pull it out of whatever per-CPU run queue it's sitting in so it
+	// can never be dispatched again, and so the zombie-cleanup pass in
+	// schedule() can safely free it later without racing a queue that
+	// still points at it.
+	scheduler_dequeue(proc);
 }
 
 process_t* get_proc_by_name(const char* name) {

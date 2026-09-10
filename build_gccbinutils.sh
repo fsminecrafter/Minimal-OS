@@ -2,7 +2,9 @@ export PREFIX="$HOME/cross"
 export TARGET=x86_64-elf
 export PATH="$PREFIX/bin:$PATH"
 
-sudo apt update && sudo apt install -y build-essential bison flex libgmp3-dev libmpc-dev libmpfr-dev texinfo wget
+sudo apt update && sudo apt install -y build-essential bison flex libgmp3-dev libmpc-dev libmpfr-dev texinfo wget git
+
+git clone https://github.com/fsminecrafter/Minimal-OS-SDK.git
 
 mkdir -p ~/src && cd ~/src
 

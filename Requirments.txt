@@ -1,5 +1,8 @@
 Requirements
 
+Python package for external file drag-and-drop in the MinimaFS explorer:
+tkinterdnd2
+
 make
 x86_64-elf-gcc
 binutils

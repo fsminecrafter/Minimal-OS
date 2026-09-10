@@ -10,6 +10,12 @@ import sys
 
 import sv_ttk
 
+try:
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+except ImportError:
+    DND_FILES = None
+    TkinterDnD = None
+
 BLOCK_SIZE = 4096
 MAX_SCAN_BLOCKS = 10000
 STREAM_CHUNK = 64 * 1024  # 64KB window
@@ -286,6 +292,9 @@ class App:
         self.clipboard = None
         self.clipboard_mode = None
         self.modified_files = {}  # Track modifications
+        self.folder_blocks = {}
+        self.drag_node = None
+        self.drag_start = None
         
         # Undo/redo
         self.history = UndoRedoStack()
@@ -353,6 +362,7 @@ class App:
         ttk.Button(top_frame, text="🔍 Search", command=self.open_search_window, style="Accent.TButton").pack(side="left", padx=3)
         ttk.Button(top_frame, text="➕ New File", command=self.new_file_dialog, style="Accent.TButton").pack(side="left", padx=3)
         ttk.Button(top_frame, text="📁 New Folder", command=self.new_folder_dialog, style="Accent.TButton").pack(side="left", padx=3)
+        ttk.Button(top_frame, text="Import Files", command=self.import_files, style="Accent.TButton").pack(side="left", padx=3)
         
         ttk.Separator(top_frame, orient="vertical").pack(side="left", fill="y", padx=10)
         
@@ -381,6 +391,12 @@ class App:
         self.tree = ttk.Treeview(left_frame, height=30)
         self.tree.bind("<<TreeviewSelect>>", self.on_select)
         self.tree.bind("<Button-3>", self.on_right_click)
+        self.tree.bind("<ButtonPress-1>", self.on_tree_press)
+        self.tree.bind("<B1-Motion>", self.on_tree_motion)
+        self.tree.bind("<ButtonRelease-1>", self.on_tree_release)
+        if DND_FILES is not None and hasattr(self.tree, "drop_target_register"):
+            self.tree.drop_target_register(DND_FILES)
+            self.tree.dnd_bind("<<Drop>>", self.on_external_drop)
 
         scroll_y = ttk.Scrollbar(left_frame, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=scroll_y.set)
@@ -510,6 +526,7 @@ class App:
     def load_fs(self):
         self.tree.delete(*self.tree.get_children())
         self.nodes.clear()
+        self.folder_blocks.clear()
 
         root = self.tree.insert("", "end", text="Drive")
         folder_nodes = {"/": root}
@@ -525,6 +542,7 @@ class App:
                     "CREATEDDATE": "",
                     "LASTCHANGED": "",
                     "PARENTFOLDER": folder_path,
+                    "PATH": self.normalize_path(folder_path + "/" + name),
                 }
             }
             return node
@@ -564,6 +582,8 @@ class App:
                     display_name = folder_path.strip("/") or "Root"
                     folder_nodes[folder_path] = self.tree.insert(parent_node, "end", text=display_name)
 
+                self.folder_blocks[folder_path] = i
+
                 folder_node = folder_nodes[folder_path]
 
                 for e in folder["entries"]:
@@ -587,6 +607,7 @@ class App:
                                 "CREATEDDATE": "",
                                 "LASTCHANGED": "",
                                 "PARENTFOLDER": folder_path,
+                                "PATH": child_path,
                             }
                         })
                     else:
@@ -683,6 +704,199 @@ class App:
     # ==========================================
     # FILESYSTEM OPERATIONS
     # ==========================================
+
+    @staticmethod
+    def normalize_path(path):
+        path = (path or "/").replace("//", "/").strip()
+        if not path.startswith("/"):
+            path = "/" + path
+        return path.rstrip("/") or "/"
+
+    def folder_descriptor(self, path):
+        """Return a parsed folder descriptor and its block number."""
+        path = self.normalize_path(path)
+        block = self.folder_blocks.get(path)
+        if block is None:
+            return None, None
+        descriptor = parse_folder_desc(read_block(self.file, block).decode(errors="ignore"))
+        descriptor["path"] = path
+        descriptor["block"] = block
+        return descriptor, block
+
+    def write_folder_descriptor(self, descriptor):
+        lines = [f"FOLDER:{self.normalize_path(descriptor['path'])}",
+                 f"ENTRIES:{len(descriptor['entries'])}"]
+        for entry in descriptor["entries"]:
+            kind = "DIR" if entry.get("type", "FILE").upper() == "DIR" else "FILE"
+            lines.append(
+                f"ENTRY:{entry['name']},{kind},BLOCK:{entry.get('block', 0)},"
+                f"COUNT:{max(1, entry.get('count', 1))},HIDDEN:{1 if entry.get('hidden') else 0}"
+            )
+        lines.append("@END")
+        data = ("\n".join(lines) + "\n").encode()
+        if len(data) > BLOCK_SIZE:
+            raise ValueError("Directory is too large for one folder.desc block")
+        self.write_block(descriptor["block"], data)
+
+    def find_free_run(self, count):
+        run_start = None
+        run_length = 0
+        for block in range(1, self.total_blocks):
+            if is_zero_block(read_block(self.file, block)):
+                run_start = block if run_start is None else run_start
+                run_length += 1
+                if run_length == count:
+                    return run_start
+            else:
+                run_start = None
+                run_length = 0
+        return None
+
+    def import_files(self, paths=None, target_path="/"):
+        if not self.check_edit_allowed():
+            return
+        if not self.file:
+            messagebox.showwarning("Import Files", "Open a MinimaFS image first")
+            return
+        if paths is None:
+            paths = filedialog.askopenfilenames(title="Import files into MinimaFS")
+        target_path = self.normalize_path(target_path)
+        imported = 0
+        for path in paths:
+            if not os.path.isfile(path):
+                continue
+            try:
+                if self.import_file(path, target_path):
+                    imported += 1
+            except (OSError, ValueError) as exc:
+                messagebox.showerror("Import failed", f"{os.path.basename(path)}: {exc}")
+                break
+        if imported:
+            self.load_fs()
+            self.update_status()
+            debug(self.log, f"Imported {imported} file(s) into {target_path}")
+
+    def import_file(self, source_path, target_path):
+        descriptor, _ = self.folder_descriptor(target_path)
+        if descriptor is None:
+            raise ValueError(f"Destination directory not found: {target_path}")
+        name = os.path.basename(source_path)
+        if not name or any(entry.get("name") == name for entry in descriptor["entries"]):
+            raise ValueError(f"A file named '{name}' already exists there")
+        with open(source_path, "rb") as source:
+            content = source.read()
+        extension = os.path.splitext(name)[1].lstrip(".") or "bin"
+        raw = self.create_binary_entry(name, extension, content, target_path)
+        block_count = max(1, (len(raw) + BLOCK_SIZE - 1) // BLOCK_SIZE)
+        block = self.find_free_run(block_count)
+        if block is None:
+            raise ValueError("No contiguous free blocks available")
+        for offset in range(block_count):
+            self.write_block(block + offset, raw[offset * BLOCK_SIZE:(offset + 1) * BLOCK_SIZE])
+        descriptor["entries"].append({"name": name, "type": "FILE", "block": block,
+                                      "count": block_count, "hidden": False})
+        self.write_folder_descriptor(descriptor)
+        return True
+
+    def create_binary_entry(self, filename, file_format, content, parent_folder):
+        created_date = datetime.now().strftime("%d%b%Y").lower()
+        filelen = 0
+        for _ in range(3):
+            header = (
+                "@HEADER@\n"
+                "@FILETYPE:binary@\n"
+                f"@FILEFORMAT:{file_format}@\n"
+                f"@FILELEN:{filelen}@\n"
+                f"@FILENAME:'{filename.ljust(32)}'@\n"
+                f"@CREATEDDATE:'{created_date}'@\n"
+                f"@LASTCHANGED:'{created_date}'@\n"
+                f"@PARENTFOLDER:'{parent_folder}'@\n"
+                "@RUNNABLE:False@\n"
+                "@HIDDEN:False@\n"
+                "@DATA@\n"
+            ).encode()
+            filelen = len(header) + len(content) + len(b"@END\n")
+        return header + content + b"@END\n"
+
+    def on_external_drop(self, event):
+        target = self.tree.identify("item", event.x, event.y)
+        target_info = self.nodes.get(target, {})
+        target_path = target_info.get("entry", {}).get("PATH", "/") if target else "/"
+        if target and target_info.get("entry", {}).get("FILETYPE") != "dir":
+            target_path = target_info.get("entry", {}).get("PARENTFOLDER", "/")
+        self.import_files(self.root.tk.splitlist(event.data), target_path)
+        return "break"
+
+    def on_tree_press(self, event):
+        self.drag_node = self.tree.identify("item", event.x, event.y)
+        self.drag_start = (event.x, event.y)
+
+    def on_tree_motion(self, event):
+        if self.drag_node and self.drag_start:
+            if abs(event.x - self.drag_start[0]) + abs(event.y - self.drag_start[1]) > 6:
+                self.tree.configure(cursor="hand2")
+
+    def on_tree_release(self, event):
+        source = self.drag_node
+        self.drag_node = None
+        self.drag_start = None
+        self.tree.configure(cursor="")
+        target = self.tree.identify("item", event.x, event.y)
+        if source and target and source != target:
+            self.move_node(source, target)
+
+    def move_node(self, source_node, target_node):
+        if not self.check_edit_allowed():
+            return
+        source_info = self.nodes.get(source_node)
+        target_info = self.nodes.get(target_node)
+        if not source_info or not target_info:
+            return
+        source_entry = source_info["entry"]
+        target_entry = target_info["entry"]
+        if target_entry.get("FILETYPE") != "dir":
+            messagebox.showwarning("Move", "Drop files and folders onto a directory")
+            return
+        source_parent = self.normalize_path(source_entry.get("PARENTFOLDER", "/"))
+        target_path = self.normalize_path(target_entry.get("PATH", "/"))
+        name = source_entry.get("FILENAME", "")
+        source_path = self.normalize_path(source_entry.get("PATH", name))
+        if source_parent == target_path or target_path == source_path or target_path.startswith(source_path + "/"):
+            return
+        source_desc, _ = self.folder_descriptor(source_parent)
+        target_desc, _ = self.folder_descriptor(target_path)
+        if not source_desc or not target_desc:
+            messagebox.showerror("Move", "Could not read the source or destination directory")
+            return
+        if any(entry.get("name") == name for entry in target_desc["entries"]):
+            messagebox.showerror("Move", f"'{name}' already exists in {target_path}")
+            return
+        moved = next((entry for entry in source_desc["entries"] if entry.get("name") == name), None)
+        if moved is None:
+            messagebox.showerror("Move", "Source entry was not found in its directory")
+            return
+        source_desc["entries"].remove(moved)
+        target_desc["entries"].append(moved)
+        try:
+            self.write_folder_descriptor(source_desc)
+            self.write_folder_descriptor(target_desc)
+            if moved.get("type") == "DIR":
+                self.update_folder_paths(source_path, self.normalize_path(target_path + "/" + name))
+        except ValueError as exc:
+            messagebox.showerror("Move", str(exc))
+            return
+        debug(self.log, f"Moved {source_path} to {target_path}")
+        self.load_fs()
+        self.update_status()
+
+    def update_folder_paths(self, old_path, new_path):
+        updates = [(path, block) for path, block in self.folder_blocks.items()
+                   if path == old_path or path.startswith(old_path + "/")]
+        for path, block in updates:
+            descriptor = parse_folder_desc(read_block(self.file, block).decode(errors="ignore"))
+            descriptor["path"] = new_path + path[len(old_path):]
+            descriptor["block"] = block
+            self.write_folder_descriptor(descriptor)
 
     def create_file_entry(self, filename, file_type, file_format, content, parent_folder="", runnable=False):
         """Create a MinimaFS file entry"""
@@ -1084,7 +1298,7 @@ class App:
 # ==========================================
 
 if __name__ == "__main__":
-    root = tk.Tk()
+    root = TkinterDnD.Tk() if TkinterDnD is not None else tk.Tk()
     root.geometry("1300x800")
     app = App(root)
     root.mainloop()

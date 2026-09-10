@@ -7,5 +7,10 @@ kernel.bin
 *.o
 *.img
 
+#Directories
+
+.venv
+
 #Other files
+
 planning.txt

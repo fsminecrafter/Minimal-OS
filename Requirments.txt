@@ -1,5 +1,3 @@
-LOCAL GIT BACKUP TEST
-
 Requirements
 
 make

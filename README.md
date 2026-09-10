@@ -159,3 +159,10 @@ fallocate -l 256M sata256.img
 ```make run```
 If audio doesnt work use either
 ```make run-sdl``` or ```make run-alsa```
+
+## Development For Minimal-OS Via .run Executables
+Now you can create .run files for Minimal-OS viaaa... (Drumroll)
+
+[Minimal-OS SDK](https://github.com/fsminecrafter/Minimal-OS-SDK)
+
+More info is found on ```Minimal-OS SDK```s Github Page.

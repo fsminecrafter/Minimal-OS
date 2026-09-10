@@ -1047,10 +1047,33 @@ static const uint8_t* audio_find_bytes(const uint8_t* haystack, uint32_t haystac
                                                                                                              * Commands
                                                                                                              * ============================================================ */
 
-                                                                                                            void cmd_play(int argc, const char** argv) {
+                                                                                                            // Normalize file path to support multiple formats:
+// "file" or "./file" -> "0:/file"
+// "0:/file" -> "0:/file" (unchanged)
+static void normalize_file_path(const char* input, char* output, uint32_t output_size) {
+    if (!input || !output || output_size < 8) return;
+    
+    // Check if already in 0:/path format
+    if (strlen(input) >= 3 && input[1] == ':' && input[2] == '/') {
+        strncpy(output, input, output_size - 1);
+        output[output_size - 1] = '\0';
+        return;
+    }
+    
+    // Handle "./file" format
+    if (input[0] == '.' && input[1] == '/') {
+        snprintf(output, output_size, "0:/%s", input + 2);
+        return;
+    }
+    
+    // Handle plain "file" format
+    snprintf(output, output_size, "0:/%s", input);
+}
+
+void cmd_play(int argc, const char** argv) {
                                                                                                                 if (argc < 2) {
                                                                                                                     graphics_write_textr("Usage: play <path>\n");
-                                                                                                                    graphics_write_textr("Example: play 0:/music.adi\n");
+                                                                                                                    graphics_write_textr("Formats: play file, play ./file, or play 0:/file\n");
                                                                                                                     return;
                                                                                                                 }
 
@@ -1059,7 +1082,9 @@ static const uint8_t* audio_find_bytes(const uint8_t* haystack, uint32_t haystac
                                                                                                                     g_audio_state.player = NULL;
                                                                                                                 }
 
-                                                                                                                const char* path = argv[1];
+                                                                                                                char normalized_path[256];
+                                                                                                                normalize_file_path(argv[1], normalized_path, sizeof(normalized_path));
+                                                                                                                const char* path = normalized_path;
                                                                                                                 graphics_write_textr("Loading: ");
                                                                                                                 graphics_write_textr(path);
                                                                                                                 graphics_write_textr("\n");

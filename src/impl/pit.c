@@ -70,3 +70,8 @@ void setup_kernel_interrupts() {
     idt_init();
     idt_set_handler_pit(pit_irq_handler);
 }
+
+
+uint32_t pit_get_frequency(void) {
+    return pit_frequency;
+}

@@ -12,6 +12,11 @@ typedef struct {
     bool       online;
     process_t* current_process;
     process_t* idle_process;
+    uint64_t   usage_total_ticks;
+    uint64_t   usage_busy_ticks;
+    uint32_t   usage_window_ticks;
+    uint32_t   usage_window_busy_ticks;
+    uint32_t   usage_last_percent;
 } cpu_local_t;
 
 extern cpu_local_t g_cpus[MAX_CPUS];
@@ -20,6 +25,7 @@ extern volatile uint32_t g_online_cpu_count;
 
 uint32_t smp_current_cpu_id(void);
 uint32_t smp_online_cpu_count(void);
+void smp_get_cpu_usage(uint32_t cpu_id, uint32_t* average, uint32_t* usage);
 void smp_init_bsp(void);
 
 // Brings up every AP reported by ACPI's MADT. Call after

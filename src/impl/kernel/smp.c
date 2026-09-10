@@ -7,6 +7,7 @@
 #include "x86_64/ap_trampoline.h"
 #include "x86_64/gdt.h"
 #include "x86_64/idt.h"
+#include "x86_64/pit.h"
 #include "x86_64/pmm.h"
 #include "serial.h"
 #include "string.h"
@@ -54,6 +55,20 @@ uint32_t smp_current_cpu_id(void) {
 
 uint32_t smp_online_cpu_count(void) {
     return __atomic_load_n(&g_online_cpu_count, __ATOMIC_ACQUIRE);
+}
+
+void smp_get_cpu_usage(uint32_t cpu_id, uint32_t* average, uint32_t* usage) {
+    if (cpu_id >= MAX_CPUS) return;
+
+    uint64_t total = __atomic_load_n(&g_cpus[cpu_id].usage_total_ticks,
+                                     __ATOMIC_RELAXED);
+    uint64_t busy = __atomic_load_n(&g_cpus[cpu_id].usage_busy_ticks,
+                                    __ATOMIC_RELAXED);
+    uint32_t recent = __atomic_load_n(&g_cpus[cpu_id].usage_last_percent,
+                                      __ATOMIC_RELAXED);
+
+    if (average) *average = total ? (uint32_t)((busy * 100) / total) : 0;
+    if (usage) *usage = recent;
 }
 
 void smp_init_bsp(void) {
@@ -222,17 +237,28 @@ void ap_entry_c(uint32_t cpu_id) {
      * scheduler_enqueue_new()/scheduler_rebalance() in scheduler.c)
      * had no way to ever get drained.
      *
-     * The initial count here is NOT calibrated against a real time
-     * reference - no per-core microsecond timer is wired up yet (see
-     * busy_wait_us_approx() above) - matching the disclaimer already
-     * on lapic_timer_init()'s declaration. It only needs to be
-     * "frequent enough" for this core to notice new work, demote/
-     * rebalance, and wake its own sleepers in a timely way; getting
-     * the absolute frequency wrong just changes how long this core's
-     * slice of the MLFQ quantum is in wall-clock time, not whether
-     * the scheduler behaves correctly.
+     * Calibrated against the wall clock (time_get_uptime_ms(), itself
+     * driven by the master core's PIT interrupt - see time_tick() in
+     * time.c) so this core's scheduler tick fires at the same target
+     * frequency the BSP uses (pit_get_frequency()), rather than at
+     * whatever rate an uncalibrated fixed initial count happens to
+     * produce on this CPU's actual bus clock. This matters because
+     * MLFQ quantum lengths (sched_level_quantum_ticks in scheduler.c)
+     * are expressed in tick counts: without calibration, two cores
+     * "using the same quantum" in tick terms could be running wildly
+     * different quanta in wall-clock terms, which would make the
+     * load figures scheduler_rebalance() compares across cores
+     * meaningless.
+     *
+     * By the time any AP reaches here, the PIT has been ticking (and
+     * the BSP has had interrupts enabled) since startroutine() ran
+     * early in kernel_main() - see idt_init()'s trailing sti() - so
+     * time_get_uptime_ms() is a valid live reference. If calibration
+     * still fails for some reason, lapic_timer_init_calibrated() falls
+     * back to the old fixed placeholder count rather than leaving the
+     * timer unprogrammed - see its comment in lapic_timer.c.
      */
-    lapic_timer_init(LAPIC_TIMER_VECTOR, 0x100000, 3 /* divide by 16 */);
+    lapic_timer_init_calibrated(LAPIC_TIMER_VECTOR, pit_get_frequency(), 3 /* divide by 16 */);
     asm volatile("sti" ::: "memory");
 
     // Idle here just means "nothing on this core's run queue right

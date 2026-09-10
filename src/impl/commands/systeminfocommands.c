@@ -399,12 +399,43 @@ void cmd_cgres(int argc, const char** argv) {
     info_text("\n");
 }
 
+// Get CPU TSC per core (simple metric for utilization tracking)
+void cmd_usage(int argc, const char** argv) {
+    info_text("CPU utilisation\n");
+    info_text("=============================\n");
+
+    uint32_t online_cpus = smp_online_cpu_count();
+    if (online_cpus == 0) {
+        info_text("No online CPUs detected\n");
+        return;
+    }
+
+    for (uint32_t i = 0; i < online_cpus && i < MAX_CPUS; i++) {
+        if (!g_cpus[i].online) continue;
+
+        uint32_t average = 0;
+        uint32_t usage = 0;
+        smp_get_cpu_usage(i, &average, &usage);
+
+        info_text("Core ");
+        info_number(i + 1);
+        info_text(" ");
+        info_number(average);
+        info_text("% avg ");
+        info_number(usage);
+        info_text("% usg");
+        if (smp_is_master_core_id(i)) info_text(" (Master)");
+        info_text("\n");
+    }
+}
+
 void register_system_info_commands(void) {
     command_register("clear", cmd_clear);
     command_register("info", cmd_info);
     command_register("cpu", cmd_cpu);
     command_register("gpu", cmd_gpu);
     command_register("chgres", cmd_cgres);
+    command_register("usage", cmd_usage);
 }
 
 REGISTER_COMMAND(register_system_info_commands);

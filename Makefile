@@ -3,10 +3,29 @@ LD := $(HOME)/cross/bin/x86_64-elf-ld
 
 .DEFAULT_GOAL := build-x86_64
 
-module_c_source_files := $(shell find src/modules -name '*.c')
+# Include module configuration
+-include config.mk
+
+# Build list of module directories to compile based on config
+MODULE_DIRS := 
+ifeq ($(ENABLE_AUDIO),1)
+	MODULE_DIRS += src/modules/Audio
+endif
+ifeq ($(ENABLE_GPU),1)
+	MODULE_DIRS += src/modules/GPU
+endif
+ifeq ($(ENABLE_PCI),1)
+	MODULE_DIRS += src/modules/PCI
+endif
+ifeq ($(ENABLE_USB),1)
+	MODULE_DIRS += src/modules/USB
+endif
+
+# Find module source files only from enabled directories
+module_c_source_files := $(foreach dir,$(MODULE_DIRS),$(shell find $(dir) -name '*.c'))
 module_c_object_files := $(patsubst src/modules/%.c, build/modules/%.o, $(module_c_source_files))
 
-module_asm_source_files := $(shell find src/modules -name '*.asm')
+module_asm_source_files := $(foreach dir,$(MODULE_DIRS),$(shell find $(dir) -name '*.asm'))
 module_asm_object_files := $(patsubst src/modules/%.asm, build/modules/%.o, $(module_asm_source_files))
 
 impl_c_source_files := $(shell find src/impl -name '*.c')

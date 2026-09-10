@@ -571,10 +571,32 @@ void scheduler_tick() {
 
     wake_sleeping_processes();
 
-    if (!current_process) {
+    bool was_idle = current_process == NULL;
+    if (was_idle) {
         schedule();
-        return;
     }
+
+    uint32_t cpu_id = smp_current_cpu_id();
+    if (cpu_id < MAX_CPUS) {
+        cpu_local_t* cpu = &g_cpus[cpu_id];
+        bool busy = current_process != NULL;
+        __atomic_add_fetch(&cpu->usage_total_ticks, 1, __ATOMIC_RELAXED);
+        if (busy) {
+            __atomic_add_fetch(&cpu->usage_busy_ticks, 1, __ATOMIC_RELAXED);
+        }
+        cpu->usage_window_ticks++;
+        if (busy) cpu->usage_window_busy_ticks++;
+        if (cpu->usage_window_ticks >= 100) {
+            uint32_t percent = (cpu->usage_window_busy_ticks * 100) /
+                               cpu->usage_window_ticks;
+            __atomic_store_n(&cpu->usage_last_percent, percent,
+                             __ATOMIC_RELAXED);
+            cpu->usage_window_ticks = 0;
+            cpu->usage_window_busy_ticks = 0;
+        }
+    }
+
+    if (was_idle || !current_process) return;
 
     current_process->sched_ticks_used++;
 

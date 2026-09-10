@@ -13,7 +13,7 @@
 #include "x86_64/allocator.h"
 #include "serial.h"
 
-bool adebug = false;
+bool ADEBUG = false;
 
 #define AC97_VENDOR_INTEL  0x8086
 #define AC97_DEVICE_ICH    0x2415
@@ -296,8 +296,7 @@ void ac97_update(void) {
 
 void ac97_kick(void) {
     if (!g_ac97_initialized) return;
-
-    serial_write_str("AC97: kick\n");
+    if (ADEBUG) serial_write_str("AC97: kick\n");
 
     port_outb(g_nabm_base + AC97_NABM_POCR, 0x00);
     port_outb(g_nabm_base + AC97_NABM_POSR, 0x1C);

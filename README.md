@@ -65,6 +65,10 @@ Last synced 2026 - Sep 10 - 13:10
 #### C = Come back later
 #### N = New plans
 
+<details>
+
+<summary>Finished</summary>
+
 #### V 0.4.00
 
 - [x] Panic screen 
@@ -89,6 +93,8 @@ Last synced 2026 - Sep 10 - 13:10
 - [x] Keyboard
 - [x] Simple Audio ! 
 - [x] File system !!! (MinimaFS)
+
+</details>
 
 #### V 0.4.4X
 

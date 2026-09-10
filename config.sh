@@ -1,341 +1,281 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-# Minimal OS Module Configuration Script
-# Tree-based menu to enable/disable kernel modules (scalable for many modules)
+# Minimal OS dynamically discovered module configuration TUI.
 
-CONFIG_FILE="config.mk"
+set -u
 
-# Color codes for better readability
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-MAGENTA='\033[0;35m'
-NC='\033[0m' # No Color
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+MODULE_ROOT="$SCRIPT_DIR/src/modules"
+CONFIG_FILE="$SCRIPT_DIR/config.mk"
 
-# Check if config.mk exists
-if [ ! -f "$CONFIG_FILE" ]; then
-    echo -e "${RED}Error: config.mk not found!${NC}"
-    echo "Please run this script from the Minimal OS root directory."
-    exit 1
-fi
+readonly RESET=$'\033[0m'
+readonly BOLD=$'\033[1m'
+readonly DIM=$'\033[2m'
+readonly CYAN=$'\033[36m'
+readonly GREEN=$'\033[32m'
+readonly RED=$'\033[31m'
+readonly YELLOW=$'\033[33m'
 
-# Function to read current config value
+# Known relationships are keyed by relative paths. New modules default to no dependencies.
+declare -A dependencies values visiting
+ dependencies["Audio/audio.c"]="Audio/audio_manager.c Audio/ac97_driver.c"
+dependencies["Audio/ac97_driver.c"]="Audio/audio_manager.c PCI/pci.c PCI/pci_write.c"
+dependencies["GPU/gpu.c"]="GPU/gpu_manager.c PCI/pci.c"
+dependencies["GPU/vgaterm.c"]="GPU/gpu_manager.c"
+dependencies["PCI/pci.c"]="PCI/pci_manager.c PCI/pci_write.c GPU/gpu.c"
+dependencies["USB/usb_manager.c"]="USB/usb/usb_stack.c USB/usb/usb_uhci.c"
+dependencies["USB/usb/usb_stack.c"]="USB/usbkeyboard.c USB/usb/usb_uhci.c"
+dependencies["USB/usb/usb_uhci.c"]="PCI/pci.c PCI/pci_write.c"
+dependencies["USB/usbkeyboard.c"]="USB/usb/usb_stack.c"
+dependencies["USB/unifiedkeyboardbridge.c"]="USB/usb/usb_stack.c USB/usbkeyboard.c"
+
+files=()
+categories=()
+category_files=()
+category_selected=0
+module_selected=0
+screen=categories
+
+module_key() {
+    local path=$1
+    path=${path//\//_}
+    path=${path//./_}
+    printf 'MODULE_%s' "$path"
+}
+
+module_label() {
+    local path=$1 name
+    name=${path##*/}
+    name=${name%.*}
+    name=${name//_/ }
+    printf '%s' "$name"
+}
+
+discover_modules() {
+    local path category found
+    files=()
+    categories=()
+    while IFS= read -r path; do
+        files+=("$path")
+        category=${path%%/*}
+        found=0
+        for existing in "${categories[@]}"; do
+            [[ "$existing" == "$category" ]] && found=1 && break
+        done
+        (( found == 0 )) && categories+=("$category")
+    done < <(cd "$MODULE_ROOT" && find . -type f \( -name '*.c' -o -name '*.asm' \) -printf '%P\n' | sort)
+
+    if (( ${#files[@]} == 0 )); then
+        printf 'Error: no module source files found under %s\n' "$MODULE_ROOT" >&2
+        exit 1
+    fi
+}
+
 read_config() {
-    local key="$1"
-    local value=$(grep "^${key}" "$CONFIG_FILE" | grep -o '[01]$')
-    echo "$value"
+    local path key value
+    for path in "${files[@]}"; do
+        key=$(module_key "$path")
+        value=$(sed -n "s/^${key}[[:space:]]*:=[[:space:]]*\([01]\).*$/\1/p" "$CONFIG_FILE" | head -n 1)
+        if [[ -z "$value" ]]; then
+            value=1
+        fi
+        values[$path]=$value
+    done
 }
 
-# Function to update config value
-update_config() {
-    local key="$1"
-    local new_value="$2"
-    sed -i "s/^${key} := [01]/${key} := ${new_value}/" "$CONFIG_FILE"
+enable_with_dependencies() {
+    local path=$1 dependency
+    [[ ${visiting[$path]:-0} == 1 ]] && return
+    visiting[$path]=1
+    values[$path]=1
+    for dependency in ${dependencies[$path]:-}; do
+        [[ -v values[$dependency] ]] && enable_with_dependencies "$dependency"
+    done
+    visiting[$path]=0
 }
 
-# Function to print status
-print_status() {
-    local module="$1"
-    local status="$2"
-    if [ "$status" -eq 1 ]; then
-        echo -e "  ${GREEN}[✓]${NC} $module"
+resolve_dependencies() {
+    local path
+    visiting=()
+    for path in "${files[@]}"; do
+        [[ ${values[$path]} == 1 ]] && enable_with_dependencies "$path"
+    done
+}
+
+disable_with_dependents() {
+    local path=$1 candidate dependency
+    values[$path]=0
+    for candidate in "${files[@]}"; do
+        [[ ${values[$candidate]} == 1 ]] || continue
+        for dependency in ${dependencies[$candidate]:-}; do
+            if [[ "$dependency" == "$path" ]]; then
+                disable_with_dependents "$candidate"
+                break
+            fi
+        done
+    done
+}
+
+toggle_module() {
+    local path=${category_files[$module_selected]}
+    if [[ ${values[$path]} == 1 ]]; then
+        disable_with_dependents "$path"
     else
-        echo -e "  ${RED}[✗]${NC} $module"
+        visiting=()
+        enable_with_dependencies "$path"
     fi
 }
 
-# Function to print status with index
-print_status_indexed() {
-    local index="$1"
-    local module="$2"
-    local status="$3"
-    if [ "$status" -eq 1 ]; then
-        echo -e "${YELLOW}  $index)${NC} ${GREEN}[✓]${NC} $module"
-    else
-        echo -e "${YELLOW}  $index)${NC} ${RED}[✗]${NC} $module"
+set_paths() {
+    local value=$1 path
+    shift
+    for path in "$@"; do
+        if (( value == 1 )); then
+            visiting=()
+            enable_with_dependencies "$path"
+        else
+            disable_with_dependents "$path"
+        fi
+    done
+}
+
+write_config() {
+    local temporary_file path key value
+    temporary_file=$(mktemp "$CONFIG_FILE.tmp.XXXXXX") || return 1
+    {
+        printf '# Module Configuration for Minimal OS\n'
+        printf '# Generated from source files under src/modules by config.sh.\n'
+        printf '# Dependencies are resolved by config.sh before saving.\n\n'
+        for path in "${files[@]}"; do
+            key=$(module_key "$path")
+            value=${values[$path]}
+            printf '%s := %s\n' "$key" "$value"
+        done
+    } > "$temporary_file"
+    if ! mv -- "$temporary_file" "$CONFIG_FILE"; then
+        rm -f -- "$temporary_file"
+        return 1
     fi
 }
 
-# ========================================
-# CATEGORY MENUS
-# ========================================
-
-audio_menu() {
-    while true; do
-        clear
-        echo -e "${BLUE}=====================================${NC}"
-        echo -e "${BLUE}   Audio Subsystem Configuration${NC}"
-        echo -e "${BLUE}=====================================${NC}"
-        echo ""
-        
-        AUDIO=$(read_config "ENABLE_AUDIO")
-        
-        echo -e "${MAGENTA}Audio Modules:${NC}"
-        print_status_indexed "1" "AC97 Driver (Audio Hardware)" "$AUDIO"
-        
-        echo ""
-        echo -e "${YELLOW}Global Options:${NC}"
-        echo "  e) Enable All Audio"
-        echo "  d) Disable All Audio"
-        echo "  b) Back to Main Menu"
-        echo ""
-        read -p "Enter your choice: " choice
-        
-        case $choice in
-            1)
-                NEW_VALUE=$((1 - AUDIO))
-                update_config "ENABLE_AUDIO" "$NEW_VALUE"
-                ;;
-            e|E)
-                update_config "ENABLE_AUDIO" "1"
-                echo -e "${GREEN}All audio modules enabled.${NC}"
-                sleep 1
-                ;;
-            d|D)
-                update_config "ENABLE_AUDIO" "0"
-                echo -e "${GREEN}All audio modules disabled.${NC}"
-                sleep 1
-                ;;
-            b|B)
-                break
-                ;;
-            *)
-                echo -e "${RED}Invalid option.${NC}"
-                sleep 1
-                ;;
-        esac
-    done
+restore_terminal() {
+    printf '\033[?25h\033[0m\033[?1049l'
 }
 
-gpu_menu() {
-    while true; do
-        clear
-        echo -e "${BLUE}=====================================${NC}"
-        echo -e "${BLUE}   GPU Subsystem Configuration${NC}"
-        echo -e "${BLUE}=====================================${NC}"
-        echo ""
-        
-        GPU=$(read_config "ENABLE_GPU")
-        
-        echo -e "${MAGENTA}GPU Modules:${NC}"
-        print_status_indexed "1" "Graphics Driver (Display Management)" "$GPU"
-        
-        echo ""
-        echo -e "${YELLOW}Global Options:${NC}"
-        echo "  e) Enable All GPU"
-        echo "  d) Disable All GPU"
-        echo "  b) Back to Main Menu"
-        echo ""
-        read -p "Enter your choice: " choice
-        
-        case $choice in
-            1)
-                NEW_VALUE=$((1 - GPU))
-                update_config "ENABLE_GPU" "$NEW_VALUE"
-                ;;
-            e|E)
-                update_config "ENABLE_GPU" "1"
-                echo -e "${GREEN}All GPU modules enabled.${NC}"
-                sleep 1
-                ;;
-            d|D)
-                update_config "ENABLE_GPU" "0"
-                echo -e "${GREEN}All GPU modules disabled.${NC}"
-                sleep 1
-                ;;
-            b|B)
-                break
-                ;;
-            *)
-                echo -e "${RED}Invalid option.${NC}"
-                sleep 1
-                ;;
-        esac
-    done
+quit_without_saving() {
+    restore_terminal
+    printf 'Configuration unchanged.\n'
+    exit 0
 }
 
-pci_menu() {
-    while true; do
-        clear
-        echo -e "${BLUE}=====================================${NC}"
-        echo -e "${BLUE}   PCI Subsystem Configuration${NC}"
-        echo -e "${BLUE}=====================================${NC}"
-        echo ""
-        
-        PCI=$(read_config "ENABLE_PCI")
-        
-        echo -e "${MAGENTA}PCI Modules:${NC}"
-        print_status_indexed "1" "PCI Device Detection (Device Discovery)" "$PCI"
-        
-        echo ""
-        echo -e "${YELLOW}Global Options:${NC}"
-        echo "  e) Enable All PCI"
-        echo "  d) Disable All PCI"
-        echo "  b) Back to Main Menu"
-        echo ""
-        read -p "Enter your choice: " choice
-        
-        case $choice in
-            1)
-                NEW_VALUE=$((1 - PCI))
-                update_config "ENABLE_PCI" "$NEW_VALUE"
-                ;;
-            e|E)
-                update_config "ENABLE_PCI" "1"
-                echo -e "${GREEN}All PCI modules enabled.${NC}"
-                sleep 1
-                ;;
-            d|D)
-                update_config "ENABLE_PCI" "0"
-                echo -e "${GREEN}All PCI modules disabled.${NC}"
-                sleep 1
-                ;;
-            b|B)
-                break
-                ;;
-            *)
-                echo -e "${RED}Invalid option.${NC}"
-                sleep 1
-                ;;
-        esac
+trap restore_terminal EXIT
+trap 'exit 130' INT TERM
+
+refresh_category_files() {
+    local path category=${categories[$category_selected]}
+    category_files=()
+    for path in "${files[@]}"; do
+        [[ ${path%%/*} == "$category" ]] && category_files+=("$path")
     done
+    (( module_selected < ${#category_files[@]} )) || module_selected=0
 }
 
-usb_menu() {
-    while true; do
-        clear
-        echo -e "${BLUE}=====================================${NC}"
-        echo -e "${BLUE}   USB Subsystem Configuration${NC}"
-        echo -e "${BLUE}=====================================${NC}"
-        echo ""
-        
-        USB=$(read_config "ENABLE_USB")
-        
-        echo -e "${MAGENTA}USB Modules:${NC}"
-        print_status_indexed "1" "USB Controller (Device Support)" "$USB"
-        
-        echo ""
-        echo -e "${YELLOW}Global Options:${NC}"
-        echo "  e) Enable All USB"
-        echo "  d) Disable All USB"
-        echo "  b) Back to Main Menu"
-        echo ""
-        read -p "Enter your choice: " choice
-        
-        case $choice in
-            1)
-                NEW_VALUE=$((1 - USB))
-                update_config "ENABLE_USB" "$NEW_VALUE"
-                ;;
-            e|E)
-                update_config "ENABLE_USB" "1"
-                echo -e "${GREEN}All USB modules enabled.${NC}"
-                sleep 1
-                ;;
-            d|D)
-                update_config "ENABLE_USB" "0"
-                echo -e "${GREEN}All USB modules disabled.${NC}"
-                sleep 1
-                ;;
-            b|B)
-                break
-                ;;
-            *)
-                echo -e "${RED}Invalid option.${NC}"
-                sleep 1
-                ;;
-        esac
+draw_categories() {
+    local index category enabled path
+    printf '\033[2J\033[H'
+    printf '%s%sMinimal OS  /  Module Categories%s\n' "$BOLD" "$CYAN" "$RESET"
+    printf '%s--------------------------------------------------------%s\n' "$DIM" "$RESET"
+    printf '  %sSelect a category to configure its discovered modules.%s\n\n' "$DIM" "$RESET"
+    for index in "${!categories[@]}"; do
+        category=${categories[$index]}
+        enabled=0
+        for path in "${files[@]}"; do
+            [[ ${path%%/*} == "$category" && ${values[$path]} == 1 ]] && (( enabled++ ))
+        done
+        if (( index == category_selected )); then
+            printf ' %s> %-18s %s(%d/%d enabled)%s\n' "$CYAN" "$category" "$DIM" "$enabled" \
+                "$(printf '%s\n' "${files[@]}" | awk -F/ -v category="$category" '$1 == category { count++ } END { print count + 0 }')" "$RESET"
+        else
+            printf '   %-18s %s(%d/%d enabled)%s\n' "$category" "$DIM" "$enabled" \
+                "$(printf '%s\n' "${files[@]}" | awk -F/ -v category="$category" '$1 == category { count++ } END { print count + 0 }')" "$RESET"
+        fi
     done
+    printf '\n%s--------------------------------------------------------%s\n' "$DIM" "$RESET"
+    printf '  %sEnter%s open   %sA%s all on   %sN%s all off   %sQ%s cancel\n' \
+        "$BOLD" "$RESET" "$BOLD" "$RESET" "$BOLD" "$RESET" "$BOLD" "$RESET"
 }
 
-# ========================================
-# MAIN MENU
-# ========================================
+draw_modules() {
+    local index path value marker color dependency_text
+    printf '\033[2J\033[H'
+    printf '%s%sMinimal OS  /  %s Modules%s\n' "$BOLD" "$CYAN" "${categories[$category_selected]}" "$RESET"
+    printf '%s--------------------------------------------------------%s\n' "$DIM" "$RESET"
+    printf '  %sDiscovered source files in this category.%s\n\n' "$DIM" "$RESET"
+    for index in "${!category_files[@]}"; do
+        path=${category_files[$index]}
+        marker=' '
+        [[ $index == $module_selected ]] && marker='>'
+        value=${values[$path]}
+        if (( value == 1 )); then color=$GREEN; value='ON '; else color=$RED; value='OFF'; fi
+        printf ' %s %s%-2s%s  %-24s %s%s%s\n' "$CYAN$marker" "$color" "$value" "$RESET" \
+            "$(module_label "$path")" "$DIM" "$path" "$RESET"
+    done
+    dependency_text=${dependencies[${category_files[$module_selected]}]:-none}
+    printf '\n%s--------------------------------------------------------%s\n' "$DIM" "$RESET"
+    printf '  %sDependencies:%s %s\n' "$BOLD" "$RESET" "$dependency_text"
+    printf '  %sSpace%s toggle   %sA%s category on   %sN%s category off   %sB%s back   %sEnter%s apply\n' \
+        "$BOLD" "$RESET" "$BOLD" "$RESET" "$BOLD" "$RESET" "$BOLD" "$RESET" "$BOLD" "$RESET"
+}
 
-main_menu() {
+main() {
+    local input path
+    [[ -f "$CONFIG_FILE" ]] || : > "$CONFIG_FILE"
+    [[ -d "$MODULE_ROOT" ]] || { printf 'Error: module directory not found: %s\n' "$MODULE_ROOT" >&2; exit 1; }
+    if [[ ! -t 0 || ! -t 1 ]]; then
+        printf 'Error: config.sh requires an interactive terminal.\n' >&2
+        exit 1
+    fi
+
+    discover_modules
+    read_config
+    resolve_dependencies
+    printf '\033[?1049h\033[?25l'
+
     while true; do
-        clear
-        echo -e "${BLUE}=====================================${NC}"
-        echo -e "${BLUE}   Minimal OS Module Configuration${NC}"
-        echo -e "${BLUE}=====================================${NC}"
-        echo ""
-        
-        # Read current config values
-        AUDIO=$(read_config "ENABLE_AUDIO")
-        GPU=$(read_config "ENABLE_GPU")
-        PCI=$(read_config "ENABLE_PCI")
-        USB=$(read_config "ENABLE_USB")
-        
-        # Display current status overview
-        echo -e "${YELLOW}Module Categories:${NC}"
-        echo ""
-        print_status_indexed "1" "Audio Subsystem" "$AUDIO"
-        print_status_indexed "2" "GPU Subsystem" "$GPU"
-        print_status_indexed "3" "PCI Subsystem" "$PCI"
-        print_status_indexed "4" "USB Subsystem" "$USB"
-        
-        echo ""
-        echo -e "${YELLOW}Quick Actions:${NC}"
-        echo "  a) Enable All Modules"
-        echo "  n) Disable All Modules"
-        echo "  s) Save and Exit"
-        echo "  q) Exit without Saving"
-        echo ""
-        read -p "Select category or action: " choice
-        
-        case $choice in
-            1)
-                audio_menu
-                ;;
-            2)
-                gpu_menu
-                ;;
-            3)
-                pci_menu
-                ;;
-            4)
-                usb_menu
-                ;;
+        if [[ "$screen" == categories ]]; then
+            draw_categories
+        else
+            refresh_category_files
+            draw_modules
+        fi
+        IFS= read -r -s -n 1 input || break
+        case "$input" in
+            $'\033')
+                IFS= read -r -s -n 2 input
+                case "$input" in
+                    '[A')
+                        if [[ "$screen" == categories ]]; then (( category_selected > 0 )) && (( category_selected-- )); else (( module_selected > 0 )) && (( module_selected-- )); fi ;;
+                    '[B')
+                        if [[ "$screen" == categories ]]; then (( category_selected < ${#categories[@]} - 1 )) && (( category_selected++ )); else (( module_selected < ${#category_files[@]} - 1 )) && (( module_selected++ )); fi ;;
+                esac ;;
+            k|K)
+                if [[ "$screen" == categories ]]; then (( category_selected > 0 )) && (( category_selected-- )); else (( module_selected > 0 )) && (( module_selected-- )); fi ;;
+            j|J)
+                if [[ "$screen" == categories ]]; then (( category_selected < ${#categories[@]} - 1 )) && (( category_selected++ )); else (( module_selected < ${#category_files[@]} - 1 )) && (( module_selected++ )); fi ;;
+            ' ')
+                [[ "$screen" == modules ]] && toggle_module ;;
             a|A)
-                update_config "ENABLE_AUDIO" "1"
-                update_config "ENABLE_GPU" "1"
-                update_config "ENABLE_PCI" "1"
-                update_config "ENABLE_USB" "1"
-                echo -e "${GREEN}All modules enabled.${NC}"
-                sleep 1
-                ;;
+                if [[ "$screen" == categories ]]; then set_paths 1 "${files[@]}"; else set_paths 1 "${category_files[@]}"; fi ;;
             n|N)
-                update_config "ENABLE_AUDIO" "0"
-                update_config "ENABLE_GPU" "0"
-                update_config "ENABLE_PCI" "0"
-                update_config "ENABLE_USB" "0"
-                echo -e "${GREEN}All modules disabled.${NC}"
-                sleep 1
-                ;;
-            s|S)
-                echo -e "${GREEN}Configuration saved!${NC}"
-                echo ""
-                echo "Current configuration:"
-                echo "  ENABLE_AUDIO=$(read_config 'ENABLE_AUDIO')"
-                echo "  ENABLE_GPU=$(read_config 'ENABLE_GPU')"
-                echo "  ENABLE_PCI=$(read_config 'ENABLE_PCI')"
-                echo "  ENABLE_USB=$(read_config 'ENABLE_USB')"
-                echo ""
-                echo -e "${YELLOW}Note: Run 'make clean && make build-x86_64' to rebuild the kernel.${NC}"
-                exit 0
-                ;;
-            q|Q)
-                echo -e "${YELLOW}Exit without saving.${NC}"
-                exit 0
-                ;;
-            *)
-                echo -e "${RED}Invalid option.${NC}"
-                sleep 1
-                ;;
+                if [[ "$screen" == categories ]]; then set_paths 0 "${files[@]}"; else set_paths 0 "${category_files[@]}"; fi ;;
+            b|B) screen=categories ;;
+            q|Q) quit_without_saving ;;
+            '')
+                if [[ "$screen" == categories ]]; then screen=modules; module_selected=0; else
+                    if write_config; then restore_terminal; trap - EXIT; printf 'Configuration saved to %s.\n' "$CONFIG_FILE"; exit 0; fi
+                fi ;;
         esac
     done
 }
 
-# Start main menu
-main_menu
+main "$@"

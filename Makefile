@@ -6,26 +6,14 @@ LD := $(HOME)/cross/bin/x86_64-elf-ld
 # Include module configuration
 -include config.mk
 
-# Build list of module directories to compile based on config
-MODULE_DIRS := 
-ifeq ($(ENABLE_AUDIO),1)
-	MODULE_DIRS += src/modules/Audio
-endif
-ifeq ($(ENABLE_GPU),1)
-	MODULE_DIRS += src/modules/GPU
-endif
-ifeq ($(ENABLE_PCI),1)
-	MODULE_DIRS += src/modules/PCI
-endif
-ifeq ($(ENABLE_USB),1)
-	MODULE_DIRS += src/modules/USB
-endif
-
-# Find module source files only from enabled directories
-module_c_source_files := $(foreach dir,$(MODULE_DIRS),$(shell find $(dir) -name '*.c'))
+# Discover module source files dynamically and filter them by their generated config key.
+module_config_key = MODULE_$(subst .,_,$(subst /,_,$(1)))
+module_files_relative := $(shell find src/modules -type f \( -name '*.c' -o -name '*.asm' \) -printf '%P\n' | sort)
+module_source_files := $(foreach file,$(module_files_relative),$(if $(filter 0,$($(call module_config_key,$(file)))),,src/modules/$(file)))
+module_c_source_files := $(filter %.c,$(module_source_files))
 module_c_object_files := $(patsubst src/modules/%.c, build/modules/%.o, $(module_c_source_files))
 
-module_asm_source_files := $(foreach dir,$(MODULE_DIRS),$(shell find $(dir) -name '*.asm'))
+module_asm_source_files := $(filter %.asm,$(module_source_files))
 module_asm_object_files := $(patsubst src/modules/%.asm, build/modules/%.o, $(module_asm_source_files))
 
 impl_c_source_files := $(shell find src/impl -name '*.c')
@@ -40,8 +28,9 @@ ap_trampoline_object := build/impl/boot/ap_trampoline.o
 source_object_files := $(module_c_object_files) $(module_asm_object_files) \
 	$(impl_c_object_files) $(impl_asm_object_files) $(ap_trampoline_object)
 
-audio_wav_files := $(shell find src/resources -name '*.wav')
-audio_obj_files_src := $(shell find src/resources -name '*.o')
+audio_player_enabled := $(if $(filter 0,$(MODULE_Audio_audio_c)),,1)
+audio_wav_files := $(if $(audio_player_enabled),$(shell find src/resources -name '*.wav'),)
+audio_obj_files_src := $(if $(audio_player_enabled),$(shell find src/resources -name '*.o'),)
 audio_obj_files_build := $(patsubst src/resources/%.wav, build/resources/%.o, $(audio_wav_files))
 audio_object_files := $(audio_obj_files_build) $(audio_obj_files_src)
 header_files := $(shell find src/intf -name '*.h')

@@ -6,3 +6,6 @@ kernel.bin
 
 *.o
 *.img
+
+#Other files
+planning.txt

@@ -49,6 +49,7 @@ static void (*const isr_stub_table[32])() = {
     isr25, isr26, isr27, isr28, isr29, isr30, isr31,
 };
 
+extern void isr_syscall_wrapped();
 
 struct IdtEntry {
 	uint16_t offset_low;
@@ -127,6 +128,13 @@ void idt_init() {
 	// Per-core scheduler tick, driven by each core's own LAPIC timer.
 	// See lapic_timer_init() / ap_entry_c() in smp.c.
 	idt_set_entry(LAPIC_TIMER_VECTOR, (uint64_t)lapic_timer_irq_handler_wrapped, GDT_SELECTOR_CS_KERNEL, IDT_ENTRY_TYPE_INTERRUPT, 0);
+
+	// Software syscall gate for .run programs (see x86_64/syscall.h).
+	// DPL3 so it stays callable once real ring3 processes exist; every
+	// process today still runs at CPL0, so the DPL check is currently
+	// moot but costs nothing to set correctly now.
+	idt_set_entry(0x80, (uint64_t)isr_syscall_wrapped, GDT_SELECTOR_CS_KERNEL,
+	              IDT_PRESENT | IDT_DPL3 | IDT_TYPE_INTERRUPT_GATE, 0);
 
 	idt_load(&idt_ptr);
 	

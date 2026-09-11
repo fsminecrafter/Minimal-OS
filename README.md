@@ -3,6 +3,9 @@ Is a OS made in C and Assembly made for x86_64 processors, It currently runs wit
 
 find roadmap in roadmap.txt or below (might be old or un-synced!)
 
+User application developers can find the syscall and SDK integration guide in
+[docs/user-sdk-syscalls.md](docs/user-sdk-syscalls.md).
+
 <details>
 
 <summary>Commands in Terminal</summary>

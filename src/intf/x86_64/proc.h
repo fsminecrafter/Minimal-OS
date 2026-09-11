@@ -6,7 +6,7 @@
 #include <stddef.h>
 
 #define MAX_PROCESS_NAME_LEN 128
-#define STACK_SIZE 0x1000  // 4 KB
+#define STACK_SIZE 0x10000  // 64 KB
 
 // Process states
 typedef enum {
@@ -17,6 +17,45 @@ typedef enum {
     PROCESS_ZOMBIE,         // Finished but not cleaned up
     PROCESS_TERMINATED      // Fully terminated
 } process_state_t;
+
+// ===========================================
+// PROCESS PRIVILEGE / USER LEVEL
+// ===========================================
+//
+// Classification of *who* a process belongs to - the kernel itself
+// (drivers, the terminal, the scheduler's own housekeeping processes)
+// versus a user-loaded .run program (see elfloader.c / runcommand.c).
+//
+// This is METADATA ONLY today. Every process, kernel or "user", still
+// executes at CPL0 with interrupts and I/O fully available, and every
+// process_t still shares the exact same kernel PML4 (see
+// proc_create_ex()'s pml4 assignment, and thread.h's comment making
+// this same point about threads vs. processes). Real ring3 isolation
+// needs three things this kernel does not have yet, each already
+// flagged as future work elsewhere in this project:
+//
+//   1. Per-process address spaces - without this a PROC_PRIVILEGE_USER
+//      process can still read/write any kernel memory it wants, so
+//      CPL3 alone would be security theater. (This is the same
+//      "future change will require revisiting the global FD table
+//      design" dependency already tracked for the syscall FD table.)
+//   2. User-mode GDT code/data segments - gdt.c only ever builds the
+//      DPL0 kernel CS/DS pair (see ACC_* flags in gdt.c), plus a TSS
+//      rsp0 to use on privilege transitions.
+//   3. A real privilege-transition path - the syscall gate already
+//      has DPL3 set (see idt_init()'s 0x80 entry in idt.c), but
+//      nothing currently performs an iret that actually drops CPL to
+//      3 on entry to a "user" process.
+//
+// Until all three land, this classification exists purely so the
+// scheduler, process listings, and future syscall policy have a
+// stable place to ask "is this a program someone ran, or part of the
+// kernel itself" - e.g. to eventually restrict which syscalls a user
+// process may issue - without guessing from the process name string.
+typedef enum {
+    PROC_PRIVILEGE_KERNEL = 0,   // Kernel-owned process (drivers, terminal, etc)
+    PROC_PRIVILEGE_USER   = 1,   // A loaded .run program (see runcommand.c)
+} process_privilege_t;
 
 // Process control block
 typedef struct process {
@@ -65,13 +104,32 @@ typedef struct process {
     struct process* rq_next;     // Intrusive next pointer for the per-CPU ready queue.
                                   // Deliberately separate from `next` above, which
                                   // remains the global creation/cleanup list link.
+
+    // Privilege classification - see process_privilege_t above. Safe
+    // to append here for the same struct-layout reason as every other
+    // field below `next`: context_switch.asm never touches anything
+    // past kernel_stack, so this struct can keep growing after it
+    // without any assembly changes.
+    process_privilege_t privilege;
 } process_t;
 
 // Global process list head (defined in proc.c)
 extern process_t* proc_list_head;
 
 // Process management functions
+
+// Creates a new PROC_PRIVILEGE_KERNEL process. Equivalent to
+// proc_create_ex(file_name, entry_point, PROC_PRIVILEGE_KERNEL) - kept
+// as its own entry point so every existing caller (there are many)
+// keeps compiling and behaving exactly as before.
 process_t* proc_create(const char* file_name, void (*entry_point)());
+
+// Full form of proc_create() that also lets the caller set the new
+// process's privilege classification up front. See process_privilege_t
+// above for what this does (and does not yet) mean.
+process_t* proc_create_ex(const char* file_name, void (*entry_point)(),
+                          process_privilege_t privilege);
+
 void kill(process_t* proc);
 process_t* get_proc_by_name(const char* name);
 process_t** get_procs(size_t* count);

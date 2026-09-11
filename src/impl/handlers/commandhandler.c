@@ -8,6 +8,8 @@
 #include "prochandler.h"
 #include "x86_64/proc.h"
 #include "x86_64/scheduler.h"
+#include "x86_64/minimafs.h"
+#include "fspaths.h"
 
 extern void (*__start_command_ctors)(void);
 extern void (*__stop_command_ctors)(void);
@@ -59,12 +61,156 @@ void commandhandler_init() {
     serial_write_str("Total ctors executed: ");
     serial_write_hex(count);
     serial_write_str("\n");
+
+    // Default file associations. Registered here (after every
+    // REGISTER_COMMAND ctor above has run, so "run" is guaranteed to
+    // already exist) rather than at REGISTER_COMMAND time in
+    // runcommand.c, since command_register_extension() only stores a
+    // name string - it doesn't need the target command to exist yet,
+    // but keeping the registration next to command discovery makes
+    // the startup ordering obvious rather than incidental.
+    if (!command_register_extension("run", "run")) {
+        serial_write_str("WARNING: failed to register default .run extension\n");
+    }
 }
 
 void command_register(const char* name, command_func_t func) {
     if (command_count < MAX_COMMANDS) {
         commands[command_count++] = (struct CommandEntry){ name, func };
     }
+}
+
+// ===========================================
+// FILE ASSOCIATIONS
+// ===========================================
+
+#define COMMAND_MAX_EXTENSIONS 32
+#define COMMAND_EXT_MAX_LEN    15
+#define COMMAND_ASSOC_CMD_LEN  32
+#define COMMAND_ASSOC_REWRITE_BUF 320
+#define COMMAND_ASSOC_MAX_DEPTH   4
+
+typedef struct {
+    char ext[COMMAND_EXT_MAX_LEN + 1];      // without leading '.', e.g. "run"
+    char command[COMMAND_ASSOC_CMD_LEN];    // registered command name to dispatch to
+    bool active;
+} command_extension_assoc_t;
+
+static command_extension_assoc_t g_extension_assocs[COMMAND_MAX_EXTENSIONS];
+static int g_extension_assoc_count = 0;
+
+// Guards against a misconfigured (e.g. self-referential) extension
+// mapping turning command_execute()/command_execute_async() into
+// unbounded recursion. In practice this never triggers - the
+// associated command name ("run") has no '.' in it, so the recursive
+// call's own association lookup bails out immediately (see
+// command_resolve_file_association() below) - but future
+// command_register_extension() callers could get creative, and this
+// costs nothing to have in place.
+static int g_assoc_depth = 0;
+
+bool command_register_extension(const char* ext, const char* command) {
+    if (!ext || !command || !*ext || !*command) return false;
+    if (strlen(ext) > COMMAND_EXT_MAX_LEN) return false;
+    if (strlen(command) >= COMMAND_ASSOC_CMD_LEN) return false;
+
+    // Overwrite an existing mapping for the same extension if present.
+    for (int i = 0; i < g_extension_assoc_count; i++) {
+        if (g_extension_assocs[i].active && strcmp(g_extension_assocs[i].ext, ext) == 0) {
+            strncpy(g_extension_assocs[i].command, command,
+                    sizeof(g_extension_assocs[i].command) - 1);
+            g_extension_assocs[i].command[sizeof(g_extension_assocs[i].command) - 1] = '\0';
+            return true;
+        }
+    }
+
+    if (g_extension_assoc_count >= COMMAND_MAX_EXTENSIONS) return false;
+
+    command_extension_assoc_t* slot = &g_extension_assocs[g_extension_assoc_count++];
+    strncpy(slot->ext, ext, COMMAND_EXT_MAX_LEN);
+    slot->ext[COMMAND_EXT_MAX_LEN] = '\0';
+    strncpy(slot->command, command, sizeof(slot->command) - 1);
+    slot->command[sizeof(slot->command) - 1] = '\0';
+    slot->active = true;
+    return true;
+}
+
+// Case-insensitive extension comparison (".RUN" and ".run" should
+// behave the same even though MinimaFS filenames themselves are
+// case-sensitive).
+static bool command_ext_equals(const char* a, const char* b) {
+    while (*a && *b) {
+        if (to_lower(*a) != to_lower(*b)) return false;
+        a++; b++;
+    }
+    return *a == *b;
+}
+
+// Returns the extension (without the dot) of `path`, or NULL if there
+// isn't one after the last path separator. Points into `path` itself -
+// caller must not hold onto it past the lifetime of `path`.
+static const char* command_file_extension(const char* path) {
+    const char* base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+    const char* dot = strrchr(base, '.');
+    if (!dot || dot == base || !dot[1]) return NULL;  // no ext, ".hidden", or trailing dot
+    return dot + 1;
+}
+
+// Resolves `argv0` (as typed - "./file.run", "0:/dir/file.run", or a
+// bare "file.run") to a command name it should be dispatched to, or
+// NULL if it isn't associated with anything. Only touches the
+// filesystem at all if `argv0` looks like a filename (has an
+// extension after the last path separator) - a plain unknown command
+// name with no dot is left alone, so ordinary typos still get the
+// normal "Unknown command" error instead of a filesystem lookup.
+static const char* command_resolve_file_association(const char* argv0) {
+    if (!argv0 || !*argv0) return NULL;
+
+    const char* ext = command_file_extension(argv0);
+    if (!ext) return NULL;
+
+    char resolved[MINIMAFS_MAX_PATH];
+    if (!fs_resolve_path(argv0, resolved)) return NULL;
+
+    if (!minimafs_exists(resolved) || minimafs_is_dir(resolved)) {
+        // Doesn't exist (or is a directory) - nothing to associate;
+        // let the normal "unknown command" path report it.
+        return NULL;
+    }
+
+    for (int i = 0; i < g_extension_assoc_count; i++) {
+        if (g_extension_assocs[i].active && command_ext_equals(g_extension_assocs[i].ext, ext)) {
+            return g_extension_assocs[i].command;
+        }
+    }
+
+    // No extension mapping - fall back to the file's own metadata. A
+    // file marked RUNNABLE (see `meta <file> executable true` in
+    // metacommand.c) can be invoked directly even with an extension
+    // nothing is explicitly registered for.
+    minimafs_file_metadata_t metadata;
+    if (minimafs_get_metadata(resolved, &metadata) && metadata.runnable) {
+        // "run" is the only command that knows how to execute an
+        // arbitrary loaded program today (see runcommand.c). If that
+        // ever changes, metadata.run_with (already part of the file
+        // format - see minimafs.h) is the natural place to record
+        // which command a specific file should dispatch to instead of
+        // hardcoding "run" here.
+        return "run";
+    }
+
+    return NULL;
+}
+
+// Builds "<assoc_cmd> <original_input>" into `out`, bounded to
+// `out_size`. Returns false (leaving `out` untouched) if it wouldn't
+// fit, rather than silently truncating a command line.
+static bool command_build_association_line(const char* assoc_cmd, const char* original_input,
+                                            char* out, size_t out_size) {
+    if (!assoc_cmd || !original_input || !out || out_size == 0) return false;
+    int needed = snprintf(out, out_size, "%s %s", assoc_cmd, original_input);
+    return needed > 0 && (size_t)needed < out_size;
 }
 
 // ===========================================
@@ -131,6 +277,20 @@ void command_execute(const char* input) {
     for (int i = 0; i < command_count; ++i) {
         if (strcmp(argv[0], commands[i].name) == 0) {
             commands[i].func(argc, (const char**)argv);
+            return;
+        }
+    }
+
+    // No direct command match - check for a file association (see
+    // command_resolve_file_association()) before giving up, so
+    // "./tool.run" behaves like "run ./tool.run".
+    const char* assoc_cmd = command_resolve_file_association(argv[0]);
+    if (assoc_cmd && g_assoc_depth < COMMAND_ASSOC_MAX_DEPTH) {
+        char rewritten[COMMAND_ASSOC_REWRITE_BUF];
+        if (command_build_association_line(assoc_cmd, input, rewritten, sizeof(rewritten))) {
+            g_assoc_depth++;
+            command_execute(rewritten);
+            g_assoc_depth--;
             return;
         }
     }
@@ -219,6 +379,23 @@ uint64_t command_execute_async(const char* input) {
     }
 
     if (!func) {
+        // No direct command match - same file-association fallback as
+        // command_execute(). Note: `input` here is the caller's
+        // ORIGINAL string, not g_launch_ctx.input_copy - the tokenizer
+        // above has already spliced NUL terminators into that copy, so
+        // it can't be used to rebuild a full command line, but `input`
+        // itself is untouched.
+        const char* assoc_cmd = command_resolve_file_association(g_launch_ctx.argv[0]);
+        if (assoc_cmd && g_assoc_depth < COMMAND_ASSOC_MAX_DEPTH) {
+            char rewritten[COMMAND_ASSOC_REWRITE_BUF];
+            if (command_build_association_line(assoc_cmd, input, rewritten, sizeof(rewritten))) {
+                g_assoc_depth++;
+                uint64_t pid = command_execute_async(rewritten);
+                g_assoc_depth--;
+                return pid;
+            }
+        }
+
         graphics_write_textr("Unknown command: (");
         graphics_write_textr(g_launch_ctx.argv[0]);
         graphics_write_textr(")\n");

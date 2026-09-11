@@ -30,27 +30,37 @@ gpu_device_t* getSystemGPU(void) {
 // PROCESS CREATION
 // ===========================================
 
-process_t* createProcess(const char* file_name, void (*entry_point)()) {
+static process_t* createProcessWithPrivilege(const char* file_name,
+                                              void (*entry_point)(),
+                                              process_privilege_t privilege) {
     if (!file_name || !entry_point) {
         serial_write_str("[PROC] Error: Invalid parameters for createProcess\n");
         return NULL;
     }
-    
-    process_t* proc = proc_create(file_name, entry_point);
+
+    process_t* proc = proc_create_ex(file_name, entry_point, privilege);
     if (!proc) {
         serial_write_str("[PROC] Error: Failed to create process ");
         serial_write_str(file_name);
         serial_write_str("\n");
         return NULL;
     }
-    
+
     proc->state = PROCESS_READY;
-    
+
     serial_write_str("[PROC] Created process: ");
     serial_write_str(proc->name);
-    serial_write_str("\n");
-    
+    serial_write_str(privilege == PROC_PRIVILEGE_USER ? " [user]\n" : " [kernel]\n");
+
     return proc;
+}
+
+process_t* createProcess(const char* file_name, void (*entry_point)()) {
+    return createProcessWithPrivilege(file_name, entry_point, PROC_PRIVILEGE_KERNEL);
+}
+
+process_t* createUserProcess(const char* file_name, void (*entry_point)()) {
+    return createProcessWithPrivilege(file_name, entry_point, PROC_PRIVILEGE_USER);
 }
 
 // ===========================================
@@ -258,6 +268,14 @@ bool unpauseProcessByName(const char* name) {
 // PROCESS INFORMATION
 // ===========================================
 
+const char* privilegeToString(process_privilege_t privilege) {
+    switch (privilege) {
+        case PROC_PRIVILEGE_USER:   return "USER";
+        case PROC_PRIVILEGE_KERNEL: return "KERNEL";
+        default:                    return "UNKNOWN";
+    }
+}
+
 void printProcessInfo(process_t* proc) {
     if (!proc) {
         serial_write_str("[PROC] Error: NULL process\n");
@@ -281,6 +299,8 @@ void printProcessInfo(process_t* proc) {
         default:                 serial_write_str("UNKNOWN"); break;
     }
     
+    serial_write_str("\n  Privilege: ");
+    serial_write_str(privilegeToString(proc->privilege));
     serial_write_str("\n  CPU:   ");
     serial_write_dec(proc->sched_cpu);
     serial_write_str("\n  Level: ");
@@ -297,7 +317,7 @@ void listAllProcesses(void) {
     serial_write_str("========================================\n");
     serial_write_str("         PROCESS LIST\n");
     serial_write_str("========================================\n");
-    serial_write_str(" PID | State    | CPU | Lvl | Name\n");
+    serial_write_str(" PID | State    | CPU | Lvl | Type   | Name\n");
     serial_write_str("----------------------------------------\n");
     
     int count = 0;
@@ -329,6 +349,8 @@ void listAllProcesses(void) {
         serial_write_str("   | ");
         serial_write_dec(proc->sched_level);
         serial_write_str("   | ");
+        serial_write_str(proc->privilege == PROC_PRIVILEGE_USER ? "USER  " : "KERNEL");
+        serial_write_str(" | ");
         serial_write_str(proc->name);
         serial_write_str("\n");
     }
@@ -390,4 +412,8 @@ uint64_t getCurrentPID(void) {
 
 const char* getCurrentProcessName(void) {
     return current_process ? current_process->name : "none";
+}
+
+bool isCurrentProcessUser(void) {
+    return current_process && current_process->privilege == PROC_PRIVILEGE_USER;
 }

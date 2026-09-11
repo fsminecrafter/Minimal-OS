@@ -21,9 +21,19 @@ gpu_device_t* getSystemGPU(void);
 // PROCESS CREATION
 
 
-// Create a new process and add it to the scheduler
+// Create a new process and add it to the scheduler.
+// Classified as PROC_PRIVILEGE_KERNEL - see process_privilege_t in
+// proc.h for what that does (and does not yet) mean.
 // Returns: Pointer to created process, or NULL on failure
 process_t* createProcess(const char* file_name, void (*entry_point)());
+
+// Create a new process classified as PROC_PRIVILEGE_USER - i.e. a
+// program someone launched (currently: the 'run' command loading a
+// .run file, see runcommand.c) rather than kernel-owned housekeeping.
+// Behaves identically to createProcess() at the scheduling/context-
+// switch level today; only the process's privilege field differs.
+// Returns: Pointer to created process, or NULL on failure
+process_t* createUserProcess(const char* file_name, void (*entry_point)());
 
 
 // PROCESS TERMINATION
@@ -79,6 +89,10 @@ void printProcessInfo(process_t* proc);
 // List all processes in the system
 void listAllProcesses(void);
 
+// Human-readable label for a privilege level ("KERNEL" / "USER").
+// Never returns NULL.
+const char* privilegeToString(process_privilege_t privilege);
+
 
 // PROCESS COUNT
 
@@ -101,6 +115,12 @@ uint64_t getCurrentPID(void);
 
 // Get the name of the currently running process
 const char* getCurrentProcessName(void);
+
+// True if the currently running process is classified
+// PROC_PRIVILEGE_USER. Returns false (kernel) if there is no current
+// process, matching the "kernel context" default everywhere else in
+// this codebase treats an absent current_process as trusted/internal.
+bool isCurrentProcessUser(void);
 
 // Get a list of all processes (up to max_procs)
 void getprocslist(process_t** buffer, size_t max_procs);

@@ -10,7 +10,6 @@ kernel.bin
 #Directories
 
 .venv
+planning
 
 #Other files
-
-planning.txt

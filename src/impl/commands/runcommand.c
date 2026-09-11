@@ -211,7 +211,13 @@ void cmd_run(int argc, const char** argv) {
     char procname[96];
     snprintf(procname, sizeof(procname), "%s#%d", run_path, slot);
 
-    process_t* proc = createProcess(procname, run_process_trampoline);
+    // A .run program is user-loaded code, not a kernel-owned
+    // housekeeping process - classify it as such. See
+    // process_privilege_t in proc.h for exactly what this does (and
+    // does not yet) enforce: today it's metadata only, since there is
+    // no per-process address space or user GDT segment to actually
+    // isolate it at CPL3 with.
+    process_t* proc = createUserProcess(procname, run_process_trampoline);
     if (!proc) {
         graphics_write_textr("run: failed to create process\n");
         flags = spinlock_acquire(&g_run_launch_lock);

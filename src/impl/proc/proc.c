@@ -10,8 +10,6 @@
 
 extern uint64_t pml4_phys_addr;
 
-#define STACK_SIZE 0x1000  // 4 KB
-
 process_t* proc_list_head = NULL;
 static uint64_t pid_counter = 1;
 
@@ -90,7 +88,8 @@ static void proc_trampoline(void) {
 	}
 }
 
-process_t* proc_create(const char* file_name, void (*entry_point)()) {
+process_t* proc_create_ex(const char* file_name, void (*entry_point)(),
+                          process_privilege_t privilege) {
 	process_t* proc = alloc(sizeof(process_t));
 	if (!proc) {
 		PANIC("Failed to allocate memory for process_t");
@@ -99,6 +98,7 @@ process_t* proc_create(const char* file_name, void (*entry_point)()) {
 
 	proc->pid = get_next_pid();
 	proc->state = PROCESS_READY;
+	proc->privilege = privilege;
 
 	// Initialize timing fields
 	proc->wake_time_ms = 0;
@@ -203,6 +203,10 @@ process_t* proc_create(const char* file_name, void (*entry_point)()) {
 	scheduler_enqueue_new(proc);
 
 	return proc;
+}
+
+process_t* proc_create(const char* file_name, void (*entry_point)()) {
+	return proc_create_ex(file_name, entry_point, PROC_PRIVILEGE_KERNEL);
 }
 
 void kill(process_t* proc) {

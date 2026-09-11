@@ -12,6 +12,7 @@
 #include "music.h"
 #include "x86_64/exec_trace.h"
 #include "x86_64/safeints.h"
+#include "fspaths.h"
 
 // ===========================================
 // FORMAT COMMAND
@@ -320,7 +321,60 @@ void cmd_listroot_debug(int argc, const char** argv) {
 static char g_current_directory[MINIMAFS_MAX_PATH] = "0:/";
 static char g_resolved_path[MINIMAFS_MAX_PATH];
 static char g_list_local_path[MINIMAFS_MAX_PATH];
-static bool fs_resolve_path(const char* input, char* resolved);
+static bool fs_append_segment(char* path, size_t* length, const char* segment);
+static void fs_remove_last_segment(char* path, size_t* length);
+
+bool fs_resolve_path(const char* input, char* resolved) {
+    if (!input || !resolved) return false;
+
+    static char base_local[MINIMAFS_MAX_PATH];
+    static char input_local[MINIMAFS_MAX_PATH];
+    static char combined[MINIMAFS_MAX_PATH * 2];
+    static char normalized[MINIMAFS_MAX_PATH];
+    static char segment[MINIMAFS_MAX_FILENAME];
+    uint8_t drive_number = 0;
+
+    const char* effective_input = *input ? input : g_current_directory;
+
+    if (strchr(effective_input, ':')) {
+        if (!minimafs_parse_path(effective_input, &drive_number, input_local)) return false;
+        combined[0] = '\0';
+        strncpy(combined, input_local, sizeof(combined) - 1);
+    } else {
+        if (!minimafs_parse_path(g_current_directory, &drive_number, base_local)) return false;
+        if (effective_input[0] == '/') {
+            snprintf(combined, sizeof(combined), "%s", effective_input);
+        } else {
+            snprintf(combined, sizeof(combined), "%s/%s", base_local, effective_input);
+        }
+    }
+
+    normalized[0] = '/';
+    normalized[1] = '\0';
+    size_t normalized_length = 1;
+    char* cursor = combined;
+    while (*cursor == '/') cursor++;
+
+    while (*cursor) {
+        size_t segment_length = 0;
+        while (*cursor && *cursor != '/') {
+            if (segment_length + 1 >= sizeof(segment)) return false;
+            segment[segment_length++] = *cursor++;
+        }
+        segment[segment_length] = '\0';
+        while (*cursor == '/') cursor++;
+
+        if (segment_length == 0 || strcmp(segment, ".") == 0) continue;
+        if (strcmp(segment, "..") == 0) {
+            fs_remove_last_segment(normalized, &normalized_length);
+        } else if (!fs_append_segment(normalized, &normalized_length, segment)) {
+            return false;
+        }
+    }
+
+    snprintf(resolved, MINIMAFS_MAX_PATH, "%u:%s", drive_number, normalized);
+    return true;
+}
 
 const char* fs_get_current_directory(void) {
     return g_current_directory;
@@ -480,58 +534,6 @@ static void fs_remove_last_segment(char* path, size_t* length) {
     while (*length > 1 && path[*length - 1] != '/') (*length)--;
     if (*length > 1) (*length)--;
     path[*length] = '\0';
-}
-
-static bool fs_resolve_path(const char* input, char* resolved) {
-    if (!input || !resolved) return false;
-
-    static char base_local[MINIMAFS_MAX_PATH];
-    static char input_local[MINIMAFS_MAX_PATH];
-    static char combined[MINIMAFS_MAX_PATH * 2];
-    static char normalized[MINIMAFS_MAX_PATH];
-    static char segment[MINIMAFS_MAX_FILENAME];
-    uint8_t drive_number = 0;
-
-    const char* effective_input = *input ? input : g_current_directory;
-
-    if (strchr(effective_input, ':')) {
-        if (!minimafs_parse_path(effective_input, &drive_number, input_local)) return false;
-        combined[0] = '\0';
-        strncpy(combined, input_local, sizeof(combined) - 1);
-    } else {
-        if (!minimafs_parse_path(g_current_directory, &drive_number, base_local)) return false;
-        if (effective_input[0] == '/') {
-            snprintf(combined, sizeof(combined), "%s", effective_input);
-        } else {
-            snprintf(combined, sizeof(combined), "%s/%s", base_local, effective_input);
-        }
-    }
-
-    normalized[0] = '/';
-    normalized[1] = '\0';
-    size_t normalized_length = 1;
-    char* cursor = combined;
-    while (*cursor == '/') cursor++;
-
-    while (*cursor) {
-        size_t segment_length = 0;
-        while (*cursor && *cursor != '/') {
-            if (segment_length + 1 >= sizeof(segment)) return false;
-            segment[segment_length++] = *cursor++;
-        }
-        segment[segment_length] = '\0';
-        while (*cursor == '/') cursor++;
-
-        if (segment_length == 0 || strcmp(segment, ".") == 0) continue;
-        if (strcmp(segment, "..") == 0) {
-            fs_remove_last_segment(normalized, &normalized_length);
-        } else if (!fs_append_segment(normalized, &normalized_length, segment)) {
-            return false;
-        }
-    }
-
-    snprintf(resolved, MINIMAFS_MAX_PATH, "%u:%s", drive_number, normalized);
-    return true;
 }
 
 static bool fs_set_directory_hidden(const char* path, bool hidden) {

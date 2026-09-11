@@ -18,6 +18,33 @@ void commandhandler_init();
 void command_list(void);
 
 // ===========================================
+// FILE ASSOCIATIONS
+// ===========================================
+//
+// Lets a file be invoked directly by name/path - e.g. typing
+// "./tool.run" behaves like "run ./tool.run" - without every caller
+// needing its own dispatch table. Two independent signals decide the
+// command a bare filename resolves to when it doesn't match any
+// registered command name (see command_resolve_file_association() in
+// commandhandler.c):
+//
+//   1. An explicit extension -> command mapping, added here. ".run"
+//      -> "run" is registered by default in commandhandler_init().
+//   2. If no extension mapping matched, the file's own MinimaFS
+//      metadata (@RUNNABLE:True@) - see the 'meta' command
+//      (metacommand.c), which is how a file with a non-matching or
+//      missing extension can still be made directly invokable, e.g.
+//      `meta ./exec.run executable true`.
+//
+// This can only ever resolve to a command that is ALREADY registered
+// via command_register() - it picks which registered command a bare
+// filename dispatches to, it can't invent new command behaviour.
+//
+// Returns false if `ext` is empty/too long, `command` is empty, or
+// the association table is full.
+bool command_register_extension(const char* ext, const char* command);
+
+// ===========================================
 // PROCESS-BASED COMMAND EXECUTION
 // ===========================================
 //

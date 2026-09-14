@@ -171,8 +171,107 @@ static uint64_t sys_usb_impl(uint64_t operation, uint64_t arg1, uint64_t arg2) {
     }
 }
 
+/* ============================================================
+ * SECURITY: user/kernel syscall privilege boundary
+ *
+ * This kernel does not yet have per-process address spaces, user-mode
+ * GDT segments, or a real CPL3 transition path (see process_privilege_t
+ * in proc.h for the full breakdown of what's missing and why a
+ * PROC_PRIVILEGE_USER process still technically runs with full kernel
+ * memory access today). Because of that, this check is NOT a hard
+ * security boundary the way a real ring3/ring0 split would be - a
+ * sufficiently malicious .run program could still corrupt kernel state
+ * directly rather than going through a syscall at all.
+ *
+ * What this DOES do, cheaply and without any of that machinery: it
+ * closes the specific, concrete hole where any loaded .run program
+ * (createUserProcess() in runcommand.c is the only thing that ever
+ * creates a PROC_PRIVILEGE_USER process today) can call through the
+ * syscall gate to reinitialize or reconfigure shared hardware/driver
+ * state - GPU mode, audio DMA start, USB controller re-enumeration,
+ * storage re-probe - that the whole system, including the kernel's
+ * own drivers and every OTHER process, depends on staying consistent.
+ * A user program has no legitimate reason to call SYS_MANAGER_INIT or
+ * SYS_USB_INIT; only kernel-owned code (main.c's boot sequence, the
+ * terminal's disk-mount prompt, etc) should ever do that.
+ *
+ * Read-only status queries (e.g. "is there audio data ready", polling
+ * for keyboard input, translating a scancode) are left available to
+ * user processes, since a .run program legitimately needs those to
+ * draw its own UI or react to input - only privilege-escalating /
+ * global-state-mutating operations are denied.
+ *
+ * To extend this: add a case for the new syscall number (or, for a
+ * multiplexed syscall like SYS_MANAGER/SYS_USB, a case for the new
+ * sub-operation) and return false for anything a user process should
+ * never be allowed to trigger. Default is "allowed" - only list what
+ * needs denying, so adding a new syscall doesn't require remembering
+ * to update this table or it silently becomes forbidden.
+ * ============================================================ */
+static bool syscall_user_may_call(uint64_t syscall_num, const syscall_regs_t* regs) {
+    switch (syscall_num) {
+        case SYS_MANAGER: {
+            // arg layout matches mos_manager(manager, operation, value)
+            // -> mos_syscall3(SYS_MANAGER, manager, operation, value)
+            // -> rdi=manager, rsi=operation, rdx=value (see
+            // sys_manager_impl()'s call site below for the same
+            // mapping).
+            uint64_t operation = regs->rsi;
+            switch (operation) {
+                case SYS_MANAGER_HAS_DATA:
+                    // Pure read - safe for any process.
+                    return true;
+                case SYS_MANAGER_INIT:
+                case SYS_MANAGER_UPDATE:
+                case SYS_MANAGER_START:
+                case SYS_MANAGER_SET_SAMPLE_RATE:
+                default:
+                    // Everything else mutates shared driver/hardware
+                    // state - kernel only.
+                    return false;
+            }
+        }
+
+        case SYS_USB: {
+            // arg layout matches mos_usb(operation, arg1, arg2) ->
+            // mos_syscall3(SYS_USB, operation, arg1, arg2) ->
+            // rdi=operation (see sys_usb_impl()'s call site below).
+            uint64_t operation = regs->rdi;
+            switch (operation) {
+                case SYS_USB_INIT:
+                    // Full controller (re-)init/enumeration - never
+                    // safe for an arbitrary user process to trigger;
+                    // it would tear down and re-probe every USB device
+                    // in the system, including the keyboard everyone
+                    // else is relying on.
+                    return false;
+                default:
+                    // Polling and read-only keyboard queries are
+                    // side-effect-free (or self-contained) enough to
+                    // allow.
+                    return true;
+            }
+        }
+
+        default:
+            // Everything else (SYS_WRITE, file I/O, graphics drawing,
+            // process/time queries, etc) has no shared-hardware-state
+            // implications and stays open to user processes.
+            return true;
+    }
+}
+
 void syscall_dispatch(syscall_regs_t* regs) {
     if (!regs) return;
+
+    if (isCurrentProcessUser() && !syscall_user_may_call(regs->rax, regs)) {
+        serial_write_str("[syscall] denied: user process attempted privileged "
+                          "syscall/op (num=");
+        serial_write_dec(regs->rax);
+        serial_write_str(")\n");
+        regs->rax = SYS_ERR_PERM;
+        return;
+    }
 
     switch (regs->rax) {
         case SYS_WRITE: {

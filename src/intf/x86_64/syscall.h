@@ -28,6 +28,11 @@
 #define SYS_ERR_BADFD    ((uint64_t)-2)
 #define SYS_ERR_NOTFOUND ((uint64_t)-3)
 #define SYS_ERR_INVAL    ((uint64_t)-4)
+// Returned when a PROC_PRIVILEGE_USER process (see process_privilege_t
+// in proc.h) calls a syscall/operation reserved for kernel-privilege
+// callers. See the syscall_user_may_call() privilege table in
+// syscall.c for exactly which operations this applies to, and why.
+#define SYS_ERR_PERM     ((uint64_t)-5)
 
 typedef enum {
     SYS_GRAPHICS_GET_WIDTH = 1,
@@ -113,6 +118,12 @@ typedef struct __attribute__((packed)) {
 // rdi/rsi/rdx (SysV-ish - matches a future `syscall`-instruction ABI
 // too, if ring3 ever lands). Return values are in rax; failures are
 // negative values represented as uint64_t.
+//
+// Before dispatching, this enforces a privilege check for
+// PROC_PRIVILEGE_USER callers - see syscall_user_may_call() in
+// syscall.c. That check is a syscall-level capability boundary only;
+// it is NOT a substitute for real ring3/CPL3 isolation, which this
+// kernel does not have yet (see process_privilege_t in proc.h).
 void syscall_dispatch(syscall_regs_t* regs);
 
 #endif // SYSCALL_H

@@ -120,13 +120,10 @@ void kernel_main(uint64_t mb2_info_addr) {
     // audio_manager.h / audio_hw.h for the module interface.
     audio_init();
 
-    // Register AHCI storage driver and initialize storage manager
+    // Register AHCI storage driver. The terminal's initdisk command owns
+    // controller probing and MinimaFS device creation, so do not initialize
+    // AHCI a second time here before the mount prompt.
     storage_manager_register_driver(ahci_get_storage_driver());
-    if (storage_manager_init()) {
-        serial_write_str("Storage manager initialized\n");
-    } else {
-        serial_write_str("No storage driver found\n");
-    }
 
     smp_start_aps(mb_info);
 

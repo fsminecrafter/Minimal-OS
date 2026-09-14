@@ -9,6 +9,7 @@
 #include "panic.h"
 #include "usb/usb_stack.h"
 #include "x86_64/smp.h"
+#include "x86_64/exec_trace.h"
 
 // PIT ports
 #define PIT_COMMAND_PORT 0x43
@@ -37,8 +38,6 @@ void pit_init(uint32_t frequency) {
     // Send divisor high byte
     port_outb(PIT_CHANNEL0_DATA_PORT, (uint8_t)(divisor >> 8));
 
-    // Enable IRQ0 in PIC (unmask timer interrupt)
-    pic_unmask_irq(IRQ0_TIMER);
 }
 
 void pit_irq_handler() {
@@ -69,6 +68,10 @@ uint64_t pit_get_ticks() {
 void setup_kernel_interrupts() {
     idt_init();
     idt_set_handler_pit(pit_irq_handler);
+    // Install the handler before allowing the timer to interrupt. pit_init()
+    // only programs the PIT; it deliberately leaves IRQ0 masked until now.
+    pic_unmask_irq(IRQ0_TIMER);
+    sti();
 }
 
 

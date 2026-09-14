@@ -121,9 +121,8 @@ typedef struct __attribute__((packed)) {
 //
 // Before dispatching, this enforces a privilege check for
 // PROC_PRIVILEGE_USER callers - see syscall_user_may_call() in
-// syscall.c. That check is a syscall-level capability boundary only;
-// it is NOT a substitute for real ring3/CPL3 isolation, which this
-// kernel does not have yet (see process_privilege_t in proc.h).
+// syscall.c. User processes enter through the DPL3 int 0x80 gate;
+// syscall policy remains a separate capability boundary.
 void syscall_dispatch(syscall_regs_t* regs);
 
 #endif // SYSCALL_H

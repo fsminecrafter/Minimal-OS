@@ -9,6 +9,7 @@
 #include "print.h"
 #include "string.h"
 #include "x86_64/allocator.h"
+#include "x86_64/pmm.h"
 #include "serial.h"
 #include "x86_64/safeints.h"
 #include "x86_64/spinlock.h"
@@ -409,6 +410,17 @@ void schedule() {
             if (to_free->kernel_stack) {
                 void* stack_base = (void*)((uint8_t*)to_free->kernel_stack - STACK_SIZE);
                 free_mem(stack_base);
+            }
+
+            if (to_free->user_image_phys) {
+                free_pages(to_free->user_image_phys, to_free->user_image_pages);
+            }
+            if (to_free->user_stack_phys) {
+                free_pages(to_free->user_stack_phys, to_free->user_stack_pages);
+            }
+
+            if (to_free->privilege == PROC_PRIVILEGE_USER) {
+                proc_destroy_address_space(to_free);
             }
 
             free_mem(to_free);

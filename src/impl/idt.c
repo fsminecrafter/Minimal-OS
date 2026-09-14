@@ -138,7 +138,6 @@ void idt_init() {
 
 	idt_load(&idt_ptr);
 	
-	sti();
 }
 
 void idt_set_handler_keyboard(void (*handler)()) {

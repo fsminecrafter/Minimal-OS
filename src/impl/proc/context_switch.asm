@@ -23,9 +23,16 @@ context_switch:
     lea rax, [rel return_point]
     mov [rdi + 0x0000000000000090 + 7*8], rax    ; regs[7]
     
-    ; Load PML4 from offset 0xD8 (NOT 0x88!)
+    ; Load PML4 from offset 0xD8 (NOT 0x88!) only when the address space
+    ; changes. Kernel processes share one root, so avoid flushing the TLB
+    ; on every kernel-to-kernel scheduler switch.
+    mov rax, [rdi + 0x00000000000000D8]
+    cmp rax, [rsi + 0x00000000000000D8]
+    je .same_address_space
     mov rax, [rsi + 0x00000000000000D8]
     mov cr3, rax
+
+.same_address_space:
     
     ; Restore new context from regs[] at offset 0x90
     mov rbx, [rsi + 0x0000000000000090 + 0*8]

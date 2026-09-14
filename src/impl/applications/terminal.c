@@ -289,6 +289,7 @@ void terminal_update(void) {
             command_poll_running();
             if (!command_is_running()) {
                 g_command_running = false;
+                graphics_write_textr("\n");
                 terminalPrompt();
             }
         }

@@ -542,6 +542,10 @@ ahci_controller_t* ahci_init(pci_device_t* pci_dev) {
 
     // Map ABAR to virtual memory
     hba_mem_t* abar = (hba_mem_t*)pci_map_bar_mmio(pci_dev, 5);
+    if (!abar) {
+        serial_write_str("AHCI: Failed to map ABAR\n");
+        return NULL;
+    }
     serial_write_str("AHCI: ABAR virtual  = 0x");
     serial_write_hex((uintptr_t)abar);
     serial_write_str("\n");
@@ -650,11 +654,13 @@ uint8_t ahci_probe_ports(ahci_controller_t* ctrl) {
         if ((pi & (1 << i)) == 0) continue;
 
         hba_port_t* port = &ctrl->abar->ports[i];
-        uint32_t sig = ahci_check_type(port);
-        if (sig == 0) {
-            // Try a port reset to coax signature on some controllers
-            if (ahci_port_reset(port)) {
-                sig = ahci_check_type(port);
+        uint32_t sig = 0;
+        for (int attempt = 0; attempt < 3 && sig == 0; attempt++) {
+            sig = ahci_check_type(port);
+            if (sig == 0) {
+                // Device detection can lag controller enumeration during boot.
+                if (ahci_port_reset(port)) sig = ahci_check_type(port);
+                if (sig == 0) ahci_sleep_ms(10);
             }
         }
 

@@ -2,11 +2,14 @@
 #include <stdint.h>
 #include <stddef.h>
 #include "x86_64/proc.h"
+#include "x86_64/gdt.h"
 #include "x86_64/scheduler.h"
 #include "x86_64/allocator.h"
+#include "x86_64/pmm.h"
 #include "time.h"
 #include "panic.h"
 #include "x86_64/safeints.h"
+#include "string.h"
 
 extern uint64_t pml4_phys_addr;
 
@@ -19,6 +22,176 @@ uint64_t get_next_pid() {
 
 uint64_t get_kernel_pml4(void) {
 	return pml4_phys_addr;  // Return the VALUE, not cast to pointer!
+}
+
+static uint64_t clone_kernel_pml4(void) {
+	uint64_t kernel_pml4 = get_kernel_pml4();
+	if (!kernel_pml4) {
+		return 0;
+	}
+
+	uint64_t* src = (uint64_t*)(uintptr_t)kernel_pml4;
+	uint64_t* dst = (uint64_t*)alloc_page_zeroed();
+	if (!dst) {
+		return 0;
+	}
+
+	memcpy(dst, src, 512 * sizeof(uint64_t));
+
+	uint64_t pml4e = src[0];
+	if (pml4e & 1) {
+		uint64_t* src_pdpt = (uint64_t*)(uintptr_t)(pml4e & ~0xFFFULL);
+		uint64_t* dst_pdpt = (uint64_t*)alloc_page_zeroed();
+		if (!dst_pdpt) return 0;
+		memcpy(dst_pdpt, src_pdpt, 512 * sizeof(uint64_t));
+
+		uint64_t pdpte = src_pdpt[0];
+		if (pdpte & 1) {
+			uint64_t* src_pd = (uint64_t*)(uintptr_t)(pdpte & ~0xFFFULL);
+			uint64_t* dst_pd = (uint64_t*)alloc_page_zeroed();
+			if (!dst_pd) return 0;
+			memcpy(dst_pd, src_pd, 512 * sizeof(uint64_t));
+
+			dst_pdpt[0] = (uint64_t)(uintptr_t)dst_pd | (pdpte & 0xFFFULL);
+		}
+
+		dst[0] = (uint64_t)(uintptr_t)dst_pdpt | (pml4e & 0xFFFULL);
+	}
+
+	return (uint64_t)(uintptr_t)dst;
+}
+
+static int proc_map_user_pages(process_t* proc, uintptr_t address, size_t length,
+					uint64_t phys_base) {
+	if (!proc || length == 0) return 0;
+
+	uintptr_t start = address & ~0xFFFULL;
+	uintptr_t end = address + length;
+	if (end < address) return 0;
+	end = (end + 0xFFFULL) & ~0xFFFULL;
+
+	uint64_t* pml4 = (uint64_t*)(uintptr_t)proc->pml4;
+	uint64_t pml4_index = (start >> 39) & 0x1FF;
+	if (((end - 1) >> 39) & 0x1FF != pml4_index || pml4_index != 0) {
+		return 0;
+	}
+
+	uint64_t pml4e = pml4[pml4_index];
+	if (!(pml4e & 1)) return 0;
+	uint64_t* pdpt = (uint64_t*)(uintptr_t)(pml4e & ~0xFFFULL);
+	pml4[pml4_index] |= 0x4;
+
+	for (uintptr_t page = start; page < end; page += 0x1000) {
+		uint64_t pdpt_index = (page >> 30) & 0x1FF;
+		uint64_t pdpte = pdpt[pdpt_index];
+		if (!(pdpte & 1) || (pdpte & (1ULL << 7))) return 0;
+		uint64_t* pd = (uint64_t*)(uintptr_t)(pdpte & ~0xFFFULL);
+		pdpt[pdpt_index] |= 0x4;
+
+		uint64_t pd_index = (page >> 21) & 0x1FF;
+		uint64_t pde = pd[pd_index];
+		if (!(pde & 1)) return 0;
+
+		uint64_t* pt;
+		if (pde & (1ULL << 7)) {
+			pt = (uint64_t*)alloc_page_zeroed();
+			if (!pt) return 0;
+			uint64_t base = pde & 0xFFFFFFE00000ULL;
+			uint64_t flags = pde & 0xFFFULL & ~(1ULL << 7);
+			for (size_t i = 0; i < 512; i++) {
+				pt[i] = (base + i * 0x1000ULL) | flags;
+			}
+			pd[pd_index] = (uint64_t)(uintptr_t)pt | flags;
+		}
+		pt = (uint64_t*)(uintptr_t)(pd[pd_index] & ~0xFFFULL);
+		uint64_t pt_index = (page >> 12) & 0x1FF;
+		uint64_t pte_flags = pt[pt_index] & 0xFFFULL;
+		pt[pt_index] = (phys_base + (page - start)) | pte_flags | 0x4;
+		pd[pd_index] |= 0x4;
+	}
+
+	return 1;
+}
+
+int proc_map_user_range(process_t* proc, void* address, size_t length) {
+	if (!proc || !address || length == 0) return 0;
+	uintptr_t start = (uintptr_t)address & ~0xFFFULL;
+	uintptr_t end = (uintptr_t)address + length;
+	if (end < (uintptr_t)address) return 0;
+	uintptr_t aligned_end = (end + 0xFFFULL) & ~0xFFFULL;
+	size_t pages = (aligned_end - start) / 0x1000;
+
+	void* physical = alloc_pages_zeroed(pages);
+	if (!physical) return 0;
+	memcpy(physical, (void*)start, pages * 0x1000);
+
+	if (!proc_map_user_pages(proc, (uintptr_t)address, length,
+				(uint64_t)(uintptr_t)physical)) {
+		free_pages(physical, pages);
+		return 0;
+	}
+
+	if (!proc->user_image_phys) {
+		proc->user_image_phys = physical;
+		proc->user_image_pages = pages;
+	} else if (!proc->user_stack_phys) {
+		proc->user_stack_phys = physical;
+		proc->user_stack_pages = pages;
+	} else {
+		free_pages(physical, pages);
+		return 0;
+	}
+	return 1;
+}
+
+void proc_destroy_address_space(process_t* proc) {
+	if (!proc || !proc->pml4) return;
+
+	uint64_t* pml4 = (uint64_t*)(uintptr_t)proc->pml4;
+	uint64_t pml4e = pml4[0];
+	if (pml4e & 1) {
+		uint64_t* pdpt = (uint64_t*)(uintptr_t)(pml4e & ~0xFFFULL);
+		uint64_t pdpte = pdpt[0];
+		if (pdpte & 1) {
+			uint64_t* pd = (uint64_t*)(uintptr_t)(pdpte & ~0xFFFULL);
+			for (size_t i = 0; i < 512; i++) {
+				if ((pd[i] & 1) && !(pd[i] & (1ULL << 7))) {
+					free_page((void*)(uintptr_t)(pd[i] & ~0xFFFULL));
+				}
+			}
+			free_page(pd);
+		}
+		free_page(pdpt);
+	}
+	free_page(pml4);
+	proc->pml4 = 0;
+}
+
+static void proc_enter_ring3(process_t* self,
+		void (*entry_point)(), void* user_stack_top) {
+	uint64_t pml4 = self->pml4;
+	__asm__ volatile(
+		"mov %[pml4], %%rax\n\t"
+		"mov %%rax, %%cr3\n\t"
+		"pushq %[ss]\n\t"
+		"pushq %[rsp]\n\t"
+		"pushfq\n\t"
+		"popq %%rax\n\t"
+		"orq $0x200, %%rax\n\t"
+		"pushq %%rax\n\t"
+		"pushq %[cs]\n\t"
+		"pushq %[rip]\n\t"
+		"iretq\n\t"
+		:
+		: [pml4] "r"(pml4),
+		  [ss] "r"((uint64_t)GDT_SELECTOR_DS_USER),
+		  [rsp] "r"((uint64_t)user_stack_top),
+		  [cs] "r"((uint64_t)GDT_SELECTOR_CS_USER),
+		  [rip] "r"((uint64_t)entry_point)
+		: "rax", "memory");
+	for (;;) {
+		asm volatile("cli; hlt" ::: "memory");
+	}
 }
 
 void memset_p(void* dest, uint8_t val, uint64_t len) { //changed memset to memset_p to make compiler STAY SILENT
@@ -62,6 +235,9 @@ static void proc_trampoline(void) {
 	process_t* self = current_process;
 
 	if (self && self->entry_point) {
+		if (self->privilege == PROC_PRIVILEGE_USER) {
+			proc_enter_ring3(self, self->entry_point, self->user_stack);
+		}
 		self->entry_point();
 	}
 
@@ -152,10 +328,17 @@ process_t* proc_create_ex(const char* file_name, void (*entry_point)(),
 	*p = '\0';
 	// === END name construction ===
 
-	// Remaining setup
-	proc->pml4 = (uint64_t)get_kernel_pml4();
+	// Every process gets its own PML4 root, cloned from the kernel's
+	// current page tables so kernel mappings remain available while
+	// still preventing a process from reusing the exact same CR3 as
+	// every other process. This is the minimum step toward real address-
+	// space isolation; the kernel still runs at CPL0 and user code is
+	// not yet switched through a ring3 path.
+	proc->pml4 = (privilege == PROC_PRIVILEGE_USER)
+		? clone_kernel_pml4()
+		: get_kernel_pml4();
 	if (!proc->pml4) {
-		PANIC("Failed to get PML4 for new process");
+		PANIC("Failed to create PML4 for new process");
 	}
 
 	void* stack = alloc(STACK_SIZE);
@@ -164,15 +347,19 @@ process_t* proc_create_ex(const char* file_name, void (*entry_point)(),
 	}
 	proc->kernel_stack = (uint64_t*)((uint8_t*)stack + STACK_SIZE);
 
+	void* user_stack = alloc(STACK_SIZE);
+	if (!user_stack) {
+		PANIC("Failed to allocate user stack");
+	}
+	proc->user_stack = (uint64_t*)((uint8_t*)user_stack + STACK_SIZE);
+
 	// Zero all registers first
 	for (int i = 0; i < 9; i++) {
 		proc->regs[i] = 0;
 	}
 
-	// Remember the real entry point so proc_trampoline() can call it,
-	// and point the saved RIP at the trampoline rather than directly
-	// at the caller's function - see proc_trampoline()'s comment for
-	// the full reasoning.
+	// Kernel processes call this entry through the trampoline. User
+	// processes use it as the actual ring3 entry target.
 	proc->entry_point = entry_point;
 
 	// Then set the important ones

@@ -7,12 +7,14 @@
 #define GDT_SELECTOR_NULL      0x00
 #define GDT_SELECTOR_CS_KERNEL 0x08   // unchanged - idt.c already builds gates against this
 #define GDT_SELECTOR_DS_KERNEL 0x10
+#define GDT_SELECTOR_CS_USER   0x1B   // DPL3 code selector (index 3 + RPL3)
+#define GDT_SELECTOR_DS_USER   0x23   // DPL3 data selector (index 4 + RPL3)
 
 // One 16-byte TSS descriptor per core, right after the fixed
-// null/code/data entries. Replaces the old fixed
+// null/code/data/user entries. Replaces the old fixed
 // _TSS/_TSS_LOW/_TSS_HIGH constants, which predate there being more
 // than one core to have a TSS each.
-#define GDT_TSS_SELECTOR(cpu) (0x18 + (cpu) * 16)
+#define GDT_TSS_SELECTOR(cpu) (0x28 + (cpu) * 16)
 #define GDT_SELECTOR_TSS      GDT_TSS_SELECTOR(0)
 
 #define IDT_GATE_TYPE_INTERRUPT 0x0E

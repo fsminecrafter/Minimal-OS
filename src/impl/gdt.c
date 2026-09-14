@@ -9,6 +9,7 @@
 #define ACC_CODEDATA  (1 << 4)
 #define ACC_EXEC      (1 << 3)
 #define ACC_RW        (1 << 1)
+#define ACC_DPL3      (3 << 5)
 #define TSS_TYPE_AVAIL 0x9
 
 typedef struct __attribute__((packed)) {
@@ -36,7 +37,7 @@ typedef struct __attribute__((packed)) {
     uint64_t base;
 } gdt_ptr_t;
 
-#define GDT_FIXED_ENTRIES 3   // null, code, data (8 bytes each)
+#define GDT_FIXED_ENTRIES 5   // null, kernel code, kernel data, user code, user data
 #define GDT_TOTAL_QWORDS  (GDT_FIXED_ENTRIES + MAX_CPUS * 2)
 
 static uint64_t   g_gdt[GDT_TOTAL_QWORDS] __attribute__((aligned(16)));
@@ -96,9 +97,12 @@ void gdt_init(void) {
 
     gdt_set_entry(1, ACC_PRESENT | ACC_CODEDATA | ACC_EXEC | ACC_RW, 0x2); // 0x08: 64-bit code (L=1)
     gdt_set_entry(2, ACC_PRESENT | ACC_CODEDATA | ACC_RW,            0xC); // 0x10: data
+    gdt_set_entry(3, ACC_PRESENT | ACC_DPL3 | ACC_CODEDATA | ACC_EXEC | ACC_RW, 0x2); // 0x18: 64-bit user code
+    gdt_set_entry(4, ACC_PRESENT | ACC_DPL3 | ACC_CODEDATA | ACC_RW,            0xC); // 0x20: user data
 
     for (int i = 0; i < MAX_CPUS; i++) {
         // GDT setup runs before the heap allocator is initialized.
+        g_tss[i].rsp0 = (uint64_t)&g_tss_stacks[i][4096];
         g_tss[i].ist[0] = (uint64_t)&g_tss_stacks[i][4096];
         gdt_set_tss(i, &g_tss[i]);
     }

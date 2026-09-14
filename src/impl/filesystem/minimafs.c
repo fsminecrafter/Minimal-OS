@@ -1834,7 +1834,6 @@ int minimafs_mount(void* device_handle, uint8_t drive_number) {
     minimafs_refresh_storage_desc(drive);
     minimafs_get_datetime(drive->storage_desc.last_mounted,
                           sizeof(drive->storage_desc.last_mounted));
-    minimafs_write_storage_desc(drive);
 
     drive->mounted = true;
     serial_write_str("MinimaFS: Drive ");

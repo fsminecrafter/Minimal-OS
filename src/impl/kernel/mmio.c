@@ -392,6 +392,10 @@ volatile void* pci_map_bar_mmio(pci_device_t* dev, int bar_num) {
     size_t total_size = offset + bar_size;
 
     uintptr_t virt_base = (uintptr_t)mmio_alloc_va(total_size);
+    if (!virt_base) {
+        serial_write_str("ERROR: failed to allocate virtual space for PCI BAR\n");
+        return NULL;
+    }
 
     // Map in chunks of 2 MiB if possible, otherwise 4 KiB
     size_t remaining = total_size;
@@ -402,7 +406,10 @@ volatile void* pci_map_bar_mmio(pci_device_t* dev, int bar_num) {
         size_t map_size = MMIO_PAGE_SIZE_2M;
         if (remaining < MMIO_PAGE_SIZE_2M) map_size = MMIO_PAGE_SIZE_4K;
 
-        map_mmio_page(vaddr, paddr, map_size);
+        if (!map_mmio_page(vaddr, paddr, map_size)) {
+            serial_write_str("ERROR: failed to map PCI BAR\n");
+            return NULL;
+        }
 
         vaddr += map_size;
         paddr += map_size;

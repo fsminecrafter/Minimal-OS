@@ -26,30 +26,12 @@ typedef enum {
 // (drivers, the terminal, the scheduler's own housekeeping processes)
 // versus a user-loaded .run program (see elfloader.c / runcommand.c).
 //
-// This is METADATA ONLY today. Every process, kernel or "user", still
-// executes at CPL0 with interrupts and I/O fully available, and every
-// process_t still shares the exact same kernel PML4 (see
-// proc_create_ex()'s pml4 assignment, and thread.h's comment making
-// this same point about threads vs. processes). Real ring3 isolation
-// needs three things this kernel does not have yet, each already
-// flagged as future work elsewhere in this project:
+// User processes enter through CPL3 with a private PML4 root, user GDT
+// segments, a TSS kernel stack, and an iretq transition. Their ELF image
+// and stack use process-owned physical pages and are reclaimed on exit.
 //
-//   1. Per-process address spaces - without this a PROC_PRIVILEGE_USER
-//      process can still read/write any kernel memory it wants, so
-//      CPL3 alone would be security theater. (This is the same
-//      "future change will require revisiting the global FD table
-//      design" dependency already tracked for the syscall FD table.)
-//   2. User-mode GDT code/data segments - gdt.c only ever builds the
-//      DPL0 kernel CS/DS pair (see ACC_* flags in gdt.c), plus a TSS
-//      rsp0 to use on privilege transitions.
-//   3. A real privilege-transition path - the syscall gate already
-//      has DPL3 set (see idt_init()'s 0x80 entry in idt.c), but
-//      nothing currently performs an iret that actually drops CPL to
-//      3 on entry to a "user" process.
-//
-// Until all three land, this classification exists purely so the
-// scheduler, process listings, and future syscall policy have a
-// stable place to ask "is this a program someone ran, or part of the
+// This classification gives the scheduler, process listings, and syscall
+// policy a stable place to ask "is this a program someone ran, or part of the
 // kernel itself" - e.g. to eventually restrict which syscalls a user
 // process may issue - without guessing from the process name string.
 typedef enum {
@@ -67,8 +49,9 @@ typedef struct process {
     uint64_t regs[9];                  // RBX, RBP, R12-R15, RSP, RIP, RFLAGS
 
     // Memory management
-    uint64_t pml4;                     // Page table (physical address)
-    uint64_t* kernel_stack;            // Kernel stack pointer
+    uint64_t pml4;                     // Per-process PML4 root (physical address)
+    uint64_t* kernel_stack;            // Kernel stack pointer used for CPL0 context
+    uint64_t* user_stack;              // User stack pointer for future ring3 entry path
 
     // Timing
     uint64_t wake_time_ms;             // When to wake if sleeping (0 = not sleeping)
@@ -78,9 +61,8 @@ typedef struct process {
     // Linked list
     struct process* next;              // Next process in list
 
-    // Real process entry point. regs[7] (the saved RIP) is ALWAYS set
-    // to the internal trampoline (proc_trampoline in proc.c), never to
-    // this pointer directly - see proc_trampoline()'s comment for why.
+    // Entry point used by the process trampoline. For user processes this
+    // is the actual user image entry and is entered through iretq.
     //
     // IMPORTANT: this field is appended at the very END of the struct
     // on purpose. context_switch.asm indexes into this struct using
@@ -111,6 +93,13 @@ typedef struct process {
     // past kernel_stack, so this struct can keep growing after it
     // without any assembly changes.
     process_privilege_t privilege;
+
+    // Physical storage owned by a user process. These fields are appended
+    // after the context-switch ABI fields and are reclaimed by the scheduler.
+    void* user_image_phys;
+    size_t user_image_pages;
+    void* user_stack_phys;
+    size_t user_stack_pages;
 } process_t;
 
 // Global process list head (defined in proc.c)
@@ -139,6 +128,11 @@ uint64_t get_next_pid(void);
 
 // Kernel page table
 uint64_t get_kernel_pml4(void);
+
+// Copy a user range to process-owned physical pages and map only those pages
+// as user-accessible in the process's private page-table hierarchy.
+int proc_map_user_range(process_t* proc, void* address, size_t length);
+void proc_destroy_address_space(process_t* proc);
 
 // Helper functions (from string.h but needed here)
 void hex_to_str(uint64_t value, char* out);

@@ -109,4 +109,14 @@ static inline void mos_graphics_set_resolution(uint32_t columns,
     mos_graphics(&request);
 }
 
+static inline void mos_graphics_measure_text(const char* text,
+                                             uint32_t* out_width,
+                                             uint32_t* out_height) {
+    syscall_graphics_request_t request = { .op = SYS_GRAPHICS_MEASURE_TEXT,
+                                           .text = text,
+                                           .out_width = out_width,
+                                           .out_height = out_height };
+    mos_graphics(&request);
+}
+
 #endif

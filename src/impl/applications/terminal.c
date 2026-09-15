@@ -393,6 +393,7 @@ void terminal_program_entry(void) {
                 if (systeminfo_load_saved_resolution()) {
                     vgaterm_print("Loaded saved display resolution.\n");
                 }
+                service_manager_init();
             }else if (success == 2) {
                 vgaterm_print("/cr255g0b0/MinimaFS: Drive already mounted/cr255g255b255/\n");
             }else if (success == 3) {

@@ -10,6 +10,7 @@
 #include "serial.h"
 #include "string.h"
 #include "time.h"
+#include "x86_64/servicemanager.h"
 
 #include "vgaterm.h"
 #include "minimafshandler.h"

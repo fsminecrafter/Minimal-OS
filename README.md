@@ -62,7 +62,7 @@ User application developers can find the syscall and SDK integration guide in
 
 ## ROADMAP
 
-Last synced 2026 - Sep 10 - 13:10
+Last synced 2026 - Sep 15 - 09:24
 
 #### X = Done
 #### C = Come back later
@@ -102,9 +102,9 @@ Last synced 2026 - Sep 10 - 13:10
 #### V 0.4.4X
 
 - [X] Multithreading And Multicore usage 
-- [ ] Services manager 
-- [ ] Syscalls and User layer
-- [ ] .run executable file
+- [X] Services manager 
+- [X] Syscalls and User layer
+- [X] .run executable file
 
 #### V 0.4.5X
 

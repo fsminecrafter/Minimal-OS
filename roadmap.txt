@@ -32,9 +32,9 @@ File system !!! [X]
 V 0.4.4X
 
 Multithreading And Multicore usage [X]
-Services manager []
-Syscalls and User layer  []
-Executable .run file []
+Services manager [X]
+Syscalls and User layer  [X]
+Executable .run file [X]
 
 V 0.4.5X
 

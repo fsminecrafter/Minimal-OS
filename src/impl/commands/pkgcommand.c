@@ -1,18 +1,22 @@
 /*
- * installpkg / pkginfo — extract or inspect a MinimalOS Package
- * (.mpkg) archive, the MinimalOS analog of unzipping an installer.
+ * pkg / installpkg / pkginfo — build, extract, and inspect a
+ * MinimalOS Package (.mpkg) archive, the MinimalOS analog of a zip
+ * file.
  *
  * See x86_64/pkgformat.h for the on-disk layout and x86_64/lzss.h for
- * the decompressor. Archives are built on the host with
- * tools/pkgbuilder/mkpkg.py.
+ * the (de)compressor.
  *
  * Usage:
- *   installpkg <path-to.mpkg> [target-dir]
- *   pkginfo    <path-to.mpkg>
+ *   pkg unzip <path.mpkg> [target-dir]
+ *   pkg zip   <file-or-folder> [algorithm]
+ *   installpkg <path.mpkg> [target-dir]   (legacy alias for `pkg unzip`)
+ *   pkginfo    <path.mpkg>
  *
- * target-dir defaults to the current directory (see fspaths.h). Every
- * file in the archive is written at <target-dir>/<entry-name>, creating
- * any missing parent directories along the way.
+ * `pkg zip` writes its output next to the source as
+ * "<source-path>.mpkg" (trailing '/' stripped for directories).
+ * `algorithm` is "lzss" (default) or "store"; any other value is
+ * rejected. Archives can also be built on the host with
+ * tools/mkpkg/mkpkg.py.
  */
 
 #include <stdint.h>
@@ -28,9 +32,24 @@
 #include "x86_64/lzss.h"
 #include "fspaths.h"
 
+/* Above this raw file size, `pkg zip` silently falls back to STORE
+ * even if lzss was requested. The brute-force encoder is
+ * O(input_size * N * F) - fine for typical program bundles, but an
+ * unbounded multi-megabyte input could tie up the calling command
+ * process for a very long time. */
+#define PKG_ZIP_LZSS_MAX_BYTES (256u * 1024u)
+
 static uint32_t pkg_read_u32(const uint8_t* p) {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
            ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static uint32_t pkg_write_u32(uint8_t* p, uint32_t v) {
+    p[0] = (uint8_t)(v & 0xFF);
+    p[1] = (uint8_t)((v >> 8) & 0xFF);
+    p[2] = (uint8_t)((v >> 16) & 0xFF);
+    p[3] = (uint8_t)((v >> 24) & 0xFF);
+    return 4;
 }
 
 typedef struct {
@@ -126,6 +145,12 @@ static bool pkg_parent_dir(const char* full_path, char* out, size_t out_size) {
     memcpy(out, full_path, len);
     out[len] = '\0';
     return true;
+}
+
+// Returns the last path component of `path` ("a/b/c.run" -> "c.run").
+static const char* pkg_basename(const char* path) {
+    const char* slash = strrchr(path, '/');
+    return slash ? slash + 1 : path;
 }
 
 static bool pkg_extract_entry(const pkg_entry_t* entry, const uint8_t* archive,
@@ -304,20 +329,24 @@ static uint32_t pkg_validate_entry_table(const uint8_t* archive, uint32_t archiv
     return entry_count;
 }
 
-void cmd_installpkg(int argc, const char** argv) {
-    if (argc < 2) {
-        graphics_write_textr("Usage: installpkg <path.mpkg> [target-dir]\n");
+/* ============================================================
+ * SHARED EXTRACTION LOGIC (used by both `installpkg` and `pkg unzip`)
+ * ============================================================ */
+
+static void pkg_do_unzip(const char* archive_arg, const char* target_arg) {
+    if (!archive_arg) {
+        graphics_write_textr("Usage: pkg unzip <path.mpkg> [target-dir]\n");
         return;
     }
 
     char archive_path[MINIMAFS_MAX_PATH];
-    if (!fs_resolve_path(argv[1], archive_path)) {
+    if (!fs_resolve_path(archive_arg, archive_path)) {
         graphics_write_textr("installpkg: invalid archive path\n");
         return;
     }
 
     char target_dir[MINIMAFS_MAX_PATH];
-    if (!fs_resolve_path(argc >= 3 ? argv[2] : "", target_dir)) {
+    if (!fs_resolve_path(target_arg ? target_arg : "", target_dir)) {
         graphics_write_textr("installpkg: invalid target directory\n");
         return;
     }
@@ -341,7 +370,7 @@ void cmd_installpkg(int argc, const char** argv) {
     graphics_write_textr("Installing ");
     graphics_write_textr_udec(entry_count);
     graphics_write_textr(" entries from ");
-    graphics_write_textr(argv[1]);
+    graphics_write_textr(archive_arg);
     graphics_write_textr(" into ");
     graphics_write_textr(target_dir);
     graphics_write_textr("\n");
@@ -368,6 +397,14 @@ void cmd_installpkg(int argc, const char** argv) {
     graphics_write_textr(" installed, ");
     graphics_write_textr_udec(failed);
     graphics_write_textr(" failed\n");
+}
+
+void cmd_installpkg(int argc, const char** argv) {
+    if (argc < 2) {
+        graphics_write_textr("Usage: installpkg <path.mpkg> [target-dir]\n");
+        return;
+    }
+    pkg_do_unzip(argv[1], argc >= 3 ? argv[2] : NULL);
 }
 
 void cmd_pkginfo(int argc, const char** argv) {
@@ -422,9 +459,385 @@ void cmd_pkginfo(int argc, const char** argv) {
     free_mem(archive);
 }
 
+/* ============================================================
+ * ZIP (ARCHIVE BUILDING)
+ * ============================================================ */
+
+typedef struct {
+    char rel_name[MPKG_NAME_SIZE];      // name inside the archive
+    char full_path[MINIMAFS_MAX_PATH];  // where to read it from on MinimaFS
+    bool is_dir;
+} pkg_zip_item_t;
+
+static bool pkg_zip_add_item(pkg_zip_item_t** items, uint32_t* count, uint32_t* capacity,
+                             const char* rel_name, const char* full_path, bool is_dir) {
+    if (*count >= *capacity) {
+        uint32_t new_cap = (*capacity == 0) ? 16 : (*capacity * 2);
+        pkg_zip_item_t* bigger =
+            (pkg_zip_item_t*)alloc_resize(*items, (size_t)new_cap * sizeof(pkg_zip_item_t));
+        if (!bigger) return false;
+        *items = bigger;
+        *capacity = new_cap;
+    }
+
+    pkg_zip_item_t* it = &(*items)[(*count)++];
+    strncpy(it->rel_name, rel_name, sizeof(it->rel_name) - 1);
+    it->rel_name[sizeof(it->rel_name) - 1] = '\0';
+    strncpy(it->full_path, full_path, sizeof(it->full_path) - 1);
+    it->full_path[sizeof(it->full_path) - 1] = '\0';
+    it->is_dir = is_dir;
+    return true;
+}
+
+// Recursively walks `full_dir_path`, adding every file and directory
+// under it to `items` with archive-relative names built from
+// `rel_prefix` ("" at the top level).
+static bool pkg_zip_collect_dir(const char* full_dir_path, const char* rel_prefix,
+                                pkg_zip_item_t** items, uint32_t* count, uint32_t* capacity) {
+    minimafs_dir_entry_t* entries = (minimafs_dir_entry_t*)alloc(
+        MINIMAFS_MAX_ROOT_ENTRIES * sizeof(minimafs_dir_entry_t));
+    if (!entries) return false;
+
+    uint32_t n = minimafs_list_dir(full_dir_path, entries, MINIMAFS_MAX_ROOT_ENTRIES);
+    bool ok = true;
+
+    for (uint32_t i = 0; i < n && ok; i++) {
+        char rel_name[MPKG_NAME_SIZE];
+        if (rel_prefix[0]) {
+            snprintf(rel_name, sizeof(rel_name), "%s/%s", rel_prefix, entries[i].name);
+        } else {
+            snprintf(rel_name, sizeof(rel_name), "%s", entries[i].name);
+        }
+
+        char child_full[MINIMAFS_MAX_PATH];
+        size_t base_len = strlen(full_dir_path);
+        if (base_len > 0 && full_dir_path[base_len - 1] == '/') {
+            snprintf(child_full, sizeof(child_full), "%s%s", full_dir_path, entries[i].name);
+        } else {
+            snprintf(child_full, sizeof(child_full), "%s/%s", full_dir_path, entries[i].name);
+        }
+
+        bool is_dir = (entries[i].type == MINIMAFS_TYPE_DIR);
+        if (!pkg_zip_add_item(items, count, capacity, rel_name, child_full, is_dir)) {
+            ok = false;
+            break;
+        }
+        if (is_dir) {
+            if (!pkg_zip_collect_dir(child_full, rel_name, items, count, capacity)) {
+                ok = false;
+                break;
+            }
+        }
+    }
+
+    free_mem(entries);
+    return ok;
+}
+
+// Frees everything pkg_do_zip() may have allocated. Safe to call with
+// any subset of pointers NULL / item_count 0.
+static void pkg_zip_free_all(pkg_zip_item_t* items,
+                             uint8_t** payloads, uint32_t item_count,
+                             uint32_t* payload_sizes, uint32_t* raw_sizes,
+                             uint32_t* methods, uint32_t* data_offsets) {
+    if (payloads) {
+        for (uint32_t i = 0; i < item_count; i++) {
+            if (payloads[i]) free_mem(payloads[i]);
+        }
+        free_mem(payloads);
+    }
+    if (payload_sizes) free_mem(payload_sizes);
+    if (raw_sizes)     free_mem(raw_sizes);
+    if (methods)       free_mem(methods);
+    if (data_offsets)  free_mem(data_offsets);
+    if (items)         free_mem(items);
+}
+
+static void pkg_do_zip(const char* source_arg, const char* algo_arg) {
+    if (!source_arg) {
+        graphics_write_textr("Usage: pkg zip <file-or-folder> [algorithm]\n");
+        return;
+    }
+
+    char resolved[MINIMAFS_MAX_PATH];
+    if (!fs_resolve_path(source_arg, resolved)) {
+        graphics_write_textr("pkg zip: invalid path\n");
+        return;
+    }
+    if (!minimafs_exists(resolved)) {
+        graphics_write_textr("pkg zip: no such file or directory: ");
+        graphics_write_textr(source_arg);
+        graphics_write_textr("\n");
+        return;
+    }
+
+    bool use_lzss = true; // default, per requested syntax ("leave empty for default")
+    if (algo_arg && *algo_arg) {
+        if (strcmp(algo_arg, "lzss") == 0) {
+            use_lzss = true;
+        } else if (strcmp(algo_arg, "store") == 0) {
+            use_lzss = false;
+        } else {
+            graphics_write_textr("pkg zip: unknown algorithm '");
+            graphics_write_textr(algo_arg);
+            graphics_write_textr("' (supported: lzss, store)\n");
+            return;
+        }
+    }
+
+    pkg_zip_item_t* items = NULL;
+    uint32_t item_count = 0, item_capacity = 0;
+    bool source_is_dir = minimafs_is_dir(resolved);
+
+    if (source_is_dir) {
+        if (!pkg_zip_collect_dir(resolved, "", &items, &item_count, &item_capacity)) {
+            graphics_write_textr("pkg zip: failed to walk directory (OOM?)\n");
+            pkg_zip_free_all(items, NULL, 0, NULL, NULL, NULL, NULL);
+            return;
+        }
+        if (item_count == 0) {
+            graphics_write_textr("pkg zip: directory is empty, nothing to archive\n");
+            pkg_zip_free_all(items, NULL, 0, NULL, NULL, NULL, NULL);
+            return;
+        }
+    } else {
+        if (!pkg_zip_add_item(&items, &item_count, &item_capacity,
+                              pkg_basename(resolved), resolved, false)) {
+            graphics_write_textr("pkg zip: OOM\n");
+            return;
+        }
+    }
+
+    // Output path: "<source-without-trailing-slash>.mpkg", next to the source.
+    char output_path[MINIMAFS_MAX_PATH];
+    {
+        char trimmed[MINIMAFS_MAX_PATH];
+        strncpy(trimmed, resolved, sizeof(trimmed) - 1);
+        trimmed[sizeof(trimmed) - 1] = '\0';
+        size_t len = strlen(trimmed);
+        if (len > 1 && trimmed[len - 1] == '/') trimmed[len - 1] = '\0';
+        if (snprintf(output_path, sizeof(output_path), "%s.mpkg", trimmed) >=
+            (int)sizeof(output_path)) {
+            graphics_write_textr("pkg zip: output path too long\n");
+            pkg_zip_free_all(items, NULL, 0, NULL, NULL, NULL, NULL);
+            return;
+        }
+    }
+
+    uint8_t** payloads       = (uint8_t**)alloc(item_count * sizeof(uint8_t*));
+    uint32_t* payload_sizes  = (uint32_t*)alloc(item_count * sizeof(uint32_t));
+    uint32_t* raw_sizes      = (uint32_t*)alloc(item_count * sizeof(uint32_t));
+    uint32_t* methods        = (uint32_t*)alloc(item_count * sizeof(uint32_t));
+
+    if (!payloads || !payload_sizes || !raw_sizes || !methods) {
+        graphics_write_textr("pkg zip: OOM\n");
+        pkg_zip_free_all(items, payloads, item_count, payload_sizes, raw_sizes, methods, NULL);
+        return;
+    }
+
+    bool capped_notice_shown = false;
+
+    for (uint32_t i = 0; i < item_count; i++) {
+        if (items[i].is_dir) {
+            payloads[i] = NULL;
+            payload_sizes[i] = 0;
+            raw_sizes[i] = 0;
+            methods[i] = MPKG_METHOD_STORE;
+            continue;
+        }
+
+        minimafs_file_handle_t* f = minimafs_open(items[i].full_path, true);
+        if (!f) {
+            graphics_write_textr("pkg zip: failed to open ");
+            graphics_write_textr(items[i].full_path);
+            graphics_write_textr("\n");
+            pkg_zip_free_all(items, payloads, item_count, payload_sizes, raw_sizes, methods, NULL);
+            return;
+        }
+
+        uint32_t raw_size = minimafs_size(f);
+        uint8_t* raw = raw_size ? (uint8_t*)alloc_unzeroed(raw_size) : NULL;
+        if (raw_size && !raw) {
+            minimafs_close(f);
+            graphics_write_textr("pkg zip: OOM reading ");
+            graphics_write_textr(items[i].full_path);
+            graphics_write_textr("\n");
+            pkg_zip_free_all(items, payloads, item_count, payload_sizes, raw_sizes, methods, NULL);
+            return;
+        }
+        if (raw_size) {
+            uint32_t got = minimafs_read(f, raw, raw_size);
+            if (got != raw_size) {
+                minimafs_close(f);
+                free_mem(raw);
+                graphics_write_textr("pkg zip: short read on ");
+                graphics_write_textr(items[i].full_path);
+                graphics_write_textr("\n");
+                pkg_zip_free_all(items, payloads, item_count, payload_sizes, raw_sizes, methods, NULL);
+                return;
+            }
+        }
+        minimafs_close(f);
+
+        raw_sizes[i] = raw_size;
+
+        bool try_lzss = use_lzss && raw_size > 0;
+        if (try_lzss && raw_size > PKG_ZIP_LZSS_MAX_BYTES) {
+            try_lzss = false;
+            if (!capped_notice_shown) {
+                graphics_write_textr("pkg zip: note: large file(s) stored uncompressed "
+                                     "(over size cap for lzss)\n");
+                capped_notice_shown = true;
+            }
+        }
+
+        if (try_lzss) {
+            uint32_t compressed_size = 0;
+            uint8_t* compressed = lzss_compress(raw, raw_size, &compressed_size);
+            if (compressed && compressed_size < raw_size) {
+                payloads[i] = compressed;
+                payload_sizes[i] = compressed_size;
+                methods[i] = MPKG_METHOD_LZSS;
+                free_mem(raw);
+            } else {
+                if (compressed) free_mem(compressed);
+                payloads[i] = raw;
+                payload_sizes[i] = raw_size;
+                methods[i] = MPKG_METHOD_STORE;
+            }
+        } else {
+            payloads[i] = raw;
+            payload_sizes[i] = raw_size;
+            methods[i] = MPKG_METHOD_STORE;
+        }
+    }
+
+    // Compute per-entry payload offsets.
+    uint32_t table_size = MPKG_HEADER_SIZE + item_count * MPKG_ENTRY_SIZE;
+    uint32_t* data_offsets = (uint32_t*)alloc(item_count * sizeof(uint32_t));
+    if (!data_offsets) {
+        graphics_write_textr("pkg zip: OOM\n");
+        pkg_zip_free_all(items, payloads, item_count, payload_sizes, raw_sizes, methods, NULL);
+        return;
+    }
+    uint32_t running = table_size;
+    for (uint32_t i = 0; i < item_count; i++) {
+        if (items[i].is_dir) { data_offsets[i] = 0; continue; }
+        data_offsets[i] = running;
+        running += payload_sizes[i];
+    }
+
+    if (minimafs_exists(output_path)) {
+        minimafs_delete_file(output_path);
+    }
+    if (!minimafs_create_file(output_path, "binary", "mpkg")) {
+        graphics_write_textr("pkg zip: failed to create ");
+        graphics_write_textr(output_path);
+        graphics_write_textr("\n");
+        pkg_zip_free_all(items, payloads, item_count, payload_sizes, raw_sizes, methods, data_offsets);
+        return;
+    }
+
+    minimafs_file_handle_t* out = minimafs_open(output_path, false);
+    if (!out) {
+        graphics_write_textr("pkg zip: failed to open output for writing\n");
+        pkg_zip_free_all(items, payloads, item_count, payload_sizes, raw_sizes, methods, data_offsets);
+        return;
+    }
+
+    bool write_ok = true;
+
+    // Header
+    {
+        uint8_t header[MPKG_HEADER_SIZE];
+        memcpy(header, MPKG_MAGIC, MPKG_MAGIC_SIZE);
+        pkg_write_u32(header + 8, MPKG_VERSION);
+        pkg_write_u32(header + 12, item_count);
+        if (minimafs_write(out, header, sizeof(header)) != sizeof(header)) write_ok = false;
+    }
+
+    // Entry table
+    for (uint32_t i = 0; write_ok && i < item_count; i++) {
+        uint8_t entry[MPKG_ENTRY_SIZE];
+        memset(entry, 0, sizeof(entry));
+        strncpy((char*)entry, items[i].rel_name, MPKG_NAME_SIZE - 1);
+
+        uint32_t off = MPKG_NAME_SIZE;
+        uint32_t flags = items[i].is_dir ? MPKG_FLAG_DIRECTORY : 0;
+        off += pkg_write_u32(entry + off, flags);
+        off += pkg_write_u32(entry + off, methods[i]);
+        off += pkg_write_u32(entry + off, raw_sizes[i]);
+        off += pkg_write_u32(entry + off, payload_sizes[i]);
+        off += pkg_write_u32(entry + off, data_offsets[i]);
+
+        if (minimafs_write(out, entry, sizeof(entry)) != sizeof(entry)) write_ok = false;
+    }
+
+    // Payloads
+    for (uint32_t i = 0; write_ok && i < item_count; i++) {
+        if (!items[i].is_dir && payload_sizes[i] > 0) {
+            if (minimafs_write(out, payloads[i], payload_sizes[i]) != payload_sizes[i]) {
+                write_ok = false;
+            }
+        }
+    }
+
+    minimafs_close(out);
+
+    if (!write_ok) {
+        graphics_write_textr("pkg zip: write failed, archive may be incomplete: ");
+        graphics_write_textr(output_path);
+        graphics_write_textr("\n");
+        minimafs_delete_file(output_path);
+        pkg_zip_free_all(items, payloads, item_count, payload_sizes, raw_sizes, methods, data_offsets);
+        return;
+    }
+
+    graphics_write_textr("pkg zip: wrote ");
+    graphics_write_textr(output_path);
+    graphics_write_textr(" (");
+    graphics_write_textr_udec(item_count);
+    graphics_write_textr(" entries)\n");
+
+    pkg_zip_free_all(items, payloads, item_count, payload_sizes, raw_sizes, methods, data_offsets);
+}
+
+/* ============================================================
+ * `pkg` DISPATCHER
+ * ============================================================ */
+
+void cmd_pkg(int argc, const char** argv) {
+    if (argc < 2) {
+        graphics_write_textr("Usage:\n");
+        graphics_write_textr("  pkg unzip <path.mpkg> [target-dir]\n");
+        graphics_write_textr("  pkg zip <file-or-folder> [algorithm]\n");
+        graphics_write_textr("    algorithm: lzss (default) or store\n");
+        return;
+    }
+
+    if (strcmp(argv[1], "unzip") == 0) {
+        if (argc < 3) {
+            graphics_write_textr("Usage: pkg unzip <path.mpkg> [target-dir]\n");
+            return;
+        }
+        pkg_do_unzip(argv[2], argc >= 4 ? argv[3] : NULL);
+    } else if (strcmp(argv[1], "zip") == 0) {
+        if (argc < 3) {
+            graphics_write_textr("Usage: pkg zip <file-or-folder> [algorithm]\n");
+            return;
+        }
+        pkg_do_zip(argv[2], argc >= 4 ? argv[3] : NULL);
+    } else {
+        graphics_write_textr("pkg: unknown subcommand '");
+        graphics_write_textr(argv[1]);
+        graphics_write_textr("'. Use zip|unzip\n");
+    }
+}
+
 void register_pkg_commands(void) {
     command_register("installpkg", cmd_installpkg);
     command_register("pkginfo", cmd_pkginfo);
+    command_register("pkg", cmd_pkg);
 }
 
 REGISTER_COMMAND(register_pkg_commands);

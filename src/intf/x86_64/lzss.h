@@ -26,4 +26,20 @@
 uint32_t lzss_decompress(const uint8_t* in, uint32_t in_size,
                          uint8_t* out, uint32_t out_capacity);
 
+/*
+ * Encodes `data` (data_size bytes) using the same LZSS scheme
+ * lzss_decompress() expects (see its comment for the exact format).
+ * Returns a heap-allocated buffer (caller must free_mem() it) sized
+ * to the actual compressed length, written to *out_size. Returns NULL
+ * on OOM or invalid arguments (data_size == 0).
+ *
+ * This is a brute-force O(input_size * N * F) encoder - fine for
+ * small-to-medium files (packages, program bundles) but NOT suitable
+ * for large inputs; callers should cap input size and fall back to
+ * uncompressed storage above a reasonable threshold. See
+ * PKG_ZIP_LZSS_MAX_BYTES in pkgcommand.c for the policy this codebase
+ * uses.
+ */
+uint8_t* lzss_compress(const uint8_t* data, uint32_t data_size, uint32_t* out_size);
+
 #endif // LZSS_H

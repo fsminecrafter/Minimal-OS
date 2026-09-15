@@ -21,6 +21,26 @@
 #define SYS_MANAGER  16
 #define SYS_USB      17
 
+// ===========================================
+// MinimaFS extension syscalls
+// ===========================================
+// These operate on the same "fd" concept SYS_OPEN already established -
+// the raw minimafs_file_handle_t* returned by SYS_OPEN, cast to a
+// register value. No new handle table, no new lifetime rules: SYS_CLOSE
+// still owns closing it.
+#define SYS_FWRITE        18  // write to an open MinimaFS handle (not stdout - see SYS_WRITE)
+#define SYS_LISTDIR       19  // list a directory into a syscall_dirent_t[] buffer
+#define SYS_DELETE        20  // delete a file
+#define SYS_RMDIR         21  // remove an (empty) directory
+#define SYS_GET_METADATA  22  // read a file's MinimaFS metadata
+#define SYS_TELL          23  // current read/write position of an open handle
+#define SYS_EOF           24  // true if an open handle is at EOF
+
+// ===========================================
+// MPKG (.mpkg archive) syscall
+// ===========================================
+#define SYS_PKG           25
+
 #define SYS_O_RDONLY 0
 
 #define SYS_SUCCESS       0
@@ -93,6 +113,62 @@ typedef struct {
     uint8_t class_code;
     uint8_t is_keyboard;
 } syscall_usb_keyboard_info_t;
+
+// ===========================================
+// MinimaFS extension structures
+// ===========================================
+//
+// Deliberately independent of minimafs_dir_entry_t / minimafs_file_metadata_t
+// (kernel-internal structs that are free to keep growing - see minimafs.h) so
+// this syscall ABI never has to change shape just because the filesystem's
+// internal representation does. Only the fields a user program can actually
+// use are exposed here.
+
+#define SYSCALL_DIRENT_NAME_SIZE 64
+
+// type field values, matching minimafs_filetype_t's ordering (kept in sync
+// manually - see minimafs.h's minimafs_filetype_t).
+#define SYSCALL_DIRENT_TYPE_FILE       0
+#define SYSCALL_DIRENT_TYPE_DIR        1
+#define SYSCALL_DIRENT_TYPE_EXECUTABLE 2
+#define SYSCALL_DIRENT_TYPE_SYMLINK    3
+
+typedef struct {
+    char name[SYSCALL_DIRENT_NAME_SIZE];
+    uint8_t type;     // SYSCALL_DIRENT_TYPE_*
+    uint8_t hidden;
+} syscall_dirent_t;
+
+typedef struct {
+    char filetype[64];
+    char fileformat[16];
+    uint32_t data_length;
+    uint8_t runnable;
+    uint8_t hidden;
+    uint64_t entrypoint;
+    char created_date[32];
+    char last_changed[32];
+} syscall_file_metadata_t;
+
+// ===========================================
+// MPKG (.mpkg archive) syscall structures
+// ===========================================
+
+typedef enum {
+    SYS_PKG_UNZIP = 1,   // extract `path` (archive) into `extra` (target dir)
+    SYS_PKG_ZIP,         // archive `path` (file/dir) using `extra` (algorithm, may be NULL)
+    SYS_PKG_INFO,        // inspect `path` (archive), report entry count via out_count
+} syscall_pkg_op_t;
+
+typedef struct {
+    uint64_t op;               // syscall_pkg_op_t
+    const char* path;          // archive path (unzip/info) or source path (zip)
+    const char* extra;         // unzip: target dir. zip: algorithm ("lzss"|"store", NULL=default). info: unused.
+    char* out_path;             // zip only: buffer to receive the produced "<source>.mpkg" path
+    uint32_t out_path_size;     // zip only: size of out_path buffer
+    uint32_t* out_count;        // unzip: installed-entry count. info: total entry count.
+    uint32_t* out_failed;       // unzip only: failed-entry count
+} syscall_pkg_request_t;
 
 // Layout MUST match the push order in syscall_isr.asm exactly.
 typedef struct __attribute__((packed)) {

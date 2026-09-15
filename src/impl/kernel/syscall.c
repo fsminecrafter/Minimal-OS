@@ -11,6 +11,9 @@
 #include "usb/usb_stack.h"
 #include "keyboard/usbkeyboard.h"
 #include "time.h"
+#include "x86_64/allocator.h"
+#include "x86_64/pkglib.h"
+#include "string.h"
 
 static uint64_t sys_write_impl(int fd, const char* buf, uint64_t len) {
     if (!buf) return SYS_ERR_INVAL;
@@ -171,6 +174,87 @@ static uint64_t sys_usb_impl(uint64_t operation, uint64_t arg1, uint64_t arg2) {
     }
 }
 
+/*
+ * SYS_LISTDIR helper: converts kernel-internal minimafs_dir_entry_t
+ * entries into the stable syscall_dirent_t ABI (see syscall.h) and
+ * writes them into the caller-supplied buffer. Caps at both the
+ * caller's requested max_entries and MINIMAFS_MAX_ROOT_ENTRIES (the
+ * most minimafs_list_dir() can ever produce for one directory), so a
+ * caller passing an unreasonably large max_entries can't turn this
+ * into an unbounded allocation.
+ */
+static uint64_t sys_listdir_impl(const char* path, syscall_dirent_t* out,
+                                 uint32_t max_entries) {
+    if (!path || !out || max_entries == 0) return SYS_ERR_INVAL;
+
+    uint32_t cap = max_entries;
+    if (cap > MINIMAFS_MAX_ROOT_ENTRIES) cap = MINIMAFS_MAX_ROOT_ENTRIES;
+
+    minimafs_dir_entry_t* entries =
+        (minimafs_dir_entry_t*)alloc(cap * sizeof(minimafs_dir_entry_t));
+    if (!entries) return SYS_ERR_GENERIC;
+
+    uint32_t count = minimafs_list_dir(path, entries, cap);
+    for (uint32_t i = 0; i < count; i++) {
+        strncpy(out[i].name, entries[i].name, sizeof(out[i].name) - 1);
+        out[i].name[sizeof(out[i].name) - 1] = '\0';
+        out[i].type = (uint8_t)entries[i].type;
+        out[i].hidden = entries[i].hidden ? 1 : 0;
+    }
+
+    free_mem(entries);
+    return count;
+}
+
+static uint64_t sys_get_metadata_impl(const char* path, syscall_file_metadata_t* out) {
+    if (!path || !out) return SYS_ERR_INVAL;
+
+    minimafs_file_metadata_t meta;
+    if (!minimafs_get_metadata(path, &meta)) return SYS_ERR_NOTFOUND;
+
+    strncpy(out->filetype, meta.filetype, sizeof(out->filetype) - 1);
+    out->filetype[sizeof(out->filetype) - 1] = '\0';
+    strncpy(out->fileformat, meta.fileformat, sizeof(out->fileformat) - 1);
+    out->fileformat[sizeof(out->fileformat) - 1] = '\0';
+    out->data_length = meta.data_length;
+    out->runnable = meta.runnable ? 1 : 0;
+    out->hidden = meta.hidden ? 1 : 0;
+    out->entrypoint = meta.entrypoint;
+    strncpy(out->created_date, meta.created_date, sizeof(out->created_date) - 1);
+    out->created_date[sizeof(out->created_date) - 1] = '\0';
+    strncpy(out->last_changed, meta.last_changed, sizeof(out->last_changed) - 1);
+    out->last_changed[sizeof(out->last_changed) - 1] = '\0';
+    return SYS_SUCCESS;
+}
+
+static uint64_t sys_pkg_impl(const syscall_pkg_request_t* request) {
+    if (!request || !request->path) return SYS_ERR_INVAL;
+
+    switch (request->op) {
+        case SYS_PKG_UNZIP: {
+            if (!request->extra) return SYS_ERR_INVAL;
+            uint32_t installed = 0, failed = 0;
+            bool ok = pkglib_unzip(request->path, request->extra, &installed, &failed);
+            if (request->out_count) *request->out_count = installed;
+            if (request->out_failed) *request->out_failed = failed;
+            return ok ? SYS_SUCCESS : SYS_ERR_GENERIC;
+        }
+        case SYS_PKG_ZIP: {
+            bool ok = pkglib_zip(request->path, request->extra,
+                                 request->out_path, request->out_path_size);
+            return ok ? SYS_SUCCESS : SYS_ERR_GENERIC;
+        }
+        case SYS_PKG_INFO: {
+            uint32_t count = 0;
+            bool ok = pkglib_info(request->path, &count);
+            if (request->out_count) *request->out_count = count;
+            return ok ? SYS_SUCCESS : SYS_ERR_GENERIC;
+        }
+        default:
+            return SYS_ERR_INVAL;
+    }
+}
+
 /* ============================================================
  * SECURITY: user/kernel syscall privilege boundary
  *
@@ -200,6 +284,13 @@ static uint64_t sys_usb_impl(uint64_t operation, uint64_t arg1, uint64_t arg2) {
  * user processes, since a .run program legitimately needs those to
  * draw its own UI or react to input - only privilege-escalating /
  * global-state-mutating operations are denied.
+ *
+ * The MinimaFS extension syscalls (SYS_FWRITE/SYS_LISTDIR/SYS_DELETE/
+ * SYS_RMDIR/SYS_GET_METADATA/SYS_TELL/SYS_EOF) and SYS_PKG are all
+ * per-file, self-contained operations with no shared-hardware-state
+ * implications - same trust level as the existing SYS_OPEN/SYS_READ/
+ * SYS_MKDIR/etc, so they fall through to "allowed" below without
+ * needing an entry here.
  *
  * To extend this: add a case for the new syscall number (or, for a
  * multiplexed syscall like SYS_MANAGER/SYS_USB, a case for the new
@@ -255,8 +346,9 @@ static bool syscall_user_may_call(uint64_t syscall_num, const syscall_regs_t* re
 
         default:
             // Everything else (SYS_WRITE, file I/O, graphics drawing,
-            // process/time queries, etc) has no shared-hardware-state
-            // implications and stays open to user processes.
+            // process/time queries, MinimaFS extensions, SYS_PKG, etc)
+            // has no shared-hardware-state implications and stays open
+            // to user processes.
             return true;
     }
 }
@@ -372,6 +464,67 @@ void syscall_dispatch(syscall_regs_t* regs) {
             const char* path = (const char*)regs->rdi;
             regs->rax = path ? (minimafs_mkdir(path) ? SYS_SUCCESS : SYS_ERR_GENERIC)
                              : SYS_ERR_INVAL;
+            break;
+        }
+
+        case SYS_FWRITE: {
+            minimafs_file_handle_t* handle =
+                (minimafs_file_handle_t*)regs->rdi;
+            const void* buf = (const void*)regs->rsi;
+            uint64_t len = regs->rdx;
+            if (!handle || !buf) {
+                regs->rax = SYS_ERR_INVAL;
+                break;
+            }
+            regs->rax = minimafs_write(handle, buf, (uint32_t)len);
+            break;
+        }
+
+        case SYS_LISTDIR: {
+            const char* path = (const char*)regs->rdi;
+            syscall_dirent_t* out = (syscall_dirent_t*)regs->rsi;
+            uint32_t max_entries = (uint32_t)regs->rdx;
+            regs->rax = sys_listdir_impl(path, out, max_entries);
+            break;
+        }
+
+        case SYS_DELETE: {
+            const char* path = (const char*)regs->rdi;
+            regs->rax = path ? (minimafs_delete_file(path) ? SYS_SUCCESS : SYS_ERR_GENERIC)
+                             : SYS_ERR_INVAL;
+            break;
+        }
+
+        case SYS_RMDIR: {
+            const char* path = (const char*)regs->rdi;
+            regs->rax = path ? (minimafs_rmdir(path) ? SYS_SUCCESS : SYS_ERR_GENERIC)
+                             : SYS_ERR_INVAL;
+            break;
+        }
+
+        case SYS_GET_METADATA: {
+            const char* path = (const char*)regs->rdi;
+            syscall_file_metadata_t* out = (syscall_file_metadata_t*)regs->rsi;
+            regs->rax = sys_get_metadata_impl(path, out);
+            break;
+        }
+
+        case SYS_TELL: {
+            minimafs_file_handle_t* handle =
+                (minimafs_file_handle_t*)regs->rdi;
+            regs->rax = handle ? minimafs_tell(handle) : SYS_ERR_INVAL;
+            break;
+        }
+
+        case SYS_EOF: {
+            minimafs_file_handle_t* handle =
+                (minimafs_file_handle_t*)regs->rdi;
+            regs->rax = handle ? (minimafs_eof(handle) ? 1 : 0) : SYS_ERR_INVAL;
+            break;
+        }
+
+        case SYS_PKG: {
+            regs->rax = sys_pkg_impl((const syscall_pkg_request_t*)regs->rdi);
             break;
         }
 

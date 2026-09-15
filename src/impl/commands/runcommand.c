@@ -9,6 +9,7 @@
 #include "x86_64/loader/elfloader.h"
 #include "x86_64/runfile.h"
 #include "x86_64/minimafs.h"
+#include "x86_64/runcommand.h"
 #include "prochandler.h"
 #include "x86_64/scheduler.h"
 
@@ -19,8 +20,8 @@ static uint32_t run_read_u32(const uint8_t* p) {
            ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
-static const char* run_normalize_path(const char* input, char* normalized,
-                                      size_t normalized_size) {
+const char* run_normalize_path(const char* input, char* normalized,
+                               size_t normalized_size) {
     if (!input || !normalized || normalized_size == 0) return NULL;
 
     while (input[0] == '.' && input[1] == '/') input += 2;
@@ -81,6 +82,52 @@ static bool run_extract_main_elf(const char* path, uint8_t** elf_data,
     return false;
 }
 
+process_t* run_launch_file(const char* run_path) {
+    elf_loaded_image_t image;
+    uint8_t* elf_data = NULL;
+    uint32_t elf_size = 0;
+    if (!run_extract_main_elf(run_path, &elf_data, &elf_size) ||
+        !elf_load_buffer(elf_data, elf_size, &image)) {
+        return NULL;
+    }
+
+    void* stack = alloc_unzeroed(RUN_STACK_SIZE);
+    if (!stack) {
+        elf_unload(&image);
+        return NULL;
+    }
+
+    char procname[96];
+    snprintf(procname, sizeof(procname), "%s", run_path);
+
+    // A .run program is user-loaded code, not a kernel-owned
+    // housekeeping process - classify it as such. See
+    // process_privilege_t in proc.h for exactly what this does (and
+    // does not yet) enforce.
+    process_t* proc = createUserProcess(procname, (void (*)())image.entry_point);
+    if (proc) {
+        // The process trampoline switches to ring3 using the application's
+        // stack. Keep the image and stack alive until the process exits.
+        proc->user_stack = (uint64_t*)((uint8_t*)stack + RUN_STACK_SIZE);
+        if (!proc_map_user_range(proc, image.base, image.image_size) ||
+            !proc_map_user_range(proc, stack, RUN_STACK_SIZE)) {
+            kill(proc);
+            proc = NULL;
+        } else {
+            // The process now owns PMM-backed copies of both ranges.
+            elf_unload(&image);
+            free_mem(stack);
+        }
+    }
+    if (!proc) {
+        free_mem(stack);
+        elf_unload(&image);
+        return NULL;
+    }
+
+    return proc;
+}
+
 void cmd_run(int argc, const char** argv) {
     if (argc < 2) {
         graphics_write_textr("Usage: run <path-to.run-file>\n");
@@ -94,53 +141,11 @@ void cmd_run(int argc, const char** argv) {
         return;
     }
 
-    elf_loaded_image_t image;
-    uint8_t* elf_data = NULL;
-    uint32_t elf_size = 0;
-    if (!run_extract_main_elf(run_path, &elf_data, &elf_size) ||
-        !elf_load_buffer(elf_data, elf_size, &image)) {
+    process_t* proc = run_launch_file(run_path);
+    if (!proc) {
         graphics_write_textr("run: failed to load ");
         graphics_write_textr(run_path);
         graphics_write_textr("\n");
-        return;
-    }
-
-    void* stack = alloc_unzeroed(RUN_STACK_SIZE);
-    if (!stack) {
-        graphics_write_textr("run: out of memory allocating stack\n");
-        elf_unload(&image);
-        return;
-    }
-
-    char procname[96];
-    snprintf(procname, sizeof(procname), "%s", run_path);
-
-    // A .run program is user-loaded code, not a kernel-owned
-    // housekeeping process - classify it as such. See
-    // process_privilege_t in proc.h for exactly what this does (and
-    // does not yet) enforce: today it's metadata only, since there is
-    // no per-process address space or user GDT segment to actually
-    // isolate it at CPL3 with.
-    process_t* proc = createUserProcess(procname, (void (*)())image.entry_point);
-    if (proc) {
-        // The process trampoline switches to ring3 using the application's
-        // stack. Keep the image and stack alive until the process exits.
-        proc->user_stack = (uint64_t*)((uint8_t*)stack + RUN_STACK_SIZE);
-        if (!proc_map_user_range(proc, image.base, image.image_size) ||
-            !proc_map_user_range(proc, stack, RUN_STACK_SIZE)) {
-            graphics_write_textr("run: failed to map user image\n");
-            kill(proc);
-            proc = NULL;
-        } else {
-            // The process now owns PMM-backed copies of both ranges.
-            elf_unload(&image);
-            free_mem(stack);
-        }
-    }
-    if (!proc) {
-        graphics_write_textr("run: failed to create process\n");
-        free_mem(stack);
-        elf_unload(&image);
         return;
     }
 

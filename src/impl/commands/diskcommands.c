@@ -132,6 +132,11 @@ void cmd_format_debug(int argc, const char** argv) {
     }
     minimafs_create_file("0:/Etc/System.conf", "text", "conf");
 
+    graphics_write_textr("Creating 0:/services...\n");
+    if (!minimafs_mkdir("0:/services")) {
+        serial_write_str("WARNING: Failed to create 0:/services (may already exist)\n");
+    }
+
     // Build System.conf content — SYSTEMVER is a string from systeminfo.h
     char date_str[32];
     minimafs_get_datetime(date_str, sizeof(date_str));

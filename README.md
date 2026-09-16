@@ -13,8 +13,7 @@ User application developers can find the syscall and SDK integration guide in
 ### Commands in MinimalOS terminal
 
 #### General
-* ```help``` Shows grouped, paged command help. Press Enter for the next category or `q` to exit.
-* ```help -c```, ```help --classic``` Shows the original one-list command output.
+* ```help``` [-c | --classic] Shows grouped, paged command help. Press Enter for the next category or `q` to exit. Use -c or --classic to use the old list.
 * ```echo``` [Text] Echoes text back to the terminal.
 * ```clear``` Clears the terminal.
 * ```sleep``` [Seconds | milliseconds"ms"] Pauses for seconds or milliseconds.
@@ -50,11 +49,11 @@ User application developers can find the syscall and SDK integration guide in
 * ```format``` [Index] Formats the selected disk as MinimaFS.
 * ```mount``` [Index] Mounts the selected disk.
 * ```importmusic``` Copies the built-in music file to the disk as `music.adi`.
-* ```pkg``` [unzip | zip] Extracts or creates a package archive.
-* ```pkg unzip``` [Archive] [Target] Extracts to a folder named after the archive by default.
-* ```pkg zip``` [File or folder] [lzss | store] Creates a package archive.
+* ```pkg``` Extracts or creates a package archive.
+  * ```unzip``` [Archive] [Target] Extracts to a folder named after the archive by default.
+  * ```zip``` [File or folder] [lzss | store] Creates a package archive.
 * ```pkginfo``` [Archive] Displays package information.
-* ```installpkg``` [Archive] [Target] Alias for `pkg unzip`.
+  * ```installpkg``` [Archive] [Target] Alias for `pkg unzip`.
 
 #### Keyboard and programs
 * ```kbrlayout``` [set | get | list] Manages keyboard layouts.

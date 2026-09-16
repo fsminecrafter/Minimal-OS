@@ -632,6 +632,9 @@ void syscall_dispatch(syscall_regs_t* regs) {
             regs->rax = SYS_SUCCESS;
             break;
         }
+        case SYS_SYSINFO:
+            regs->rax = sys_sysinfo_impl(regs->rdi);
+            break;
 
         default: {
             regs->rax = SYS_ERR_GENERIC;

@@ -245,6 +245,7 @@ bool systeminfo_load_saved_resolution(void) {
 
     if (!gpu_set_resolution(&gpu, width, height)) return false;
     graphics_set_resolution(width / 8, height / 8);
+    graphics_terminal_redraw();
 
     if (!has_width) write_fixed_config_value(path, "DisplayWidth", width);
     if (!has_height) write_fixed_config_value(path, "DisplayHeight", height);
@@ -414,6 +415,7 @@ void cmd_cgres(int argc, const char** argv) {
         return;
     }
     graphics_set_resolution(width / 8, height / 8);
+    graphics_terminal_redraw();
 
     const char* path = find_system_conf();
     if (path && write_fixed_config_value(path, "DisplayWidth", width) &&

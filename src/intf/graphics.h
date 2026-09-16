@@ -190,6 +190,7 @@ void graphics_complete_demo(gpu_device_t* gpu);
 
 // Terminal control
 void graphics_terminal_clear(void);
+void graphics_terminal_redraw(void);
 void graphics_terminal_newline(void);
 void graphics_terminal_set_cursor(uint32_t x, uint32_t y);
 void graphics_terminal_get_cursor(uint32_t* x, uint32_t* y);

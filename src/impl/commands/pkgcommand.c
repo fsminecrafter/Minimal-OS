@@ -14,6 +14,8 @@
  *
  * `pkg zip` writes its output next to the source as
  * "<source-path>.mpkg" (trailing '/' stripped for directories).
+ * `pkg unzip` extracts to a folder named after the archive, without the
+ * `.mpkg` suffix, when no target is supplied.
  * `algorithm` is "lzss" (default) or "store"; any other value is
  * rejected. Archives can also be built on the host with
  * tools/mkpkg/mkpkg.py.
@@ -347,8 +349,30 @@ static void pkg_do_unzip(const char* archive_arg, const char* target_arg,
     }
 
     char target_dir[MINIMAFS_MAX_PATH];
-    const char* requested_target =
-        use_current_dir ? "" : (target_arg ? target_arg : "extract");
+    char default_target[MINIMAFS_MAX_FILENAME];
+    const char* requested_target;
+    if (use_current_dir) {
+        requested_target = "";
+    } else if (target_arg) {
+        requested_target = target_arg;
+    } else {
+        const char* archive_name = pkg_basename(archive_path);
+        size_t archive_name_len = strlen(archive_name);
+        size_t target_len = archive_name_len;
+
+        if (archive_name_len > 5 &&
+            strcmp(archive_name + archive_name_len - 5, ".mpkg") == 0) {
+            target_len -= 5;
+        }
+        if (target_len == 0 || target_len >= sizeof(default_target)) {
+            graphics_write_textr("installpkg: invalid archive name\n");
+            return;
+        }
+
+        memcpy(default_target, archive_name, target_len);
+        default_target[target_len] = '\0';
+        requested_target = default_target;
+    }
     if (!fs_resolve_path(requested_target, target_dir)) {
         graphics_write_textr("installpkg: invalid target directory\n");
         return;

@@ -940,22 +940,18 @@ void callback(uint8_t scancode, char character, bool down) {
 }
 
 char vgaterm_wait_key(void) {
-    key = 0;
-    pressed = false;
+    usb_keyboard_clear_key_event();
+    usb_keyboard_begin_key_wait();
 
-    // Save old callback
-    usb_keyboard_callback_t old_cb = usb_keyboard_get_callback();
-
-    // Set temporary callback
-    usb_keyboard_set_callback(callback);
-
-    while (!pressed) {
+    while (true) {
+        char event = usb_keyboard_take_key_event();
+        if (event) {
+            usb_keyboard_end_key_wait();
+            return event;
+        }
         usb_keyboard_update();
+        asm volatile("pause");
     }
-
-    usb_keyboard_set_callback(old_cb);
-
-    return key;
 }
 
 void vgaterm_beep(void) {

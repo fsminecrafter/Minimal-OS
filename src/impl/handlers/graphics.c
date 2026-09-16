@@ -369,7 +369,6 @@ void graphics_set_resolution(uint32_t cols, uint32_t rows) {
     serial_write_dec(max_rows);
     serial_write_str(")\n");
 
-    graphics_terminal_clear();
 }
 
 terminal_t* graphics_get_terminal(void) {
@@ -383,6 +382,20 @@ void graphics_terminal_clear(void) {
     // Clear character buffer
     for (uint32_t row = 0; row < TERM_MAX_ROWS; row++) {
         term_buf_clear_row(row);
+    }
+}
+
+void graphics_terminal_redraw(void) {
+    if (!g_gpu || !g_gpu->fb) return;
+
+    graphics_clear_c(g_terminal.bg_color);
+    for (uint32_t row = 0; row < g_terminal.rows && row < TERM_MAX_ROWS; row++) {
+        for (uint32_t col = 0; col < g_terminal.cols && col < TERM_MAX_COLS; col++) {
+            term_cell_t* cell = &g_term_buf[row][col];
+            graphics_terminal_putchar(cell->ch, col, row,
+                                      (color_t){cell->r, cell->g, cell->b, 0xFF},
+                                      g_terminal.bg_color);
+        }
     }
 }
 

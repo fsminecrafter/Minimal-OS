@@ -1790,6 +1790,7 @@ int minimafs_mount(void* device_handle, uint8_t drive_number) {
 #endif
 
     /* Read storage.desc – heap allocated */
+    serial_write_str("MinimaFS: Reading storage.desc...\n");
     minimafs_storage_desc_t* sd =
         (minimafs_storage_desc_t*)alloc(sizeof(minimafs_storage_desc_t));
     if (!sd) { serial_write_str("MinimaFS: OOM mount\n"); return 0; }

@@ -23,8 +23,15 @@ static volatile int g_ahci_lock = 0;
 
 static void ahci_dump_port(const char* tag, hba_port_t* port);
 
-static inline void ahci_lock_acquire(void) {
-    while (__sync_lock_test_and_set(&g_ahci_lock, 1)) { /* spin */ }
+static inline bool ahci_lock_acquire(void) {
+    uint64_t start_ms = time_get_uptime_ms();
+    while (__sync_lock_test_and_set(&g_ahci_lock, 1)) {
+        if (time_get_uptime_ms() - start_ms > AHCI_CMD_TIMEOUT_MS) {
+            serial_write_str("AHCI: command lock timeout\n");
+            return false;
+        }
+    }
+    return true;
 }
 
 static inline void ahci_lock_release(void) {
@@ -769,7 +776,7 @@ static int ahci_find_cmdslot(hba_port_t* port) {
 bool ahci_read(ahci_drive_t* drive, uint64_t lba, uint32_t count, void* buffer) {
     if (!drive || !drive->present || !buffer) return false;
 
-    ahci_lock_acquire();
+    if (!ahci_lock_acquire()) return false;
 
     hba_port_t* port = drive->port;
     bool ok = false;
@@ -903,7 +910,11 @@ bool ahci_write(ahci_drive_t* drive, uint64_t lba, uint32_t count, const void* b
         return result;
     }
 
-    ahci_lock_acquire();
+    if (!ahci_lock_acquire()) {
+        TRACE_MSG("Command lock timeout");
+        TRACE_EXIT();
+        return false;
+    }
 
     hba_port_t* port = drive->port;
     bool ok = false;

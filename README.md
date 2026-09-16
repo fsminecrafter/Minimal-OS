@@ -12,31 +12,62 @@ User application developers can find the syscall and SDK integration guide in
 
 ### Commands in MinimalOS terminal
 
-* ```help``` List all available commands
-* ```echo``` [Text] Echoes text back to terminal
-* ```memsize``` Returns the size of available memory in MB
-* ```sleep``` [Seconds | milliseconds"ms"] sleeps for an set amount of seconds or millieseconds.
+#### General
+* ```help``` Shows grouped, paged command help. Press Enter for the next category or `q` to exit.
+* ```help -c```, ```help --classic``` Shows the original one-list command output.
+* ```echo``` [Text] Echoes text back to the terminal.
+* ```clear``` Clears the terminal.
+* ```sleep``` [Seconds | milliseconds"ms"] Pauses for seconds or milliseconds.
+* ```systime``` Shows the current system time.
+
+#### System information
+* ```info``` Shows system, CPU, PCI, and memory information.
+* ```cpu``` Shows CPU information.
+* ```gpu``` Shows GPU information.
+* ```memsize``` Returns the size of available memory in MB.
+* ```usage``` Shows memory and process usage.
+* ```chgres``` [Width] [Height] Changes the display resolution.
+
 -------------------------------------------------------
 #### Audio related commands
 * ```play``` [File path] Plays `.adi` files from the disk.
-* ```stop``` Stops the playing of music / audio
-* ```pause``` toggle pause and unpause of the music / audio
-* ```volume``` [0 - 100] Sets the system volume
+* ```stop``` Stops music or audio playback.
+* ```pause``` Toggles pause and resume of music or audio playback.
+* ```volume``` [0 - 100] Sets the system volume.
 -------------------------------------------------------
-#### MinimaFS related commands
-* ```listroot``` list the root of the disk
-* ```list```, ```ls``` [Path] (--recurvesive) lists the current or entered path.
-* ```cd``` [Path] Change the current directory.
-* ```mdr``` [Path + Folder Name] Creates a folder at the entered path.
-* ```insert``` [File Path] [Text] Creates a new file with the contents of [Text].
-* ```read```, ```rd``` (--metadata) Reads a file and outputs it to the terminal
-* ```initdisk``` [Index] Searches and activates the disk(s) available
-* ```format``` [Index] Formats the Selected disk to MinimaFS
-* ```mount``` [Index] Mounts the selected disk
-* ```importmusic``` Takes the music.wav from `src/resources` and puts it on disk as music.adi
-* ```remove```, ```rm``` [path] (-r | --recursive) Removes the targeted file or folder.
-* ```meta``` [Option] [File] Edits Metadata
-* ```run``` [File] Runs the ".run" executable.
+#### Files and directories
+* ```list```, ```ls``` [Path] [--recursive] Lists the current or entered path.
+* ```listroot```, ```lsroot``` Shows the root of the disk, including metadata.
+* ```cd``` [Path] Changes the current directory.
+* ```mdr``` [Path] [--hidden] Creates a folder at the entered path.
+* ```insert``` [File Path] [Text] Creates or replaces a file with [Text].
+* ```read```, ```rd``` [Path] [--metadata] Reads a file.
+* ```remove```, ```rm``` [Path] [-r | --recursive] Removes a file or folder.
+* ```meta``` [Option] [File] Views or edits file metadata.
+
+#### Storage and packages
+* ```initdisk``` [Index] Searches for and initializes an available disk.
+* ```format``` [Index] Formats the selected disk as MinimaFS.
+* ```mount``` [Index] Mounts the selected disk.
+* ```importmusic``` Copies the built-in music file to the disk as `music.adi`.
+* ```pkg``` [unzip | zip] Extracts or creates a package archive.
+* ```pkg unzip``` [Archive] [Target] Extracts to a folder named after the archive by default.
+* ```pkg zip``` [File or folder] [lzss | store] Creates a package archive.
+* ```pkginfo``` [Archive] Displays package information.
+* ```installpkg``` [Archive] [Target] Alias for `pkg unzip`.
+
+#### Keyboard and programs
+* ```kbrlayout``` [set | get | list] Manages keyboard layouts.
+* ```run``` [File] Runs a `.run` executable.
+* ```services``` Lists registered services.
+
+#### Diagnostics
+* ```testwrite``` Runs the MinimaFS write test.
+* ```verifyfile``` Verifies a file on disk.
+* ```diskusage``` Shows disk usage.
+* ```trace_on``` Enables execution tracing.
+* ```trace_off``` Disables execution tracing.
+* ```trace_stack``` Shows the execution trace stack.
 
 -------------------------------------------------------
 

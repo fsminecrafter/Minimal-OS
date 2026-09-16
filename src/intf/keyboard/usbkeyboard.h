@@ -302,6 +302,12 @@ typedef void (*usb_keyboard_callback_t)(uint8_t scancode, char character, bool p
 void usb_keyboard_set_callback(usb_keyboard_callback_t callback);
 // Gets the current callback for key events
 usb_keyboard_callback_t usb_keyboard_get_callback(void);
+// Temporarily route key presses to the pending-key mailbox instead of the terminal.
+void usb_keyboard_begin_key_wait(void);
+void usb_keyboard_end_key_wait(void);
+bool usb_keyboard_key_wait_active(void);
+void usb_keyboard_clear_key_event(void);
+char usb_keyboard_take_key_event(void);
 
 // ===========================================
 // UTILITY FUNCTIONS

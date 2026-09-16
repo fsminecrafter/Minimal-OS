@@ -10,6 +10,8 @@
 
 static usb_keyboard_state_t g_keyboard_state = {0};
 static usb_keyboard_callback_t g_user_callback = NULL;
+static volatile uint32_t g_pending_key_event = 0;
+static volatile bool g_key_wait_active = false;
 
 // Key name lookup table
 static const char* g_key_names[256] = {
@@ -59,6 +61,8 @@ void usb_keyboard_init(void) {
     serial_write_str("USB Keyboard: Initializing...\n");
     
     memset(&g_keyboard_state, 0, sizeof(usb_keyboard_state_t));
+    g_pending_key_event = 0;
+    g_key_wait_active = false;
     
     g_keyboard_state.caps_lock = false;
     g_keyboard_state.num_lock = true;
@@ -170,6 +174,11 @@ static void usb_keyboard_handle_key_press(uint8_t scancode, uint8_t modifiers) {
     // Don't call callback for modifier-only keys
     if (usb_keyboard_is_modifier(scancode)) {
         return;
+    }
+
+    if (character) {
+        __atomic_store_n(&g_pending_key_event, (uint32_t)(uint8_t)character,
+                         __ATOMIC_RELEASE);
     }
     
     // Call user callback for the press
@@ -360,6 +369,28 @@ const keyboard_layout_t* usb_keyboard_get_builtin_layout(const char* name) {
 
 void usb_keyboard_set_callback(usb_keyboard_callback_t callback) {
     g_user_callback = callback;
+}
+
+void usb_keyboard_begin_key_wait(void) {
+    g_key_wait_active = true;
+}
+
+void usb_keyboard_end_key_wait(void) {
+    g_key_wait_active = false;
+}
+
+bool usb_keyboard_key_wait_active(void) {
+    return g_key_wait_active;
+}
+
+void usb_keyboard_clear_key_event(void) {
+    __atomic_store_n(&g_pending_key_event, 0, __ATOMIC_RELEASE);
+}
+
+char usb_keyboard_take_key_event(void) {
+    uint32_t value = __atomic_exchange_n(&g_pending_key_event, 0,
+                                         __ATOMIC_ACQUIRE);
+    return (char)(uint8_t)value;
 }
 
 // ===========================================

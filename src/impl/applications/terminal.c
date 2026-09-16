@@ -66,6 +66,8 @@ void terminalPrompt(void) {
 
 void terminal_keyboard_callback(uint8_t scancode, char character, bool pressed) {
     if (!pressed) return;  // Only handle key presses
+
+    if (usb_keyboard_key_wait_active()) return;
     
     /*
      * Ctrl+C (ETX, 0x03). The active keyboard layout's ctrl layer already
@@ -370,6 +372,7 @@ void terminal_program_entry(void) {
     // Clear screen and setup
     graphics_clear(0, 0, 0);
     graphics_set_resolution(cols, rows);
+    graphics_terminal_clear();
     graphics_terminal_set_color(COLOR_WHITE, COLOR_BLACK);
     
     // Initialize command system

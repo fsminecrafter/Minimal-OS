@@ -168,7 +168,8 @@ void proc_destroy_address_space(process_t* proc) {
 }
 
 static void proc_enter_ring3(process_t* self,
-		void (*entry_point)(), void* user_stack_top) {
+		void (*entry_point)(), void* user_stack_top,
+		uint64_t user_argc, void* user_argv) {
 	uint64_t pml4 = self->pml4;
 	__asm__ volatile(
 		"mov %[pml4], %%rax\n\t"
@@ -181,23 +182,23 @@ static void proc_enter_ring3(process_t* self,
 		"pushq %%rax\n\t"
 		"pushq %[cs]\n\t"
 		"pushq %[rip]\n\t"
+		/* SysV integer args to the entry point: RDI=argc, RSI=argv.
+		 * These are ordinary register writes (not popped by iretq),
+		 * so they survive the ring transition below untouched. */
+		"mov %[argc], %%rdi\n\t"
+		"mov %[argv], %%rsi\n\t"
 		"iretq\n\t"
 		:
 		: [pml4] "r"(pml4),
 		  [ss] "r"((uint64_t)GDT_SELECTOR_DS_USER),
 		  [rsp] "r"((uint64_t)user_stack_top),
 		  [cs] "r"((uint64_t)GDT_SELECTOR_CS_USER),
-		  [rip] "r"((uint64_t)entry_point)
-		: "rax", "memory");
+		  [rip] "r"((uint64_t)entry_point),
+		  [argc] "r"(user_argc),
+		  [argv] "r"((uint64_t)(uintptr_t)user_argv)
+		: "rax", "rdi", "rsi", "memory");
 	for (;;) {
 		asm volatile("cli; hlt" ::: "memory");
-	}
-}
-
-void memset_p(void* dest, uint8_t val, uint64_t len) { //changed memset to memset_p to make compiler STAY SILENT
-	uint8_t* ptr = dest;
-	for (uint64_t i = 0; i < len; i++) {
-		ptr[i] = val;
 	}
 }
 
@@ -236,7 +237,8 @@ static void proc_trampoline(void) {
 
 	if (self && self->entry_point) {
 		if (self->privilege == PROC_PRIVILEGE_USER) {
-			proc_enter_ring3(self, self->entry_point, self->user_stack);
+			proc_enter_ring3(self, self->entry_point, self->user_stack,
+			                  self->user_argc, self->user_argv);
 		}
 		self->entry_point();
 	}
@@ -245,19 +247,6 @@ static void proc_trampoline(void) {
 	 * itself. Terminate this process the correct way. */
 	process_exit();
 
-	/*
-	 * process_exit() marks this process TERMINATED and calls
-	 * schedule(), which normally switches away and never returns here.
-	 * The only way control could fall through to this point is if, at
-	 * the exact moment of exit, there was no other READY process for
-	 * the scheduler to pick (schedule() just returns in that case
-	 * instead of switching). That shouldn't happen in practice - there
-	 * is always at least one other background process alive - but if
-	 * it ever does, keep retrying the scheduler instead of running off
-	 * the end of this function. `sti` before each `hlt` guarantees
-	 * interrupts are enabled so a timer tick can always wake us up to
-	 * try again.
-	 */
 	for (;;) {
 		schedule();
 		asm volatile("sti; hlt" ::: "memory");

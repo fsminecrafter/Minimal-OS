@@ -3,7 +3,7 @@
 mkpkg.py - build a MinimalOS .mpkg package archive from a directory.
 
 Usage:
-    python3 mkpkg.py <source-dir> <output.mpkg> [--store]
+    python3 mkpkg.py <source-dir> <output.mpkg> [--store] [--verbose]
 
 Every file and directory under <source-dir> is added to the archive,
 using its path relative to <source-dir> as the entry name. Files are
@@ -107,7 +107,18 @@ def collect_entries(source: Path):
     return entries
 
 
-def build(source: Path, output: Path, store: bool):
+def _write_progress(current: int, total: int, name: str, interactive: bool):
+    width = 30
+    filled = width * current // total
+    bar = "=" * filled + ">" + " " * (width - filled - 1)
+    line = f"mkpkg: [{bar}] {current}/{total} {name}"
+    if interactive:
+        print(f"\r{line:<100}", end="", file=sys.stderr, flush=True)
+    else:
+        print(line, file=sys.stderr)
+
+
+def build(source: Path, output: Path, store: bool, verbose: bool = False):
     if not source.is_dir():
         raise ValueError(f"source is not a directory: {source}")
 
@@ -120,13 +131,19 @@ def build(source: Path, output: Path, store: bool):
     table_size = HEADER_SIZE + len(entries) * ENTRY_SIZE
     offset = table_size
 
-    for rel, is_dir, path in entries:
+    interactive = sys.stderr.isatty()
+    total_entries = len(entries)
+
+    for index, (rel, is_dir, path) in enumerate(entries, start=1):
         name_bytes = rel.encode("utf-8")
         if len(name_bytes) >= NAME_SIZE:
             raise ValueError(f"entry name too long (max {NAME_SIZE - 1} bytes): {rel}")
 
         if is_dir:
             encoded_entries.append((name_bytes, FLAG_DIRECTORY, METHOD_STORE, 0, 0, 0))
+            if verbose:
+                print(f"mkpkg: {rel}/ (directory)", file=sys.stderr)
+            _write_progress(index, total_entries, rel + "/", interactive)
             continue
 
         raw = path.read_bytes()
@@ -146,6 +163,15 @@ def build(source: Path, output: Path, store: bool):
         offset += len(data)
 
         encoded_entries.append((name_bytes, 0, method, len(raw), len(data), entry_offset))
+
+        if verbose:
+            method_name = "lzss" if method == METHOD_LZSS else "store"
+            print(f"mkpkg: {rel} ({method_name}, {len(raw)} -> {len(data)} bytes)",
+                  file=sys.stderr)
+        _write_progress(index, total_entries, rel, interactive)
+
+    if interactive:
+        print(file=sys.stderr)
 
     with open(output, "wb") as f:
         f.write(struct.pack("<8sII", MAGIC, VERSION, len(encoded_entries)))
@@ -168,10 +194,12 @@ def main():
     parser.add_argument("output", type=Path, help="output .mpkg file")
     parser.add_argument("--store", action="store_true",
                         help="store files as-is instead of LZSS-compressing them")
+    parser.add_argument("--verbose", action="store_true",
+                        help="print each entry and its compression result")
     args = parser.parse_args()
 
     try:
-        build(args.source, args.output, args.store)
+        build(args.source, args.output, args.store, args.verbose)
     except (OSError, ValueError) as error:
         print(f"mkpkg: {error}", file=sys.stderr)
         return 1

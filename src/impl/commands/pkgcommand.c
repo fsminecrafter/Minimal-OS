@@ -7,7 +7,7 @@
  * the (de)compressor.
  *
  * Usage:
- *   pkg unzip <path.mpkg> [target-dir]
+ *   pkg unzip <path.mpkg> [-c|--current|target-dir]
  *   pkg zip   <file-or-folder> [algorithm]
  *   installpkg <path.mpkg> [target-dir]   (legacy alias for `pkg unzip`)
  *   pkginfo    <path.mpkg>
@@ -117,7 +117,7 @@ static bool pkg_mkdir_p(const char* path) {
             char saved = buf[i];
             buf[i] = '\0';
             if (i > min_len) {
-                if (!minimafs_mkdir(buf)) {
+                if (!minimafs_is_dir(buf) && !minimafs_mkdir(buf)) {
                     return false;
                 }
             }
@@ -333,9 +333,10 @@ static uint32_t pkg_validate_entry_table(const uint8_t* archive, uint32_t archiv
  * SHARED EXTRACTION LOGIC (used by both `installpkg` and `pkg unzip`)
  * ============================================================ */
 
-static void pkg_do_unzip(const char* archive_arg, const char* target_arg) {
+static void pkg_do_unzip(const char* archive_arg, const char* target_arg,
+                         bool use_current_dir) {
     if (!archive_arg) {
-        graphics_write_textr("Usage: pkg unzip <path.mpkg> [target-dir]\n");
+        graphics_write_textr("Usage: pkg unzip <path.mpkg> [-c|--current|target-dir]\n");
         return;
     }
 
@@ -346,7 +347,9 @@ static void pkg_do_unzip(const char* archive_arg, const char* target_arg) {
     }
 
     char target_dir[MINIMAFS_MAX_PATH];
-    if (!fs_resolve_path(target_arg ? target_arg : "", target_dir)) {
+    const char* requested_target =
+        use_current_dir ? "" : (target_arg ? target_arg : "extract");
+    if (!fs_resolve_path(requested_target, target_dir)) {
         graphics_write_textr("installpkg: invalid target directory\n");
         return;
     }
@@ -401,10 +404,13 @@ static void pkg_do_unzip(const char* archive_arg, const char* target_arg) {
 
 void cmd_installpkg(int argc, const char** argv) {
     if (argc < 2) {
-        graphics_write_textr("Usage: installpkg <path.mpkg> [target-dir]\n");
+        graphics_write_textr("Usage: installpkg <path.mpkg> [-c|--current|target-dir]\n");
         return;
     }
-    pkg_do_unzip(argv[1], argc >= 3 ? argv[2] : NULL);
+    bool use_current_dir = argc >= 3 &&
+        (strcmp(argv[2], "-c") == 0 || strcmp(argv[2], "--current") == 0);
+    const char* target_arg = (argc >= 3 && !use_current_dir) ? argv[2] : NULL;
+    pkg_do_unzip(argv[1], target_arg, use_current_dir);
 }
 
 void cmd_pkginfo(int argc, const char** argv) {
@@ -809,7 +815,7 @@ static void pkg_do_zip(const char* source_arg, const char* algo_arg) {
 void cmd_pkg(int argc, const char** argv) {
     if (argc < 2) {
         graphics_write_textr("Usage:\n");
-        graphics_write_textr("  pkg unzip <path.mpkg> [target-dir]\n");
+        graphics_write_textr("  pkg unzip <path.mpkg> [-c|--current|target-dir]\n");
         graphics_write_textr("  pkg zip <file-or-folder> [algorithm]\n");
         graphics_write_textr("    algorithm: lzss (default) or store\n");
         return;
@@ -817,10 +823,13 @@ void cmd_pkg(int argc, const char** argv) {
 
     if (strcmp(argv[1], "unzip") == 0) {
         if (argc < 3) {
-            graphics_write_textr("Usage: pkg unzip <path.mpkg> [target-dir]\n");
+            graphics_write_textr("Usage: pkg unzip <path.mpkg> [-c|--current|target-dir]\n");
             return;
         }
-        pkg_do_unzip(argv[2], argc >= 4 ? argv[3] : NULL);
+        bool use_current_dir = argc >= 4 &&
+            (strcmp(argv[3], "-c") == 0 || strcmp(argv[3], "--current") == 0);
+        const char* target_arg = (argc >= 4 && !use_current_dir) ? argv[3] : NULL;
+        pkg_do_unzip(argv[2], target_arg, use_current_dir);
     } else if (strcmp(argv[1], "zip") == 0) {
         if (argc < 3) {
             graphics_write_textr("Usage: pkg zip <file-or-folder> [algorithm]\n");

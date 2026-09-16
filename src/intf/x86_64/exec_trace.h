@@ -25,7 +25,7 @@
 // CONFIGURATION
 // ===========================================
 
-#define TRACE_ENABLED 1           // Set to 0 to disable all tracing
+#define TRACE_ENABLED 0           // Set to 1 when execution tracing is needed
 #define TRACE_MAX_DEPTH 100       // Max call stack depth
 #define TRACE_BUFFER_SIZE 256     // Per-message buffer size
 

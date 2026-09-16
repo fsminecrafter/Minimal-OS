@@ -222,6 +222,8 @@ process_t* run_launch_file(const char* run_path, int extra_argc, const char** ex
         return NULL;
     }
 
+    command_set_last_user_pid(proc->pid);
+
     return proc;
 }
 

@@ -241,6 +241,8 @@ void graphics_free_image(bmp_image_t* image) {
 }
 
 void graphics_terminal_putchar(char c, uint32_t col, uint32_t row, color_t fg, color_t bg) {
+    if (!g_gpu || !g_gpu->fb) return;
+
     if (c < 32 || c > 126)
         c = '?';
 
@@ -248,16 +250,18 @@ void graphics_terminal_putchar(char c, uint32_t col, uint32_t row, color_t fg, c
 
     uint32_t px = col * g_terminal.char_width;
     uint32_t py = row * g_terminal.char_height;
+    if (px >= g_gpu->width || py >= g_gpu->height) return;
+    uint32_t fg_pixel = graphics_color_to_u32(fg);
+    uint32_t bg_pixel = graphics_color_to_u32(bg);
 
     for (uint32_t y = 0; y < 8 && y < g_terminal.char_height; y++) {
         uint8_t row_data = font8x8_basic[char_index][y];
+        volatile uint32_t* pixel_row = g_gpu->fb +
+            ((py + y) * g_gpu->pitch) / sizeof(uint32_t) + px;
 
         for (uint32_t x = 0; x < 8 && x < g_terminal.char_width; x++) {
             bool pixel_set = (row_data & (1 << x)) != 0;
-
-            color_t color = pixel_set ? fg : bg;
-
-            graphics_write_pixel_c(px + x, py + y, color);
+            pixel_row[x] = pixel_set ? fg_pixel : bg_pixel;
         }
     }
 }
@@ -413,15 +417,17 @@ void graphics_terminal_scroll(void) {
     // character row instead of rasterizing every glyph on every scroll.
     uint32_t pixel_width = cols * g_terminal.char_width;
     uint32_t pixel_height = rows * g_terminal.char_height;
-    uint32_t row_bytes = pixel_width * sizeof(uint32_t);
-    volatile uint8_t* framebuffer = (volatile uint8_t*)g_gpu->fb;
+    uint32_t row_pixels = pixel_width;
+    volatile uint32_t* framebuffer = g_gpu->fb;
     uint32_t pitch = g_gpu->pitch;
 
     for (uint32_t y = g_terminal.char_height; y < pixel_height; y++) {
-        volatile uint8_t* dst = framebuffer + (y - g_terminal.char_height) * pitch;
-        volatile uint8_t* src = framebuffer + y * pitch;
-        for (uint32_t byte = 0; byte < row_bytes; byte++) {
-            dst[byte] = src[byte];
+        volatile uint32_t* dst = framebuffer +
+            ((y - g_terminal.char_height) * pitch) / sizeof(uint32_t);
+        volatile uint32_t* src = framebuffer +
+            (y * pitch) / sizeof(uint32_t);
+        for (uint32_t pixel = 0; pixel < row_pixels; pixel++) {
+            dst[pixel] = src[pixel];
         }
     }
 
@@ -430,7 +436,8 @@ void graphics_terminal_scroll(void) {
         ((uint32_t)g_terminal.bg_color.g << 8) |
         g_terminal.bg_color.b;
     for (uint32_t y = pixel_height - g_terminal.char_height; y < pixel_height; y++) {
-        volatile uint32_t* row = (volatile uint32_t*)(framebuffer + y * pitch);
+        volatile uint32_t* row = framebuffer +
+            (y * pitch) / sizeof(uint32_t);
         for (uint32_t x = 0; x < pixel_width; x++) {
             row[x] = background;
         }

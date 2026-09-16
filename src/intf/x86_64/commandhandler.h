@@ -70,3 +70,6 @@ void command_poll_running(void);
 // Kills the currently-running command process, if any (e.g. on Ctrl+C).
 // No-op if no command is running.
 void command_kill_running(void);
+
+void command_set_last_user_pid(uint64_t pid);
+void command_kill_last_user_program(void);

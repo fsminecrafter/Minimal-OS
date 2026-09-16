@@ -110,7 +110,7 @@ bool gpu_init(gpu_device_t* gpu, pci_device_t* pci_dev, uint32_t width, uint32_t
 
     serial_write_str("Attempting to map framebuffer...\n");
     
-    if (!map_mmio_page(fb_va, fb_phys, fb_size)) {
+    if (!map_mmio_page_cached(fb_va, fb_phys, fb_size)) {
         PANIC("gpu_init: failed to map framebuffer BAR0");
     }
 

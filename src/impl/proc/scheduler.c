@@ -333,6 +333,20 @@ static void wake_sleeping_processes() {
     }
 }
 
+static bool process_is_current_on_any_cpu(process_t* proc) {
+    if (!proc) return false;
+
+    uint32_t cpu_count = g_cpu_count;
+    if (cpu_count > MAX_CPUS) cpu_count = MAX_CPUS;
+
+    for (uint32_t i = 0; i < cpu_count; i++) {
+        if (g_cpus[i].online && smp_current_process_for_cpu(i) == proc)
+            return true;
+    }
+
+    return false;
+}
+
 // Print current process state (for debugging)
 void currentstate() {
     if (!current_process) {
@@ -387,7 +401,7 @@ void schedule() {
 
     while (curr) {
         if (curr->state == PROCESS_ZOMBIE || curr->state == PROCESS_TERMINATED) {
-            if (curr == current_process) {
+            if (process_is_current_on_any_cpu(curr)) {
                 prev = curr;
                 curr = curr->next;
                 continue;

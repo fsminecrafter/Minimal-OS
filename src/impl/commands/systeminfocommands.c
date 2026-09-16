@@ -68,17 +68,14 @@ static void get_cpu_name(char* name) {
 
 static void info_text(const char* text) {
     graphics_write_textr(text);
-    serial_write_str(text);
 }
 
 static void info_number(uint64_t value) {
     graphics_write_textr_udec(value);
-    serial_write_dec(value);
 }
 
 static void info_hex(uint64_t value) {
     graphics_write_textr_hex(value);
-    serial_write_hex(value);
 }
 
 static uint64_t read_tsc(void) {
@@ -201,6 +198,33 @@ static bool read_config_dimension(const char* path, const char* key, uint32_t* v
     return true;
 }
 
+static bool read_config_dimension_from_file(const minimafs_file_handle_t* file,
+                                            const char* key, uint32_t* value) {
+    if (!file || !file->data || !key || !value) return false;
+
+    size_t key_len = strlen(key);
+    for (uint32_t i = 0; i + key_len + 1 < file->data_size; i++) {
+        if (memcmp(file->data + i, key, key_len) != 0 ||
+            file->data[i + key_len] != '=') {
+            continue;
+        }
+
+        uint32_t parsed = 0;
+        uint32_t pos = i + key_len + 1;
+        while (pos < file->data_size &&
+               file->data[pos] >= '0' && file->data[pos] <= '9') {
+            parsed = parsed * 10 + (uint32_t)(file->data[pos] - '0');
+            pos++;
+        }
+
+        if (parsed == 0 || parsed > 8192) return false;
+        *value = parsed;
+        return true;
+    }
+
+    return false;
+}
+
 bool systeminfo_load_saved_resolution(void) {
     const char* path = find_system_conf();
     uint32_t width = GPU_DEFAULT_WIDTH;
@@ -209,8 +233,13 @@ bool systeminfo_load_saved_resolution(void) {
         return false;
     }
 
-    bool has_width = read_config_dimension(path, "DisplayWidth", &width);
-    bool has_height = read_config_dimension(path, "DisplayHeight", &height);
+    minimafs_file_handle_t* file = minimafs_open(path, true);
+    if (!file) return false;
+
+    bool has_width = read_config_dimension_from_file(file, "DisplayWidth", &width);
+    bool has_height = read_config_dimension_from_file(file, "DisplayHeight", &height);
+    minimafs_close(file);
+
     if (!has_width) width = GPU_DEFAULT_WIDTH;
     if (!has_height) height = GPU_DEFAULT_HEIGHT;
 

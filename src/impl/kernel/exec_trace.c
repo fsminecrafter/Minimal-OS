@@ -181,13 +181,6 @@ void trace_irq_restore(const char* file, const char* func, int line) {
     if (g_int_sp == 0)
         g_int_owner = 0;
 
-    serial_write_str("[IRQ RESTORE] ");
-    serial_write_str(basename(file));
-    serial_write_str(":");
-    serial_write_str(func);
-    serial_write_str(":");
-    serial_write_dec(line);
-    serial_write_str("\n");
 }
 
 // HARD ASSERT CHECK (used by FS / AHCI)

@@ -772,7 +772,8 @@ static bool minimafs_read_folder_desc_block(minimafs_drive_t* drive, uint32_t bl
             if (len >= MINIMAFS_MAX_PATH) len = MINIMAFS_MAX_PATH - 1;
             memcpy(desc->path, line + 7, len);
             desc->path[len] = '\0';
-        } else if (strncmp(line, "ENTRY:", 6) == 0 && parsed_count < 256) {
+        } else if (strncmp(line, "ENTRY:", 6) == 0 &&
+               parsed_count < MINIMAFS_MAX_ROOT_ENTRIES) {
             if (parse_folder_entry_line(line, &desc->entries[parsed_count]))
                 parsed_count++;
         }
@@ -853,6 +854,10 @@ bool minimafs_read_folder_desc(minimafs_drive_t* drive, const char* path,
 
 bool minimafs_write_folder_desc(minimafs_drive_t* drive, minimafs_folder_desc_t* desc) {
     if (!drive || !desc || desc->block_offset == 0) return false;
+    if (desc->entry_count > MINIMAFS_MAX_ROOT_ENTRIES) {
+        serial_write_str("ERROR: folder.desc entry limit exceeded\n");
+        return false;
+    }
 
     char* buffer = (char*)alloc_unzeroed(MINIMAFS_BLOCK_SIZE);
     if (!buffer) { serial_write_str("ERROR: OOM writing folder.desc\n"); return false; }
@@ -965,10 +970,6 @@ static bool minimafs_write_file_to_disk_segments(minimafs_drive_t* drive,
     metadata->data_length   = data_size;
     metadata->file_length   = 0;
 
-    serial_write_str("MinimaFS: Writing file, data_size=");
-    serial_write_dec(data_size);
-    serial_write_str("\n");
-
     uint32_t header_size = 0;
     uint32_t footer_size = 5; /* "@END\n" */
 
@@ -1007,12 +1008,6 @@ static bool minimafs_write_file_to_disk_segments(minimafs_drive_t* drive,
 
     metadata->block_count  = block_count;
     metadata->block_offset = start_block;
-
-    serial_write_str("MinimaFS: Writing blocks ");
-    serial_write_dec(start_block);
-    serial_write_str(" - ");
-    serial_write_dec(start_block + block_count - 1);
-    serial_write_str("\n");
 
     const uint8_t* data1   = (const uint8_t*)seg1;
     const uint8_t* data2   = (const uint8_t*)seg2;
@@ -1068,7 +1063,6 @@ static bool minimafs_write_file_to_disk_segments(minimafs_drive_t* drive,
     free_mem(chunk_buf);
     free_mem(header);
     minimafs_refresh_storage_desc(drive);
-    serial_write_str("MinimaFS: Write complete\n");
     return true;
 }
 
@@ -1160,7 +1154,7 @@ bool minimafs_create_file(const char* path, const char* filetype,
         goto cleanup;
     }
 
-    if (parent_desc->entry_count >= 256) {
+    if (parent_desc->entry_count >= MINIMAFS_MAX_ROOT_ENTRIES) {
         serial_write_str("ERROR: Parent folder full\n");
         goto cleanup;
     }
@@ -1589,7 +1583,7 @@ bool minimafs_mkdir(const char* path) {
         free_mem(parent_desc); return false;
     }
 
-    if (parent_desc->entry_count >= 256) {
+    if (parent_desc->entry_count >= MINIMAFS_MAX_ROOT_ENTRIES) {
         block_free_run(drive_num, dir_block, 1);
         free_mem(parent_desc); return false;
     }
@@ -2101,7 +2095,7 @@ bool minimafs_write_file_segments(const char* path,
         }
 
         if (!exists) {
-            if (pd->entry_count >= 256) goto cleanup;
+            if (pd->entry_count >= MINIMAFS_MAX_ROOT_ENTRIES) goto cleanup;
             idx = pd->entry_count++;
             memset(&pd->entries[idx], 0, sizeof(minimafs_dir_entry_t));
             strncpy(pd->entries[idx].name, filename,

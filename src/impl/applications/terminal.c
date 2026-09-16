@@ -38,6 +38,7 @@ static bool command_ready = false;
 //   - ordinary keystrokes are ignored by terminal_keyboard_callback()
 //   - Ctrl+C kills the running command process instead of editing input
 static bool g_command_running = false;
+static uint64_t g_last_ctrl_c_ms = 0;
 
 // ===========================================
 // TERMINAL RENDERING
@@ -66,21 +67,6 @@ void terminalPrompt(void) {
 void terminal_keyboard_callback(uint8_t scancode, char character, bool pressed) {
     if (!pressed) return;  // Only handle key presses
     
-    // Debug log
-    serial_write_str("Terminal: Key scancode=0x");
-    serial_write_hex(scancode);
-    serial_write_str(" char='");
-    if (character >= 32 && character <= 126) {
-        char buf[2];
-        buf[0] = character;
-        buf[1] = 0;
-        serial_write_str(buf);
-    } else {
-        serial_write_str("0x");
-        serial_write_hex((uint8_t)character);
-    }
-    serial_write_str("'\n");
-
     /*
      * Ctrl+C (ETX, 0x03). The active keyboard layout's ctrl layer already
      * translates Ctrl+C into this control character for us (see
@@ -91,6 +77,25 @@ void terminal_keyboard_callback(uint8_t scancode, char character, bool pressed) 
      * treated as input. When nothing is running it just clears whatever
      * is currently typed, same spirit as the existing ESC handling below.
      */
+    const usb_keyboard_state_t* keyboard_state = usb_keyboard_get_state();
+    bool physical_ctrl_c = scancode == USB_KEY_C && keyboard_state &&
+                           keyboard_state->ctrl;
+    uint64_t now_ms = time_get_uptime_ms();
+
+    if (physical_ctrl_c && g_last_ctrl_c_ms != 0 &&
+        now_ms - g_last_ctrl_c_ms <= 1000) {
+        command_kill_last_user_program();
+        g_last_ctrl_c_ms = 0;
+        if (!g_command_running) {
+            graphics_write_textr("^C\n");
+            terminalPrompt();
+        }
+        return;
+    }
+
+    if (physical_ctrl_c)
+        g_last_ctrl_c_ms = now_ms;
+
     if (character == 0x03) {
         if (g_command_running) {
             serial_write_str("Terminal: Ctrl+C - killing running command\n");
@@ -390,10 +395,13 @@ void terminal_program_entry(void) {
             int success = mountdrive(device, 0);
             if (success == 1) {
                 vgaterm_print("Mount succeded.\n");
+                serial_write_str("Terminal: mountdrive returned; loading saved resolution...\n");
                 if (systeminfo_load_saved_resolution()) {
                     vgaterm_print("Loaded saved display resolution.\n");
                 }
+                serial_write_str("Terminal: saved resolution step complete; initializing services...\n");
                 service_manager_init();
+                serial_write_str("Terminal: service initialization complete\n");
             }else if (success == 2) {
                 vgaterm_print("/cr255g0b0/MinimaFS: Drive already mounted/cr255g255b255/\n");
             }else if (success == 3) {
@@ -405,14 +413,14 @@ void terminal_program_entry(void) {
             } else {
                 vgaterm_print("/cr255g0b0/Mount failed.\n");
             }
-        minimafs_drive_t* d = get_drive(1);
+        minimafs_drive_t* d = get_drive(0);
 
         if (!d) {
-            serial_write_str("Drive 1 = NULL\n");
+            serial_write_str("Drive 0 = NULL\n");
         } else if (!d->mounted) {
-            serial_write_str("Drive 1 not mounted\n");
+            serial_write_str("Drive 0 not mounted\n");
         } else {
-            vgaterm_print("Drive 1 OK\n");
+            vgaterm_print("Drive 0 OK\n");
         }
         }
     }

@@ -24,6 +24,7 @@ extern volatile uint32_t g_cpu_count;
 extern volatile uint32_t g_online_cpu_count;
 
 uint32_t smp_current_cpu_id(void);
+process_t* smp_current_process_for_cpu(uint32_t cpu_id);
 uint32_t smp_online_cpu_count(void);
 void smp_get_cpu_usage(uint32_t cpu_id, uint32_t* average, uint32_t* usage);
 void smp_init_bsp(void);

@@ -53,6 +53,11 @@ uint32_t smp_current_cpu_id(void) {
     return 0;
 }
 
+process_t* smp_current_process_for_cpu(uint32_t cpu_id) {
+    if (cpu_id >= MAX_CPUS) return NULL;
+    return g_cpus[cpu_id].current_process;
+}
+
 uint32_t smp_online_cpu_count(void) {
     return __atomic_load_n(&g_online_cpu_count, __ATOMIC_ACQUIRE);
 }

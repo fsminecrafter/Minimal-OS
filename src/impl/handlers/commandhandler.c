@@ -343,6 +343,7 @@ typedef struct {
  */
 static command_launch_ctx_t g_launch_ctx;
 static volatile uint64_t g_command_proc_pid = 0;
+static volatile uint64_t g_last_user_pid = 0;
 
 // Real entry point for a spawned command process. Reads the command that
 // command_execute_async() already tokenized into g_launch_ctx before
@@ -419,6 +420,25 @@ uint64_t command_execute_async(const char* input) {
 
 bool command_is_running(void) {
     return g_command_proc_pid != 0;
+}
+
+void command_set_last_user_pid(uint64_t pid) {
+    g_last_user_pid = pid;
+}
+
+void command_kill_last_user_program(void) {
+    uint64_t pid = g_last_user_pid;
+    if (pid == 0) return;
+
+    process_t* proc = findProcessByPID(pid);
+    if (!proc || proc->privilege != PROC_PRIVILEGE_USER ||
+        proc->state == PROCESS_ZOMBIE || proc->state == PROCESS_TERMINATED) {
+        g_last_user_pid = 0;
+        return;
+    }
+
+    if (killProcess(pid))
+        g_last_user_pid = 0;
 }
 
 void command_poll_running(void) {

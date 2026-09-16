@@ -281,6 +281,7 @@ class App:
 
         self.total_blocks = 0
         self.raw_mode = False
+        self.block_view = False
 
         self.current_file = None
         self.current_block = 0
@@ -295,6 +296,7 @@ class App:
         self.folder_blocks = {}
         self.drag_node = None
         self.drag_start = None
+        self.context_menu = None
         
         # Undo/redo
         self.history = UndoRedoStack()
@@ -322,6 +324,8 @@ class App:
         self.root.bind('<Control-x>', lambda e: self.cut_file())
         self.root.bind('<Control-v>', lambda e: self.paste_file())
         self.root.bind('<Control-s>', lambda e: self.save_fs())
+        self.root.bind('<Button-1>', self.close_context_menu, add='+')
+        self.root.bind('<Escape>', self.close_context_menu, add='+')
 
     # --------------------------------------
 
@@ -372,6 +376,10 @@ class App:
         
         ttk.Separator(top_frame, orient="vertical").pack(side="left", fill="y", padx=10)
         
+        self.block_view_button = ttk.Button(
+            top_frame, text="BLK View", command=self.toggle_block_view,
+            style="Accent.TButton")
+        self.block_view_button.pack(side="left", padx=3)
         ttk.Button(top_frame, text="🔄 Toggle RAW", command=self.toggle_raw, style="Accent.TButton").pack(side="left", padx=3)
 
         # STATUS BAR
@@ -557,13 +565,14 @@ class App:
 
             if "@HEADER@" in t:
                 entries = parse_entries(t)
-                for e in entries:
-                    name = e.get("FILENAME", f"blk_{i}")
-                    node = self.tree.insert(root, "end", text=f"{name} (blk {i})")
-                    self.nodes[node] = {
-                        "block": i,
-                        "entry": e
-                    }
+                if self.block_view:
+                    for e in entries:
+                        name = e.get("FILENAME", f"blk_{i}")
+                        node = self.tree.insert(root, "end", text=f"{name} (blk {i})")
+                        self.nodes[node] = {
+                            "block": i,
+                            "entry": e
+                        }
                 continue
 
             if "FOLDER:" in t or "ENTRY:" in t:
@@ -700,6 +709,20 @@ class App:
         self.update_part_spin()
         self.update_status()
         self.show_file()
+
+    def toggle_block_view(self):
+        self.block_view = not self.block_view
+        self.block_view_button.config(
+            text="File Tree" if self.block_view else "BLK View")
+        if not self.file:
+            debug(self.log, "Open a MinimaFS image to load the selected view")
+            return
+        self.current_file = None
+        self.text.config(state="normal")
+        self.text.delete("1.0", tk.END)
+        self.text.config(state="disabled")
+        self.load_fs()
+        debug(self.log, f"View = {'BLK' if self.block_view else 'File Tree'}")
 
     # ==========================================
     # FILESYSTEM OPERATIONS
@@ -1122,19 +1145,22 @@ class App:
     def update_status(self):
         """Update status bar"""
         mode = "RAW" if self.raw_mode else "Parsed"
+        view = "BLK" if self.block_view else "File Tree"
         edit = "ON" if self.edit_allowed else "OFF"
         modified = f" | {len(self.modified_files)} unsaved" if self.modified_files else ""
-        self.status.config(text=f"Ready  |  Mode: {mode}  |  Edit: {edit}{modified}")
+        self.status.config(text=f"Ready  |  View: {view}  |  Mode: {mode}  |  Edit: {edit}{modified}")
 
     # COPY/CUT/PASTE
     def on_right_click(self, event):
         """Handle right-click context menu"""
+        self.close_context_menu()
         item = self.tree.identify("item", event.x, event.y)
         if item:
             self.tree.selection_set(item)
             self.on_select(None)
 
             menu = tk.Menu(self.root, tearoff=0)
+            self.context_menu = menu
             menu.add_command(label="Copy", command=self.copy_file)
             menu.add_command(label="Cut", command=self.cut_file)
             menu.add_command(label="Paste", command=self.paste_file)
@@ -1144,8 +1170,19 @@ class App:
             menu.grab_release()
         return "break"
 
+    def close_context_menu(self, event=None):
+        if self.context_menu is not None:
+            try:
+                self.context_menu.grab_release()
+                self.context_menu.unpost()
+            except tk.TclError:
+                pass
+            self.context_menu = None
+
     def show_text_context_menu(self, event):
+        self.close_context_menu()
         menu = tk.Menu(self.root, tearoff=0)
+        self.context_menu = menu
         menu.add_command(label="Copy", command=lambda: self.text.event_generate("<<Copy>>"))
         menu.add_command(label="Cut", command=lambda: self.text.event_generate("<<Cut>>"))
         menu.add_command(label="Paste", command=lambda: self.text.event_generate("<<Paste>>"))

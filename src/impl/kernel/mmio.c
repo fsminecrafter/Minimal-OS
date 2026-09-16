@@ -213,7 +213,8 @@ void* mmio_alloc_va(size_t size) {
 /* --------------------------------------------------
  * MMIO page mapping
  * -------------------------------------------------- */
-bool map_mmio_page(uintptr_t virt_addr, uintptr_t phys_addr, size_t size) {
+static bool map_mmio_page_mode(uintptr_t virt_addr, uintptr_t phys_addr,
+                               size_t size, bool cache_disable) {
     serial_write_str("map_mmio_page: virt=");
     serial_write_hex(virt_addr);
     serial_write_str(" phys=");
@@ -282,7 +283,8 @@ bool map_mmio_page(uintptr_t virt_addr, uintptr_t phys_addr, size_t size) {
             
             l2_table[l2_index] =
                 (current_phys & ~(MMIO_PAGE_SIZE_2M - 1)) |
-                PAGE_PRESENT | PAGE_WRITABLE | PAGE_CACHE_DISABLE | PAGE_SIZE_FLAG;
+                PAGE_PRESENT | PAGE_WRITABLE |
+                (cache_disable ? PAGE_CACHE_DISABLE : 0) | PAGE_SIZE_FLAG;
 
             if (verbose) {
                 serial_write_str("  L2[");
@@ -345,7 +347,8 @@ bool map_mmio_page(uintptr_t virt_addr, uintptr_t phys_addr, size_t size) {
             
             l1_array[l1_index] =
                 (current_phys & ~(MMIO_PAGE_SIZE_4K - 1)) |
-                PAGE_PRESENT | PAGE_WRITABLE | PAGE_CACHE_DISABLE;
+                PAGE_PRESENT | PAGE_WRITABLE |
+                (cache_disable ? PAGE_CACHE_DISABLE : 0);
 
             if (verbose) {
                 serial_write_str("  L1[");
@@ -369,6 +372,14 @@ bool map_mmio_page(uintptr_t virt_addr, uintptr_t phys_addr, size_t size) {
     serial_write_dec(pages_mapped);
     serial_write_str(" pages successfully\n");
     return true;
+}
+
+bool map_mmio_page(uintptr_t virt_addr, uintptr_t phys_addr, size_t size) {
+    return map_mmio_page_mode(virt_addr, phys_addr, size, true);
+}
+
+bool map_mmio_page_cached(uintptr_t virt_addr, uintptr_t phys_addr, size_t size) {
+    return map_mmio_page_mode(virt_addr, phys_addr, size, false);
 }
 
 /* --------------------------------------------------

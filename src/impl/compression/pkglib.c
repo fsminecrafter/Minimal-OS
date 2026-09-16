@@ -82,7 +82,7 @@ static bool pkg_mkdir_p(const char* path) {
             char saved = buf[i];
             buf[i] = '\0';
             if (i > min_len) {
-                if (!minimafs_mkdir(buf)) return false;
+                if (!minimafs_is_dir(buf) && !minimafs_mkdir(buf)) return false;
             }
             buf[i] = saved;
             if (at_end) break;

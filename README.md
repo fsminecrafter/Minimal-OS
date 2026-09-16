@@ -15,6 +15,7 @@ User application developers can find the syscall and SDK integration guide in
 * ```help``` List all available commands
 * ```echo``` [Text] Echoes text back to terminal
 * ```memsize``` Returns the size of available memory in MB
+* ```sleep``` [Seconds | milliseconds"ms"] sleeps for an set amount of seconds or millieseconds.
 -------------------------------------------------------
 #### Audio related commands
 * ```play``` [File path] Plays `.adi` files from the disk.
@@ -34,7 +35,8 @@ User application developers can find the syscall and SDK integration guide in
 * ```mount``` [Index] Mounts the selected disk
 * ```importmusic``` Takes the music.wav from `src/resources` and puts it on disk as music.adi
 * ```remove```, ```rm``` [path] (-r | --recursive) Removes the targeted file or folder.
-* ```sleep``` [Seconds | milliseconds"ms"] sleeps for an set amount of seconds or millieseconds.
+* ```meta``` [Option] [File] Edits Metadata
+* ```run``` [File] Runs the ".run" executable.
 
 -------------------------------------------------------
 

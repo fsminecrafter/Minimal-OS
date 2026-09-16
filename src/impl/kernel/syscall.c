@@ -146,6 +146,82 @@ static uint64_t sys_manager_impl(uint64_t manager, uint64_t operation,
     }
 }
 
+static uint64_t sys_sysinfo_impl(uint64_t op) {
+    // Per-core usage lives in the open-ended tail of the op space, so
+    // check that range first.
+    if (op >= SYS_SYSINFO_CORE_USAGE_BASE) {
+        uint64_t core_id = op - SYS_SYSINFO_CORE_USAGE_BASE;
+        if (core_id >= MAX_CPUS || !g_cpus[core_id].online) {
+            return SYS_ERR_INVAL;
+        }
+        uint32_t average = 0, usage = 0;
+        smp_get_cpu_usage((uint32_t)core_id, &average, &usage);
+        return usage;
+    }
+
+    switch (op) {
+        case SYS_SYSINFO_CPU_USAGE: {
+            uint32_t online = smp_online_cpu_count();
+            if (online > MAX_CPUS) online = MAX_CPUS;
+
+            uint64_t sum = 0;
+            uint32_t counted = 0;
+            for (uint32_t i = 0; i < online; i++) {
+                if (!g_cpus[i].online) continue;
+                uint32_t average = 0, usage = 0;
+                smp_get_cpu_usage(i, &average, &usage);
+                sum += usage;
+                counted++;
+            }
+            return counted ? (sum / counted) : 0;
+        }
+
+        case SYS_SYSINFO_RAM_TOTAL:
+            return findvar("totalrambytes");
+
+        case SYS_SYSINFO_RAM_USED: {
+            uint64_t heap_used = (uint64_t)allocator_used_bytes();
+            uint64_t pmm_used  = (uint64_t)pmm_used_pages() * 4096ULL;
+            return heap_used + pmm_used;
+        }
+
+        case SYS_SYSINFO_RAM_FREE: {
+            uint64_t total = findvar("totalrambytes");
+            uint64_t used  = (uint64_t)allocator_used_bytes() +
+                              (uint64_t)pmm_used_pages() * 4096ULL;
+            // Heap + PMM usage is an approximation of total RAM in use
+            // (both pools sit inside total RAM but neither one alone
+            // accounts for kernel/BIOS-reserved regions), so guard
+            // against underflow rather than trust it can't exceed total.
+            return (used < total) ? (total - used) : 0;
+        }
+
+        case SYS_SYSINFO_UPTIME_MS:
+            return time_get_uptime_ms();
+
+        case SYS_SYSINFO_PROCESS_COUNT:
+            return (uint64_t)getProcessCount();
+
+        case SYS_SYSINFO_CORE_COUNT:
+            return (uint64_t)smp_online_cpu_count();
+
+        case SYS_SYSINFO_HEAP_USED:
+            return (uint64_t)allocator_used_bytes();
+
+        case SYS_SYSINFO_HEAP_FREE:
+            return (uint64_t)allocator_free_bytes();
+
+        case SYS_SYSINFO_PMM_USED_PAGES:
+            return (uint64_t)pmm_used_pages();
+
+        case SYS_SYSINFO_PMM_FREE_PAGES:
+            return (uint64_t)pmm_free_pages();
+
+        default:
+            return SYS_ERR_INVAL;
+    }
+}
+
 static uint64_t sys_usb_impl(uint64_t operation, uint64_t arg1, uint64_t arg2) {
     switch (operation) {
         case SYS_USB_INIT:

@@ -112,6 +112,9 @@ static uint64_t sys_graphics_impl(const syscall_graphics_request_t* request) {
         case SYS_GRAPHICS_SET_RESOLUTION:
             graphics_set_resolution((uint32_t)a[0], (uint32_t)a[1]);
             return SYS_SUCCESS;
+        case SYS_GRAPHICS_TERMINAL_CLEAR:
+            graphics_terminal_clear();
+            return SYS_SUCCESS;
         default:
             return SYS_ERR_INVAL;
     }
@@ -334,6 +337,38 @@ static uint64_t sys_pkg_impl(const syscall_pkg_request_t* request) {
         default:
             return SYS_ERR_INVAL;
     }
+}
+
+/*
+ * SYS_PSLIST helper: snapshots the current process list into the
+ * stable syscall_process_info_t ABI (see syscall.h). Uses get_procs()
+ * (proc.h) rather than walking proc_list_head directly so this stays
+ * consistent with how every other process-listing consumer in the
+ * kernel (listAllProcesses(), getprocslist()) already does it.
+ */
+static uint64_t sys_pslist_impl(syscall_process_info_t* out, uint32_t max_entries) {
+    if (!out || max_entries == 0) return 0;
+
+    size_t count = 0;
+    process_t** procs = get_procs(&count);
+    if (!procs || count == 0) return 0;
+
+    uint32_t n = (uint32_t)count;
+    if (n > max_entries) n = max_entries;
+
+    for (uint32_t i = 0; i < n; i++) {
+        process_t* p = procs[i];
+        strncpy(out[i].name, p->name, sizeof(out[i].name) - 1);
+        out[i].name[sizeof(out[i].name) - 1] = '\0';
+        out[i].pid         = p->pid;
+        out[i].state       = (uint8_t)p->state;
+        out[i].privilege   = (uint8_t)p->privilege;
+        out[i].sched_cpu   = p->sched_cpu;
+        out[i].sched_level = p->sched_level;
+    }
+
+    free_mem(procs);
+    return n;
 }
 
 /* ============================================================
@@ -606,6 +641,13 @@ void syscall_dispatch(syscall_regs_t* regs) {
 
         case SYS_PKG: {
             regs->rax = sys_pkg_impl((const syscall_pkg_request_t*)regs->rdi);
+            break;
+        }
+
+        case SYS_PSLIST: {
+            syscall_process_info_t* out = (syscall_process_info_t*)regs->rdi;
+            uint32_t max_entries = (uint32_t)regs->rsi;
+            regs->rax = sys_pslist_impl(out, max_entries);
             break;
         }
 

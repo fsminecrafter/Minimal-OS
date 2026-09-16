@@ -4,12 +4,15 @@
 #include "x86_64/gpu.h"
 #include "serial.h"
 #include "panic.h"
+#include "time.h"
 
 // ===========================================
 // GPU DEVICE ACCESS
 // ===========================================
 
 static gpu_device_t* g_system_gpu = NULL;
+
+process_t* findProcessByPID(uint64_t pid);
 
 void setSystemGPU(gpu_device_t* gpu) {
     g_system_gpu = gpu;
@@ -117,6 +120,26 @@ bool killProcess(uint64_t pid) {
         schedule();
     }
     
+    return true;
+}
+
+bool requestProcessCleanup(uint64_t pid) {
+    process_t* proc = findProcessByPID(pid);
+    if (!proc || proc->privilege != PROC_PRIVILEGE_USER ||
+        proc->state == PROCESS_ZOMBIE || proc->state == PROCESS_TERMINATED) {
+        return false;
+    }
+
+    if (!proc->cleanup_entry) {
+        return killProcess(pid);
+    }
+
+    proc->cleanup_requested = true;
+    proc->cleanup_invoked = false;
+    proc->cleanup_deadline_ms = time_get_uptime_ms() + 1000;
+    serial_write_str("[PROC] Cleanup requested for ");
+    serial_write_str(proc->name);
+    serial_write_str("\n");
     return true;
 }
 

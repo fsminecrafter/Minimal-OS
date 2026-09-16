@@ -57,6 +57,7 @@ typedef struct {
 // BSS-zeroed, so every queue starts empty and every lock starts
 // unlocked without needing an explicit init pass.
 static percpu_runqueue_t g_runqueues[MAX_CPUS];
+static process_t* g_deferred_reap[MAX_CPUS];
 
 const uint32_t sched_level_quantum_ticks[SCHED_NUM_LEVELS] = {
     2,   // interactive: short quantum, dispatched first
@@ -203,6 +204,11 @@ void scheduler_rebalance(void) {
         uint32_t load = rq_total(&g_runqueues[cpu]);
         spinlock_release(&g_runqueues[cpu].lock, flags);
 
+        // Account for the currently running process as well as queued work.
+        // Sleeping/idle current processes do not contribute to load.
+        process_t* running = smp_current_process_for_cpu(cpu);
+        if (running && running->state == PROCESS_RUNNING) load++;
+
         if (load > busiest_load) { busiest_load = load; busiest_cpu = cpu; }
         if (load < idlest_load)  { idlest_load  = load; idlest_cpu  = cpu; }
     }
@@ -223,11 +229,34 @@ void scheduler_rebalance(void) {
     uint64_t f1 = spinlock_acquire(&first->lock);
     uint64_t f2 = spinlock_acquire(&second->lock);
 
-    // Prefer donating background/normal work over interactive work, so
-    // rebalancing never hurts the busy core's input latency.
+    // Prefer the least-used queued process. The large running process stays
+    // on its core while a smaller waiting process migrates away.
     process_t* migrant = NULL;
-    for (int level = SCHED_NUM_LEVELS - 1; level >= 0 && !migrant; level--) {
-        migrant = rq_pop(src, (uint32_t)level);
+    uint32_t migrant_level = 0;
+    uint64_t migrant_cpu_time = UINT64_MAX;
+    for (uint32_t level = 0; level < SCHED_NUM_LEVELS; level++) {
+        for (process_t* candidate = src->head[level]; candidate;
+             candidate = candidate->rq_next) {
+            if (candidate->cpu_time_ms < migrant_cpu_time) {
+                migrant = candidate;
+                migrant_level = level;
+                migrant_cpu_time = candidate->cpu_time_ms;
+            }
+        }
+    }
+
+    if (migrant) {
+        process_t* previous = NULL;
+        process_t* candidate = src->head[migrant_level];
+        while (candidate != migrant) {
+            previous = candidate;
+            candidate = candidate->rq_next;
+        }
+        if (previous) previous->rq_next = migrant->rq_next;
+        else src->head[migrant_level] = migrant->rq_next;
+        if (src->tail[migrant_level] == migrant) src->tail[migrant_level] = previous;
+        src->count[migrant_level]--;
+        migrant->rq_next = NULL;
     }
 
     if (migrant) {
@@ -396,12 +425,21 @@ void schedule() {
 
     // ---- Zombie / terminated cleanup (global list, cross-core) ----
     uint64_t sched_flags = scheduler_lock();
+    process_t* deferred_reap = g_deferred_reap[cpu_id];
+    g_deferred_reap[cpu_id] = NULL;
     process_t* prev = NULL;
     process_t* curr = proc_list_head;
 
     while (curr) {
         if (curr->state == PROCESS_ZOMBIE || curr->state == PROCESS_TERMINATED) {
-            if (process_is_current_on_any_cpu(curr)) {
+            bool deferred = curr == deferred_reap;
+            for (uint32_t i = 0; i < cpu_id && !deferred; i++) {
+                deferred = curr == g_deferred_reap[i];
+            }
+            for (uint32_t i = cpu_id + 1; i < MAX_CPUS && !deferred; i++) {
+                deferred = curr == g_deferred_reap[i];
+            }
+            if (deferred || process_is_current_on_any_cpu(curr)) {
                 prev = curr;
                 curr = curr->next;
                 continue;
@@ -496,6 +534,9 @@ void schedule() {
     }
     spinlock_release(&rq->lock, rq_flags);
 
+    if (old && (old->state == PROCESS_ZOMBIE || old->state == PROCESS_TERMINATED)) {
+        g_deferred_reap[cpu_id] = old;
+    }
     next->sched_ticks_used = 0;
     next->state = PROCESS_RUNNING;
     current_process = next;
@@ -590,12 +631,30 @@ void sleep(uint64_t milliseconds) {
 // per interval rather than once per interval PER CORE.
 static volatile uint64_t g_global_tick_count = 0;
 
+static void expire_cleanup_requests(void) {
+    uint64_t now = time_get_uptime_ms();
+    for (process_t* proc = proc_list_head; proc; proc = proc->next) {
+        if (!proc->cleanup_requested ||
+            proc->state == PROCESS_ZOMBIE || proc->state == PROCESS_TERMINATED ||
+            now < proc->cleanup_deadline_ms) {
+            continue;
+        }
+        serial_write_str("[PROC] Cleanup timeout, terminating ");
+        serial_write_str(proc->name);
+        serial_write_str("\n");
+        proc->state = PROCESS_ZOMBIE;
+        scheduler_dequeue(proc);
+        if (proc == current_process) schedule();
+    }
+}
+
 void scheduler_tick() {
     if (!scheduler_on) {
         return;
     }
 
     wake_sleeping_processes();
+    expire_cleanup_requests();
 
     bool was_idle = current_process == NULL;
     if (was_idle) {
@@ -605,7 +664,7 @@ void scheduler_tick() {
     uint32_t cpu_id = smp_current_cpu_id();
     if (cpu_id < MAX_CPUS) {
         cpu_local_t* cpu = &g_cpus[cpu_id];
-        bool busy = current_process != NULL;
+        bool busy = current_process && current_process->state == PROCESS_RUNNING;
         __atomic_add_fetch(&cpu->usage_total_ticks, 1, __ATOMIC_RELAXED);
         if (busy) {
             __atomic_add_fetch(&cpu->usage_busy_ticks, 1, __ATOMIC_RELAXED);
@@ -625,6 +684,7 @@ void scheduler_tick() {
     if (was_idle || !current_process) return;
 
     current_process->sched_ticks_used++;
+    current_process->cpu_time_ms++;
 
     uint64_t my_tick = __sync_add_and_fetch(&g_global_tick_count, 1);
 
@@ -697,5 +757,9 @@ void process_exit(void) {
     current_process->state = PROCESS_TERMINATED;
     schedule();
 
-    PANIC("process_exit() returned!");
+    // There may be no ready process on this CPU yet. Keep the terminated
+    // context alive until a timer tick can switch away from its stack.
+    for (;;) {
+        asm volatile("sti; hlt" ::: "memory");
+    }
 }

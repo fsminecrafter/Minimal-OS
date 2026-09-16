@@ -4,6 +4,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <stdbool.h>
 
 #define MAX_PROCESS_NAME_LEN 128
 #define STACK_SIZE 0x10000  // 64 KB
@@ -109,6 +110,12 @@ typedef struct process {
     // assembly changes.
     uint64_t user_argc;
     char** user_argv;
+
+    // Cooperative cleanup requested by the terminal before forced kill.
+    void (*cleanup_entry)();
+    uint64_t cleanup_deadline_ms;
+    bool cleanup_requested;
+    bool cleanup_invoked;
 } process_t;
 
 // Global process list head (defined in proc.c)

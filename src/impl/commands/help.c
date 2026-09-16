@@ -126,8 +126,7 @@ void cmd_help(int argc, const char** argv) {
 
     for (size_t i = 0; i < sizeof(pages) / sizeof(pages[0]); i++) {
         pages[i]();
-        if (i + 1 < sizeof(pages) / sizeof(pages[0]) &&
-            !help_wait_for_next_page()) {
+        if (!help_wait_for_next_page()) {
             break;
         }
     }

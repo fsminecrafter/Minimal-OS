@@ -4,6 +4,7 @@
 #include "serial.h"
 #include "time.h"
 #include "x86_64/allocator.h"
+#include "x86_64/scheduler.h"
 #include "keyboard/usbkeyboard.h"
 
 // ===========================================
@@ -950,7 +951,7 @@ char vgaterm_wait_key(void) {
             return event;
         }
         usb_keyboard_update();
-        asm volatile("pause");
+        sleep(1);
     }
 }
 

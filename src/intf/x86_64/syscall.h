@@ -40,6 +40,7 @@
 // MPKG (.mpkg archive) syscall
 // ===========================================
 #define SYS_PKG           25
+#define SYS_REGISTER_CLEANUP 28
 
 #define SYS_O_RDONLY 0
 

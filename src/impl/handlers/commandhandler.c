@@ -10,6 +10,7 @@
 #include "x86_64/scheduler.h"
 #include "x86_64/minimafs.h"
 #include "fspaths.h"
+#include "keyboard/usbkeyboard.h"
 
 extern void (*__start_command_ctors)(void);
 extern void (*__stop_command_ctors)(void);
@@ -437,8 +438,24 @@ void command_kill_last_user_program(void) {
         return;
     }
 
-    if (killProcess(pid))
+    requestProcessCleanup(pid);
+}
+
+void command_terminate_last_user_program(void) {
+    uint64_t pid = g_last_user_pid;
+    if (!pid) return;
+    if (killProcess(pid)) g_last_user_pid = 0;
+}
+
+bool command_has_last_user_program(void) {
+    if (!g_last_user_pid) return false;
+    process_t* proc = findProcessByPID(g_last_user_pid);
+    if (!proc || proc->privilege != PROC_PRIVILEGE_USER ||
+        proc->state == PROCESS_ZOMBIE || proc->state == PROCESS_TERMINATED) {
         g_last_user_pid = 0;
+        return false;
+    }
+    return true;
 }
 
 void command_poll_running(void) {
@@ -451,7 +468,12 @@ void command_poll_running(void) {
 }
 
 void command_kill_running(void) {
+    if (g_last_user_pid != 0) {
+        command_kill_last_user_program();
+        return;
+    }
     if (g_command_proc_pid == 0) return;
+    usb_keyboard_end_key_wait();
     killProcess(g_command_proc_pid);
     /*
      * Don't clear g_command_proc_pid here. killProcess() only marks the

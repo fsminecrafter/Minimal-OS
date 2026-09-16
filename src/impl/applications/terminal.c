@@ -67,8 +67,6 @@ void terminalPrompt(void) {
 void terminal_keyboard_callback(uint8_t scancode, char character, bool pressed) {
     if (!pressed) return;  // Only handle key presses
 
-    if (usb_keyboard_key_wait_active()) return;
-    
     /*
      * Ctrl+C (ETX, 0x03). The active keyboard layout's ctrl layer already
      * translates Ctrl+C into this control character for us (see
@@ -85,8 +83,12 @@ void terminal_keyboard_callback(uint8_t scancode, char character, bool pressed) 
     uint64_t now_ms = time_get_uptime_ms();
 
     if (physical_ctrl_c && g_last_ctrl_c_ms != 0 &&
-        now_ms - g_last_ctrl_c_ms <= 1000) {
-        command_kill_last_user_program();
+        now_ms - g_last_ctrl_c_ms <= 800) {
+        if (command_has_last_user_program()) {
+            command_terminate_last_user_program();
+        } else {
+            command_kill_running();
+        }
         g_last_ctrl_c_ms = 0;
         if (!g_command_running) {
             graphics_write_textr("^C\n");
@@ -99,7 +101,7 @@ void terminal_keyboard_callback(uint8_t scancode, char character, bool pressed) 
         g_last_ctrl_c_ms = now_ms;
 
     if (character == 0x03) {
-        if (g_command_running) {
+        if (g_command_running || command_has_last_user_program()) {
             serial_write_str("Terminal: Ctrl+C - killing running command\n");
             command_kill_running();
             graphics_write_textr("^C\n");
@@ -111,6 +113,8 @@ void terminal_keyboard_callback(uint8_t scancode, char character, bool pressed) 
         }
         return;
     }
+
+    if (usb_keyboard_key_wait_active()) return;
 
     /*
      * While a command is running, the input line/prompt is gone (see

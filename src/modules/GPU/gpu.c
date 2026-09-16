@@ -189,6 +189,12 @@ bool gpu_set_resolution(gpu_device_t* gpu, uint32_t width, uint32_t height) {
     if (!gpu || !gpu->pci_dev || width == 0 || height == 0 || width > 8192 || height > 8192) {
         return false;
     }
+    // BAR0 is mapped as a 16 MiB framebuffer window by gpu_init(). Reject
+    // saved modes that would make clearing or redrawing walk past it.
+    if ((uint64_t)width * height * gpu->bpp > 0x01000000ULL) {
+        serial_write_str("gpu_set_resolution: mode exceeds framebuffer window\n");
+        return false;
+    }
     if (gpu->width == width && gpu->height == height) {
         return true;
     }

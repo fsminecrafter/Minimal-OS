@@ -472,6 +472,15 @@ static bool syscall_user_may_call(uint64_t syscall_num, const syscall_regs_t* re
 void syscall_dispatch(syscall_regs_t* regs) {
     if (!regs) return;
 
+    if (isCurrentProcessUser() && current_process->cleanup_requested &&
+        !current_process->cleanup_invoked && current_process->cleanup_entry &&
+        regs->rax != SYS_REGISTER_CLEANUP) {
+        current_process->cleanup_invoked = true;
+        current_process->cleanup_entry();
+        // A callback may return without calling mos_exit(); give the
+        // process the remainder of its grace period in that case.
+    }
+
     if (isCurrentProcessUser() && !syscall_user_may_call(regs->rax, regs)) {
         serial_write_str("[syscall] denied: user process attempted privileged "
                           "syscall/op (num=");
@@ -497,6 +506,17 @@ void syscall_dispatch(syscall_regs_t* regs) {
             process_exit();
             break;
         }
+
+        case SYS_REGISTER_CLEANUP:
+            if (!isCurrentProcessUser() || !regs->rdi) {
+                regs->rax = SYS_ERR_INVAL;
+                break;
+            }
+            current_process->cleanup_entry = (void (*)())regs->rdi;
+            current_process->cleanup_requested = false;
+            current_process->cleanup_invoked = false;
+            regs->rax = SYS_SUCCESS;
+            break;
 
         case SYS_GETPID: {
             regs->rax = getCurrentPID();

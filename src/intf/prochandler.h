@@ -43,6 +43,10 @@ process_t* createUserProcess(const char* file_name, void (*entry_point)());
 // Returns: true if process was killed, false if not found or already dead
 bool killProcess(uint64_t pid);
 
+// Request a user process's registered cleanup callback, with a one-second
+// grace period before the scheduler force-terminates it.
+bool requestProcessCleanup(uint64_t pid);
+
 // Kill a process by name
 // Returns: true if process was killed, false if not found or already dead
 bool killProcessByName(const char* name);

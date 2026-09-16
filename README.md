@@ -10,7 +10,7 @@ User application developers can find the syscall and SDK integration guide in
 
 <summary>Commands in Terminal</summary>
 
-### Commands in MinamalOS terminal
+### Commands in MinimalOS terminal
 
 * ```help``` List all available commands
 * ```echo``` [Text] Echoes text back to terminal

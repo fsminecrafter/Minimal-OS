@@ -189,6 +189,28 @@ typedef struct __attribute__((packed)) {
     uint64_t r15;
 } syscall_regs_t;
 
+#define SYS_SYSINFO 18
+
+typedef enum {
+    SYS_SYSINFO_CPU_USAGE       = 0x01, // avg CPU usage % across all online cores
+    SYS_SYSINFO_RAM_TOTAL       = 0x02, // total RAM, bytes
+    SYS_SYSINFO_RAM_USED        = 0x03, // used RAM (heap + PMM), bytes
+    SYS_SYSINFO_RAM_FREE        = 0x04, // free RAM, bytes
+    SYS_SYSINFO_UPTIME_MS       = 0x05,
+    SYS_SYSINFO_PROCESS_COUNT   = 0x06,
+    SYS_SYSINFO_CORE_COUNT      = 0x07, // online core count
+    SYS_SYSINFO_HEAP_USED       = 0x08, // allocator (kernel heap), bytes
+    SYS_SYSINFO_HEAP_FREE       = 0x09,
+    SYS_SYSINFO_PMM_USED_PAGES  = 0x0A, // 4KB physical pages
+    SYS_SYSINFO_PMM_FREE_PAGES  = 0x0B,
+    // 0x0C-0x0F reserved for future global stats
+
+    // Per-core usage: op = SYS_SYSINFO_CORE_USAGE_BASE + core_id.
+    // Deliberately last/open-ended since core count can vary between
+    // boots (SMP bring-up may bring up fewer cores than expected).
+    SYS_SYSINFO_CORE_USAGE_BASE = 0x10,
+} syscall_sysinfo_op_t;
+
 // Called by isr_syscall_wrapped (syscall_isr.asm) for every `int 0x80`.
 // regs->rax = syscall number in, return value out. Args in
 // rdi/rsi/rdx (SysV-ish - matches a future `syscall`-instruction ABI

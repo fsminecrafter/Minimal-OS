@@ -21,8 +21,18 @@ const char* run_normalize_path(const char* input, char* normalized, size_t norma
 // Loads the .run bundle (MINIRUN1 archive) at `run_path` - which must
 // already be a fully-qualified path, see run_normalize_path() - and
 // starts it as a new user process, exactly like the `run` command.
+//
+// `extra_argc`/`extra_argv` are additional arguments handed to the
+// program as argv[1..] (argv[0] is always `run_path` itself) - e.g.
+// the "-h --hello 0:/randomfile" in "run 0:/hello.run -h --hello
+// 0:/randomfile", or equivalently "./hello.run -h --hello
+// 0:/randomfile" typed directly at the prompt (see
+// command_resolve_file_association() in commandhandler.c, which
+// forwards the whole original line through to `run`). Pass 0/NULL for
+// a program that takes no arguments.
+//
 // Returns the new process, or NULL on failure (bad path, malformed
-// archive/ELF, or OOM).
-process_t* run_launch_file(const char* run_path);
+// archive/ELF, too many/too-long arguments, or OOM).
+process_t* run_launch_file(const char* run_path, int extra_argc, const char** extra_argv);
 
 #endif // RUNCOMMAND_H

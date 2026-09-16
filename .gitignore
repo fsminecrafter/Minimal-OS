@@ -11,5 +11,7 @@ kernel.bin
 
 .venv
 planning
+build
+.vscode
 
 #Other files

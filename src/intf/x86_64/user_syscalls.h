@@ -48,4 +48,7 @@ static inline uint64_t mos_usb(uint64_t operation, uint64_t arg1,
     return mos_syscall3(SYS_USB, operation, arg1, arg2);
 }
 
+static inline uint64_t mos_sysinfo(uint64_t op) {
+    return mos_syscall1(SYS_SYSINFO, op);
+}
 #endif

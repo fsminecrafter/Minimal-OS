@@ -189,7 +189,7 @@ typedef struct __attribute__((packed)) {
     uint64_t r15;
 } syscall_regs_t;
 
-#define SYS_SYSINFO 18
+#define SYS_SYSINFO 26
 
 typedef enum {
     SYS_SYSINFO_CPU_USAGE       = 0x01, // avg CPU usage % across all online cores

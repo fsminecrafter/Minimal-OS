@@ -100,6 +100,15 @@ typedef struct process {
     size_t user_image_pages;
     void* user_stack_phys;
     size_t user_stack_pages;
+    // argv/argc for a user process's entry point, consumed by
+    // proc_enter_ring3() via proc_trampoline(). Set by run_launch_file()
+    // (runcommand.c) before the process is first scheduled. Safe to
+    // append here for the same struct-layout reason as every other
+    // field below `next` - context_switch.asm never touches anything
+    // past kernel_stack, so this struct can keep growing without any
+    // assembly changes.
+    uint64_t user_argc;
+    char** user_argv;
 } process_t;
 
 // Global process list head (defined in proc.c)

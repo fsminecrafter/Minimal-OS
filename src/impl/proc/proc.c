@@ -259,7 +259,7 @@ process_t* proc_create_ex(const char* file_name, void (*entry_point)(),
 	if (!proc) {
 		PANIC("Failed to allocate memory for process_t");
 	}
-	memset_p(proc, 0, sizeof(process_t));
+	memset(proc, 0, sizeof(process_t));
 
 	proc->pid = get_next_pid();
 	proc->state = PROCESS_READY;

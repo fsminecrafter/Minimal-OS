@@ -15,6 +15,11 @@
 #include "x86_64/pkglib.h"
 #include "string.h"
 
+#include "x86_64/smp.h"
+#include "x86_64/allocator.h"
+#include "x86_64/pmm.h"
+#include "x86_64/globaldatatable.h"
+
 static uint64_t sys_write_impl(int fd, const char* buf, uint64_t len) {
     if (!buf) return SYS_ERR_INVAL;
     if (fd != 1 && fd != 2) return SYS_ERR_BADFD;

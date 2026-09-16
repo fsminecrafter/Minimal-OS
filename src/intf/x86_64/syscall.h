@@ -243,33 +243,6 @@ typedef enum {
     SYS_SYSINFO_CORE_USAGE_BASE = 0x10,
 } syscall_sysinfo_op_t;
 
-// ===========================================
-// PROCESS LIST (SYS_PSLIST)
-// ===========================================
-//
-// Deliberately independent of process_t (kernel-internal, proc.h) -
-// same reasoning as syscall_dirent_t vs minimafs_dir_entry_t: only
-// the fields a user program can actually use are exposed, and the
-// kernel struct stays free to grow without breaking this ABI.
-//
-// Call with mos_pslist(buffer, max_entries) - see minimalos.h.
-#define SYS_PSLIST 27
-
-#define SYSCALL_PROCESS_NAME_SIZE 128   // matches MAX_PROCESS_NAME_LEN in proc.h
-
-// state field values - kept in sync manually with process_state_t in proc.h
-#define SYSCALL_PROC_STATE_READY      0
-#define SYSCALL_PROC_STATE_RUNNING    1
-#define SYSCALL_PROC_STATE_WAITING    2
-#define SYSCALL_PROC_STATE_PAUSED     3
-#define SYSCALL_PROC_STATE_ZOMBIE     4
-#define SYSCALL_PROC_STATE_TERMINATED 5
-
-// privilege field values - kept in sync manually with process_privilege_t in proc.h
-#define SYSCALL_PROC_PRIV_KERNEL 0
-#define SYSCALL_PROC_PRIV_USER   1
-
-
 // Called by isr_syscall_wrapped (syscall_isr.asm) for every `int 0x80`.
 // regs->rax = syscall number in, return value out. Args in
 // rdi/rsi/rdx (SysV-ish - matches a future `syscall`-instruction ABI

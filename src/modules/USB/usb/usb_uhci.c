@@ -1321,12 +1321,12 @@ bool usb_enumerate_device(uint8_t port, bool low_speed) {
         return false;
     }
     
-    // Parse configuration for keyboard
-    bool is_keyboard = usb_parse_configuration(dev, config_buffer, config.wTotalLength);
+    // Parse configuration for keyboard/mouse
+    bool found_hid = usb_parse_configuration(dev, config_buffer, config.wTotalLength);
     
-    if (is_keyboard) {
-        serial_write_str("USB: Keyboard detected!\n");
-        dev->is_keyboard = true;
+    if (found_hid) {
+        if (dev->is_keyboard) serial_write_str("USB: Keyboard detected!\n");
+        if (dev->is_mouse)    serial_write_str("USB: Mouse detected!\n");
         
         // Set configuration
         serial_write_str("USB: Setting configuration\n");
@@ -1344,8 +1344,8 @@ bool usb_enumerate_device(uint8_t port, bool low_speed) {
         dev->config_value = config.bConfigurationValue;
         dev->state = USB_DEVICE_STATE_CONFIGURED;
         
-        // Initialize keyboard
-        usb_keyboard_init_device(dev);
+        if (dev->is_keyboard) usb_keyboard_init_device(dev);
+        if (dev->is_mouse)    usb_mouse_init_device(dev);
     }
     
     g_usb_hc.num_devices++;

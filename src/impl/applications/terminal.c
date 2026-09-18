@@ -15,6 +15,7 @@
 #include "vgaterm.h"
 #include "minimafshandler.h"
 #include "systeminfo.h"
+#include "mouse/usbmouse.h"
 
 void usb_keyboard_update_task(void);
 extern const char* fs_get_current_directory(void);

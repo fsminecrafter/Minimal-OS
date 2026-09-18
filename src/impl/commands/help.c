@@ -93,6 +93,13 @@ static void help_diagnostics(void) {
     help_item("trace_stack", "Show the execution trace stack.");
 }
 
+static void help_networking(void) {
+    help_section("Networking");
+    help_item("ifconfig", "Show network interface status.");
+    help_item("dhcp", "Request an IP address from the router.");
+    help_item("wget <url> [-d <path>]", "Fetch a URL over HTTP; print or save to file.");
+}
+
 typedef void (*help_page_func_t)(void);
 
 static bool help_wait_for_next_page(void) {
@@ -121,6 +128,7 @@ void cmd_help(int argc, const char** argv) {
         help_storage_and_packages,
         help_audio,
         help_keyboard_and_programs,
+        help_networking,
         help_diagnostics,
     };
 

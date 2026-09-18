@@ -26,6 +26,14 @@
 #include "x86_64/global_audio_state.h"
 #include "x86_64/smp.h"
 
+#include "x86_64/network_manager.h"
+#include "x86_64/rtl8139.h"
+#include "net/ethernet.h"
+#include "net/arp.h"
+#include "net/ip.h"
+#include "net/udp.h"
+#include "net/tcp.h"
+
 
 void busy(void) {
     serial_write_str("Busy process\n");
@@ -112,6 +120,18 @@ void kernel_main(uint64_t mb2_info_addr) {
     const char* proc_list[32];
     getprocslistNames(proc_list, 32);
     serial_write_str(proc_list[0]);
+
+    network_manager_register_driver(rtl8139_get_driver());
+    if (network_manager_init()) {
+        eth_init();
+        arp_init();
+        ip_init();
+        udp_init();
+        tcp_init();
+        serial_write_str("Network: interface ready (run 'dhcp' to get an address)\n");
+    } else {
+        serial_write_str("Network: no supported NIC found\n");
+    }
 
     time_set_from_str("2026-08-19 18:50:30");
 

@@ -790,6 +790,10 @@ bool usb_init(void) {
                     if (kbd) {
                         uhci_keyboard_interrupt_init(kbd);
                     }
+                    usb_device_t* mouse = usb_get_mouse();
+                    if (mouse) {
+                        uhci_mouse_interrupt_init(mouse);
+                    }
                     
                     return true;
                 }
@@ -1144,6 +1148,142 @@ void usb_poll_keyboard(usb_device_t* dev) {
 // Call this ONCE after keyboard enumeration
 void usb_init_keyboard_polling(usb_device_t* dev) {
     uhci_keyboard_interrupt_init(dev);
+}
+
+// Mouse TD shares the interrupt queue with the keyboard TD (if any):
+// interrupt_qh -> keyboard_td -> mouse_td -> keyboard_td (circular), so
+// both get polled by the controller every frame. If no keyboard is
+// present, the mouse TD self-loops and is the sole entry, same pattern
+// as the keyboard-only case.
+void uhci_mouse_interrupt_init(usb_device_t* dev) {
+    serial_write_str("UHCI: Setting up persistent mouse interrupt TD\n");
+
+    mouse_int_td = uhci_alloc_td();
+    if (!mouse_int_td) {
+        serial_write_str("UHCI: CRITICAL - Failed to allocate mouse TD!\n");
+        return;
+    }
+
+    memset(mouse_int_buffer, 0, sizeof(mouse_int_buffer));
+
+    uint16_t max_packet = dev->mouse_max_packet_size;
+    if (max_packet == 0 || max_packet > 8) {
+        max_packet = 4;  // typical boot mouse report size
+    }
+
+    mouse_is_low_speed = dev->low_speed;
+
+    uint32_t td_phys = ((uint32_t)(uintptr_t)mouse_int_td) & ~0xF;
+
+    mouse_int_td->status =
+        UHCI_TD_ACTIVE |
+        UHCI_TD_IOC |
+        UHCI_TD_SPD |
+        (3 << 27) |
+        0x7FF;
+
+    if (mouse_is_low_speed) {
+        mouse_int_td->status |= UHCI_TD_LS;
+    }
+
+    mouse_int_td->token =
+        (USB_PID_IN & 0xFF) |
+        ((dev->address & 0x7F) << 8) |
+        ((dev->mouse_endpoint & 0xF) << 15) |
+        (0 << 20) |                       // DATA0 toggle
+        (((max_packet - 1) & 0x7FF) << 21);
+
+    mouse_int_td->buffer_ptr = (uint32_t)(uintptr_t)mouse_int_buffer;
+    mouse_int_td->buffer_virt = mouse_int_buffer;
+
+    if (keyboard_int_td) {
+        mouse_int_td->link_ptr = ((uint32_t)(uintptr_t)keyboard_int_td) & ~0xF;
+        keyboard_int_td->link_ptr = td_phys;
+    } else {
+        mouse_int_td->link_ptr = td_phys;   // self-loop, sole entry
+        interrupt_qh->element_ptr = td_phys;
+    }
+
+    mouse_toggle = 0;
+
+    serial_write_str("UHCI: Mouse TD installed\n");
+    serial_write_str("  Device addr: ");
+    serial_write_dec(dev->address);
+    serial_write_str("\n  Endpoint: ");
+    serial_write_dec(dev->mouse_endpoint);
+    serial_write_str("\n  Max packet: ");
+    serial_write_dec(max_packet);
+    serial_write_str("\n  TD phys: 0x");
+    serial_write_hex(td_phys);
+    serial_write_str("\n");
+}
+
+static void uhci_mouse_interrupt_reactivate(void) {
+    if (!mouse_int_td) return;
+
+    memset(mouse_int_buffer, 0, 8);
+
+    uint32_t token = mouse_int_td->token;
+    token &= ~(1 << 20);
+    token |= (mouse_toggle << 20);
+    mouse_int_td->token = token;
+
+    uint32_t status =
+        UHCI_TD_ACTIVE |
+        UHCI_TD_IOC |
+        UHCI_TD_SPD |
+        (3 << 27) |
+        0x7FF;
+
+    if (mouse_is_low_speed)
+        status |= UHCI_TD_LS;
+
+    mouse_int_td->status = status;
+}
+
+static bool uhci_mouse_interrupt_poll(uint8_t* buffer, uint16_t length) {
+    if (!mouse_int_td) return false;
+
+    uint32_t status = mouse_int_td->status;
+
+    if (status & UHCI_TD_ACTIVE) return false;
+
+    if (status & UHCI_TD_NAK) {
+        uhci_mouse_interrupt_reactivate();
+        return false;
+    }
+
+    if (status & (UHCI_TD_STALLED | UHCI_TD_DBERR | UHCI_TD_BABBLE |
+                  UHCI_TD_CRCTIMEOUT | UHCI_TD_BITSTUFF)) {
+        uhci_mouse_interrupt_reactivate();
+        return false;
+    }
+
+    for (int i = 0; i < length && i < 8; i++) {
+        buffer[i] = mouse_int_buffer[i];
+    }
+
+    mouse_toggle ^= 1;
+    uhci_mouse_interrupt_reactivate();
+    return true;
+}
+
+void usb_poll_mouse(usb_device_t* dev) {
+    static uint8_t report_buffer[8];
+
+    if (uhci_mouse_interrupt_poll(report_buffer, 8)) {
+        usb_hid_mouse_report_t* report = (usb_hid_mouse_report_t*)report_buffer;
+        usb_mouse_process_report(report);
+    }
+}
+
+usb_device_t* usb_get_mouse(void) {
+    for (uint8_t i = 0; i < g_usb_hc.num_devices; i++) {
+        if (g_usb_hc.devices[i].is_mouse) {
+            return &g_usb_hc.devices[i];
+        }
+    }
+    return NULL;
 }
 
 // ===========================================
@@ -1508,6 +1648,9 @@ void usb_poll(void) {
         
         if (dev->is_keyboard && dev->state == USB_DEVICE_STATE_CONFIGURED) {
             usb_poll_keyboard(dev);
+        }
+        if (dev->is_mouse && dev->state == USB_DEVICE_STATE_CONFIGURED) {
+            usb_poll_mouse(dev);
         }
     }
 }

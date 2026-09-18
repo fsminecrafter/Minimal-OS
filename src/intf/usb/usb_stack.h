@@ -329,6 +329,18 @@ void usb_poll(void);
 usb_device_t* usb_get_keyboard(void);
 
 /**
+ * Get first USB mouse device
+ * @return pointer to mouse device, or NULL if none found
+ */
+usb_device_t* usb_get_mouse(void);
+
+/**
+ * Poll mouse interrupt endpoint and feed any report to the mouse driver
+ * (mouse/usbmouse.h). Called automatically by usb_poll() per device.
+ */
+void usb_poll_mouse(usb_device_t* dev);
+
+/**
  * Read from USB keyboard interrupt endpoint
  * @param dev USB device (must be keyboard)
  * @param buffer Buffer to receive 8-byte HID report

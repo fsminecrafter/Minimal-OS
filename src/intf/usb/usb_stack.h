@@ -233,9 +233,11 @@ typedef struct {
     uint16_t keyboard_max_packet_size;  // Keyboard endpoint max packet
     uint8_t keyboard_interval;  // Keyboard polling interval (ms)
     
-    // Mouse-specific fields (future expansion)
+    // Mouse-specific fields
     bool is_mouse;
     uint8_t mouse_endpoint;
+    uint16_t mouse_max_packet_size;
+    uint8_t mouse_interval;
     
     // Timing
     uint64_t last_poll_time;    // Last time device was polled

@@ -54,6 +54,8 @@ void pit_irq_handler() {
     // Audio update (mix into HW buffer)
     audio_update();
 
+    network_manager_poll(); //Net-no-scape
+
     // Run scheduler
     scheduler_tick();
     

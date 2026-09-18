@@ -1465,6 +1465,29 @@ bool usb_keyboard_init_device(usb_device_t* dev) {
     return true;
 }
 
+bool usb_mouse_init_device(usb_device_t* dev) {
+    serial_write_str("USB: Initializing mouse device\n");
+
+    usb_setup_packet_t setup = {
+        .bmRequestType = 0x21,  // Class, Interface
+        .bRequest = 0x0B,       // SET_PROTOCOL
+        .wValue = 0,            // Boot protocol
+        .wIndex = 0,            // Interface 0
+        .wLength = 0
+    };
+
+    if (!uhci_control_transfer(dev->address, &setup, NULL, 0)) {
+        serial_write_str("USB: Failed to set mouse boot protocol\n");
+        return false;
+    }
+
+    serial_write_str("USB: Mouse initialized successfully!\n");
+    serial_write_str("USB:   Endpoint: ");
+    serial_write_dec(dev->mouse_endpoint);
+    serial_write_str("\n");
+    return true;
+}
+
 // ===========================================
 // USB POLLING
 // ===========================================

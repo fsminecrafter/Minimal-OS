@@ -9,6 +9,10 @@
 #include "string.h"
 #include "time.h"
 #include "x86_64/scheduler.h"
+#include "usb/usb_stack.h"
+#include "usb/uhci.h"
+#include "keyboard/usbkeyboard.h"
+#include "mouse/usbmouse.h"
 #include <stdbool.h>
 
 // ===========================================

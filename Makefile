@@ -84,35 +84,35 @@ src/resources/%.o: src/resources/%.wav
 
 .PHONY: run
 run: build-x86_64
-	qemu-system-x86_64 -smp 2 -cdrom dist/x86_64/kernel.iso -m 1024M -boot d -d guest_errors,int,cpu_reset,unimp -D qemu.log -serial stdio -usb -device usb-kbd -audiodev pa,id=speaker -machine pcspk-audiodev=speaker  -audiodev pa,id=audio0 -device AC97,audiodev=audio0 -device ahci,id=ahci -drive id=disk0,file=sata256.img,if=none,format=raw -device ide-hd,drive=disk0,bus=ahci.0
+	qemu-system-x86_64 -smp 2 -cdrom dist/x86_64/kernel.iso -m 1024M -boot d -d guest_errors,int,cpu_reset,unimp -D qemu.log -serial stdio -usb -device usb-kbd -audiodev pa,id=speaker -machine pcspk-audiodev=speaker  -audiodev pa,id=audio0 -device AC97,audiodev=audio0 -device ahci,id=ahci -drive id=disk0,file=sata256.img,if=none,format=raw -device ide-hd,drive=disk0,bus=ahci.0 -netdev tap,id=net0,ifname=tap0,script=no,downscript=no -device rtl8139,netdev=net0,mac=52:54:00:12:34:56
 
 .PHONY: run-audio
 run-audio: build-x86_64
-	qemu-system-x86_64 -smp 2 -cdrom dist/x86_64/kernel.iso -m 1024M -boot d -d guest_errors,int,cpu_reset,unimp -D qemu.log  -usb -device usb-kbd -serial stdio -audiodev wav,id=speaker,path=speaker.wav -machine pcspk-audiodev=speaker -audiodev wav,id=audio0,path=ac97.wav -device AC97,audiodev=audio0,audiodev=audio0 -device ahci,id=ahci -drive id=disk0,file=sata256.img,if=none,format=raw -device ide-hd,drive=disk0,bus=ahci.0
+	qemu-system-x86_64 -smp 2 -cdrom dist/x86_64/kernel.iso -m 1024M -boot d -d guest_errors,int,cpu_reset,unimp -D qemu.log  -usb -device usb-kbd -serial stdio -audiodev wav,id=speaker,path=speaker.wav -machine pcspk-audiodev=speaker -audiodev wav,id=audio0,path=ac97.wav -device AC97,audiodev=audio0,audiodev=audio0 -device ahci,id=ahci -drive id=disk0,file=sata256.img,if=none,format=raw -device ide-hd,drive=disk0,bus=ahci.0 -netdev tap,id=net0,ifname=tap0,script=no,downscript=no -device rtl8139,netdev=net0,mac=52:54:00:12:34:56
 
 .PHONY: run-sdl
 run-sdl: build-x86_64
-	qemu-system-x86_64 -smp 2 -cdrom dist/x86_64/kernel.iso -m 1024M -boot d -serial stdio -audiodev sdl,id=speaker -machine pcspk-audiodev=speaker -usb -device usb-kbd -audiodev sdl,id=audio0 -device AC97,audiodev=audio0 -device ahci,id=ahci -drive id=disk0,file=sata256.img,if=none,format=raw -device ide-hd,drive=disk0,bus=ahci.0
+	qemu-system-x86_64 -smp 2 -cdrom dist/x86_64/kernel.iso -m 1024M -boot d -serial stdio -audiodev sdl,id=speaker -machine pcspk-audiodev=speaker -usb -device usb-kbd -audiodev sdl,id=audio0 -device AC97,audiodev=audio0 -device ahci,id=ahci -drive id=disk0,file=sata256.img,if=none,format=raw -device ide-hd,drive=disk0,bus=ahci.0 -netdev tap,id=net0,ifname=tap0,script=no,downscript=no -device rtl8139,netdev=net0,mac=52:54:00:12:34:56
 
 .PHONY: run-alsa
 run-alsa: build-x86_64
-	qemu-system-x86_64 -smp 2 -cdrom dist/x86_64/kernel.iso -m 1024M -boot d -serial stdio -audiodev alsa,id=speaker -machine pcspk-audiodev=speaker -usb -device usb-kbd -audiodev alsa,id=audio0 -device AC97,audiodev=audio0 -device ahci,id=ahci -drive id=disk0,file=sata256.img,if=none,format=raw -device ide-hd,drive=disk0,bus=ahci.0
+	qemu-system-x86_64 -smp 2 -cdrom dist/x86_64/kernel.iso -m 1024M -boot d -serial stdio -audiodev alsa,id=speaker -machine pcspk-audiodev=speaker -usb -device usb-kbd -audiodev alsa,id=audio0 -device AC97,audiodev=audio0 -device ahci,id=ahci -drive id=disk0,file=sata256.img,if=none,format=raw -device ide-hd,drive=disk0,bus=ahci.0 -netdev tap,id=net0,ifname=tap0,script=no,downscript=no -device rtl8139,netdev=net0,mac=52:54:00:12:34:56
 
 .PHONY: run-ps2
 run-ps2: build-x86_64
-	qemu-system-x86_64 -smp 2 -cdrom dist/x86_64/kernel.iso -m 1024M -boot d -serial stdio -audiodev pa,id=speaker -machine pcspk-audiodev=speaker
+	qemu-system-x86_64 -smp 2 -cdrom dist/x86_64/kernel.iso -m 1024M -boot d -serial stdio -audiodev pa,id=speaker -machine pcspk-audiodev=speaker -netdev tap,id=net0,ifname=tap0,script=no,downscript=no -device rtl8139,netdev=net0,mac=52:54:00:12:34:56
 
 .PHONY: run-int
 run-int: build-x86_64
-	qemu-system-x86_64 -smp 2 -cdrom dist/x86_64/kernel.iso -m 1024M -boot d -serial stdio -d int -audiodev pa,id=speaker -machine pcspk-audiodev=speaker -usb -device usb-kbd
+	qemu-system-x86_64 -smp 2 -cdrom dist/x86_64/kernel.iso -m 1024M -boot d -serial stdio -d int -audiodev pa,id=speaker -machine pcspk-audiodev=speaker -usb -device usb-kbd -netdev tap,id=net0,ifname=tap0,script=no,downscript=no -device rtl8139,netdev=net0,mac=52:54:00:12:34:56
 
 .PHONY: run-de
 run-de: build-x86_64
-	qemu-system-x86_64 -smp 2 -cdrom dist/x86_64/kernel.iso -m 1024M -boot d -d guest_errors,int,cpu_reset,unimp -D qemu.log --no-reboot -serial stdio -audiodev pa,id=speaker -machine pcspk-audiodev=speaker -usb -device usb-kbd
+	qemu-system-x86_64 -smp 2 -cdrom dist/x86_64/kernel.iso -m 1024M -boot d -d guest_errors,int,cpu_reset,unimp -D qemu.log --no-reboot -serial stdio -audiodev pa,id=speaker -machine pcspk-audiodev=speaker -usb -device usb-kbd -netdev tap,id=net0,ifname=tap0,script=no,downscript=no -device rtl8139,netdev=net0,mac=52:54:00:12:34:56
 
 .PHONY: run-dex
 run-dex: build-x86_64
-	qemu-system-x86_64 -smp 2 -cdrom dist/x86_64/kernel.iso -m 1024M -boot d -d guest_errors,int,cpu_reset,unimp -D qemu.log --no-reboot -serial stdio -S -s -usb -device usb-kbd
+	qemu-system-x86_64 -smp 2 -cdrom dist/x86_64/kernel.iso -m 1024M -boot d -d guest_errors,int,cpu_reset,unimp -D qemu.log --no-reboot -serial stdio -S -s -usb -device usb-kbd -netdev tap,id=net0,ifname=tap0,script=no,downscript=no -device rtl8139,netdev=net0,mac=52:54:00:12:34:56
 
 .PHONY: ci-test
 ci-test:

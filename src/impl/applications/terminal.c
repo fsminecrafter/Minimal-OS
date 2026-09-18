@@ -322,6 +322,9 @@ void terminal_init_keyboard(void) {
 
     // Initialize USB keyboard driver
     usb_keyboard_init();
+
+    // Initialize USB mouse driver
+    usb_mouse_init();
     
     // Load Swedish keyboard layout
     extern const keyboard_layout_t usb_layout_se_qwerty;

@@ -723,6 +723,10 @@ void syscall_dispatch(syscall_regs_t* regs) {
             regs->rax = sys_usb_impl(regs->rdi, regs->rsi, regs->rdx);
             break;
 
+        case SYS_MOUSE:
+            regs->rax = sys_mouse_impl(regs->rdi, regs->rsi, regs->rdx);
+            break;
+
         case SYS_GETTIME: {
             datetime_t* output = (datetime_t*)regs->rdi;
             if (!output) {

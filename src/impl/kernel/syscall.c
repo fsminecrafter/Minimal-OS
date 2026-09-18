@@ -13,6 +13,9 @@
 #include "time.h"
 #include "x86_64/allocator.h"
 #include "x86_64/pkglib.h"
+#include "usb/usb_stack.h"
+#include "keyboard/usbkeyboard.h"
+#include "mouse/usbmouse.h"
 #include "string.h"
 
 #include "x86_64/smp.h"

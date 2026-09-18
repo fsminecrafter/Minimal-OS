@@ -261,6 +261,33 @@ static uint64_t sys_usb_impl(uint64_t operation, uint64_t arg1, uint64_t arg2) {
     }
 }
 
+static uint64_t sys_mouse_impl(uint64_t operation, uint64_t arg1, uint64_t arg2) {
+    switch (operation) {
+        case SYS_MOUSE_INIT:
+            usb_mouse_init();
+            return SYS_SUCCESS;
+        case SYS_MOUSE_POLL:
+            usb_poll();
+            return SYS_SUCCESS;
+        case SYS_MOUSE_HAS_MOUSE:
+            return usb_mouse_is_present() ? 1 : 0;
+        case SYS_MOUSE_GET_STATE: {
+            syscall_mouse_state_t* out = (syscall_mouse_state_t*)arg1;
+            if (!out) return SYS_ERR_INVAL;
+            int32_t dx, dy, wheel;
+            uint8_t buttons;
+            usb_mouse_consume_delta(&dx, &dy, &wheel, &buttons);
+            out->dx = dx;
+            out->dy = dy;
+            out->wheel = wheel;
+            out->buttons = buttons;
+            return SYS_SUCCESS;
+        }
+        default:
+            return SYS_ERR_INVAL;
+    }
+}
+
 /*
  * SYS_LISTDIR helper: converts kernel-internal minimafs_dir_entry_t
  * entries into the stable syscall_dirent_t ABI (see syscall.h) and
@@ -459,6 +486,15 @@ static bool syscall_user_may_call(uint64_t syscall_num, const syscall_regs_t* re
                     // Polling and read-only keyboard queries are
                     // side-effect-free (or self-contained) enough to
                     // allow.
+                    return true;
+            }
+        }
+        case SYS_MOUSE: {
+            uint64_t operation = regs->rdi;
+            switch (operation) {
+                case SYS_MOUSE_INIT:
+                    return false;
+                default:
                     return true;
             }
         }

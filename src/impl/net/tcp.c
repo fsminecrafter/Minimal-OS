@@ -1,6 +1,7 @@
 #include "net/tcp.h"
 #include "net/ip.h"
 #include "x86_64/network_manager.h"
+#include "x86_64/scheduler.h"
 #include "time.h"
 #include "string.h"
 #include "serial.h"
@@ -74,7 +75,10 @@ tcp_conn_t* tcp_connect(uint32_t dst_ip, uint16_t dst_port, uint32_t timeout_ms)
     conn->last_activity_ms = time_get_uptime_ms();
 
     for (int attempt = 0; attempt < TCP_MAX_RETRIES; attempt++) {
-        tcp_send_segment(conn, TCP_FLAG_SYN, NULL, 0);
+        if (!tcp_send_segment(conn, TCP_FLAG_SYN, NULL, 0)) {
+            conn->in_use = false;
+            return NULL;
+        }
 
         uint64_t start = time_get_uptime_ms();
         while (time_get_uptime_ms() - start < TCP_RETRANSMIT_MS) {
@@ -102,21 +106,26 @@ int32_t tcp_send(tcp_conn_t* conn, const void* data, uint32_t len, uint32_t time
         if (this_chunk > CHUNK) this_chunk = CHUNK;
 
         uint32_t seq_before = conn->snd_nxt;
-        conn->snd_nxt += this_chunk;
+        uint32_t seq_after = seq_before + this_chunk;
 
         bool acked = false;
         for (int attempt = 0; attempt < TCP_MAX_RETRIES && !acked; attempt++) {
-            tcp_send_segment(conn, TCP_FLAG_ACK | TCP_FLAG_PSH, p + sent, (uint16_t)this_chunk);
+            conn->snd_nxt = seq_before;
+            if (!tcp_send_segment(conn, TCP_FLAG_ACK | TCP_FLAG_PSH,
+                                  p + sent, (uint16_t)this_chunk)) {
+                continue;
+            }
 
             uint64_t start = time_get_uptime_ms();
             while (time_get_uptime_ms() - start < TCP_RETRANSMIT_MS) {
                 network_manager_poll();
-                if (conn->snd_una >= seq_before + this_chunk) { acked = true; break; }
+                if (conn->snd_una >= seq_after) { acked = true; break; }
                 if (conn->reset || conn->state == TCP_CLOSED) return (int32_t)sent;
                 sleep(5);
             }
         }
         if (!acked) return (int32_t)sent;
+        conn->snd_nxt = seq_after;
         sent += this_chunk;
     }
     return (int32_t)sent;
@@ -189,6 +198,7 @@ void tcp_handle_packet(uint32_t src_ip, const uint8_t* seg, uint16_t len) {
         if ((hdr->flags & TCP_FLAG_SYN) && (hdr->flags & TCP_FLAG_ACK)) {
             conn->rcv_nxt = seq + 1;
             conn->snd_una = ack;
+            if (conn->snd_nxt < ack) conn->snd_nxt = ack;
             conn->state = TCP_ESTABLISHED;
             tcp_send_segment(conn, TCP_FLAG_ACK, NULL, 0);
         }

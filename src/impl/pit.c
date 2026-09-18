@@ -8,6 +8,7 @@
 #include "time.h"
 #include "panic.h"
 #include "usb/usb_stack.h"
+#include "x86_64/network_manager.h"
 #include "x86_64/smp.h"
 #include "x86_64/exec_trace.h"
 

@@ -3,6 +3,7 @@
 #include "net/ip.h"
 #include "net/ethernet.h"
 #include "x86_64/network_manager.h"
+#include "x86_64/scheduler.h"
 #include "time.h"
 #include "string.h"
 #include "serial.h"

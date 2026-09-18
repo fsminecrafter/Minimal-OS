@@ -1,5 +1,9 @@
-CC := $(HOME)/cross/bin/x86_64-elf-gcc
-LD := $(HOME)/cross/bin/x86_64-elf-ld
+toolchain_home := $(if $(SUDO_USER),$(shell getent passwd $(SUDO_USER) | cut -d: -f6),$(HOME))
+CC := $(toolchain_home)/cross/bin/x86_64-elf-gcc
+LD := $(toolchain_home)/cross/bin/x86_64-elf-ld
+
+QEMU_NETDEV ?= user,id=net0
+QEMU_AUDIO_DRIVER ?= none
 
 .DEFAULT_GOAL := build-x86_64
 
@@ -84,7 +88,7 @@ src/resources/%.o: src/resources/%.wav
 
 .PHONY: run
 run: build-x86_64
-	qemu-system-x86_64 -smp 2 -cdrom dist/x86_64/kernel.iso -m 1024M -boot d -d guest_errors,int,cpu_reset,unimp -D qemu.log -serial stdio -usb -device usb-kbd -audiodev pa,id=speaker -machine pcspk-audiodev=speaker  -audiodev pa,id=audio0 -device AC97,audiodev=audio0 -device ahci,id=ahci -drive id=disk0,file=sata256.img,if=none,format=raw -device ide-hd,drive=disk0,bus=ahci.0 -netdev tap,id=net0,ifname=tap0,script=no,downscript=no -device rtl8139,netdev=net0,mac=52:54:00:12:34:56
+	qemu-system-x86_64 -smp 2 -cdrom dist/x86_64/kernel.iso -m 1024M -boot d -d guest_errors,int,cpu_reset,unimp -D qemu.log -serial stdio -usb -device usb-kbd -audiodev $(QEMU_AUDIO_DRIVER),id=speaker -machine pcspk-audiodev=speaker  -audiodev $(QEMU_AUDIO_DRIVER),id=audio0 -device AC97,audiodev=audio0 -device ahci,id=ahci -drive id=disk0,file=sata256.img,if=none,format=raw -device ide-hd,drive=disk0,bus=ahci.0 -netdev $(QEMU_NETDEV) -device rtl8139,netdev=net0,mac=52:54:00:12:34:56
 
 .PHONY: run-audio
 run-audio: build-x86_64

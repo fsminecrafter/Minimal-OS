@@ -5,6 +5,7 @@
 #include "string.h"
 #include "x86_64/commandhandler.h"
 #include "x86_64/commandreg.h"
+#include "x86_64/scheduler.h"
 #include "x86_64/network_manager.h"
 #include "net/ethernet.h"
 #include "net/ip.h"

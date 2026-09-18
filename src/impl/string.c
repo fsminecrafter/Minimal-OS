@@ -602,6 +602,16 @@ static size_t append_char_to_buffer(char* buf, size_t bufsize, size_t pos, char 
     return pos;
 }
 
+static size_t append_padded_to_buffer(char* buf, size_t bufsize, size_t pos,
+                                      const char* src, int width, char pad) {
+    size_t length = strlen(src);
+    while (width > (int)length) {
+        pos = append_char_to_buffer(buf, bufsize, pos, pad);
+        width--;
+    }
+    return append_to_buffer(buf, bufsize, pos, src);
+}
+
 // ------------------------
 // Minimal vsnprintf implementation
 // ------------------------
@@ -614,6 +624,17 @@ static int vsnprintf_internal(char* buffer, size_t size, const char* fmt, va_lis
             if (*fmt == '\0') break;
 
             bool longlong = false;
+            bool zero_pad = false;
+            int width = 0;
+
+            if (*fmt == '0') {
+                zero_pad = true;
+                fmt++;
+            }
+            while (*fmt >= '0' && *fmt <= '9') {
+                width = width * 10 + (*fmt - '0');
+                fmt++;
+            }
 
             if (*fmt == 'l') {
                 fmt++;
@@ -642,7 +663,7 @@ static int vsnprintf_internal(char* buffer, size_t size, const char* fmt, va_lis
                     int64_t val = longlong ? va_arg(args, int64_t) : va_arg(args, int);
                     char tmp[32];
                     int_to_str(val, tmp);
-                    pos = append_to_buffer(buffer, size, pos, tmp);
+                    pos = append_padded_to_buffer(buffer, size, pos, tmp, width, ' ');
                     break;
                 }
 
@@ -650,7 +671,7 @@ static int vsnprintf_internal(char* buffer, size_t size, const char* fmt, va_lis
                     uint64_t val = longlong ? va_arg(args, uint64_t) : va_arg(args, unsigned int);
                     char tmp[32];
                     uint_to_str(val, tmp);
-                    pos = append_to_buffer(buffer, size, pos, tmp);
+                    pos = append_padded_to_buffer(buffer, size, pos, tmp, width, ' ');
                     break;
                 }
 
@@ -659,7 +680,8 @@ static int vsnprintf_internal(char* buffer, size_t size, const char* fmt, va_lis
                     uint64_t val = longlong ? va_arg(args, uint64_t) : va_arg(args, unsigned int);
                     char tmp[32];
                     hex_to_str(val, tmp);
-                    pos = append_to_buffer(buffer, size, pos, tmp);
+                    pos = append_padded_to_buffer(buffer, size, pos, tmp, width,
+                                                  zero_pad ? '0' : ' ');
                     break;
                 }
 

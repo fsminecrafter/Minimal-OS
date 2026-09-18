@@ -38,6 +38,11 @@ static uint8_t keyboard_int_buffer[8];
 static uint8_t keyboard_toggle = 0;
 static bool keyboard_is_low_speed = false;
 
+static uhci_td_t* mouse_int_td = NULL;
+static uint8_t mouse_int_buffer[8];
+static uint8_t mouse_toggle = 0;
+static bool mouse_is_low_speed = false;
+
 // ===========================================
 // UHCI REGISTERS AND CONSTANTS
 // ===========================================

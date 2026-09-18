@@ -1359,16 +1359,17 @@ bool usb_enumerate_device(uint8_t port, bool low_speed) {
 bool usb_parse_configuration(usb_device_t* dev, uint8_t* config_data, uint16_t length) {
     uint16_t offset = 0;
     bool found_keyboard = false;
-    
+    bool found_mouse = false;
+
     while (offset < length) {
         uint8_t desc_len = config_data[offset];
         uint8_t desc_type = config_data[offset + 1];
-        
+
         if (desc_len == 0) break;
-        
+
         if (desc_type == USB_DESC_INTERFACE) {
             usb_interface_descriptor_t* iface = (usb_interface_descriptor_t*)&config_data[offset];
-            
+
             serial_write_str("USB:   Interface: class=0x");
             serial_write_hex(iface->bInterfaceClass);
             serial_write_str(" subclass=0x");
@@ -1376,18 +1377,27 @@ bool usb_parse_configuration(usb_device_t* dev, uint8_t* config_data, uint16_t l
             serial_write_str(" protocol=0x");
             serial_write_hex(iface->bInterfaceProtocol);
             serial_write_str("\n");
-            
+
             // HID class (0x03), Boot interface subclass (0x01), Keyboard protocol (0x01)
             if (iface->bInterfaceClass == 0x03 &&
                 iface->bInterfaceSubClass == 0x01 &&
                 iface->bInterfaceProtocol == 0x01) {
                 serial_write_str("USB:   -> This is a HID Boot Keyboard!\n");
                 found_keyboard = true;
+                dev->is_keyboard = true;
+            }
+            // HID class (0x03), Boot interface subclass (0x01), Mouse protocol (0x02)
+            else if (iface->bInterfaceClass == 0x03 &&
+                     iface->bInterfaceSubClass == 0x01 &&
+                     iface->bInterfaceProtocol == 0x02) {
+                serial_write_str("USB:   -> This is a HID Boot Mouse!\n");
+                found_mouse = true;
+                dev->is_mouse = true;
             }
         }
         else if (desc_type == USB_DESC_ENDPOINT) {
             usb_endpoint_descriptor_t* ep = (usb_endpoint_descriptor_t*)&config_data[offset];
-            
+
             serial_write_str("USB:   Endpoint: addr=0x");
             serial_write_hex(ep->bEndpointAddress);
             serial_write_str(" attr=0x");
@@ -1397,23 +1407,27 @@ bool usb_parse_configuration(usb_device_t* dev, uint8_t* config_data, uint16_t l
             serial_write_str(" interval=");
             serial_write_dec(ep->bInterval);
             serial_write_str("\n");
-            
-            // Save keyboard interrupt endpoint (IN, interrupt)
-            if (found_keyboard && 
-                (ep->bEndpointAddress & 0x80) &&  // IN endpoint
-                (ep->bmAttributes & 0x03) == 0x03) {  // Interrupt transfer
+
+            bool is_in_interrupt = (ep->bEndpointAddress & 0x80) &&
+                                    (ep->bmAttributes & 0x03) == 0x03;
+
+            if (found_keyboard && is_in_interrupt && !dev->keyboard_endpoint) {
                 dev->keyboard_endpoint = ep->bEndpointAddress & 0x0F;
                 dev->keyboard_max_packet_size = ep->wMaxPacketSize;
                 dev->keyboard_interval = ep->bInterval;
-                
                 serial_write_str("USB:   -> Keyboard interrupt endpoint found!\n");
+            } else if (found_mouse && is_in_interrupt && !dev->mouse_endpoint) {
+                dev->mouse_endpoint = ep->bEndpointAddress & 0x0F;
+                dev->mouse_max_packet_size = ep->wMaxPacketSize;
+                dev->mouse_interval = ep->bInterval;
+                serial_write_str("USB:   -> Mouse interrupt endpoint found!\n");
             }
         }
-        
+
         offset += desc_len;
     }
-    
-    return found_keyboard;
+
+    return found_keyboard || found_mouse;
 }
 
 // ===========================================

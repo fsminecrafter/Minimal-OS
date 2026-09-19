@@ -33,6 +33,8 @@
 #include "net/ip.h"
 #include "net/udp.h"
 #include "net/tcp.h"
+#include "x86_64/net_syscall.h"
+#include "x86_64/random.h"
 
 
 void busy(void) {
@@ -128,12 +130,19 @@ void kernel_main(uint64_t mb2_info_addr) {
         ip_init();
         udp_init();
         tcp_init();
+        // Handle table + per-port UDP receive queues that SYS_NET
+        // hands to user processes (see net_syscall.c).
+        net_syscall_init();
         serial_write_str("Network: interface ready (run 'dhcp' to get an address)\n");
     } else {
         serial_write_str("Network: no supported NIC found\n");
     }
 
     time_set_from_str("2026-08-19 18:50:30");
+
+    // Seeded after the clock is set so the RTC contributes something
+    // real. Userland reaches this through SYS_RANDOM.
+    random_init();
 
     // Registers every built-in audio_hw_driver_t with audio_manager
     // and initializes whichever one is actually present. See

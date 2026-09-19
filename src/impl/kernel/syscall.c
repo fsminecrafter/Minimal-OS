@@ -22,6 +22,9 @@
 #include "x86_64/allocator.h"
 #include "x86_64/pmm.h"
 #include "x86_64/globaldatatable.h"
+#include "x86_64/net_syscall.h"
+#include "x86_64/random.h"
+#include "x86_64/runcommand.h"
 
 static uint64_t sys_write_impl(int fd, const char* buf, uint64_t len) {
     if (!buf) return SYS_ERR_INVAL;
@@ -445,6 +448,64 @@ static uint64_t sys_pslist_impl(syscall_process_info_t* out, uint32_t max_entrie
  * needs denying, so adding a new syscall doesn't require remembering
  * to update this table or it silently becomes forbidden.
  * ============================================================ */
+/*
+ * SYS_HEAP - userland dynamic memory.
+ *
+ * Until now a .run program had no heap at all: no malloc, no sbrk, no
+ * mmap, just whatever fit in .bss and its stack. That rules out any
+ * program whose working set is not known at compile time.
+ *
+ * Because every process still shares the kernel's PML4 (see
+ * proc_create()), this is a direct shim over the kernel allocator
+ * rather than a separate user address space. That means a buggy .run
+ * program can corrupt the kernel heap - which is already true of
+ * everything else it can do, so this adds no new trust boundary. When
+ * per-process page tables land, this becomes the natural place to
+ * carve out a real user heap region instead.
+ */
+static uint64_t sys_heap_impl(uint64_t op, void* ptr, uint64_t size) {
+    switch (op) {
+        case SYS_HEAP_ALLOC: {
+            if (size == 0) return SYS_ERR_INVAL;
+            void* mem = alloc_unzeroed((size_t)size);
+            return mem ? (uint64_t)(uintptr_t)mem : SYS_ERR_GENERIC;
+        }
+        case SYS_HEAP_ALLOC_ZEROED: {
+            if (size == 0) return SYS_ERR_INVAL;
+            void* mem = alloc((size_t)size);
+            return mem ? (uint64_t)(uintptr_t)mem : SYS_ERR_GENERIC;
+        }
+        case SYS_HEAP_FREE:
+            free_mem(ptr);          // already NULL-safe
+            return SYS_SUCCESS;
+        case SYS_HEAP_RESIZE: {
+            void* mem = alloc_resize(ptr, (size_t)size);
+            if (size == 0) return SYS_SUCCESS;
+            return mem ? (uint64_t)(uintptr_t)mem : SYS_ERR_GENERIC;
+        }
+        default:
+            return SYS_ERR_INVAL;
+    }
+}
+
+static uint64_t sys_random_impl(void* buf, uint64_t len) {
+    if (!buf || len == 0) return SYS_ERR_INVAL;
+    random_bytes(buf, (size_t)len);
+    return len;
+}
+
+static uint64_t sys_exec_impl(const char* path, const char** argv, uint64_t argc) {
+    if (!path) return SYS_ERR_INVAL;
+    if (argc > 16) return SYS_ERR_INVAL;      // run_launch_file's own ceiling
+
+    char normalized[MINIMAFS_MAX_PATH];
+    if (!run_normalize_path(path, normalized, sizeof(normalized))) return SYS_ERR_INVAL;
+
+    process_t* proc = run_launch_file(normalized, (int)argc, argv);
+    if (!proc) return SYS_ERR_GENERIC;
+    return proc->pid;
+}
+
 static bool syscall_user_may_call(uint64_t syscall_num, const syscall_regs_t* regs) {
     switch (syscall_num) {
         case SYS_MANAGER: {
@@ -466,6 +527,32 @@ static bool syscall_user_may_call(uint64_t syscall_num, const syscall_regs_t* re
                     // Everything else mutates shared driver/hardware
                     // state - kernel only.
                     return false;
+            }
+        }
+
+        case SYS_NET: {
+            // rdi = syscall_net_request_t*. Read the op out of the
+            // request rather than a register, since this syscall is a
+            // dispatch like SYS_GRAPHICS/SYS_PKG.
+            const syscall_net_request_t* req =
+                (const syscall_net_request_t*)regs->rdi;
+            if (!req) return true;      // sys_net_impl() rejects it anyway
+
+            switch (req->op) {
+                case SYS_NET_DHCP:
+                    // Rewrites the interface's address, netmask,
+                    // gateway and DNS for EVERY process on the
+                    // machine, and blocks the net stack for up to ten
+                    // seconds doing it. Same reasoning as
+                    // SYS_USB_INIT below: bringing the shared
+                    // interface up is an operator action, so it stays
+                    // with the terminal's 'dhcp' command.
+                    return false;
+                default:
+                    // Connect/send/recv/bind are per-connection and
+                    // bounded; a user program doing them is the whole
+                    // point of the syscall.
+                    return true;
             }
         }
 
@@ -700,6 +787,49 @@ void syscall_dispatch(syscall_regs_t* regs) {
 
         case SYS_PKG: {
             regs->rax = sys_pkg_impl((const syscall_pkg_request_t*)regs->rdi);
+            break;
+        }
+
+        case SYS_NET: {
+            regs->rax = sys_net_impl((syscall_net_request_t*)regs->rdi);
+            break;
+        }
+
+        case SYS_CREATE: {
+            const char* path   = (const char*)regs->rdi;
+            const char* type   = (const char*)regs->rsi;
+            const char* format = (const char*)regs->rdx;
+            if (!path) {
+                regs->rax = SYS_ERR_INVAL;
+                break;
+            }
+            regs->rax = minimafs_create_file(path,
+                                             type   ? type   : "binary",
+                                             format ? format : "bin")
+                        ? SYS_SUCCESS : SYS_ERR_GENERIC;
+            break;
+        }
+
+        case SYS_EXEC: {
+            const char* path   = (const char*)regs->rdi;
+            const char** argv  = (const char**)regs->rsi;
+            uint64_t argc      = regs->rdx;
+            regs->rax = sys_exec_impl(path, argv, argc);
+            break;
+        }
+
+        case SYS_HEAP: {
+            uint64_t op   = regs->rdi;
+            void* ptr     = (void*)regs->rsi;
+            uint64_t size = regs->rdx;
+            regs->rax = sys_heap_impl(op, ptr, size);
+            break;
+        }
+
+        case SYS_RANDOM: {
+            void* buf    = (void*)regs->rdi;
+            uint64_t len = regs->rsi;
+            regs->rax = sys_random_impl(buf, len);
             break;
         }
 

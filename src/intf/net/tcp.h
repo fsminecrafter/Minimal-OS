@@ -10,7 +10,18 @@ typedef enum {
     TCP_CLOSE_WAIT,
 } tcp_state_t;
 
-#define TCP_RX_BUF_SIZE 8192
+/*
+ * Receive buffer, per connection. 8 KiB was too small for bulk
+ * transfers: a peer with a real stack (any Linux sender) fills it
+ * faster than a single-threaded polled reader drains it, and because
+ * this stack has no reassembly queue, everything past the buffer is
+ * dropped and retransmitted. 32 KiB with a correctly advertised
+ * window (see tcp_send_segment) keeps a file download moving instead
+ * of collapsing into retransmit cycles.
+ *
+ * Cost: TCP_MAX_CONNS * TCP_RX_BUF_SIZE of kernel .bss = 128 KiB.
+ */
+#define TCP_RX_BUF_SIZE 32768
 
 typedef struct {
     bool in_use;

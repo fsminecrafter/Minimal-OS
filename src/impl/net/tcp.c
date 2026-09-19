@@ -7,6 +7,8 @@
 #include "serial.h"
 
 #define TCP_MAX_CONNS 4
+/* Retained for reference; the advertised window is now computed from
+ * the free space in conn->rx_buf on every segment. */
 #define TCP_DEFAULT_WINDOW 4096
 #define TCP_RETRANSMIT_MS 500
 #define TCP_MAX_RETRIES 6
@@ -45,7 +47,18 @@ static bool tcp_send_segment(tcp_conn_t* conn, uint8_t flags, const void* data, 
     hdr->ack = net_htonl((flags & TCP_FLAG_ACK) ? conn->rcv_nxt : 0);
     hdr->data_offset = (uint8_t)(5 << 4);
     hdr->flags = flags;
-    hdr->window = net_htons(TCP_DEFAULT_WINDOW);
+    /*
+     * Advertise the space actually left in the receive buffer, not a
+     * fixed constant. The old fixed 4096 lied in both directions: it
+     * under-advertised on an empty buffer (throttling the sender for
+     * no reason) and over-advertised on a nearly full one (inviting
+     * data this stack has nowhere to put, which it then silently
+     * dropped because there is no reassembly queue).
+     */
+    uint32_t rx_space = (conn->rx_len < TCP_RX_BUF_SIZE)
+                        ? (TCP_RX_BUF_SIZE - conn->rx_len) : 0;
+    if (rx_space > 0xFFFFu) rx_space = 0xFFFFu;
+    hdr->window = net_htons((uint16_t)rx_space);
     hdr->checksum = 0;
     hdr->urgent_ptr = 0;
 

@@ -43,7 +43,45 @@
 #define SYS_REGISTER_CLEANUP 28
 #define SYS_MOUSE         29
 
+// ===========================================
+// NETWORK (SYS_NET), USER HEAP (SYS_HEAP), CSPRNG (SYS_RANDOM)
+// ===========================================
+// SYS_NET exposes the kernel's existing net stack (src/impl/net/*) to
+// user processes. It is a dispatch syscall in the same shape as
+// SYS_GRAPHICS / SYS_PKG: rdi points at a syscall_net_request_t.
+//
+// Connections are referred to by small integer handles owned by
+// net_syscall.c, NOT by raw tcp_conn_t* - the kernel struct is free to
+// keep changing shape without breaking this ABI, and the handle table
+// gives the kernel a place to validate what userland hands back.
+#define SYS_NET           30
+// Userland heap. Every process currently shares the kernel's PML4
+// (see proc_create()), so this is a thin shim over the kernel
+// allocator rather than a separate per-process address space.
+#define SYS_HEAP          31
+// Kernel entropy source - needed for anything generating session keys.
+#define SYS_RANDOM        32
+// Launch another program (a .run bundle), the same way the terminal's
+// `run` command does. rdi = path, rsi = const char** extra argv,
+// rdx = extra argc. Returns the new pid.
+//
+// A .run program could already do anything the kernel can - it shares
+// the kernel's address space - so this grants no new authority; it
+// just makes the existing capability reachable. It is what makes an
+// [Install.<platform>] `run=` directive executable without a shell.
+#define SYS_EXEC          33
+// Create a new (empty) MinimaFS file. SYS_OPEN only ever opens an
+// existing file - minimafs_open() has no create-on-missing behaviour -
+// so without this a user program can read and append but can never
+// bring a new file into existence, which is the whole job of a package
+// manager. rdi = path, rsi = filetype (e.g. "binary"), rdx = format
+// (e.g. "bin"); both default sensibly when NULL.
+#define SYS_CREATE        34
+
 #define SYS_O_RDONLY 0
+// Anything non-zero opens writable; SYS_OPEN maps flags==SYS_O_RDONLY
+// to minimafs_open(path, read_only=true).
+#define SYS_O_RDWR   1
 
 #define SYS_SUCCESS       0
 #define SYS_ERR_GENERIC  ((uint64_t)-1)
@@ -55,6 +93,10 @@
 // callers. See the syscall_user_may_call() privilege table in
 // syscall.c for exactly which operations this applies to, and why.
 #define SYS_ERR_PERM     ((uint64_t)-5)
+// The (non-reentrant) network stack is already in use by another
+// process/core; the caller should retry rather than treat this as a
+// hard failure. See net_syscall.c.
+#define SYS_ERR_BUSY     ((uint64_t)-6)
 
 typedef enum {
     SYS_GRAPHICS_GET_WIDTH = 1,
@@ -194,6 +236,89 @@ typedef struct {
     uint32_t* out_count;        // unzip: installed-entry count. info: total entry count.
     uint32_t* out_failed;       // unzip only: failed-entry count
 } syscall_pkg_request_t;
+
+
+// ===========================================
+// NETWORK (SYS_NET) structures
+// ===========================================
+//
+// All IPv4 addresses in this ABI are host-order uint32_t (the same
+// representation ip.c uses internally and that ip_parse() produces),
+// NOT network order. Ports are host order too.
+
+typedef enum {
+    SYS_NET_STATUS = 1,     // fill out_status; no side effects
+    SYS_NET_DHCP,           // kernel-only: mutates global interface config
+    SYS_NET_RESOLVE,        // host -> out_ip (uses timeout_ms)
+    SYS_NET_POLL,           // pump the NIC once; cheap, safe to call in a loop
+
+    SYS_NET_TCP_CONNECT = 0x10, // ip/port/timeout_ms -> out_handle
+    SYS_NET_TCP_SEND,           // handle/buf/len -> bytes actually sent
+    SYS_NET_TCP_RECV,           // handle/buf/len -> bytes (0 = nothing yet)
+    SYS_NET_TCP_CLOSE,          // handle
+    SYS_NET_TCP_STATE,          // handle -> SYSCALL_NET_TCP_*
+
+    SYS_NET_UDP_BIND = 0x20,    // local_port -> out_handle
+    SYS_NET_UDP_UNBIND,         // handle
+    SYS_NET_UDP_RECV,           // handle/buf/len -> bytes, fills out_from_*
+    SYS_NET_UDP_SEND,           // ip/port/local_port/buf/len
+} syscall_net_op_t;
+
+// Mirrors tcp_state_t (net/tcp.h) but kept separate so the kernel enum
+// can grow (LISTEN/SYN_RCVD when the server side lands) without
+// changing what userland sees.
+#define SYSCALL_NET_TCP_CLOSED      0
+#define SYSCALL_NET_TCP_CONNECTING  1
+#define SYSCALL_NET_TCP_ESTABLISHED 2
+#define SYSCALL_NET_TCP_CLOSING     3
+#define SYSCALL_NET_TCP_PEER_CLOSED 4
+
+// 255.255.255.255 - accepted as a destination by ip_send().
+#define SYSCALL_NET_IP_BROADCAST 0xFFFFFFFFu
+
+typedef struct {
+    uint8_t  has_driver;    // a NIC driver is registered
+    uint8_t  configured;    // an IPv4 address is set (ip_is_configured())
+    uint8_t  mac[6];
+    uint32_t local_ip;
+    uint32_t netmask;
+    uint32_t gateway;
+    uint32_t dns;
+} syscall_net_status_t;
+
+typedef struct {
+    uint64_t op;                // syscall_net_op_t
+    uint64_t handle;            // tcp/udp handle for ops that take one
+
+    uint32_t ip;                // remote IPv4, host order
+    uint16_t port;              // remote port
+    uint16_t local_port;        // udp bind / udp send source port
+    uint32_t timeout_ms;        // connect / resolve
+
+    void*    buf;               // send source or recv destination
+    uint32_t len;               // size of buf
+
+    const char* host;           // SYS_NET_RESOLVE
+
+    uint64_t* out_handle;
+    uint32_t* out_ip;
+    uint32_t* out_from_ip;      // udp recv: datagram source
+    uint16_t* out_from_port;
+    syscall_net_status_t* out_status;
+} syscall_net_request_t;
+
+// ===========================================
+// USER HEAP (SYS_HEAP)
+// ===========================================
+// rdi = op, rsi = pointer, rdx = size. Returns the allocation address
+// as a uint64_t, or one of the SYS_ERR_* values. Addresses that high
+// are not valid heap pointers, so the two cannot be confused.
+typedef enum {
+    SYS_HEAP_ALLOC = 1,     // rdx = size            -> address
+    SYS_HEAP_FREE,          // rsi = pointer         -> SYS_SUCCESS
+    SYS_HEAP_RESIZE,        // rsi = pointer, rdx = new size -> address
+    SYS_HEAP_ALLOC_ZEROED,  // rdx = size            -> address, zeroed
+} syscall_heap_op_t;
 
 // Layout MUST match the push order in syscall_isr.asm exactly.
 typedef struct __attribute__((packed)) {

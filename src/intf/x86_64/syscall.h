@@ -97,6 +97,9 @@
 // process/core; the caller should retry rather than treat this as a
 // hard failure. See net_syscall.c.
 #define SYS_ERR_BUSY     ((uint64_t)-6)
+// Non-blocking call with nothing to report yet (SYS_NET_TCP_ACCEPT with
+// an empty backlog). Not an error: call again.
+#define SYS_ERR_AGAIN    ((uint64_t)-7)
 
 typedef enum {
     SYS_GRAPHICS_GET_WIDTH = 1,
@@ -258,14 +261,36 @@ typedef enum {
     SYS_NET_TCP_CLOSE,          // handle
     SYS_NET_TCP_STATE,          // handle -> SYSCALL_NET_TCP_*
 
+    // Passive open (server side). Listener handles and connection
+    // handles are separate namespaces: a listener handle is only ever
+    // valid for ACCEPT/UNLISTEN, a connection handle for the TCP_* ops
+    // above.
+    SYS_NET_TCP_LISTEN,         // local_port, len = backlog (0 = default) -> out_handle
+    SYS_NET_TCP_ACCEPT,         // handle = listener; NON-BLOCKING. SYS_SUCCESS fills
+                                // out_handle/out_from_ip/out_from_port, SYS_ERR_AGAIN = none yet
+    SYS_NET_TCP_UNLISTEN,       // handle = listener
+    SYS_NET_TCP_HANDOFF,        // handle = connection, len = pid to give it to (see below)
+
     SYS_NET_UDP_BIND = 0x20,    // local_port -> out_handle
     SYS_NET_UDP_UNBIND,         // handle
     SYS_NET_UDP_RECV,           // handle/buf/len -> bytes, fills out_from_*
     SYS_NET_UDP_SEND,           // ip/port/local_port/buf/len
 } syscall_net_op_t;
 
+// Handle ownership. Every connection and listener handle belongs to the
+// process that created (or accepted) it. When that process is gone
+// (exited, crashed, or was killed) the kernel closes its handles the
+// next time any process makes a handle-allocating call, so a dead
+// program cannot exhaust the table. A server that hands an accepted
+// connection to a child process calls SYS_NET_TCP_HANDOFF with the
+// child's pid right after starting it (only the current owner may hand a
+// handle over, which also stops a stale handle number that has since
+// been reused from being stolen). Until then the accepting process still
+// owns it. The child does not need to do anything to receive it: the
+// handle number is passed on its command line.
+
 // Mirrors tcp_state_t (net/tcp.h) but kept separate so the kernel enum
-// can grow (LISTEN/SYN_RCVD when the server side lands) without
+// can grow (SYN_RCVD is folded into CONNECTING today) without
 // changing what userland sees.
 #define SYSCALL_NET_TCP_CLOSED      0
 #define SYSCALL_NET_TCP_CONNECTING  1

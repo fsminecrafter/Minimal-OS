@@ -33,12 +33,16 @@ uint32_t lzss_decompress(const uint8_t* in, uint32_t in_size,
  * to the actual compressed length, written to *out_size. Returns NULL
  * on OOM or invalid arguments (data_size == 0).
  *
- * This is a brute-force O(input_size * N * F) encoder - fine for
- * small-to-medium files (packages, program bundles) but NOT suitable
- * for large inputs; callers should cap input size and fall back to
- * uncompressed storage above a reasonable threshold. See
- * PKG_ZIP_LZSS_MAX_BYTES in pkgcommand.c for the policy this codebase
- * uses.
+ * Match finding uses hash chains over the 4096-byte window
+ * (LZSS_MAX_CHAIN candidates per byte), so cost is roughly linear in
+ * the input size. It used to be exhaustive - O(input_size * N * F) -
+ * which made even a 256 KiB file take minutes under QEMU. Callers
+ * still cap the input size (PKGLIB_ZIP_LZSS_MAX_BYTES) and store larger
+ * files uncompressed. Output is a valid stream for lzss_decompress()
+ * and for mkpkg.py's decoder either way; it is not required to equal
+ * what mkpkg.py's encoder would produce.
+ *
+ * Allocates about 32 KiB of scratch on the heap while running.
  */
 uint8_t* lzss_compress(const uint8_t* data, uint32_t data_size, uint32_t* out_size);
 

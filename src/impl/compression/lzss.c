@@ -98,6 +98,45 @@ uint32_t lzss_decompress(const uint8_t* in, uint32_t in_size,
  * ring buffer here at all.
  * ============================================================ */
 
+/* Compression speed knobs. The decoder does not care about any of these -
+ * any stream that follows the layout above decodes - so they can change
+ * without touching the format or mkpkg.py.
+ *
+ * LZSS_MAX_CHAIN bounds how many earlier positions are tried per input
+ * byte. The old encoder tried every position in the 4096-byte window
+ * (O(size * 4096), minutes for a 256 KiB file in a VM); 128 keeps the
+ * ratio within a whisker of it on real package contents (see
+ * tests/pkg-host) at a small fraction of the cost. Build with
+ * -DLZSS_MAX_CHAIN=1000000 to get the exhaustive search back.
+ */
+#ifndef LZSS_MAX_CHAIN
+#define LZSS_MAX_CHAIN 128
+#endif
+
+#define LZSS_HASH_BITS 12
+#define LZSS_HASH_SIZE (1u << LZSS_HASH_BITS)
+#define LZSS_NONE      0xFFFFFFFFu
+
+static inline uint32_t lzss_hash3(const uint8_t* p) {
+    uint32_t v = (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16);
+    return (v * 2654435761u) >> (32 - LZSS_HASH_BITS);
+}
+
+// Records positions [start, start+count) so later bytes can match them.
+// A position needs 3 bytes ahead of it to be hashed, so the last two
+// bytes of the input are never inserted (and never need to be: no
+// match can start there).
+static void lzss_insert_range(const uint8_t* data, uint32_t data_size,
+                              uint32_t* head, uint32_t* prev,
+                              uint32_t start, uint32_t count) {
+    for (uint32_t p = start; p < start + count; p++) {
+        if (p + 2 >= data_size) break;
+        uint32_t h = lzss_hash3(data + p);
+        prev[p & (LZSS_N - 1)] = head[h];
+        head[h] = p;
+    }
+}
+
 uint8_t* lzss_compress(const uint8_t* data, uint32_t data_size, uint32_t* out_size) {
     if (out_size) *out_size = 0;
     if (!data || data_size == 0 || !out_size) return NULL;
@@ -106,6 +145,17 @@ uint8_t* lzss_compress(const uint8_t* data, uint32_t data_size, uint32_t* out_si
     uint8_t* out = (uint8_t*)alloc_unzeroed(capacity);
     if (!out) return NULL;
     uint32_t out_pos = 0;
+
+    // Hash-chain match finder state: head[h] is the newest position
+    // whose 3 bytes hash to h, prev[p & (N-1)] the previous position
+    // with the same hash. A ring of N entries is enough because nothing
+    // older than the window is ever followed. 2 * 16 KiB on the heap
+    // (never the stack), freed on every exit path below.
+    uint32_t* tables = (uint32_t*)alloc_unzeroed(sizeof(uint32_t) * (LZSS_HASH_SIZE + LZSS_N));
+    if (!tables) { free_mem(out); return NULL; }
+    uint32_t* head = tables;
+    uint32_t* prev = tables + LZSS_HASH_SIZE;
+    for (uint32_t i = 0; i < LZSS_HASH_SIZE + LZSS_N; i++) tables[i] = LZSS_NONE;
 
     uint8_t  flag_byte = 0;
     uint8_t  flag_bit  = 0;
@@ -120,16 +170,27 @@ uint8_t* lzss_compress(const uint8_t* data, uint32_t data_size, uint32_t* out_si
 
         if (max_len >= LZSS_THRESHOLD + 1) {
             uint32_t window_start = (pos > LZSS_N) ? (pos - LZSS_N) : 0;
-            for (uint32_t src = window_start; src < pos; src++) {
+
+            // Walk the candidates that share this position's 3-byte
+            // hash, newest first. `>=` (not `>`) keeps the OLDEST of
+            // equally long matches, which is what the brute-force
+            // encoder this replaced returned, so with an unlimited
+            // chain the output is byte-identical to it (tests/pkg-host
+            // checks exactly that).
+            uint32_t cand = head[lzss_hash3(data + pos)];
+            uint32_t chain = LZSS_MAX_CHAIN;
+            while (cand != LZSS_NONE && cand >= window_start && chain-- > 0) {
                 uint32_t length = 0;
-                while (length < max_len && data[src + length] == data[pos + length]) {
+                while (length < max_len && data[cand + length] == data[pos + length]) {
                     length++;
                 }
-                if (length > best_len) {
+                if (length >= best_len) {
                     best_len = length;
-                    best_src = src;
-                    if (length >= max_len) break;
+                    best_src = cand;
                 }
+                uint32_t next = prev[cand & (LZSS_N - 1)];
+                if (next != LZSS_NONE && next >= cand) break;   // never loop
+                cand = next;
             }
         }
 
@@ -139,10 +200,12 @@ uint8_t* lzss_compress(const uint8_t* data, uint32_t data_size, uint32_t* out_si
             chunk[chunk_len++] = (uint8_t)(match_pos & 0xFF);
             chunk[chunk_len++] = (uint8_t)(((match_pos >> 8) << 4) | (length_field & 0x0F));
             /* flag bit stays 0 for a match */
+            lzss_insert_range(data, data_size, head, prev, pos, best_len);
             pos += best_len;
         } else {
             flag_byte |= (uint8_t)(1u << flag_bit);
             chunk[chunk_len++] = data[pos];
+            lzss_insert_range(data, data_size, head, prev, pos, 1);
             pos += 1;
         }
 
@@ -153,7 +216,7 @@ uint8_t* lzss_compress(const uint8_t* data, uint32_t data_size, uint32_t* out_si
                 uint32_t new_cap = capacity * 2;
                 while (needed > new_cap) new_cap *= 2;
                 uint8_t* bigger = (uint8_t*)alloc_resize(out, new_cap);
-                if (!bigger) { free_mem(out); return NULL; }
+                if (!bigger) { free_mem(out); free_mem(tables); return NULL; }
                 out = bigger;
                 capacity = new_cap;
             }
@@ -172,7 +235,7 @@ uint8_t* lzss_compress(const uint8_t* data, uint32_t data_size, uint32_t* out_si
             uint32_t new_cap = capacity * 2;
             while (needed > new_cap) new_cap *= 2;
             uint8_t* bigger = (uint8_t*)alloc_resize(out, new_cap);
-            if (!bigger) { free_mem(out); return NULL; }
+            if (!bigger) { free_mem(out); free_mem(tables); return NULL; }
             out = bigger;
             capacity = new_cap;
         }
@@ -180,6 +243,7 @@ uint8_t* lzss_compress(const uint8_t* data, uint32_t data_size, uint32_t* out_si
         for (uint32_t i = 0; i < chunk_len; i++) out[out_pos++] = chunk[i];
     }
 
+    free_mem(tables);
     *out_size = out_pos;
     return out;
 }

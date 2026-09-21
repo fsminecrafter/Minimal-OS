@@ -10,6 +10,7 @@
 #include "net/ethernet.h"
 #include "net/ip.h"
 #include "net/tcp.h"
+#include "net/tls13.h"
 #include "net/dhcp.h"
 #include "net/dns.h"
 #include "x86_64/minimafs.h"
@@ -66,12 +67,15 @@ void cmd_dhcp(int argc, const char** argv) {
 }
 
 static bool parse_url(const char* url, char* host, size_t host_size,
-                      uint16_t* port, char* path, size_t path_size) {
+                      uint16_t* port, char* path, size_t path_size, bool* https) {
     const char* p = url;
-    if (strncmp(p, "http://", 7) == 0) p += 7;
+    *https = false;
+    if (strncmp(p, "https://", 8) == 0) { *https = true; p += 8; }
+    else if (strncmp(p, "http://", 7) == 0) p += 7;
+    else return false;
 
     size_t hi = 0;
-    *port = 80;
+    *port = *https ? 443 : 80;
     while (*p && *p != '/' && *p != ':' && hi + 1 < host_size) host[hi++] = *p++;
     host[hi] = '\0';
     if (hi == 0) return false;
@@ -80,7 +84,7 @@ static bool parse_url(const char* url, char* host, size_t host_size,
         p++;
         uint16_t val = 0;
         while (*p >= '0' && *p <= '9') { val = (uint16_t)(val * 10 + (*p - '0')); p++; }
-        *port = val ? val : 80;
+        *port = val ? val : (*https ? 443 : 80);
     }
 
     if (*p == '/') strncpy(path, p, path_size - 1);
@@ -111,7 +115,8 @@ void cmd_wget(int argc, const char** argv) {
     char host[128];
     char path[256];
     uint16_t port;
-    if (!parse_url(url, host, sizeof(host), &port, path, sizeof(path))) {
+    bool https;
+    if (!parse_url(url, host, sizeof(host), &port, path, sizeof(path), &https)) {
         graphics_write_textr("wget: could not parse URL\n");
         return;
     }
@@ -133,20 +138,35 @@ void cmd_wget(int argc, const char** argv) {
     graphics_write_textr(ip_str);
     graphics_write_textr("...\n");
 
-    tcp_conn_t* conn = tcp_connect(target_ip, port, 5000);
-    if (!conn) {
-        graphics_write_textr("wget: connection failed\n");
+    tcp_conn_t* conn = NULL;
+    tls13_client_t* tls = NULL;
+    if (https) tls = tls13_connect(target_ip, port, host, 15000);
+    else conn = tcp_connect(target_ip, port, 5000);
+    if ((!https && !conn) || (https && !tls)) {
+        if (https) {
+            graphics_write_textr("wget: TLS connection failed (stage: ");
+            graphics_write_textr(tls13_last_error());
+            graphics_write_textr(")\n");
+            serial_write_str("wget: TLS connection failed (stage: ");
+            serial_write_str(tls13_last_error());
+            serial_write_str(")\n");
+        } else graphics_write_textr("wget: connection failed\n");
         return;
     }
+
+    if (https)
+        serial_write_str("wget: TLS handshake completed\n");
 
     char request[512];
     int req_len = snprintf(request, sizeof(request),
         "GET %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\nUser-Agent: MinimalOS-wget\r\n\r\n",
         path, host);
 
-    if (tcp_send(conn, request, (uint32_t)req_len, 5000) != req_len) {
+    int32_t sent = https ? tls13_send(tls, request, (uint32_t)req_len)
+                         : tcp_send(conn, request, (uint32_t)req_len, 5000);
+    if (sent != req_len) {
         graphics_write_textr("wget: failed to send request\n");
-        tcp_close(conn);
+        if (https) tls13_close(tls); else tcp_close(conn);
         return;
     }
 
@@ -157,20 +177,20 @@ void cmd_wget(int argc, const char** argv) {
     if (save_path) {
         if (!fs_resolve_path(save_path, resolved_path)) {
             graphics_write_textr("wget: invalid output path\n");
-            tcp_close(conn);
+            if (https) tls13_close(tls); else tcp_close(conn);
             return;
         }
         minimafs_file_handle_t* existing = minimafs_open(resolved_path, true);
         if (existing) { minimafs_close(existing); minimafs_delete_file(resolved_path); }
         if (!minimafs_create_file(resolved_path, "binary", "bin")) {
             graphics_write_textr("wget: could not create output file\n");
-            tcp_close(conn);
+            if (https) tls13_close(tls); else tcp_close(conn);
             return;
         }
         out_file = minimafs_open(resolved_path, false);
         if (!out_file) {
             graphics_write_textr("wget: could not open output file\n");
-            tcp_close(conn);
+            if (https) tls13_close(tls); else tcp_close(conn);
             return;
         }
     }
@@ -183,7 +203,8 @@ void cmd_wget(int argc, const char** argv) {
     uint64_t last_data_ms = time_get_uptime_ms();
 
     while (true) {
-        int32_t got = tcp_recv(conn, chunk, sizeof(chunk));
+        int32_t got = https ? tls13_recv(tls, chunk, sizeof(chunk), 8000)
+                    : tcp_recv(conn, chunk, sizeof(chunk));
         if (got < 0) break;
         if (got == 0) {
             if (time_get_uptime_ms() - last_data_ms > IDLE_TIMEOUT_MS) break;
@@ -220,7 +241,9 @@ void cmd_wget(int argc, const char** argv) {
     }
 
     if (out_file) minimafs_close(out_file);
-    tcp_close(conn);
+    if (https) tls13_close(tls); else tcp_close(conn);
+
+    serial_write_str("wget: download completed\n");
 
     if (save_path) {
         graphics_write_textr("\nSaved ");

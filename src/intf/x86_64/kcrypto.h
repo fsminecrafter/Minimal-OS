@@ -51,6 +51,17 @@ int kcrypto_aes256_gcm_decrypt(const uint8_t key[32], const uint8_t iv[12],
                                const uint8_t* ct, size_t len,
                                const uint8_t tag[16], uint8_t* pt);
 
+// TLS 1.3 uses AES-128-GCM with the record header as authenticated data.
+void kcrypto_aes128_gcm_encrypt_aad(const uint8_t key[16], const uint8_t iv[12],
+                                    const uint8_t* aad, size_t aad_len,
+                                    const uint8_t* pt, size_t len,
+                                    uint8_t* ct, uint8_t tag[16]);
+
+int kcrypto_aes128_gcm_decrypt_aad(const uint8_t key[16], const uint8_t iv[12],
+                                   const uint8_t* aad, size_t aad_len,
+                                   const uint8_t* ct, size_t len,
+                                   const uint8_t tag[16], uint8_t* pt);
+
 // Constant-time compare - use for tags/keys, never memcmp.
 int kcrypto_memeq_ct(const void* a, const void* b, size_t n);
 

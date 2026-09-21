@@ -40,6 +40,38 @@ static bool command_ready = false;
 //   - Ctrl+C kills the running command process instead of editing input
 static bool g_command_running = false;
 static uint64_t g_last_ctrl_c_ms = 0;
+void terminal_keyboard_callback(uint8_t scancode, char character, bool pressed);
+
+/*
+ * QEMU's serial device is the only dependable input channel in a
+ * display-less test.  Feed its bytes through the same terminal callback as
+ * the USB keyboard so headless automation exercises the normal command
+ * parser instead of requiring monitor "sendkey" support.
+ */
+static void terminal_poll_serial_input(void) {
+    static bool previous_was_cr = false;
+
+    /* A hostile or accidentally connected serial peer must not starve the
+     * terminal process forever. */
+    for (uint16_t i = 0; i < INPUT_BUFFER_SIZE && serial_received(); i++) {
+        char c = serial_read();
+
+        if (c == '\r') {
+            terminal_keyboard_callback(USB_KEY_ENTER, '\n', true);
+            previous_was_cr = true;
+        } else if (c == '\n') {
+            if (!previous_was_cr)
+                terminal_keyboard_callback(USB_KEY_ENTER, '\n', true);
+            previous_was_cr = false;
+        } else if (c == '\b' || (uint8_t)c == 0x7f) {
+            terminal_keyboard_callback(USB_KEY_BACKSPACE, '\b', true);
+            previous_was_cr = false;
+        } else if ((uint8_t)c >= 32 && (uint8_t)c <= 126) {
+            terminal_keyboard_callback(0, c, true);
+            previous_was_cr = false;
+        }
+    }
+}
 
 // ===========================================
 // TERMINAL RENDERING
@@ -278,6 +310,7 @@ void terminal_process_command(const char* cmd) {
 
 void terminal_update(void) {
     while (1) {
+        terminal_poll_serial_input();
         
         // Process pending command
         if (command_ready) {

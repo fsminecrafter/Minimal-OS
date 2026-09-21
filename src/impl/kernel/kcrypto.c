@@ -373,6 +373,98 @@ int kcrypto_aes256_gcm_decrypt(const uint8_t key[32], const uint8_t iv[12],
     return diff == 0;
 }
 
+/* TLS 1.3 record cipher: AES-128-GCM with arbitrary additional data. */
+typedef struct { uint32_t rk[44]; } aes128_key_t;
+
+static void aes128_expand_key(const uint8_t key[16], aes128_key_t* out) {
+    static const uint8_t rcon[10] = { 1, 2, 4, 8, 16, 32, 64, 128, 0x1b, 0x36 };
+    for (int i = 0; i < 4; i++) {
+        out->rk[i] = ((uint32_t)key[4*i] << 24) | ((uint32_t)key[4*i+1] << 16) |
+                     ((uint32_t)key[4*i+2] << 8) | key[4*i+3];
+    }
+    for (int i = 4; i < 44; i++) {
+        uint32_t t = out->rk[i - 1];
+        if ((i & 3) == 0) t = sub_word(rot_word(t)) ^ ((uint32_t)rcon[i/4-1] << 24);
+        out->rk[i] = out->rk[i - 4] ^ t;
+    }
+}
+
+static void aes128_encrypt_block(const aes128_key_t* key, const uint8_t in[16], uint8_t out[16]) {
+    uint8_t s[16];
+    memcpy(s, in, 16);
+    add_round_key(s, key->rk);
+    for (int round = 1; round <= 10; round++) {
+        for (int i = 0; i < 16; i++) s[i] = SBOX[s[i]];
+        uint8_t t;
+        t=s[1]; s[1]=s[5]; s[5]=s[9]; s[9]=s[13]; s[13]=t;
+        t=s[2]; s[2]=s[10]; s[10]=t;
+        t=s[6]; s[6]=s[14]; s[14]=t;
+        t=s[15]; s[15]=s[11]; s[11]=s[7]; s[7]=s[3]; s[3]=t;
+        if (round != 10) {
+            for (int c = 0; c < 4; c++) {
+                uint8_t* col = &s[c*4];
+                uint8_t a0=col[0], a1=col[1], a2=col[2], a3=col[3];
+                uint8_t all=(uint8_t)(a0^a1^a2^a3);
+                col[0]=(uint8_t)(a0^all^xtime((uint8_t)(a0^a1)));
+                col[1]=(uint8_t)(a1^all^xtime((uint8_t)(a1^a2)));
+                col[2]=(uint8_t)(a2^all^xtime((uint8_t)(a2^a3)));
+                col[3]=(uint8_t)(a3^all^xtime((uint8_t)(a3^a0)));
+            }
+        }
+        add_round_key(s, &key->rk[round*4]);
+    }
+    memcpy(out, s, 16);
+}
+
+static void gcm_core128(const aes128_key_t* aes, const uint8_t iv[12],
+                        const uint8_t* aad, size_t aad_len,
+                        const uint8_t* in, size_t len, uint8_t* out,
+                        const uint8_t* ghash_src,
+                        uint8_t tag[16]) {
+    ghash_key_t gk;
+    uint8_t zero[16] = {0}, h[16];
+    aes128_encrypt_block(aes, zero, h);
+    ghash_init(&gk, h);
+    uint8_t j0[16] = {0};
+    memcpy(j0, iv, 12); j0[15] = 1;
+    uint8_t counter[16]; memcpy(counter, j0, 16);
+    for (size_t off = 0; off < len;) {
+        gcm_inc32(counter);
+        uint8_t stream[16]; aes128_encrypt_block(aes, counter, stream);
+        size_t n = len - off; if (n > 16) n = 16;
+        for (size_t i = 0; i < n; i++) out[off+i] = (uint8_t)(in[off+i]^stream[i]);
+        off += n;
+    }
+    uint8_t y[16] = {0};
+    ghash_update(&gk, y, aad, aad_len);
+    /* GCM authenticates ciphertext on both encryption and decryption. */
+    ghash_update(&gk, y, ghash_src, len);
+    uint8_t lengths[16] = {0};
+    uint64_t ab = (uint64_t)aad_len * 8u, cb = (uint64_t)len * 8u;
+    for (int i = 0; i < 8; i++) { lengths[7-i]=(uint8_t)(ab>>(i*8)); lengths[15-i]=(uint8_t)(cb>>(i*8)); }
+    ghash_update(&gk, y, lengths, 16);
+    uint8_t s[16]; aes128_encrypt_block(aes, j0, s);
+    for (int i = 0; i < 16; i++) tag[i] = (uint8_t)(y[i]^s[i]);
+}
+
+void kcrypto_aes128_gcm_encrypt_aad(const uint8_t key[16], const uint8_t iv[12],
+                                    const uint8_t* aad, size_t aad_len,
+                                    const uint8_t* pt, size_t len,
+                                    uint8_t* ct, uint8_t tag[16]) {
+    aes128_key_t aes; aes128_expand_key(key, &aes);
+    gcm_core128(&aes, iv, aad, aad_len, pt, len, ct, ct, tag);
+}
+
+int kcrypto_aes128_gcm_decrypt_aad(const uint8_t key[16], const uint8_t iv[12],
+                                   const uint8_t* aad, size_t aad_len,
+                                   const uint8_t* ct, size_t len,
+                                   const uint8_t tag[16], uint8_t* pt) {
+    aes128_key_t aes; aes128_expand_key(key, &aes);
+    uint8_t computed[16]; gcm_core128(&aes, iv, aad, aad_len, ct, len, pt, ct, computed);
+    uint8_t diff = 0; for (int i = 0; i < 16; i++) diff |= (uint8_t)(computed[i]^tag[i]);
+    return diff == 0;
+}
+
 int kcrypto_memeq_ct(const void* a, const void* b, size_t n) {
     const unsigned char* x = (const unsigned char*)a;
     const unsigned char* y = (const unsigned char*)b;

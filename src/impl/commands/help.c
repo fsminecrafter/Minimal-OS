@@ -97,7 +97,7 @@ static void help_networking(void) {
     help_section("Networking");
     help_item("ifconfig", "Show network interface status.");
     help_item("dhcp", "Request an IP address from the router.");
-    help_item("wget <url> [-d <path>]", "Fetch a URL over HTTP; print or save to file.");
+    help_item("wget <url> [-d <path>]", "Fetch an HTTP or HTTPS URL; print or save to file.");
 }
 
 typedef void (*help_page_func_t)(void);

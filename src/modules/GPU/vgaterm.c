@@ -945,6 +945,16 @@ char vgaterm_wait_key(void) {
     usb_keyboard_begin_key_wait();
 
     while (true) {
+        /* Headless QEMU has no frontend keyboard.  Let interactive boot
+         * prompts consume the same COM1 input used by the terminal's serial
+         * console, so automation is not stranded before terminal_update(). */
+        if (serial_received()) {
+            char serial_key = serial_read();
+            if (serial_key == '\n') continue; /* tolerate CRLF clients */
+            usb_keyboard_end_key_wait();
+            return serial_key;
+        }
+
         char event = usb_keyboard_take_key_event();
         if (event) {
             usb_keyboard_end_key_wait();

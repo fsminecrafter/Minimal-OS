@@ -307,6 +307,9 @@ typedef enum {
 #define SYSCALL_NET_TCP_ESTABLISHED 2
 #define SYSCALL_NET_TCP_CLOSING     3
 #define SYSCALL_NET_TCP_PEER_CLOSED 4
+#define SYSCALL_NET_TLS_CLOSED       0   /* failed or closed */
+#define SYSCALL_NET_TLS_HANDSHAKING  1
+#define SYSCALL_NET_TLS_ESTABLISHED  2
 
 // 255.255.255.255 - accepted as a destination by ip_send().
 #define SYSCALL_NET_IP_BROADCAST 0xFFFFFFFFu

@@ -275,6 +275,16 @@ typedef enum {
     SYS_NET_UDP_UNBIND,         // handle
     SYS_NET_UDP_RECV,           // handle/buf/len -> bytes, fills out_from_*
     SYS_NET_UDP_SEND,           // ip/port/local_port/buf/len
+
+    // TLS-style sessions (ktls). Separate handle namespace from TCP.
+    SYS_NET_TLS_CONNECT = 0x30, // ip/port/timeout_ms -> out_handle. TCP up + hello sent;
+                                // handshake completes in the background (poll TLS_STATE)
+    SYS_NET_TLS_ACCEPT,         // handle = TCP conn you own -> out_handle. The TCP handle
+                                // becomes unusable for raw ops; closing the TLS handle closes it
+    SYS_NET_TLS_STATE,          // handle -> SYSCALL_NET_TLS_*  (also advances the handshake)
+    SYS_NET_TLS_SEND,           // handle/buf/len -> bytes (<= 4096 per call), SYS_ERR_AGAIN while handshaking
+    SYS_NET_TLS_RECV,           // handle/buf/len -> bytes, 0 = nothing yet, SYS_ERR_NOTFOUND = closed/dead
+    SYS_NET_TLS_CLOSE,          // handle
 } syscall_net_op_t;
 
 // Handle ownership. Every connection and listener handle belongs to the

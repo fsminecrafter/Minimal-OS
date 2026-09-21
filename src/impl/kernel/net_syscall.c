@@ -186,6 +186,39 @@ static net_listen_slot_t* listen_slot_get(uint64_t handle) {
 }
 
 // ---------------------------------------------------------------------------
+// TLS (ktls) handle table
+// ---------------------------------------------------------------------------
+//
+// Own handle namespace. A client session owns its tcp_conn_t outright
+// (tcp_handle == 0). A server session wraps an accepted TCP handle:
+// tcp_handle is that handle, which stays occupied (tls_wrapped) so raw
+// SEND/RECV can't bypass the record layer, and is freed with the session.
+
+#define NET_MAX_TLS_HANDLES  TCP_MAX_CONNS
+#define NET_TLS_SEND_SLICE   4096   // same reasoning as NET_TCP_SEND_SLICE
+
+typedef struct {
+    bool in_use;
+    ktls_conn_t* k;
+    uint64_t owner_pid;
+    uint64_t tcp_handle;        // 0 = client session (owns its own tcp_conn_t)
+} net_tls_slot_t;
+
+static net_tls_slot_t g_tls_slots[NET_MAX_TLS_HANDLES];
+
+static int tls_slot_find_free(void) {
+    for (int i = 0; i < NET_MAX_TLS_HANDLES; i++)
+        if (!g_tls_slots[i].in_use) return i;
+    return -1;
+}
+
+static net_tls_slot_t* tls_slot_get(uint64_t handle) {
+    if (handle == 0 || handle > NET_MAX_TLS_HANDLES) return NULL;
+    net_tls_slot_t* slot = &g_tls_slots[handle - 1];
+    return (slot->in_use && slot->k) ? slot : NULL;
+}
+
+// ---------------------------------------------------------------------------
 // Dead-owner sweep
 // ---------------------------------------------------------------------------
 
@@ -213,6 +246,8 @@ static void net_sweep_dead_owners(void) {
         if (g_tcp_slots[i].in_use && g_tcp_slots[i].owner_pid) any_owned = true;
     for (int i = 0; i < NET_MAX_LISTENERS; i++)
         if (g_listen_slots[i].in_use && g_listen_slots[i].owner_pid) any_owned = true;
+    for (int i = 0; i < NET_MAX_TLS_HANDLES; i++)
+        if (g_tls_slots[i].in_use && g_tls_slots[i].owner_pid) any_owned = true;
     if (!any_owned) return;
 
     size_t count = 0;
@@ -222,6 +257,7 @@ static void net_sweep_dead_owners(void) {
     for (int i = 0; i < NET_MAX_TCP_HANDLES; i++) {
         net_tcp_slot_t* slot = &g_tcp_slots[i];
         if (!slot->in_use || !slot->owner_pid) continue;
+        if (slot->tls_wrapped) continue;            // its TLS slot decides
         if (pid_is_live(slot->owner_pid, procs, count)) continue;
 
         serial_write_str("net: reclaiming TCP handle of dead process\n");
@@ -229,6 +265,20 @@ static void net_sweep_dead_owners(void) {
         slot->in_use = false;
         slot->conn = NULL;
         slot->owner_pid = 0;
+    }
+
+    for (int i = 0; i < NET_MAX_TLS_HANDLES; i++) {
+        net_tls_slot_t* slot = &g_tls_slots[i];
+        if (!slot->in_use || !slot->owner_pid) continue;
+        if (pid_is_live(slot->owner_pid, procs, count)) continue;
+
+        serial_write_str("net: reclaiming TLS session of dead process\n");
+        ktls_abort(slot->k);                        // aborts the underlying tcp_conn_t
+        if (slot->tcp_handle) tcp_slot_release(slot->tcp_handle);
+        slot->in_use = false;
+        slot->k = NULL;
+        slot->owner_pid = 0;
+        slot->tcp_handle = 0;
     }
 
     for (int i = 0; i < NET_MAX_LISTENERS; i++) {
@@ -245,18 +295,15 @@ static void net_sweep_dead_owners(void) {
     free_mem(procs);
 }
 
+// Raw-TCP view: refuses connections that a TLS session has taken over.
 static net_tcp_slot_t* tcp_slot_get(uint64_t handle) {
-    if (handle == 0 || handle > NET_MAX_TCP_HANDLES) return NULL;
-    net_tcp_slot_t* slot = &g_tcp_slots[handle - 1];
-    if (!slot->in_use || !slot->conn) return NULL;
+    net_tcp_slot_t* slot = tcp_slot_raw(handle);
+    if (!slot || slot->tls_wrapped) return NULL;
     return slot;
 }
 
 static void tcp_slot_free(uint64_t handle) {
-    net_tcp_slot_t* slot = tcp_slot_get(handle);
-    if (!slot) return;
-    slot->in_use = false;
-    slot->conn = NULL;
+    tcp_slot_release(handle);
 }
 
 // ---------------------------------------------------------------------------
@@ -408,6 +455,123 @@ static uint64_t map_tcp_state(const tcp_conn_t* conn) {
 }
 
 // ---------------------------------------------------------------------------
+// TLS ops. Called from sys_net_impl() with the net claim already held.
+// ---------------------------------------------------------------------------
+
+static uint64_t net_tls_dispatch(syscall_net_request_t* request) {
+    switch (request->op) {
+
+    case SYS_NET_TLS_CONNECT: {
+        if (!request->out_handle || request->ip == 0 || request->port == 0) return SYS_ERR_INVAL;
+        if (!ip_is_configured()) return SYS_ERR_GENERIC;
+        net_sweep_dead_owners();
+
+        int idx = tls_slot_find_free();
+        if (idx < 0) return SYS_ERR_GENERIC;
+
+        ktls_conn_t* k = ktls_client_begin(request->ip, request->port,
+                                           request->timeout_ms ? request->timeout_ms : 5000);
+        if (!k) return SYS_ERR_GENERIC;
+
+        net_tls_slot_t* s = &g_tls_slots[idx];
+        s->in_use = true;
+        s->k = k;
+        s->owner_pid = getCurrentPID();
+        s->tcp_handle = 0;
+        *request->out_handle = (uint64_t)(idx + 1);
+        return SYS_SUCCESS;
+    }
+
+    case SYS_NET_TLS_ACCEPT: {
+        if (!request->out_handle) return SYS_ERR_INVAL;
+
+        net_tcp_slot_t* ts = tcp_slot_get(request->handle);   // also rejects already-wrapped
+        if (!ts) return SYS_ERR_BADFD;
+        // Only the owner may upgrade a connection (mirrors HANDOFF).
+        if (ts->owner_pid != getCurrentPID()) return SYS_ERR_PERM;
+
+        int idx = tls_slot_find_free();
+        if (idx < 0) return SYS_ERR_GENERIC;
+
+        ktls_conn_t* k = ktls_server_begin(ts->conn);
+        if (!k) return SYS_ERR_GENERIC;             // TCP handle untouched, caller may still close it
+
+        ts->tls_wrapped = true;
+
+        net_tls_slot_t* s = &g_tls_slots[idx];
+        s->in_use = true;
+        s->k = k;
+        s->owner_pid = getCurrentPID();
+        s->tcp_handle = request->handle;
+        *request->out_handle = (uint64_t)(idx + 1);
+        return SYS_SUCCESS;
+    }
+
+    case SYS_NET_TLS_STATE: {
+        net_tls_slot_t* s = tls_slot_get(request->handle);
+        if (!s) return SYS_ERR_BADFD;
+        if (s->owner_pid != getCurrentPID()) return SYS_ERR_PERM;
+
+        if (s->k->state == KTLS_STATE_HANDSHAKE) ktls_handshake_step(s->k);
+
+        switch (s->k->state) {
+            case KTLS_STATE_HANDSHAKE:   return SYSCALL_NET_TLS_HANDSHAKING;
+            case KTLS_STATE_ESTABLISHED: return SYSCALL_NET_TLS_ESTABLISHED;
+            default:                     return SYSCALL_NET_TLS_CLOSED;
+        }
+    }
+
+    case SYS_NET_TLS_SEND: {
+        net_tls_slot_t* s = tls_slot_get(request->handle);
+        if (!s) return SYS_ERR_BADFD;
+        if (s->owner_pid != getCurrentPID()) return SYS_ERR_PERM;
+        if (!request->buf || request->len == 0) return SYS_ERR_INVAL;
+
+        if (s->k->state == KTLS_STATE_HANDSHAKE) ktls_handshake_step(s->k);
+        if (s->k->state == KTLS_STATE_HANDSHAKE) return SYS_ERR_AGAIN;
+        if (s->k->state != KTLS_STATE_ESTABLISHED) return SYS_ERR_GENERIC;
+
+        uint32_t slice = request->len;
+        if (slice > NET_TLS_SEND_SLICE) slice = NET_TLS_SEND_SLICE;
+        return ktls_send(s->k, request->buf, slice) ? (uint64_t)slice : SYS_ERR_GENERIC;
+    }
+
+    case SYS_NET_TLS_RECV: {
+        net_tls_slot_t* s = tls_slot_get(request->handle);
+        if (!s) return SYS_ERR_BADFD;
+        if (s->owner_pid != getCurrentPID()) return SYS_ERR_PERM;
+        if (!request->buf || request->len == 0) return SYS_ERR_INVAL;
+
+        if (s->k->state == KTLS_STATE_HANDSHAKE) {
+            ktls_handshake_step(s->k);
+            if (s->k->state == KTLS_STATE_HANDSHAKE) return 0;   // nothing yet
+        }
+
+        int32_t n = ktls_read(s->k, request->buf, request->len);
+        if (n < 0) return SYS_ERR_NOTFOUND;         // dead / peer closed and drained
+        return (uint64_t)n;
+    }
+
+    case SYS_NET_TLS_CLOSE: {
+        net_tls_slot_t* s = tls_slot_get(request->handle);
+        if (!s) return SYS_ERR_BADFD;
+        if (s->owner_pid != getCurrentPID()) return SYS_ERR_PERM;
+
+        ktls_close(s->k);                           // closes the underlying tcp_conn_t too
+        if (s->tcp_handle) tcp_slot_release(s->tcp_handle);
+        s->in_use = false;
+        s->k = NULL;
+        s->owner_pid = 0;
+        s->tcp_handle = 0;
+        return SYS_SUCCESS;
+    }
+
+    default:
+        return SYS_ERR_INVAL;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Entry point (called from syscall_dispatch)
 // ---------------------------------------------------------------------------
 
@@ -415,6 +579,7 @@ void net_syscall_init(void) {
     memset(g_tcp_slots, 0, sizeof(g_tcp_slots));
     memset(g_listen_slots, 0, sizeof(g_listen_slots));
     memset(g_udp_bindings, 0, sizeof(g_udp_bindings));
+    memset(g_tls_slots, 0, sizeof(g_tls_slots));
     g_net_busy = 0;
     g_last_sweep_ms = 0;
 }
@@ -665,6 +830,14 @@ uint64_t sys_net_impl(syscall_net_request_t* request) {
             result = ok ? (uint64_t)request->len : SYS_ERR_GENERIC;
             break;
         }
+                case SYS_NET_TLS_CONNECT:
+        case SYS_NET_TLS_ACCEPT:
+        case SYS_NET_TLS_STATE:
+        case SYS_NET_TLS_SEND:
+        case SYS_NET_TLS_RECV:
+        case SYS_NET_TLS_CLOSE:
+            result = net_tls_dispatch(request);
+            break;
 
         default:
             result = SYS_ERR_INVAL;

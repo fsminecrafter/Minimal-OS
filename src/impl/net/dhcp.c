@@ -126,13 +126,13 @@ static void dhcp_handle_reply(uint32_t src_ip, uint16_t src_port,
     }
 }
 
-bool dhcp_acquire(uint32_t timeout_ms) {
+static bool dhcp_acquire_internal(uint32_t timeout_ms, bool quiet) {
     g_offer_received = g_ack_received = g_nak_received = false;
     g_xid = (uint32_t)time_get_uptime_ms() ^ 0xA5A5A5A5u;
 
     udp_register_handler(DHCP_CLIENT_PORT, dhcp_handle_reply);
 
-    serial_write_str("DHCP: sending DISCOVER\n");
+    if (!quiet) serial_write_str("DHCP: sending DISCOVER\n");
     dhcp_send(DHCPDISCOVER, 0, 0);
 
     uint64_t start = time_get_uptime_ms();
@@ -141,12 +141,12 @@ bool dhcp_acquire(uint32_t timeout_ms) {
         sleep(10);
     }
     if (!g_offer_received) {
-        serial_write_str("DHCP: no OFFER received\n");
+        if (!quiet) serial_write_str("DHCP: no OFFER received\n");
         udp_unregister_handler(DHCP_CLIENT_PORT);
         return false;
     }
 
-    serial_write_str("DHCP: got OFFER, sending REQUEST\n");
+    if (!quiet) serial_write_str("DHCP: got OFFER, sending REQUEST\n");
     dhcp_send(DHCPREQUEST, g_offered_ip, g_server_ip);
 
     start = time_get_uptime_ms();
@@ -157,7 +157,7 @@ bool dhcp_acquire(uint32_t timeout_ms) {
     udp_unregister_handler(DHCP_CLIENT_PORT);
 
     if (g_nak_received || !g_ack_received) {
-        serial_write_str("DHCP: request denied or timed out\n");
+        if (!quiet) serial_write_str("DHCP: request denied or timed out\n");
         return false;
     }
 
@@ -166,6 +166,16 @@ bool dhcp_acquire(uint32_t timeout_ms) {
 
     char buf[16];
     ip_to_string(g_offered_ip, buf);
-    serial_write_str("DHCP: bound "); serial_write_str(buf); serial_write_str("\n");
+    if (!quiet) {
+        serial_write_str("DHCP: bound "); serial_write_str(buf); serial_write_str("\n");
+    }
     return true;
+}
+
+bool dhcp_acquire(uint32_t timeout_ms) {
+    return dhcp_acquire_internal(timeout_ms, false);
+}
+
+bool dhcp_acquire_quiet(uint32_t timeout_ms) {
+    return dhcp_acquire_internal(timeout_ms, true);
 }

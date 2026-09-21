@@ -50,19 +50,21 @@ void cmd_ifconfig(int argc, const char** argv) {
 }
 
 void cmd_dhcp(int argc, const char** argv) {
+    bool background = argc > 1 && strcmp(argv[1], "--background") == 0;
     if (!network_manager_has_driver()) {
-        graphics_write_textr("No network interface present\n");
+        if (!background) graphics_write_textr("No network interface present\n");
         return;
     }
-    graphics_write_textr("Requesting IP via DHCP...\n");
-    if (dhcp_acquire(10000)) {
+    if (!background) graphics_write_textr("Requesting IP via DHCP...\n");
+    if ((background ? dhcp_acquire_quiet : dhcp_acquire)(10000)) {
+        if (background) return;
         char ip_str[16];
         ip_to_string(ip_get_local(), ip_str);
         graphics_write_textr("Bound address: ");
         graphics_write_textr(ip_str);
         graphics_write_textr("\n");
     } else {
-        graphics_write_textr("DHCP failed (no router response?)\n");
+        if (!background) graphics_write_textr("DHCP failed (no router response?)\n");
     }
 }
 

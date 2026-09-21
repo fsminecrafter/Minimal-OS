@@ -298,6 +298,13 @@ void erase_cursor(int cx, int cy) {
     );
 }
 
+static void invalidate_cursor(void) {
+    if (last_x == -1 || last_y == -1) return;
+    erase_cursor(last_x, last_y);
+    last_x = -1;
+    last_y = -1;
+}
+
 void terminalUpdateCursor() {
     // Erase old cursor
     if (last_x != -1 && last_y != -1) {
@@ -376,6 +383,7 @@ terminal_t* graphics_get_terminal(void) {
 }
 
 void graphics_terminal_clear(void) {
+    invalidate_cursor();
     graphics_clear_c(g_terminal.bg_color);
     g_terminal.cursor_x = 0;
     g_terminal.cursor_y = 0;
@@ -388,6 +396,7 @@ void graphics_terminal_clear(void) {
 void graphics_terminal_redraw(void) {
     if (!g_gpu || !g_gpu->fb) return;
 
+    invalidate_cursor();
     graphics_clear_c(g_terminal.bg_color);
     for (uint32_t row = 0; row < g_terminal.rows && row < TERM_MAX_ROWS; row++) {
         for (uint32_t col = 0; col < g_terminal.cols && col < TERM_MAX_COLS; col++) {
@@ -400,6 +409,7 @@ void graphics_terminal_redraw(void) {
 }
 
 void graphics_terminal_newline(void) {
+    invalidate_cursor();
     g_terminal.cursor_x = 0;
     g_terminal.cursor_y++;
     
@@ -411,6 +421,7 @@ void graphics_terminal_newline(void) {
 void graphics_terminal_scroll(void) {
     if (!g_gpu) return;
 
+    invalidate_cursor();
     uint32_t rows = g_terminal.rows;
     uint32_t cols = g_terminal.cols;
 
@@ -460,6 +471,7 @@ void graphics_terminal_scroll(void) {
 }
 
 void graphics_terminal_set_cursor(uint32_t x, uint32_t y) {
+    invalidate_cursor();
     g_terminal.cursor_x = MIN(x, g_terminal.cols - 1);
     g_terminal.cursor_y = MIN(y, g_terminal.rows - 1);
 }
@@ -475,6 +487,8 @@ void graphics_terminal_set_color(color_t fg, color_t bg) {
 }
 
 void graphics_write_textr_char(char c) {
+    invalidate_cursor();
+
     if (c == '\n') {
         graphics_terminal_newline();
         return;

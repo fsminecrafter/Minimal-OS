@@ -95,6 +95,31 @@ static bool parse_url(const char* url, char* host, size_t host_size,
     return true;
 }
 
+static bool parse_unix_timestamp(const uint8_t* body, uint32_t body_len,
+                                 uint64_t* timestamp) {
+    const char* key = "\"unix_timestamp\"";
+    size_t key_len = strlen(key);
+    for (uint32_t i = 0; i + key_len < body_len; i++) {
+        if (memcmp(body + i, key, key_len) != 0) continue;
+
+        uint32_t cursor = i + (uint32_t)key_len;
+        while (cursor < body_len &&
+               (body[cursor] == ' ' || body[cursor] == '\t' || body[cursor] == ':')) {
+            cursor++;
+        }
+        if (cursor == body_len || body[cursor] < '0' || body[cursor] > '9') return false;
+
+        uint64_t value = 0;
+        while (cursor < body_len && body[cursor] >= '0' && body[cursor] <= '9') {
+            value = value * 10 + (uint64_t)(body[cursor] - '0');
+            cursor++;
+        }
+        *timestamp = value;
+        return true;
+    }
+    return false;
+}
+
 void cmd_wget(int argc, const char** argv) {
     if (argc < 2) {
         graphics_write_textr("Usage: wget <url> [-d|--download <path>]\n");
@@ -122,6 +147,8 @@ void cmd_wget(int argc, const char** argv) {
         graphics_write_textr("wget: could not parse URL\n");
         return;
     }
+    bool unix_time_request = !save_path && strcmp(host, "timeapi.io") == 0 &&
+                             strcmp(path, "/api/v1/time/current/unix") == 0;
 
     uint32_t target_ip = ip_parse(host);
     if (target_ip == 0) {
@@ -203,6 +230,9 @@ void cmd_wget(int argc, const char** argv) {
     uint32_t header_len = 0;
     uint64_t total_bytes = 0;
     bool receive_failed = false;
+    static uint8_t unix_time_body[4096];
+    uint32_t unix_time_body_len = 0;
+    bool unix_time_body_overflow = false;
     const uint64_t IDLE_TIMEOUT_MS = 8000;
     uint64_t last_data_ms = time_get_uptime_ms();
 
@@ -247,7 +277,14 @@ void cmd_wget(int argc, const char** argv) {
         }
 
         if (body_len > 0) {
-            if (out_file) {
+            if (unix_time_request) {
+                if (unix_time_body_len + body_len > sizeof(unix_time_body)) {
+                    unix_time_body_overflow = true;
+                } else {
+                    memcpy(unix_time_body + unix_time_body_len, body, body_len);
+                    unix_time_body_len += body_len;
+                }
+            } else if (out_file) {
                 minimafs_write(out_file, body, body_len);
             } else {
                 for (uint32_t i = 0; i < body_len; i++) {
@@ -269,6 +306,17 @@ void cmd_wget(int argc, const char** argv) {
     }
     if (!headers_done) {
         graphics_write_textr("wget: incomplete HTTP response\n");
+        return;
+    }
+    if (unix_time_request) {
+        uint64_t timestamp;
+        if (unix_time_body_overflow ||
+            !parse_unix_timestamp(unix_time_body, unix_time_body_len, &timestamp)) {
+            graphics_write_textr("wget: invalid Unix timestamp response\n");
+            return;
+        }
+        graphics_write_textr_udec(timestamp);
+        graphics_write_textr("\n");
         return;
     }
     serial_write_str("wget: download completed\n");

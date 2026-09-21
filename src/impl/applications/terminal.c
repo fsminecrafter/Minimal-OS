@@ -28,9 +28,14 @@ gpu_device_t g_gpu;
 terminal_t* terminal;
 
 #define INPUT_BUFFER_SIZE 256
+#define COMMAND_HISTORY_SIZE 25
 static char input_buffer[INPUT_BUFFER_SIZE];
 static uint16_t input_pos = 0;
 static bool command_ready = false;
+static char command_history[COMMAND_HISTORY_SIZE][INPUT_BUFFER_SIZE];
+static uint16_t command_history_count = 0;
+static int16_t command_history_index = -1;
+static char command_history_current[INPUT_BUFFER_SIZE];
 
 // True while a command process launched via command_execute_async() is
 // running. While this is true:
@@ -93,6 +98,81 @@ void terminalPrompt(void) {
     graphics_write_textr("$ ");
 }
 
+static void terminal_erase_last_char(void) {
+    if (input_pos == 0) return;
+
+    input_pos--;
+    input_buffer[input_pos] = '\0';
+
+    if (terminal->cursor_x > 0) {
+        terminal->cursor_x--;
+    } else if (terminal->cursor_y > 0) {
+        terminal->cursor_y--;
+        terminal->cursor_x = terminal->cols - 1;
+    }
+
+    uint16_t saved_x = terminal->cursor_x;
+    uint16_t saved_y = terminal->cursor_y;
+    graphics_write_textr_char(' ');
+    terminal->cursor_x = saved_x;
+    terminal->cursor_y = saved_y;
+}
+
+static void terminal_erase_input(void) {
+    while (input_pos > 0) terminal_erase_last_char();
+}
+
+static void terminal_replace_input(const char* text) {
+    terminal_erase_input();
+    strncpy(input_buffer, text, INPUT_BUFFER_SIZE - 1);
+    input_buffer[INPUT_BUFFER_SIZE - 1] = '\0';
+    input_pos = (uint16_t)strlen(input_buffer);
+    graphics_write_textr(input_buffer);
+}
+
+static void terminal_add_history(const char* command) {
+    if (!command || command[0] == '\0') return;
+
+    if (command_history_count < COMMAND_HISTORY_SIZE) {
+        strncpy(command_history[command_history_count], command, INPUT_BUFFER_SIZE - 1);
+        command_history[command_history_count][INPUT_BUFFER_SIZE - 1] = '\0';
+        command_history_count++;
+        return;
+    }
+
+    for (uint16_t i = 1; i < COMMAND_HISTORY_SIZE; i++) {
+        strncpy(command_history[i - 1], command_history[i], INPUT_BUFFER_SIZE);
+    }
+    strncpy(command_history[COMMAND_HISTORY_SIZE - 1], command, INPUT_BUFFER_SIZE - 1);
+    command_history[COMMAND_HISTORY_SIZE - 1][INPUT_BUFFER_SIZE - 1] = '\0';
+}
+
+static void terminal_history_up(void) {
+    if (command_history_count == 0) return;
+
+    if (command_history_index < 0) {
+        strncpy(command_history_current, input_buffer, INPUT_BUFFER_SIZE - 1);
+        command_history_current[INPUT_BUFFER_SIZE - 1] = '\0';
+        command_history_index = (int16_t)command_history_count - 1;
+    } else if (command_history_index > 0) {
+        command_history_index--;
+    }
+
+    terminal_replace_input(command_history[command_history_index]);
+}
+
+static void terminal_history_down(void) {
+    if (command_history_index < 0) return;
+
+    if (command_history_index < (int16_t)command_history_count - 1) {
+        command_history_index++;
+        terminal_replace_input(command_history[command_history_index]);
+    } else {
+        command_history_index = -1;
+        terminal_replace_input(command_history_current);
+    }
+}
+
 // ===========================================
 // KEYBOARD CALLBACK
 // ===========================================
@@ -141,6 +221,7 @@ void terminal_keyboard_callback(uint8_t scancode, char character, bool pressed) 
         } else {
             input_pos = 0;
             input_buffer[0] = '\0';
+            command_history_index = -1;
             graphics_write_textr("^C\n");
             terminalPrompt();
         }
@@ -164,6 +245,8 @@ void terminal_keyboard_callback(uint8_t scancode, char character, bool pressed) 
             // Submit command
             graphics_write_textr("\n");
             input_buffer[input_pos] = '\0';
+            terminal_add_history(input_buffer);
+            command_history_index = -1;
             command_ready = true;
             serial_write_str("Terminal: Command ready: '");
             serial_write_str(input_buffer);
@@ -171,29 +254,7 @@ void terminal_keyboard_callback(uint8_t scancode, char character, bool pressed) 
             break;
             
         case USB_KEY_BACKSPACE:
-            if (input_pos > 0) {
-                input_pos--;
-                input_buffer[input_pos] = '\0';
-                
-                // Move cursor back
-                if (terminal->cursor_x > 0) {
-                    terminal->cursor_x--;
-                } else if (terminal->cursor_y > 0) {
-                    terminal->cursor_y--;
-                    terminal->cursor_x = terminal->cols - 1;
-                }
-                
-                // Save current position
-                uint16_t saved_x = terminal->cursor_x;
-                uint16_t saved_y = terminal->cursor_y;
-                
-                // Write space and move forward
-                graphics_write_textr_char(' ');
-                
-                // Restore position
-                terminal->cursor_x = saved_x;
-                terminal->cursor_y = saved_y;
-            }
+            terminal_erase_last_char();
             break;
             
         case USB_KEY_TAB:
@@ -208,12 +269,17 @@ void terminal_keyboard_callback(uint8_t scancode, char character, bool pressed) 
             // Clear input
             input_pos = 0;
             input_buffer[0] = '\0';
+            command_history_index = -1;
             graphics_write_textr("^C\n");
             terminalPrompt();
             break;
             
         case USB_KEY_UP:
+            terminal_history_up();
+            break;
         case USB_KEY_DOWN:
+            terminal_history_down();
+            break;
         case USB_KEY_LEFT:
         case USB_KEY_RIGHT:
         case USB_KEY_HOME:

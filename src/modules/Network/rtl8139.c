@@ -174,6 +174,22 @@ static void rtl8139_send(const void* frame, uint16_t len) {
     }
 }
 
+static void rtl8139_reset_rx_ring(void) {
+    wr8(REG_CMD, CMD_RESET);
+    int timeout = 1000000;
+    while ((rd8(REG_CMD) & CMD_RESET) && timeout-- > 0) { }
+    if (timeout <= 0) return;
+
+    memset(g_rx_buffer, 0, RX_RING_SIZE);
+    wr32(REG_RBSTART, (uint32_t)(uintptr_t)g_rx_buffer);
+    wr32(REG_RCR, RCR_AAP | RCR_APM | RCR_AM | RCR_AB | RCR_WRAP);
+    wr32(REG_TCR, 0x03000700);
+    wr16(REG_IMR, 0x0000);
+    wr8(REG_CMD, CMD_RX_EN | CMD_TX_EN);
+    g_rx_offset = 0;
+    wr16(REG_CAPR, (uint16_t)(g_rx_offset - 16));
+}
+
 static void rtl8139_poll(void) {
     if (!g_present) return;
 
@@ -183,11 +199,20 @@ static void rtl8139_poll(void) {
         uint16_t length = (uint16_t)rx_byte(g_rx_offset + 2) |
                           ((uint16_t)rx_byte(g_rx_offset + 3) << 8);
 
-        if (!(status & 0x01) || length < 64 || length > ETH_FRAME_MAX + 4) {
-            serial_write_str("RTL8139: bad rx status, resetting ring\n");
-            g_rx_offset = 0;
-            port_outw(g_io_base + REG_CAPR, (uint16_t)(g_rx_offset - 16));
+        if (length < 64 || length > ETH_FRAME_MAX + 4) {
+            serial_write_str("RTL8139: corrupt rx header, resetting ring\n");
+            rtl8139_reset_rx_ring();
             break;
+        }
+
+        uint32_t packet_end = (g_rx_offset + length + 4 + 3) & ~3u;
+        if (!(status & 0x01)) {
+            // Error frames still have a valid length and must be consumed;
+            // rewinding CAPR makes the same frame appear forever.
+            g_rx_offset = packet_end;
+            if (g_rx_offset >= RX_RING_SIZE) g_rx_offset -= RX_RING_SIZE;
+            port_outw(g_io_base + REG_CAPR, (uint16_t)(g_rx_offset - 16));
+            continue;
         }
 
         static uint8_t linear[ETH_FRAME_MAX];
@@ -196,7 +221,7 @@ static void rtl8139_poll(void) {
 
         eth_handle_frame(linear, payload_len);
 
-        g_rx_offset = (g_rx_offset + length + 4 + 3) & ~3u;
+        g_rx_offset = packet_end;
         if (g_rx_offset >= RX_RING_SIZE) g_rx_offset -= RX_RING_SIZE;
         port_outw(g_io_base + REG_CAPR, (uint16_t)(g_rx_offset - 16));
     }

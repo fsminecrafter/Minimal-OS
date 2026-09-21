@@ -13,6 +13,7 @@
 #include "net/dns.h"
 #include "net/dhcp.h"
 #include "net/ethernet.h"
+#include "net/tls.h"
 #include "string.h"
 #include "serial.h"
 #include "time.h"
@@ -108,6 +109,7 @@ typedef struct {
     bool in_use;
     tcp_conn_t* conn;
     uint64_t owner_pid;         // 0 = unowned (never swept)
+    bool tls_wrapped;           // conn is driven by a TLS slot; raw TCP ops must refuse it
 } net_tcp_slot_t;
 
 static net_tcp_slot_t g_tcp_slots[NET_MAX_TCP_HANDLES];
@@ -119,6 +121,7 @@ static uint64_t tcp_slot_alloc(tcp_conn_t* conn) {
             g_tcp_slots[i].in_use = true;
             g_tcp_slots[i].conn = conn;
             g_tcp_slots[i].owner_pid = getCurrentPID();
+            g_tcp_slots[i].tls_wrapped = false;
             return (uint64_t)(i + 1);
         }
     }
@@ -129,6 +132,23 @@ static int tcp_slot_free_count(void) {
     int n = 0;
     for (int i = 0; i < NET_MAX_TCP_HANDLES; i++) if (!g_tcp_slots[i].in_use) n++;
     return n;
+}
+
+// Slot lookup that ignores TLS wrapping (for the TLS layer itself).
+static net_tcp_slot_t* tcp_slot_raw(uint64_t handle) {
+    if (handle == 0 || handle > NET_MAX_TCP_HANDLES) return NULL;
+    net_tcp_slot_t* slot = &g_tcp_slots[handle - 1];
+    if (!slot->in_use || !slot->conn) return NULL;
+    return slot;
+}
+
+static void tcp_slot_release(uint64_t handle) {
+    net_tcp_slot_t* slot = tcp_slot_raw(handle);
+    if (!slot) return;
+    slot->in_use = false;
+    slot->conn = NULL;
+    slot->owner_pid = 0;
+    slot->tls_wrapped = false;
 }
 
 // ---------------------------------------------------------------------------

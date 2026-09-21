@@ -19,12 +19,14 @@
  *   script="run 0:/itsalive.run"
  *   // -- or --
  *   exec="0:/hello.run"
+ *   // -- or --
+ *   exec="echo service started"
  *
- * [STARTUP] needs exactly one of `script` or `exec`. `exec` loads the
- * given .run bundle directly. `script="run <path>"` is treated the
- * same way; any other script command is executed once at startup with
- * no process being tracked, so `exit=Restart`/`exit=Script` have
- * nothing to act on for it.
+ * [STARTUP] needs exactly one of `script` or `exec`. A path-valued `exec`
+ * loads the given .run bundle directly. `exec="run <path>"` is treated
+ * the same way. Other exec/script values are executed once as terminal
+ * commands with no process being tracked, so exit restart/script modes
+ * have nothing to act on for them.
  */
 
 // Scans 0:/services and starts every valid service found there. Safe

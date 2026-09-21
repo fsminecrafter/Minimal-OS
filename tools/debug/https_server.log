@@ -8,9 +8,9 @@ Header:
     ClientHello, Length=161
       client_version=0x303 (TLS 1.2)
       Random:
-        gmt_unix_time=0x2B0D941C
-        random_bytes (len=28): B7242799AA4FC828B2FEC9EF69FD80D6D7EADACF7222812B20ADAE0D
-      session_id (len=32): 1D24CDBACE9BF390219C39311AEDF6D70801ADA2161A9F10904BEFA4E06660A1
+        gmt_unix_time=0x4409C9B8
+        random_bytes (len=28): 40E166B60F13A6089C602FC44CD09DDAD8071D3BF9111A37471E5C0C
+      session_id (len=32): 552E8A0EBD14F49EAF8792857CAB9677CECD5F96E6CC2D7A8EC5ACE321DC145B
       cipher_suites (len=2)
         {0x13, 0x01} TLS_AES_128_GCM_SHA256
       compression_methods (len=1)
@@ -24,7 +24,7 @@ Header:
           ecdh_x25519 (29)
         extension_type=key_share(51), length=38
             NamedGroup: ecdh_x25519 (29)
-            key_exchange:  (len=32): 6FD2005ED1264E0D30DFB6628715D85D3E60D84191BBCBFC3B9652C618E7F014
+            key_exchange:  (len=32): 358BDCC6782705A7BFAA655319292A24252036C7E2A68B7F5D47E4DE97BD3312
         extension_type=signature_algorithms(13), length=8
           ecdsa_secp256r1_sha256 (0x0403)
           rsa_pss_rsae_sha256 (0x0804)
@@ -38,9 +38,9 @@ Header:
     ServerHello, Length=118
       server_version=0x303 (TLS 1.2)
       Random:
-        gmt_unix_time=0x1628E4B8
-        random_bytes (len=28): 54E39F6B3A9CB6C7E6A7E3D0142B7A34476D62C890E58D47CA1632B9
-      session_id (len=32): 1D24CDBACE9BF390219C39311AEDF6D70801ADA2161A9F10904BEFA4E06660A1
+        gmt_unix_time=0x575141CA
+        random_bytes (len=28): 2840496B3BB1AB0F6815976F50E3B0C076E94FF068A41CB283171C1B
+      session_id (len=32): 552E8A0EBD14F49EAF8792857CAB9677CECD5F96E6CC2D7A8EC5ACE321DC145B
       cipher_suite {0x13, 0x01} TLS_AES_128_GCM_SHA256
       compression_method: No Compression (0x00)
       extensions, length = 46
@@ -48,7 +48,7 @@ Header:
             TLS 1.3 (772)
         extension_type=key_share(51), length=36
             NamedGroup: ecdh_x25519 (29)
-            key_exchange:  (len=32): 0126BEEDFF42DC936BD13F3B81DEED541C1B15BBBC3689AD6F111CA7D6622237
+            key_exchange:  (len=32): 24BDD4A14FFC8066AF9B5F02A6654E4EC8E89829BB88730607801C5030899F45
 
 Sent TLS Record
 Header:
@@ -90,78 +90,78 @@ Certificate:
     Data:
         Version: 3 (0x2)
         Serial Number:
-            72:f2:01:b7:e2:33:36:2d:e5:f2:76:94:d9:5a:dc:10:7c:c1:16:18
+            2d:98:a0:25:59:12:b9:36:18:74:9c:7e:1a:90:98:f6:60:03:39:1d
         Signature Algorithm: sha256WithRSAEncryption
         Issuer: CN = 10.0.2.2
         Validity
-            Not Before: Sep 21 15:55:51 2026 GMT
-            Not After : Sep 22 15:55:51 2026 GMT
+            Not Before: Sep 21 17:24:36 2026 GMT
+            Not After : Sep 22 17:24:36 2026 GMT
         Subject: CN = 10.0.2.2
         Subject Public Key Info:
             Public Key Algorithm: rsaEncryption
                 Public-Key: (2048 bit)
                 Modulus:
-                    00:9d:c4:df:3b:b5:f8:a1:26:48:f4:e1:1e:8f:af:
-                    b9:7f:ab:21:97:0f:46:b7:92:df:90:62:5f:47:06:
-                    fb:36:5f:d3:c1:b1:d8:7a:cf:c4:43:2f:8c:84:38:
-                    d1:46:f9:b0:d9:58:31:8b:e2:05:65:72:7d:c3:60:
-                    5f:5c:c5:26:5f:41:6d:f5:48:be:55:4f:52:60:7e:
-                    6e:2d:f9:10:5a:3d:7f:13:eb:84:23:c1:45:02:75:
-                    a6:89:71:3f:e2:48:3f:0f:e8:33:17:64:9d:25:b7:
-                    db:58:ea:3f:c8:25:6a:3a:63:c0:9b:29:23:cf:af:
-                    24:71:72:43:bd:81:68:be:f6:bd:74:d3:92:d1:b8:
-                    49:0a:54:61:c1:5b:f0:5f:e6:2d:05:4a:4a:e7:bc:
-                    e4:61:4c:e6:36:22:1a:f3:d3:67:48:e2:6d:9f:8d:
-                    62:b7:49:55:aa:78:fb:ec:6e:81:08:cf:f9:68:61:
-                    8a:1e:15:05:88:d7:28:e3:41:4d:56:37:29:f9:ec:
-                    55:7c:fa:c6:b3:73:b2:04:06:f4:35:15:c9:b4:66:
-                    79:96:9f:10:cf:b7:ba:cb:4b:46:09:dd:00:7a:f2:
-                    33:50:52:3a:a2:2c:b2:b7:82:7a:b1:a5:bf:ef:d9:
-                    9d:63:fd:48:f0:95:13:16:2e:21:57:ba:e1:b9:a8:
-                    65:8b
+                    00:9f:7f:e2:9f:37:60:86:3f:81:b8:64:ce:48:9c:
+                    f4:87:f5:ff:36:50:98:19:35:2f:bf:3a:cb:55:e0:
+                    a9:c4:59:52:d0:3c:ea:94:95:6f:27:7d:cc:b1:9d:
+                    cb:87:c6:80:4d:32:02:80:e6:24:2b:1f:f4:6b:60:
+                    d1:32:d0:b6:70:17:09:58:65:a9:cf:fc:9e:1b:34:
+                    c2:ed:54:35:3c:09:2a:be:8a:c0:bc:ba:32:94:c0:
+                    ae:98:86:1e:05:7e:6c:46:ce:7f:9f:69:ce:10:85:
+                    bc:7d:ac:38:e6:ee:0d:ef:a0:af:5d:48:bb:74:ad:
+                    04:63:1e:e7:8b:ff:56:8c:8b:06:d9:11:44:4f:2c:
+                    ec:9e:33:74:14:2e:fe:fe:af:78:04:9b:7d:87:53:
+                    f2:37:c2:d5:65:c2:87:6a:b9:5e:b8:57:ea:a2:15:
+                    2f:4e:20:e9:c5:ac:a5:93:d0:7b:69:6a:87:a5:c5:
+                    be:0e:3f:be:7f:91:26:f2:31:ab:b2:31:98:ac:74:
+                    e4:f3:d7:d2:27:79:38:d8:3c:5a:55:b4:49:e8:14:
+                    01:e0:20:cc:04:b5:ec:d5:c4:f3:7a:5c:bb:53:b1:
+                    9c:ac:20:e9:a7:18:9a:71:a2:47:28:f8:52:54:e3:
+                    01:68:e1:ca:43:12:59:28:10:5b:eb:25:7c:a3:0b:
+                    06:ab
                 Exponent: 65537 (0x10001)
         X509v3 extensions:
             X509v3 Subject Key Identifier: 
-                05:45:2D:B9:2F:7F:31:4C:24:A6:82:31:57:4D:05:81:59:7F:5F:E6
+                09:50:86:47:92:24:6B:23:2D:79:BB:CC:75:67:60:E4:B5:9D:83:D4
             X509v3 Authority Key Identifier: 
-                05:45:2D:B9:2F:7F:31:4C:24:A6:82:31:57:4D:05:81:59:7F:5F:E6
+                09:50:86:47:92:24:6B:23:2D:79:BB:CC:75:67:60:E4:B5:9D:83:D4
             X509v3 Basic Constraints: critical
                 CA:TRUE
     Signature Algorithm: sha256WithRSAEncryption
     Signature Value:
-        62:63:5c:03:9e:16:d4:2a:52:f6:43:ac:15:1c:2f:fb:8d:f1:
-        06:98:92:58:bb:14:1d:ff:74:06:c5:99:b5:f1:a7:c2:3f:7c:
-        73:f0:2c:8d:66:a8:17:c8:39:5f:40:a7:4b:6b:eb:a8:16:26:
-        11:a0:a3:b3:67:f3:f1:69:3f:bf:b4:17:f1:fe:d9:ff:43:7c:
-        fb:9f:a9:eb:d7:8b:bb:84:4c:ed:c5:67:d3:6e:4d:fa:8c:77:
-        50:6b:da:0d:c3:83:a3:4c:f4:66:22:a8:31:75:0f:26:94:9b:
-        5c:6a:42:a9:8b:93:4c:64:a8:91:17:0a:10:6f:ef:b4:08:57:
-        15:d3:70:db:d8:bb:e8:34:0b:40:27:24:07:da:41:97:79:ca:
-        6b:14:36:1e:26:d7:84:d2:63:bc:6c:1f:39:62:fa:0b:54:4b:
-        c0:6f:b9:56:48:d9:df:2f:ba:ea:bd:22:46:d8:34:9e:71:3f:
-        05:2f:d3:77:d7:4f:47:90:f6:75:d3:a4:11:99:8b:b7:16:37:
-        9f:8c:43:88:b5:30:80:48:14:30:2f:45:0e:37:dd:ad:25:c7:
-        cb:89:e7:6e:ef:b3:3d:22:2b:1c:c8:2f:f6:06:da:ad:79:b2:
-        e0:7a:e1:a8:37:55:c8:65:ad:8d:cf:8a:04:54:ad:2b:92:44:
-        54:be:56:7e
+        55:ee:3a:e9:25:03:a2:c9:1b:3b:a7:da:9a:d2:37:f7:86:58:
+        92:81:83:96:0c:59:c4:d3:77:65:2e:8b:48:7e:43:06:9a:6d:
+        2f:b5:a0:4c:9a:7c:26:1e:ee:13:d9:13:20:cc:24:81:2e:17:
+        4f:9f:37:45:00:93:3d:53:61:dd:57:62:f0:d3:1b:7d:1a:fd:
+        5a:72:c8:d7:db:b9:d6:4f:c6:a7:23:8b:89:c1:0f:d4:6e:79:
+        d1:b0:b8:bb:6f:eb:7f:cd:3c:59:bc:1b:3b:1f:f9:7b:8e:a9:
+        ad:17:96:b4:3d:4b:20:92:b9:e3:23:dd:61:2c:25:72:0c:e8:
+        45:73:c7:eb:ed:95:13:af:8e:4a:94:43:55:ea:61:60:56:e1:
+        c6:9c:91:9b:4b:b1:ea:04:4e:67:69:88:f4:13:98:fb:84:7f:
+        d7:1e:f4:fe:da:d2:07:9d:89:e2:a0:e1:1a:63:4e:cc:d8:77:
+        11:90:d7:3d:3e:d0:6d:0b:95:05:a1:3b:c4:39:fb:9b:8b:c0:
+        f1:0f:61:e3:7b:2b:2e:5b:49:a2:65:05:f4:19:05:5b:d9:c3:
+        75:9e:80:bc:d4:2c:f4:d9:51:08:d3:3c:4c:9d:a0:35:51:b9:
+        f3:c4:ff:a3:26:98:c9:a9:3f:0a:e3:54:5a:36:eb:d8:6c:e1:
+        15:98:ce:6e
 -----BEGIN CERTIFICATE-----
-MIIDBzCCAe+gAwIBAgIUcvIBt+IzNi3l8naU2VrcEHzBFhgwDQYJKoZIhvcNAQEL
-BQAwEzERMA8GA1UEAwwIMTAuMC4yLjIwHhcNMjYwOTIxMTU1NTUxWhcNMjYwOTIy
-MTU1NTUxWjATMREwDwYDVQQDDAgxMC4wLjIuMjCCASIwDQYJKoZIhvcNAQEBBQAD
-ggEPADCCAQoCggEBAJ3E3zu1+KEmSPThHo+vuX+rIZcPRreS35BiX0cG+zZf08Gx
-2HrPxEMvjIQ40Ub5sNlYMYviBWVyfcNgX1zFJl9BbfVIvlVPUmB+bi35EFo9fxPr
-hCPBRQJ1polxP+JIPw/oMxdknSW321jqP8glajpjwJspI8+vJHFyQ72BaL72vXTT
-ktG4SQpUYcFb8F/mLQVKSue85GFM5jYiGvPTZ0jibZ+NYrdJVap4++xugQjP+Whh
-ih4VBYjXKONBTVY3KfnsVXz6xrNzsgQG9DUVybRmeZafEM+3ustLRgndAHryM1BS
-OqIssreCerGlv+/ZnWP9SPCVExYuIVe64bmoZYsCAwEAAaNTMFEwHQYDVR0OBBYE
-FAVFLbkvfzFMJKaCMVdNBYFZf1/mMB8GA1UdIwQYMBaAFAVFLbkvfzFMJKaCMVdN
-BYFZf1/mMA8GA1UdEwEB/wQFMAMBAf8wDQYJKoZIhvcNAQELBQADggEBAGJjXAOe
-FtQqUvZDrBUcL/uN8QaYkli7FB3/dAbFmbXxp8I/fHPwLI1mqBfIOV9Ap0tr66gW
-JhGgo7Nn8/FpP7+0F/H+2f9DfPufqevXi7uETO3FZ9NuTfqMd1Br2g3Dg6NM9GYi
-qDF1DyaUm1xqQqmLk0xkqJEXChBv77QIVxXTcNvYu+g0C0AnJAfaQZd5ymsUNh4m
-14TSY7xsHzli+gtUS8BvuVZI2d8vuuq9IkbYNJ5xPwUv03fXT0eQ9nXTpBGZi7cW
-N5+MQ4i1MIBIFDAvRQ433a0lx8uJ527vsz0iKxzIL/YG2q15suB64ag3VchlrY3P
-igRUrSuSRFS+Vn4=
+MIIDBzCCAe+gAwIBAgIULZigJVkSuTYYdJx+GpCY9mADOR0wDQYJKoZIhvcNAQEL
+BQAwEzERMA8GA1UEAwwIMTAuMC4yLjIwHhcNMjYwOTIxMTcyNDM2WhcNMjYwOTIy
+MTcyNDM2WjATMREwDwYDVQQDDAgxMC4wLjIuMjCCASIwDQYJKoZIhvcNAQEBBQAD
+ggEPADCCAQoCggEBAJ9/4p83YIY/gbhkzkic9If1/zZQmBk1L786y1XgqcRZUtA8
+6pSVbyd9zLGdy4fGgE0yAoDmJCsf9Gtg0TLQtnAXCVhlqc/8nhs0wu1UNTwJKr6K
+wLy6MpTArpiGHgV+bEbOf59pzhCFvH2sOObuDe+gr11Iu3StBGMe54v/VoyLBtkR
+RE8s7J4zdBQu/v6veASbfYdT8jfC1WXCh2q5XrhX6qIVL04g6cWspZPQe2lqh6XF
+vg4/vn+RJvIxq7IxmKx05PPX0id5ONg8WlW0SegUAeAgzAS17NXE83pcu1OxnKwg
+6acYmnGiRyj4UlTjAWjhykMSWSgQW+slfKMLBqsCAwEAAaNTMFEwHQYDVR0OBBYE
+FAlQhkeSJGsjLXm7zHVnYOS1nYPUMB8GA1UdIwQYMBaAFAlQhkeSJGsjLXm7zHVn
+YOS1nYPUMA8GA1UdEwEB/wQFMAMBAf8wDQYJKoZIhvcNAQELBQADggEBAFXuOukl
+A6LJGzun2prSN/eGWJKBg5YMWcTTd2Uui0h+QwaabS+1oEyafCYe7hPZEyDMJIEu
+F0+fN0UAkz1TYd1XYvDTG30a/VpyyNfbudZPxqcji4nBD9RuedGwuLtv63/NPFm8
+Gzsf+XuOqa0XlrQ9SyCSueMj3WEsJXIM6EVzx+vtlROvjkqUQ1XqYWBW4cackZtL
+seoETmdpiPQTmPuEf9ce9P7a0gedieKg4RpjTszYdxGQ1z0+0G0LlQWhO8Q5+5uL
+wPEPYeN7Ky5bSaJlBfQZBVvZw3WegLzULPTZUQjTPEydoDVRufPE/6MmmMmpPwrj
+VFo269hs4RWYzm4=
 -----END CERTIFICATE-----
 ------------------
         No extensions
@@ -174,7 +174,7 @@ Header:
   Inner Content Type = Handshake (22)
     CertificateVerify, Length=260
       Signature Algorithm: rsa_pss_rsae_sha256 (0x0804)
-      Signature (len=256): 1A93A7C2C8DDE99544825805E71FBAE2DAD6FBF298953E9F9C88A89787132FE42ADC7367FC4B96682BD3BC1FCC268DA411CBEE3C0787D3E0883DAABED92D24DB137A885F3980B413C3F148A39FA3CA79A3A1772504E03A6D8EEE9DC8AECDB51EDD20CA6F785E8415A76A9599F515210288030BAD32AED3DC3C30D257BE4F6D99879EC37FBFA9059B2616817FF298C04E85204AF22FC86E62A839577FC0492919EAF7880584FE7C53FAD3DEAFCFE119FE73E0BF66B1313AED00D29A416E7B5B5D16E5A5B88134D147AA12406F365EE2A91D9A2DF689B6D6450C6DAF14B86ADC83EC3106CC6BF1FF12B2D42F88B4B0E17EACE8AE6CA788CA3E659665C1365D2875
+      Signature (len=256): 020992E47E0BD7669B3F1F573FA5A74DF75E8C07F5DFF5676D80D79C22B3BC07AA994581DCE78A74EC1D6E672951760FBC1D8E145A0B0D2E5B0FF2C6F477CD883B6B642C358347D29F8833F209852E9B699F395EB8EBC106F42900C786FBCDD1EDAC878B3176ED2E49BAC7474421EA681B6BB633864593C39AD5C5E4A9D48F79435358D16BE8F54592424441C209396B03B040E69CD834F96E383E7B55928223C6F4D5E401A6DE523E1C33A727FED5259B48E3E1BB2D56CDF72D8E718162EDDC7DD497F776DB4CA5BF2132D02BD57C51E757224CD26A409025F48AEAC9131A79B5E6121E2C2C780BEF35E5200AD3A155E457D33ECCC7060F2B29584D7F4304A6
 
 Sent TLS Record
 Header:
@@ -183,9 +183,9 @@ Header:
   Length = 53
   Inner Content Type = Handshake (22)
     Finished, Length=32
-      verify_data (len=32): 453538C2624A691035E0CD3B8C6C27125B6A40640BA8678C7A9D1017F75E23B9
+      verify_data (len=32): C78DFCCE7F03E16A2999D6658C4DB48D0A01F994D31EA394FEDB3F604C4B3DB3
 
-Sent TLS Record
+Received TLS Record
 Header:
   Version = TLS 1.2 (0x303)
-  Con402744CD2C7F0000:error:0A000126:SSL routines::unexpected eof while reading:../ssl/record/rec_layer_s3.c:698:
+ 

@@ -39,7 +39,7 @@ typedef struct {
     char exitscript[SERVICE_MAX_CMD];     // [GENERAL] exitscript
 
     bool has_exec;
-    char exec_path[MINIMAFS_MAX_PATH];    // [STARTUP] exec
+    char exec_path[SERVICE_MAX_CMD];     // [STARTUP] exec path or command
 
     bool has_script;
     char startup_script[SERVICE_MAX_CMD]; // [STARTUP] script
@@ -242,16 +242,31 @@ static bool service_script_run_path(const char* script, char* out, size_t out_si
     return i > 0;
 }
 
-// Launches the service once and blocks until it exits (or until
-// launching itself fails). Returns immediately for non-"run" script
-// commands, since there's no pid to wait on for those.
+// Launches the service once and blocks until a directly launched .run exits.
+// Command-style exec/script entries are handed to the command system once;
+// those commands do not provide a process pid for service monitoring.
 static void service_run_and_wait(service_entry_t* svc) {
     process_t* proc = NULL;
     char target_path[MINIMAFS_MAX_PATH];
     const char* raw_path = NULL;
 
     if (svc->has_exec) {
-        raw_path = svc->exec_path;
+        char run_arg[MINIMAFS_MAX_PATH];
+        if (service_script_run_path(svc->exec_path, run_arg, sizeof(run_arg))) {
+            const char* resolved = run_normalize_path(run_arg, target_path, sizeof(target_path));
+            if (resolved) raw_path = target_path;
+        } else if (svc->exec_path[0] == '/' ||
+                   svc->exec_path[0] == '.' || strchr(svc->exec_path, ':')) {
+            raw_path = svc->exec_path;
+        } else {
+            serial_write_str("[SERVICES] '");
+            serial_write_str(service_display_name(svc));
+            serial_write_str("' executing command: ");
+            serial_write_str(svc->exec_path);
+            serial_write_str("\n");
+            command_execute(svc->exec_path);
+            return;
+        }
     } else if (svc->has_script) {
         char run_arg[MINIMAFS_MAX_PATH];
         if (service_script_run_path(svc->startup_script, run_arg, sizeof(run_arg))) {

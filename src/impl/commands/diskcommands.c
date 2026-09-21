@@ -12,6 +12,8 @@
 #include "music.h"
 #include "x86_64/exec_trace.h"
 #include "x86_64/safeints.h"
+#include "x86_64/pkgformat.h"
+#include "x86_64/lzss.h"
 #include "fspaths.h"
 
 // ===========================================
@@ -28,6 +30,87 @@
  */
 #define DISKCMD_MAX_FORMAT_SIZE (256ULL * 1024 * 1024)
 #define DISKCMD_FALLBACK_SIZE   (128ULL * 1024 * 1024)
+
+extern const uint8_t _binary_install1_mpkg_start[];
+extern const uint8_t _binary_install1_mpkg_end[];
+extern const uint8_t _binary_install2_mpkg_start[];
+extern const uint8_t _binary_install2_mpkg_end[];
+extern const uint8_t _binary_install3_mpkg_start[];
+extern const uint8_t _binary_install3_mpkg_end[];
+
+static uint32_t format_pkg_u32(const uint8_t* p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static bool format_install_package(const uint8_t* archive, uint32_t archive_size,
+                                   const char* target_dir) {
+    if (archive_size < MPKG_HEADER_SIZE ||
+        memcmp(archive, MPKG_MAGIC, MPKG_MAGIC_SIZE) != 0 ||
+        format_pkg_u32(archive + 8) != MPKG_VERSION) {
+        serial_write_str("FORMAT: embedded package is invalid\n");
+        return false;
+    }
+
+    uint32_t count = format_pkg_u32(archive + 12);
+    uint64_t table_end = (uint64_t)MPKG_HEADER_SIZE +
+                         (uint64_t)count * MPKG_ENTRY_SIZE;
+    if (table_end > archive_size) return false;
+
+    for (uint32_t i = 0; i < count; i++) {
+        const uint8_t* entry = archive + MPKG_HEADER_SIZE + i * MPKG_ENTRY_SIZE;
+        char name[MPKG_NAME_SIZE];
+        memcpy(name, entry, MPKG_NAME_SIZE);
+        name[MPKG_NAME_SIZE - 1] = '\0';
+        uint32_t flags = format_pkg_u32(entry + MPKG_NAME_SIZE);
+        uint32_t method = format_pkg_u32(entry + MPKG_NAME_SIZE + 4);
+        uint32_t raw_size = format_pkg_u32(entry + MPKG_NAME_SIZE + 8);
+        uint32_t packed_size = format_pkg_u32(entry + MPKG_NAME_SIZE + 12);
+        uint32_t offset = format_pkg_u32(entry + MPKG_NAME_SIZE + 16);
+        if (flags & MPKG_FLAG_DIRECTORY) continue;
+        if (!name[0] || name[0] == '/' || strstr(name, "..")) return false;
+        if ((uint64_t)offset < table_end ||
+            (uint64_t)offset + packed_size > archive_size) return false;
+
+        char path[MINIMAFS_MAX_PATH];
+        int written = snprintf(path, sizeof(path), "%s/%s", target_dir, name);
+        if (written <= 0 || (size_t)written >= sizeof(path)) return false;
+        const uint8_t* payload = archive + offset;
+        uint8_t* expanded = NULL;
+        const uint8_t* data = payload;
+        uint32_t data_size = packed_size;
+        if (method == MPKG_METHOD_STORE) {
+            if (raw_size != packed_size) return false;
+        } else if (method == MPKG_METHOD_LZSS) {
+            expanded = (uint8_t*)alloc_unzeroed(raw_size);
+            if (raw_size && !expanded) return false;
+            data_size = lzss_decompress(payload, packed_size, expanded, raw_size);
+            if (data_size != raw_size) { if (expanded) free_mem(expanded); return false; }
+            data = expanded;
+        } else return false;
+
+        bool ok = minimafs_write_file_segments(path, data, data_size,
+                                               NULL, 0, "binary", "slib");
+        if (expanded) free_mem(expanded);
+        if (!ok) return false;
+        serial_write_str("FORMAT: installed ");
+        serial_write_str(name);
+        serial_write_str("\n");
+    }
+    return true;
+}
+
+static bool format_install_packages(void) {
+    return format_install_package(_binary_install1_mpkg_start,
+                                  (uint32_t)(_binary_install1_mpkg_end - _binary_install1_mpkg_start),
+                                  "0:/Etc") &&
+           format_install_package(_binary_install2_mpkg_start,
+                                  (uint32_t)(_binary_install2_mpkg_end - _binary_install2_mpkg_start),
+                                  "0:/programs") &&
+           format_install_package(_binary_install3_mpkg_start,
+                                  (uint32_t)(_binary_install3_mpkg_end - _binary_install3_mpkg_start),
+                                  "0:/services");
+}
 
 void cmd_format_debug(int argc, const char** argv) {
     serial_write_str("\n=== FORMAT DEBUG ===\n");
@@ -185,6 +268,12 @@ void cmd_format_debug(int argc, const char** argv) {
 
     free_mem(conf_content);
     graphics_write_textr("File created OK.\n");
+
+    if (!format_install_packages()) {
+        serial_write_str("FORMAT: failed to install resource package\n");
+        graphics_write_textr("Failed to install resource package.\n");
+        return;
+    }
 
     // Verify the file was registered in the Etc folder
     minimafs_folder_desc_t* etc_desc = (minimafs_folder_desc_t*)alloc(sizeof(minimafs_folder_desc_t));

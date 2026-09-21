@@ -1,4 +1,5 @@
 #include "net/tls13.h"
+#include "minimaSSL/tls_gcm.h"
 #include "x86_64/kcrypto.h"
 #include "x86_64/random.h"
 #include "x86_64/allocator.h"
@@ -22,12 +23,15 @@ struct tls13_client {
     uint8_t server_hs_key[16], server_hs_iv[12];
     uint8_t client_app_key[16], client_app_iv[12];
     uint8_t server_app_key[16], server_app_iv[12];
+    uint8_t app_plain[TLS13_MAX_RECORD];
+    uint32_t app_plain_len, app_plain_off;
     uint64_t tx_seq, rx_seq;
     bool established;
 };
 
 static const char* g_tls13_error = "unknown";
 const char* tls13_last_error(void) { return g_tls13_error; }
+
 
 static const char* tls_alert_name(uint8_t description) {
     switch (description) {
@@ -165,20 +169,23 @@ static void x25519_pack(uint8_t out[32], const x25519_fe in) {
 }
 static void x25519(uint8_t out[32], const uint8_t scalar[32], const uint8_t point[32]) {
     static const x25519_fe a24 = {0xdb41, 1};
-    uint8_t scalar_copy[32]; x25519_fe x,a,b,c,d,e,f;
+    uint8_t scalar_copy[32]; x25519_fe x,x2,z2,x3,z3,a,aa,b,bb,e,c,d,da,cb,t;
     memcpy(scalar_copy,scalar,32); scalar_copy[0]&=248; scalar_copy[31]&=127; scalar_copy[31]|=64;
-    x25519_unpack(x,point); memset(a,0,sizeof(a)); memset(b,0,sizeof(b)); memset(c,0,sizeof(c)); memset(d,0,sizeof(d));
-    a[0]=d[0]=1; memcpy(b,x,sizeof(b));
+    x25519_unpack(x,point); memset(x2,0,sizeof(x2)); memset(z2,0,sizeof(z2));
+    memset(x3,0,sizeof(x3)); memset(z3,0,sizeof(z3));
+    x2[0]=z3[0]=1; memcpy(x3,x,sizeof(x3));
+    uint8_t swap=0;
     for (int pos=254;pos>=0;pos--) {
-        uint8_t bit=(uint8_t)((scalar_copy[pos>>3]>>(pos&7))&1); x25519_select(a,b,bit); x25519_select(c,d,bit);
-        x25519_add(e,a,c); x25519_sub(a,a,c); x25519_add(c,b,d); x25519_sub(b,b,d);
-        x25519_square(d,e); x25519_square(f,a); x25519_mul(a,c,a); x25519_mul(c,b,e);
-        x25519_add(e,a,c); x25519_sub(a,a,c); x25519_square(b,e); x25519_square(c,a);
-        x25519_sub(a,d,f); x25519_mul(a,a,a24); x25519_add(a,a,d); x25519_mul(c,c,a);
-        x25519_mul(a,d,f); x25519_mul(d,b,x); x25519_square(b,e);
-        x25519_select(a,b,bit); x25519_select(c,d,bit);
+        uint8_t bit=(uint8_t)((scalar_copy[pos>>3]>>(pos&7))&1); swap^=bit;
+        x25519_select(x2,x3,swap); x25519_select(z2,z3,swap); swap=bit;
+        x25519_add(a,x2,z2); x25519_sub(b,x2,z2); x25519_square(aa,a); x25519_square(bb,b);
+        x25519_sub(e,aa,bb); x25519_add(c,x3,z3); x25519_sub(d,x3,z3);
+        x25519_mul(da,d,a); x25519_mul(cb,c,b); x25519_add(t,da,cb); x25519_square(x3,t);
+        x25519_sub(t,da,cb); x25519_square(t,t); x25519_mul(z3,x,t);
+        x25519_mul(x2,aa,bb); x25519_mul(t,e,a24); x25519_add(t,aa,t); x25519_mul(z2,e,t);
     }
-    x25519_invert(c,c); x25519_mul(a,a,c); x25519_pack(out,a);
+    x25519_select(x2,x3,swap); x25519_select(z2,z3,swap);
+    x25519_invert(z2,z2); x25519_mul(x2,x2,z2); x25519_pack(out,x2);
 }
 
 static bool read_record(tls13_client_t* c,uint8_t* type,uint8_t** payload,uint32_t* len,uint32_t timeout){
@@ -187,23 +194,30 @@ static bool read_record(tls13_client_t* c,uint8_t* type,uint8_t** payload,uint32
 }
 static void nonce_for(const uint8_t iv[12],uint64_t seq,uint8_t out[12]){memcpy(out,iv,12);for(int i=0;i<8;i++)out[11-i]^=(uint8_t)(seq>>(i*8));}
 
-static bool decrypt_record(tls13_client_t* c,const uint8_t key[16],const uint8_t iv[12],uint8_t* out,uint32_t* out_len,uint8_t* inner_type,uint32_t timeout){
+static bool decrypt_record(tls13_client_t* c,const uint8_t key[16],const uint8_t iv[12],uint8_t* out,uint32_t* out_len,uint8_t* inner_type,uint32_t timeout,const char* stage){
     uint8_t type,*body;uint32_t n;if(!read_record(c,&type,&body,&n,timeout))return false;
     if(type==20&&n==1){*out_len=0;*inner_type=20;return true;}
     if(type!=23||n<17)return false;
     uint8_t hdr[5]={23,3,3,(uint8_t)(n>>8),(uint8_t)n},nonce[12];nonce_for(iv,c->rx_seq++,nonce);
-    if(!kcrypto_aes128_gcm_decrypt_aad(key,nonce,hdr,5,body,n-16,body+n-16,out))return false;
+    if(!mssl_aes128_gcm_decrypt_aad(key,nonce,hdr,5,body,n-16,body+n-16,out)){
+        g_tls13_error=stage;
+        serial_write_str("tls13: server ");
+        serial_write_str(stage);
+        serial_write_str("\n");
+        return false;
+    }
     uint32_t p=n-16;while(p&&out[p-1]==0)p--;if(!p)return false;*out_len=p-1;*inner_type=out[p-1];return *inner_type==22||*inner_type==20||*inner_type==21||*inner_type==8||*inner_type==23;
 }
 
 static bool send_record(tls13_client_t* c,const uint8_t key[16],const uint8_t iv[12],const uint8_t* data,uint32_t len,uint8_t inner){
-    if(len>16383)return false;uint8_t buf[16384+1+16+5],nonce[12],tag[16];uint32_t n=len+1+16;buf[0]=23;buf[1]=3;buf[2]=3;put16(buf+3,(uint16_t)n);memcpy(buf+5,data,len);buf[5+len]=inner;nonce_for(iv,c->tx_seq++,nonce);
-    kcrypto_aes128_gcm_encrypt_aad(key,nonce,buf,5,buf+5,len+1,buf+5+len+1,tag);memcpy(buf+5+len+1+(len+1),tag,16);
+    static uint8_t buf[16384+1+16+5],cipher[16384+1];
+    if(len>16383)return false;uint8_t nonce[12],tag[16];uint32_t n=len+1+16;buf[0]=23;buf[1]=3;buf[2]=3;put16(buf+3,(uint16_t)n);memcpy(buf+5,data,len);buf[5+len]=inner;nonce_for(iv,c->tx_seq++,nonce);
+    mssl_aes128_gcm_encrypt_aad(key,nonce,buf,5,buf+5,len+1,cipher,tag);memcpy(buf+5,cipher,len+1);memcpy(buf+5+len+1,tag,16);
     return send_all(c->conn,buf,5+n);
 }
 
 static bool make_client_hello(tls13_client_t* c,const char* host,uint8_t priv[32],uint8_t pub[32]){
-    uint8_t ch[2048],random[32],sid[32];random_bytes(random,32);random_bytes(sid,32);random_bytes(priv,32);uint8_t base[32]={9};x25519(pub,priv,base);
+    static uint8_t ch[2048],hs[2048],rec[2053];uint8_t random[32],sid[32];random_bytes(random,32);random_bytes(sid,32);random_bytes(priv,32);uint8_t base[32]={9};x25519(pub,priv,base);
     uint32_t p=0;put16(ch+p,0x0303);p+=2;memcpy(ch+p,random,32);p+=32;ch[p++]=32;memcpy(ch+p,sid,32);p+=32;
     put16(ch+p,2);p+=2;put16(ch+p,0x1301);p+=2;ch[p++]=1;ch[p++]=0;
     uint32_t ext_start=p;p+=2;uint32_t e=p;
@@ -214,7 +228,7 @@ static bool make_client_hello(tls13_client_t* c,const char* host,uint8_t priv[32
     put16(ch+p,0x0033);put16(ch+p+2,38);put16(ch+p+4,36);
     put16(ch+p+6,0x001d);put16(ch+p+8,32);memcpy(ch+p+10,pub,32);p+=42;
     put16(ch+p,0x000d);put16(ch+p+2,8);put16(ch+p+4,6);put16(ch+p+6,0x0403);put16(ch+p+8,0x0804);put16(ch+p+10,0x0503);p+=12;
-    put16(ch+ext_start,(uint16_t)(p-e));uint32_t body=p;uint8_t hs[2048];hs[0]=1;put24(hs+1,body);memcpy(hs+4,ch,body);uint8_t rec[2053];rec[0]=22;rec[1]=3;rec[2]=1;put16(rec+3,(uint16_t)(body+4));memcpy(rec+5,hs,body+4);
+    put16(ch+ext_start,(uint16_t)(p-e));uint32_t body=p;hs[0]=1;put24(hs+1,body);memcpy(hs+4,ch,body);rec[0]=22;rec[1]=3;rec[2]=1;put16(rec+3,(uint16_t)(body+4));memcpy(rec+5,hs,body+4);
     transcript_add(c,hs,body+4);return send_all(c->conn,rec,body+9);
 }
 
@@ -226,11 +240,28 @@ tls13_client_t* tls13_connect(uint32_t ip,uint16_t port,const char* host,uint32_
     g_tls13_error="tcp connect";tcp_conn_t* conn=tcp_connect(ip,port,timeout_ms?timeout_ms:5000);if(!conn)return NULL;tls13_client_t* c=(tls13_client_t*)alloc(sizeof(*c));if(!c){g_tls13_error="allocation";tcp_close(conn);return NULL;}memset(c,0,sizeof(*c));c->conn=conn;uint8_t priv[32],pub[32],peer[32],sr[32];
     g_tls13_error="client hello";if(!make_client_hello(c,host,priv,pub)){tcp_close(conn);free_mem(c);return NULL;}g_tls13_error="server hello";if(!parse_server_hello(c,peer,sr)){tcp_close(conn);free_mem(c);return NULL;}
     uint8_t shared[32],empty[32]={0},empty_hash[32],early[32],derived[32],hs_secret[32],th[32];x25519(shared,priv,peer);kcrypto_sha256(NULL,0,empty_hash);hkdf_extract(NULL,0,empty,32,early);hkdf_label(early,"derived",empty_hash,32,derived,32);hkdf_extract(derived,32,shared,32,hs_secret);transcript_hash(c,th);uint8_t shs[32],chs[32];hkdf_label(hs_secret,"s hs traffic",th,32,shs,32);hkdf_label(hs_secret,"c hs traffic",th,32,chs,32);hkdf_label(shs,"key",NULL,0,c->server_hs_key,16);hkdf_label(shs,"iv",NULL,0,c->server_hs_iv,12);hkdf_label(chs,"key",NULL,0,c->client_hs_key,16);hkdf_label(chs,"iv",NULL,0,c->client_hs_iv,12);
-    bool finished=false;uint8_t plain[TLS13_MAX_RECORD];g_tls13_error="encrypted handshake";while(!finished){uint32_t plen;uint8_t inner;if(!decrypt_record(c,c->server_hs_key,c->server_hs_iv,plain,&plen,&inner,TLS13_TIMEOUT)){tcp_close(conn);free_mem(c);return NULL;}if(inner!=22)continue;uint32_t off=0;while(off+4<=plen){uint32_t ml=be24(plain+off+1);if(off+4+ml>plen)break;uint8_t mt=plain[off];if(mt==20){uint8_t fh[32],verify[32];transcript_hash(c,fh);uint8_t fk[32];hkdf_label(shs,"finished",NULL,0,fk,32);hmac_sha256(fk,32,fh,32,verify);if(ml!=32||!kcrypto_memeq_ct(verify,plain+off+4,32)){g_tls13_error="server finished verify";tcp_close(conn);free_mem(c);return NULL;}transcript_add(c,plain+off,ml+4);finished=true;}else transcript_add(c,plain+off,ml+4);off+=ml+4;}}
+    static uint8_t plain[TLS13_MAX_RECORD];bool finished=false;g_tls13_error="encrypted handshake";while(!finished){uint32_t plen;uint8_t inner;if(!decrypt_record(c,c->server_hs_key,c->server_hs_iv,plain,&plen,&inner,TLS13_TIMEOUT,"handshake record authentication")){tcp_close(conn);free_mem(c);return NULL;}if(inner!=22)continue;uint32_t off=0;while(off+4<=plen){uint32_t ml=be24(plain+off+1);if(off+4+ml>plen)break;uint8_t mt=plain[off];if(mt==20){uint8_t fh[32],verify[32];transcript_hash(c,fh);uint8_t fk[32];hkdf_label(shs,"finished",NULL,0,fk,32);hmac_sha256(fk,32,fh,32,verify);if(ml!=32||!kcrypto_memeq_ct(verify,plain+off+4,32)){g_tls13_error="server finished verify";tcp_close(conn);free_mem(c);return NULL;}transcript_add(c,plain+off,ml+4);finished=true;}else transcript_add(c,plain+off,ml+4);off+=ml+4;}}
     transcript_hash(c,th);uint8_t master[32],d2[32],cap[32],sap[32];hkdf_label(hs_secret,"derived",empty_hash,32,d2,32);hkdf_extract(d2,32,empty,32,master);hkdf_label(master,"c ap traffic",th,32,cap,32);hkdf_label(master,"s ap traffic",th,32,sap,32);hkdf_label(cap,"key",NULL,0,c->client_app_key,16);hkdf_label(cap,"iv",NULL,0,c->client_app_iv,12);hkdf_label(sap,"key",NULL,0,c->server_app_key,16);hkdf_label(sap,"iv",NULL,0,c->server_app_iv,12);
     uint8_t fh[32],fk[32],fin[32],msg[36];transcript_hash(c,fh);hkdf_label(chs,"finished",NULL,0,fk,32);hmac_sha256(fk,32,fh,32,fin);msg[0]=20;put24(msg+1,32);memcpy(msg+4,fin,32);g_tls13_error="client finished";if(!send_record(c,c->client_hs_key,c->client_hs_iv,msg,36,22)){tcp_close(conn);free_mem(c);return NULL;}transcript_add(c,msg,36);c->tx_seq=0;c->rx_seq=0;c->established=true;serial_write_str("tls13: connected (certificate verification deferred)\n");return c;
 }
 
 int32_t tls13_send(tls13_client_t* c,const void* data,uint32_t len){if(!c||!c->established||len>16383)return -1;return send_record(c,c->client_app_key,c->client_app_iv,(const uint8_t*)data,len,23)?(int32_t)len:-1;}
-int32_t tls13_recv(tls13_client_t* c,void* data,uint32_t cap,uint32_t timeout){if(!c||!c->established)return -1;uint8_t plain[TLS13_MAX_RECORD];for(;;){uint32_t n;uint8_t inner;if(!decrypt_record(c,c->server_app_key,c->server_app_iv,plain,&n,&inner,timeout))return -1;if(inner!=23){if(inner==21)return -1;continue;}if(n>cap)return -1;memcpy(data,plain,n);return (int32_t)n;}}
+int32_t tls13_recv(tls13_client_t* c,void* data,uint32_t cap,uint32_t timeout){
+    if(!c||!c->established||!data||cap==0)return -1;
+    if(c->app_plain_off<c->app_plain_len){
+        uint32_t n=c->app_plain_len-c->app_plain_off;if(n>cap)n=cap;
+        memcpy(data,c->app_plain+c->app_plain_off,n);c->app_plain_off+=n;
+        if(c->app_plain_off==c->app_plain_len)c->app_plain_off=c->app_plain_len=0;
+        return (int32_t)n;
+    }
+    for(;;){
+        uint32_t n;uint8_t inner;
+        if(!decrypt_record(c,c->server_app_key,c->server_app_iv,c->app_plain,&n,&inner,timeout,"application record authentication"))return -1;
+        if(inner!=23){if(inner==21)return -1;continue;}
+        c->app_plain_len=n;c->app_plain_off=0;
+        uint32_t take=n<cap?n:cap;memcpy(data,c->app_plain,take);c->app_plain_off=take;
+        if(c->app_plain_off==c->app_plain_len)c->app_plain_off=c->app_plain_len=0;
+        return (int32_t)take;
+    }
+}
 void tls13_close(tls13_client_t* c){if(!c)return;if(c->conn)tcp_close(c->conn);memset(c,0,sizeof(*c));free_mem(c);}

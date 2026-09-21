@@ -27,6 +27,9 @@
 #define CMD_RX_EN    0x08
 #define CMD_TX_EN    0x04
 #define CMD_BUFE     0x01
+#define TSD_TOK      (1u << 15)
+#define TSD_TUN      (1u << 14)
+#define TSD_TABT     (1u << 13)
 
 #define RCR_AAP  (1 << 0)
 #define RCR_APM  (1 << 1)
@@ -34,7 +37,8 @@
 #define RCR_AB   (1 << 3)
 #define RCR_WRAP (1 << 7)
 
-#define RX_BUFFER_SIZE (8192 + 16 + 1500)
+#define RX_RING_SIZE (8192 + 16)
+#define RX_BUFFER_SIZE (RX_RING_SIZE + 16 + 1500)
 #define TX_BUFFER_SIZE 1536
 #define NUM_TX_DESC 4
 
@@ -51,6 +55,14 @@ static inline void wr16(uint16_t reg, uint16_t v) { port_outw(g_io_base + reg, v
 static inline void wr32(uint16_t reg, uint32_t v) { port_outl(g_io_base + reg, v); }
 static inline uint8_t  rd8(uint16_t reg)  { return port_inb(g_io_base + reg); }
 static inline uint32_t rd32(uint16_t reg) { return port_inl(g_io_base + reg); }
+
+static uint8_t rx_byte(uint32_t offset) {
+    return g_rx_buffer[offset % RX_RING_SIZE];
+}
+
+static void rx_copy(uint8_t* dst, uint32_t offset, uint32_t len) {
+    for (uint32_t i = 0; i < len; i++) dst[i] = rx_byte(offset + i);
+}
 
 static pci_device_t* find_rtl8139(void) {
     extern pci_device_t pci_devices[];
@@ -141,10 +153,9 @@ static void rtl8139_send(const void* frame, uint16_t len) {
     uint32_t slot = g_tx_next;
     g_tx_next = (g_tx_next + 1) % NUM_TX_DESC;
 
-    // Bounded wait for OWN (bit13) - set once the NIC has consumed this
-    // descriptor's previous contents and it's free to reuse.
+    // Do not reuse a descriptor until its previous transmission completed.
     int timeout = 100000;
-    while (!(rd32(REG_TSD0 + slot * 4) & (1 << 13)) && timeout-- > 0) {
+    while (!(rd32(REG_TSD0 + slot * 4) & (TSD_TOK | TSD_TUN | TSD_TABT)) && timeout-- > 0) {
         asm volatile("pause");
     }
 
@@ -156,39 +167,37 @@ static void rtl8139_send(const void* frame, uint16_t len) {
 
     wr32(REG_TSAD0 + slot * 4, (uint32_t)(uintptr_t)g_tx_buffer[slot]);
     wr32(REG_TSD0 + slot * 4, len); // clears OWN, starts transmission
+
+    timeout = 100000;
+    while (!(rd32(REG_TSD0 + slot * 4) & (TSD_TOK | TSD_TUN | TSD_TABT)) && timeout-- > 0) {
+        asm volatile("pause");
+    }
 }
 
 static void rtl8139_poll(void) {
     if (!g_present) return;
 
     while (!(rd8(REG_CMD) & CMD_BUFE)) {
-        uint8_t* header_ptr = g_rx_buffer + g_rx_offset;
-        uint16_t status = *(uint16_t*)(header_ptr + 0);
-        uint16_t length  = *(uint16_t*)(header_ptr + 2);
+        uint16_t status = (uint16_t)rx_byte(g_rx_offset) |
+                          ((uint16_t)rx_byte(g_rx_offset + 1) << 8);
+        uint16_t length = (uint16_t)rx_byte(g_rx_offset + 2) |
+                          ((uint16_t)rx_byte(g_rx_offset + 3) << 8);
 
-        if (!(status & 0x01) || length < 14 || length > RX_BUFFER_SIZE) {
+        if (!(status & 0x01) || length < 64 || length > ETH_FRAME_MAX + 4) {
             serial_write_str("RTL8139: bad rx status, resetting ring\n");
             g_rx_offset = 0;
             port_outw(g_io_base + REG_CAPR, (uint16_t)(g_rx_offset - 16));
             break;
         }
 
-        uint8_t* packet = header_ptr + 4;
         static uint8_t linear[ETH_FRAME_MAX];
         uint16_t payload_len = length - 4; // exclude trailing CRC
-
-        if (g_rx_offset + 4 + payload_len <= RX_BUFFER_SIZE) {
-            memcpy(linear, packet, payload_len);
-        } else {
-            uint32_t first_part = RX_BUFFER_SIZE - (g_rx_offset + 4);
-            memcpy(linear, packet, first_part);
-            memcpy(linear + first_part, g_rx_buffer, payload_len - first_part);
-        }
+        rx_copy(linear, g_rx_offset + 4, payload_len);
 
         eth_handle_frame(linear, payload_len);
 
         g_rx_offset = (g_rx_offset + length + 4 + 3) & ~3u;
-        if (g_rx_offset >= RX_BUFFER_SIZE) g_rx_offset -= RX_BUFFER_SIZE;
+        if (g_rx_offset >= RX_RING_SIZE) g_rx_offset -= RX_RING_SIZE;
         port_outw(g_io_base + REG_CAPR, (uint16_t)(g_rx_offset - 16));
     }
 }

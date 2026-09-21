@@ -1,0 +1,37 @@
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include "minimaSSL/tls_gcm.h"
+
+int main(void) {
+    static const uint8_t key[16] = {0};
+    static const uint8_t iv[12] = {0};
+    static const uint8_t plain[16] = {0};
+    static const uint8_t expected_cipher[16] = {
+        0x03,0x88,0xda,0xce,0x60,0xb6,0xa3,0x92,
+        0xf3,0x28,0xc2,0xb9,0x71,0xb2,0xfe,0x78
+    };
+    static const uint8_t expected_tag[16] = {
+        0xab,0x6e,0x47,0xd4,0x2c,0xec,0x13,0xbd,
+        0xf5,0x3a,0x67,0xb2,0x12,0x57,0xbd,0xdf
+    };
+    uint8_t cipher[16], tag[16], recovered[16];
+    mssl_aes128_gcm_encrypt_aad(key, iv, NULL, 0, plain, sizeof plain, cipher, tag);
+    if (memcmp(cipher, expected_cipher, 16) || memcmp(tag, expected_tag, 16) ||
+        !mssl_aes128_gcm_decrypt_aad(key, iv, NULL, 0, cipher, 16, tag, recovered) ||
+        memcmp(recovered, plain, 16)) return 1;
+    static const uint8_t aad[5] = {0x17,0x03,0x03,0x00,0x35};
+    static const uint8_t tls_expected[53] = {
+        0x03,0x88,0xda,0xce,0x60,0xb6,0xa3,0x92,0xf3,0x28,0xc2,0xb9,0x71,0xb2,0xfe,0x78,
+        0xf7,0x95,0xaa,0xab,0x49,0x4b,0x59,0x23,0xf7,0xfd,0x89,0xff,0x94,0x8b,0xc1,0xe0,
+        0x20,0x02,0x11,0x21,0x4e,0x64,0xb8,0x9d,0x55,0x6c,0x65,0x77,0x83,0x97,0x2e,0xbb,
+        0xa1,0x6f,0x47,0xcb,0xcb
+    };
+    uint8_t tls_plain[37]={0}, tls_cipher[37], tls_tag[16], tls_recovered[37];
+    mssl_aes128_gcm_encrypt_aad(key, iv, aad, 5, tls_plain, 37, tls_cipher, tls_tag);
+    if (memcmp(tls_cipher, tls_expected, 37) || memcmp(tls_tag, tls_expected+37, 16) ||
+        !mssl_aes128_gcm_decrypt_aad(key, iv, aad, 5, tls_cipher, 37, tls_tag, tls_recovered) ||
+        memcmp(tls_recovered, tls_plain, 37)) return 1;
+    puts("minimaSSL AES-128-GCM KAT passed");
+    return 0;
+}

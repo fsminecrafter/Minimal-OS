@@ -5,6 +5,10 @@ find roadmap in roadmap.txt or below (might be old or un-synced!)
 
 User application developers can find the syscall and SDK integration guide in
 [docs/user-sdk-syscalls.md](docs/user-sdk-syscalls.md).
+Install packages and service definitions are documented in
+[docs/install-and-services.md](docs/install-and-services.md).
+The full kernel, boot, storage, networking, process, and build architecture is
+summarized in [docs/system-overview.md](docs/system-overview.md).
 
 <details>
 
@@ -55,10 +59,43 @@ User application developers can find the syscall and SDK integration guide in
 * ```pkginfo``` [Archive] Displays package information.
   * ```installpkg``` [Archive] [Target] Alias for `pkg unzip`.
 
+During `make build-x86_64`, the SDK builds `minimaSSL.slib`, copies it into
+`src/resources/install1`, and packages that directory as an embedded
+`install1.mpkg`. Running `format` extracts the package into `0:/Etc`, so the
+library is installed as `0:/Etc/minimaSSL.slib`. The kernel TLS client is
+linked with the same freestanding minimaSSL crypto sources; the current OS has
+no dynamic `.slib` loader, so the filesystem copy is not executable code by
+itself.
+
 #### Keyboard and programs
 * ```kbrlayout``` [set | get | list] Manages keyboard layouts.
 * ```run``` [File] Runs a `.run` executable.
 * ```services``` Lists registered services.
+
+#### Adding a service
+
+Put a file ending in `.service` in `src/resources/install3`. It is packaged
+automatically and installed to `0:/services` when `format` runs. Services are
+registered automatically after the boot disk is mounted; no C registration
+call is needed.
+
+Example `src/resources/install3/example.service`:
+
+```ini
+[GENERAL]
+name="Example Service"
+desc="Starts an example program"
+exit=Restart
+
+[STARTUP]
+exec="0:/programs/example.run"
+```
+
+Use exactly one `[STARTUP]` entry. `exec` can load a `.run` bundle directly or
+run a terminal command such as `exec="echo service started"`.
+`script="run 0:/programs/example.run"` starts through the command system.
+Command-style entries run once without PID tracking. The `services` command
+lists successfully parsed and registered services.
 
 #### Diagnostics
 * ```testwrite``` Runs the MinimaFS write test.
@@ -201,3 +238,12 @@ Now you can create .run files for Minimal-OS viaaa... (Drumroll)
 [Minimal-OS SDK](https://github.com/fsminecrafter/Minimal-OS-SDK)
 
 More info is found on ```Minimal-OS SDK```s Github Page.
+
+
+# Development Stuff
+
+Format / Install Placement
+
+* install1 -> 0:/Etc
+*  install2 -> 0:/programs
+* install3 -> 0:/services

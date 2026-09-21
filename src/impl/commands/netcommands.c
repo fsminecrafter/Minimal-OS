@@ -196,16 +196,23 @@ void cmd_wget(int argc, const char** argv) {
     }
 
     bool headers_done = false;
-    int header_match = 0;
     static uint8_t chunk[1024];
+    static uint8_t header_buf[4096];
+    uint32_t header_len = 0;
     uint64_t total_bytes = 0;
+    bool receive_failed = false;
     const uint64_t IDLE_TIMEOUT_MS = 8000;
     uint64_t last_data_ms = time_get_uptime_ms();
 
     while (true) {
         int32_t got = https ? tls13_recv(tls, chunk, sizeof(chunk), 8000)
                     : tcp_recv(conn, chunk, sizeof(chunk));
-        if (got < 0) break;
+        if (got < 0) {
+            if (https && (strcmp(tls13_last_error(), "handshake record authentication") == 0 ||
+                          strcmp(tls13_last_error(), "application record authentication") == 0))
+                receive_failed = true;
+            break;
+        }
         if (got == 0) {
             if (time_get_uptime_ms() - last_data_ms > IDLE_TIMEOUT_MS) break;
             tcp_poll();
@@ -214,26 +221,35 @@ void cmd_wget(int argc, const char** argv) {
         }
         last_data_ms = time_get_uptime_ms();
 
-        uint32_t body_start = 0;
+        const uint8_t* body = chunk;
+        uint32_t body_len = (uint32_t)got;
         if (!headers_done) {
-            uint32_t i = 0;
-            for (; i < (uint32_t)got; i++) {
-                char c = (char)chunk[i];
-                if ((header_match == 0 || header_match == 2) && c == '\r') header_match++;
-                else if ((header_match == 1 || header_match == 3) && c == '\n') header_match++;
-                else header_match = (c == '\r') ? 1 : 0;
-                if (header_match == 4) { headers_done = true; body_start = i + 1; break; }
+            if (header_len + (uint32_t)got > sizeof(header_buf)) {
+                graphics_write_textr("wget: HTTP headers too large\n");
+                break;
             }
-            if (!headers_done) continue;
+            memcpy(header_buf + header_len, chunk, (uint32_t)got);
+            header_len += (uint32_t)got;
+            uint32_t header_end = 0;
+            for (uint32_t i = 3; i < header_len; i++) {
+                if (header_buf[i - 3] == '\r' && header_buf[i - 2] == '\n' &&
+                    header_buf[i - 1] == '\r' && header_buf[i] == '\n') {
+                    header_end = i + 1;
+                    break;
+                }
+            }
+            if (header_end == 0) continue;
+            headers_done = true;
+            body = header_buf + header_end;
+            body_len = header_len - header_end;
         }
 
-        uint32_t body_len = (uint32_t)got - body_start;
         if (body_len > 0) {
             if (out_file) {
-                minimafs_write(out_file, chunk + body_start, body_len);
+                minimafs_write(out_file, body, body_len);
             } else {
                 for (uint32_t i = 0; i < body_len; i++) {
-                    graphics_write_textr_char((char)chunk[body_start + i]);
+                    graphics_write_textr_char((char)body[i]);
                 }
             }
             total_bytes += body_len;
@@ -243,6 +259,16 @@ void cmd_wget(int argc, const char** argv) {
     if (out_file) minimafs_close(out_file);
     if (https) tls13_close(tls); else tcp_close(conn);
 
+    if (receive_failed) {
+        graphics_write_textr("wget: TLS receive failed (stage: ");
+        graphics_write_textr(tls13_last_error());
+        graphics_write_textr(")\n");
+        return;
+    }
+    if (!headers_done) {
+        graphics_write_textr("wget: incomplete HTTP response\n");
+        return;
+    }
     serial_write_str("wget: download completed\n");
 
     if (save_path) {

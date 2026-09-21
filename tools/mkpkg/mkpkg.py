@@ -123,9 +123,6 @@ def build(source: Path, output: Path, store: bool, verbose: bool = False):
         raise ValueError(f"source is not a directory: {source}")
 
     entries = collect_entries(source)
-    if not entries:
-        raise ValueError(f"source directory is empty: {source}")
-
     encoded_entries = []
     payload = bytearray()
     table_size = HEADER_SIZE + len(entries) * ENTRY_SIZE

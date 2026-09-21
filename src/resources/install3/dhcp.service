@@ -1,0 +1,7 @@
+[GENERAL]
+name="Auto DHCP"
+desc="Runs the dhcp command upon mount"
+exit=None
+
+[STARTUP]
+exec="dhcp"

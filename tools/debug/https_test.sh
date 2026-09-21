@@ -21,6 +21,7 @@ cleanup() {
     exec 8>&- 2>/dev/null || true
     exec 9>&- 2>/dev/null || true
     rm -rf "$TMPDIR"
+    rm -f "$TLS_LOG.keylog"
 }
 trap cleanup EXIT
 

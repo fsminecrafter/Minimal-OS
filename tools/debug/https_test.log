@@ -1,48 +1,48 @@
 SMP: BSP online (cpu 0). Call smp_start_aps() once the PIT/ACPI are ready to bring up the rest.
 GDT: initialized, 16 TSS slots ready
 Command handler init
-ctors start: 0x000000000035CFD8
-ctors end: 0x000000000035D0A8
+ctors start: 0x0000000000360528
+ctors end: 0x00000000003605F8
 Calling ctor at: 0x0000000000104511
-Calling ctor at: 0x00000000001157F2
-Calling ctor at: 0x0000000000116C37
-Calling ctor at: 0x000000000013D2DC
-Calling ctor at: 0x000000000013D387
-Calling ctor at: 0x000000000013DAD3
-Calling ctor at: 0x000000000013DAE9
-Calling ctor at: 0x000000000013DAFF
-Calling ctor at: 0x000000000013DBCB
-Calling ctor at: 0x000000000013E521
-Calling ctor at: 0x000000000013E59A
-Calling ctor at: 0x0000000000140C2A
-Calling ctor at: 0x000000000014110B
-Calling ctor at: 0x0000000000142A95
-Calling ctor at: 0x000000000014330B
-Calling ctor at: 0x000000000014384E
-Calling ctor at: 0x0000000000142CB0
-Calling ctor at: 0x0000000000142C9A
-Calling ctor at: 0x0000000000142C5F
-Calling ctor at: 0x0000000000142C75
-Calling ctor at: 0x0000000000142C3A
-Calling ctor at: 0x0000000000143829
-Calling ctor at: 0x0000000000144086
-Calling ctor at: 0x0000000000144226
-Calling ctor at: 0x0000000000144DAA
-Calling ctor at: 0x0000000000145879
+Calling ctor at: 0x0000000000115872
+Calling ctor at: 0x0000000000116CB7
+Calling ctor at: 0x000000000013CE2D
+Calling ctor at: 0x000000000013CED8
+Calling ctor at: 0x000000000013D624
+Calling ctor at: 0x000000000013D63A
+Calling ctor at: 0x000000000013D650
+Calling ctor at: 0x000000000013D71C
+Calling ctor at: 0x000000000013E072
+Calling ctor at: 0x000000000013E0EB
+Calling ctor at: 0x000000000014077B
+Calling ctor at: 0x0000000000140C5C
+Calling ctor at: 0x00000000001425E6
+Calling ctor at: 0x0000000000142E5C
+Calling ctor at: 0x000000000014339F
+Calling ctor at: 0x0000000000142801
+Calling ctor at: 0x00000000001427EB
+Calling ctor at: 0x00000000001427B0
+Calling ctor at: 0x00000000001427C6
+Calling ctor at: 0x000000000014278B
+Calling ctor at: 0x000000000014337A
+Calling ctor at: 0x0000000000143BD7
+Calling ctor at: 0x0000000000143D77
+Calling ctor at: 0x00000000001449D8
+Calling ctor at: 0x00000000001454A7
 Total ctors executed: 0x000000000000001A
 Initializing time subsystem...
-Time initialized: 1992-09-15 15:37:37
+Time initialized: 1992-09-15 11:18:28
 !!! IRQ RESTORE WITHOUT CONTEXT !!!
-Allocator: Ready. Heap=0x00000000003B7580-0x00000000003B8580, free=4064 bytes
-Heap start: 0x0x00000000008B1000
-Allocator: Ready. Heap=0x00000000008B1000-0x000000001FF7DC00, free=527223776 bytes
+Allocator: Ready. Heap=0x00000000003BA4E0-0x00000000003BB4E0, free=4064 bytes
+Heap start: 0x0x00000000008C3000
+Allocator: Ready. Heap=0x00000000008C3000-0x000000001FF7DC00, free=527150048 bytes
 PMM initialized: 0x0000000001000000 -> 0x0000000005000000, pages: 16384
 Initializing MMIO subsystem...
 Array locations:
-  page_table_l2_mmio: 0x00000000003D33A0
-  page_table_l1_mmio: 0x00000000003D43A0
-  l2_installed: 0x00000000005D43A0
-  l1_installed: 0x00000000005D45A0
+  page_table_l2_mmio: 0x00000000003D6300
+  page_table_l1_mmio: 0x00000000003D7300
+  l2_installed: 0x00000000005D7300
+  l1_installed: 0x00000000005D7500
 Zeroing MMIO page table arrays...
   Zeroing index 0/512
   Zeroing index 128/512
@@ -50,7 +50,7 @@ Zeroing MMIO page table arrays...
   Zeroing index 384/512
 MMIO arrays zeroed
 MMIO VA range: 0xFFFFFFA000000000 - 0xFFFFFFAFFFFFFFFF
-PML4 entry for MMIO (index 511): 0x0000000000394003
+PML4 entry for MMIO (index 511): 0x0000000000397003
 MMIO page tables ready (initialized by bootloader)
 Enumerating PCI devices starting from bus 0...
 Enumerating bus: 0
@@ -73,7 +73,7 @@ UHCI: BAR4 raw value = 0x0x000000000000C101
 UHCI: I/O Base = 0x0x000000000000C100
 UHCI: Resetting controller
 UHCI: Reset complete
-UHCI: Frame list at 0x0x000000000039E000
+UHCI: Frame list at 0x0x00000000003A1000
 UHCI: Controller started
 UHCI: Controller running
 USB: Enumerating devices...
@@ -88,10 +88,10 @@ USB: Enumerating device on port 0
 USB: Getting device descriptor (8 bytes)
 UHCI: Control transfer to device 0, length=8
 UHCI: TDs created:
-  Setup: 0x0x000000000039F030 token=0x0x0000000000E0002D
-  Data:  0x0x000000000039F090 token=0x0x0000000000E80069
-  Status: 0x0x000000000039F060 token=0x0x00000000FFE800E1
-UHCI: Control QH element_ptr set to 0x0x000000000039F030 OK
+  Setup: 0x0x00000000003A2030 token=0x0x0000000000E0002D
+  Data:  0x0x00000000003A2090 token=0x0x0000000000E80069
+  Status: 0x0x00000000003A2060 token=0x0x00000000FFE800E1
+UHCI: Control QH element_ptr set to 0x0x00000000003A2030 OK
 UHCI: Setup status: 0x0x0000000018000007
 UHCI: Status status: 0x0x00000000190007FF
 UHCI: Transfer completed!
@@ -100,9 +100,9 @@ USB: Max packet size: 8
 USB: Setting address to 1
 UHCI: Control transfer to device 0, length=0
 UHCI: TDs created:
-  Setup: 0x0x000000000039F0C0 token=0x0x0000000000E0002D
-  Status: 0x0x000000000039F0F0 token=0x0x00000000FFE80069
-UHCI: Control QH element_ptr set to 0x0x000000000039F0C0 OK
+  Setup: 0x0x00000000003A20C0 token=0x0x0000000000E0002D
+  Status: 0x0x00000000003A20F0 token=0x0x00000000FFE80069
+UHCI: Control QH element_ptr set to 0x0x00000000003A20C0 OK
 UHCI: Setup status: 0x0x0000000018000007
 UHCI: Status status: 0x0x00000000190007FF
 UHCI: Transfer completed!
@@ -110,10 +110,10 @@ UHCI: Control transfer SUCCESS
 USB: Getting full device descriptor
 UHCI: Control transfer to device 1, length=18
 UHCI: TDs created:
-  Setup: 0x0x000000000039F120 token=0x0x0000000000E0012D
-  Data:  0x0x000000000039F180 token=0x0x0000000002280169
-  Status: 0x0x000000000039F150 token=0x0x00000000FFE801E1
-UHCI: Control QH element_ptr set to 0x0x000000000039F120 OK
+  Setup: 0x0x00000000003A2120 token=0x0x0000000000E0012D
+  Data:  0x0x00000000003A2180 token=0x0x0000000002280169
+  Status: 0x0x00000000003A2150 token=0x0x00000000FFE801E1
+UHCI: Control QH element_ptr set to 0x0x00000000003A2120 OK
 UHCI: Setup status: 0x0x0000000018000007
 UHCI: Status status: 0x0x00000000190007FF
 UHCI: Transfer completed!
@@ -122,10 +122,10 @@ USB: Device: VID=0x0x0000000000000627 PID=0x0x0000000000000001 Class=0x0x0000000
 USB: Getting configuration descriptor
 UHCI: Control transfer to device 1, length=9
 UHCI: TDs created:
-  Setup: 0x0x000000000039F1B0 token=0x0x0000000000E0012D
-  Data:  0x0x000000000039F210 token=0x0x0000000001080169
-  Status: 0x0x000000000039F1E0 token=0x0x00000000FFE801E1
-UHCI: Control QH element_ptr set to 0x0x000000000039F1B0 OK
+  Setup: 0x0x00000000003A21B0 token=0x0x0000000000E0012D
+  Data:  0x0x00000000003A2210 token=0x0x0000000001080169
+  Status: 0x0x00000000003A21E0 token=0x0x00000000FFE801E1
+UHCI: Control QH element_ptr set to 0x0x00000000003A21B0 OK
 UHCI: Setup status: 0x0x0000000018000007
 UHCI: Status status: 0x0x00000000190007FF
 UHCI: Transfer completed!
@@ -133,10 +133,10 @@ UHCI: Control transfer SUCCESS
 USB: Configuration: interfaces=1 total_length=34
 UHCI: Control transfer to device 1, length=34
 UHCI: TDs created:
-  Setup: 0x0x000000000039F240 token=0x0x0000000000E0012D
-  Data:  0x0x000000000039F2A0 token=0x0x0000000004280169
-  Status: 0x0x000000000039F270 token=0x0x00000000FFE801E1
-UHCI: Control QH element_ptr set to 0x0x000000000039F240 OK
+  Setup: 0x0x00000000003A2240 token=0x0x0000000000E0012D
+  Data:  0x0x00000000003A22A0 token=0x0x0000000004280169
+  Status: 0x0x00000000003A2270 token=0x0x00000000FFE801E1
+UHCI: Control QH element_ptr set to 0x0x00000000003A2240 OK
 UHCI: Setup status: 0x0x0000000018000007
 UHCI: Status status: 0x0x00000000190007FF
 UHCI: Transfer completed!
@@ -149,9 +149,9 @@ USB: Keyboard detected!
 USB: Setting configuration
 UHCI: Control transfer to device 1, length=0
 UHCI: TDs created:
-  Setup: 0x0x000000000039F2D0 token=0x0x0000000000E0012D
-  Status: 0x0x000000000039F300 token=0x0x00000000FFE80169
-UHCI: Control QH element_ptr set to 0x0x000000000039F2D0 OK
+  Setup: 0x0x00000000003A22D0 token=0x0x0000000000E0012D
+  Status: 0x0x00000000003A2300 token=0x0x00000000FFE80169
+UHCI: Control QH element_ptr set to 0x0x00000000003A22D0 OK
 UHCI: Setup status: 0x0x0000000018000007
 UHCI: Status status: 0x0x00000000190007FF
 UHCI: Transfer completed!
@@ -159,9 +159,9 @@ UHCI: Control transfer SUCCESS
 USB: Initializing keyboard device
 UHCI: Control transfer to device 1, length=0
 UHCI: TDs created:
-  Setup: 0x0x000000000039F330 token=0x0x0000000000E0012D
-  Status: 0x0x000000000039F360 token=0x0x00000000FFE80169
-UHCI: Control QH element_ptr set to 0x0x000000000039F330 OK
+  Setup: 0x0x00000000003A2330 token=0x0x0000000000E0012D
+  Status: 0x0x00000000003A2360 token=0x0x00000000FFE80169
+UHCI: Control QH element_ptr set to 0x0x00000000003A2330 OK
 UHCI: Setup status: 0x0x0000000018000007
 UHCI: Status status: 0x0x00000000190007FF
 UHCI: Transfer completed!
@@ -178,7 +178,7 @@ UHCI: Keyboard TD installed
   Device addr: 1
   Endpoint: 1
   Max packet: 8
-  TD phys: 0x0x000000000039F390
+  TD phys: 0x0x00000000003A2390
 USB keyboard available!
 gpu_manager: initializing driver
 gpu_init: starting GPU...
@@ -261,8 +261,8 @@ map_mmio_page: virt=0xFFFFFFA001002000 phys=0x00000000FEC00000 size=0x0000000000
 IOAPIC: mapped, 24 redirection entries
 SMP: 1 core(s) online
 !!! IRQ RESTORE WITHOUT CONTEXT !!!
-[PROC] Created process: busy@11B11E [pid=1] [kernel]
-[PROC] Created process: kernelaudio@11B131 [pid=2] [kernel]
+[PROC] Created process: busy@11B19E [pid=1] [kernel]
+[PROC] Created process: kernelaudio@11B1B1 [pid=2] [kernel]
 === TERMINAL STARTING ===
 gpu_clear: clearing 1280x720 framebuffer with color 0x00000000FF000000
 gpu_clear: done
@@ -280,21 +280,23 @@ USB Keyboard: Loaded layout 'Swedish QWERTY' (sv-SE)
 Terminal: USB keyboard detected!
 Terminal: Keyboard ready!
 Terminal: Starting cursor process...
-[PROC] Created process: cursorupdater@11E9D2 [pid=3] [kernel]
+[PROC] Created process: cursorupdater@11EA52 [pid=3] [kernel]
 === TERMINAL READY ===
-[PROC] Created process: terminal_update@11EE78 [pid=4] [kernel]
-[PROC] Created process: usb_keyboard_update@11B167 [pid=5] [kernel]
+[PROC] Created process: terminal_update@11EEF8 [pid=4] [kernel]
+[PROC] Created process: usb_keyboard_update@11B1E7 [pid=5] [kernel]
 Cursor updater process started
 Terminal: Command ready: ''
 Terminal: Command ready: 'dhcp'
 Terminal: Processing command: 'dhcp'
-[PROC] Created process: dhcp@12F646 [pid=6] [kernel]
+[PROC] Created process: dhcp@12F197 [pid=6] [kernel]
 DHCP: sending DISCOVER
 DHCP: got OFFER, sending REQUEST
 DHCP: bound 10.0.2.15
-[PROC] Exiting process: dhcp@12F646 [pid=6]
+[PROC] Exiting process: dhcp@12F197 [pid=6]
 Terminal: Command ready: 'wget https://10.0.2.2:8443/'
 Terminal: Processing command: 'wget https://10.0.2.2:8443/'
-[PROC] Created process: wget@12F646 [pid=7] [kernel]
-wget: TLS connection failed (stage: encrypted handshake)
-[PROC] Exiting process: wget@12F646 [pid=7]
+[PROC] Created process: wget@12F197 [pid=7] [kernel]
+tls13: connected (certificate verification deferred)
+wget: TLS handshake completed
+wget: download completed
+[PROC] Exiting process: wget@12F197 [pid=7]

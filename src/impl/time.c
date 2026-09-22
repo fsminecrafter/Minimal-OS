@@ -589,6 +589,50 @@ bool time_set_from_str(const char* datetime_str) {
     return false;
 }
 
+bool time_set_from_str_if_newer(const char* datetime_str) {
+    datetime_t build_datetime;
+    datetime_t rtc_datetime = current_datetime;
+
+    if (!datetime_str || strlen(datetime_str) < 19) return false;
+
+    build_datetime.year = (datetime_str[0] - '0') * 1000 +
+                          (datetime_str[1] - '0') * 100 +
+                          (datetime_str[2] - '0') * 10 +
+                          (datetime_str[3] - '0');
+    build_datetime.month = (datetime_str[5] - '0') * 10 +
+                           (datetime_str[6] - '0');
+    build_datetime.day = (datetime_str[8] - '0') * 10 +
+                         (datetime_str[9] - '0');
+    build_datetime.hour = (datetime_str[11] - '0') * 10 +
+                          (datetime_str[12] - '0');
+    build_datetime.minute = (datetime_str[14] - '0') * 10 +
+                            (datetime_str[15] - '0');
+    build_datetime.second = (datetime_str[17] - '0') * 10 +
+                            (datetime_str[18] - '0');
+
+    if (!time_validate_datetime(&build_datetime)) return false;
+    if (build_datetime.year != rtc_datetime.year)
+        return build_datetime.year > rtc_datetime.year &&
+               (current_datetime = build_datetime, write_rtc_if_needed(), true);
+    if (build_datetime.month != rtc_datetime.month)
+        return build_datetime.month > rtc_datetime.month &&
+               (current_datetime = build_datetime, write_rtc_if_needed(), true);
+    if (build_datetime.day != rtc_datetime.day)
+        return build_datetime.day > rtc_datetime.day &&
+               (current_datetime = build_datetime, write_rtc_if_needed(), true);
+    if (build_datetime.hour != rtc_datetime.hour)
+        return build_datetime.hour > rtc_datetime.hour &&
+               (current_datetime = build_datetime, write_rtc_if_needed(), true);
+    if (build_datetime.minute != rtc_datetime.minute)
+        return build_datetime.minute > rtc_datetime.minute &&
+               (current_datetime = build_datetime, write_rtc_if_needed(), true);
+    if (build_datetime.second <= rtc_datetime.second) return false;
+
+    current_datetime = build_datetime;
+    write_rtc_if_needed();
+    return true;
+}
+
 // ===========================================
 // LEGACY FORMAT FUNCTIONS
 // ===========================================

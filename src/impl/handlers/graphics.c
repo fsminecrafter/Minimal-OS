@@ -335,9 +335,10 @@ void terminalUpdateCursor() {
 // Terminal Functions
 // ===========================================
 
-void graphics_set_resolution(uint32_t cols, uint32_t rows) {
+static void graphics_set_resolution_internal(uint32_t cols, uint32_t rows,
+                                             bool report) {
     if (!g_gpu) {
-        serial_write_str("graphics_set_resolution: GPU not initialized\n");
+        if (report) serial_write_str("graphics_set_resolution: GPU not initialized\n");
         return;
     }
 
@@ -366,16 +367,25 @@ void graphics_set_resolution(uint32_t cols, uint32_t rows) {
     g_terminal.bg_color = COLOR_BLACK;
     g_terminal.cursor_visible = true;
 
-    serial_write_str("Terminal resolution set to ");
-    serial_write_dec(cols);
-    serial_write_str("x");
-    serial_write_dec(rows);
-    serial_write_str(" (8x8 pixels per char, max ");
-    serial_write_dec(max_cols);
-    serial_write_str("x");
-    serial_write_dec(max_rows);
-    serial_write_str(")\n");
+    if (report) {
+        serial_write_str("Terminal resolution set to ");
+        serial_write_dec(cols);
+        serial_write_str("x");
+        serial_write_dec(rows);
+        serial_write_str(" (8x8 pixels per char, max ");
+        serial_write_dec(max_cols);
+        serial_write_str("x");
+        serial_write_dec(max_rows);
+        serial_write_str(")\n");
+    }
+}
 
+void graphics_set_resolution(uint32_t cols, uint32_t rows) {
+    graphics_set_resolution_internal(cols, rows, true);
+}
+
+void graphics_set_resolution_quiet(uint32_t cols, uint32_t rows) {
+    graphics_set_resolution_internal(cols, rows, false);
 }
 
 terminal_t* graphics_get_terminal(void) {

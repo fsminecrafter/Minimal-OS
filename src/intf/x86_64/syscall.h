@@ -77,6 +77,7 @@
 // manager. rdi = path, rsi = filetype (e.g. "binary"), rdx = format
 // (e.g. "bin"); both default sensibly when NULL.
 #define SYS_CREATE        34
+#define SYS_GETCWD        35
 
 #define SYS_O_RDONLY 0
 // Anything non-zero opens writable; SYS_OPEN maps flags==SYS_O_RDONLY

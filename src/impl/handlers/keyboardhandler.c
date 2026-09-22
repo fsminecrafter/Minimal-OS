@@ -1,4 +1,4 @@
-// File: src/modules/Etc/handlers/keyboardhandler.c
+// File: src/impl/handlers/keyboardhandler.c
 
 #include "print.h"
 #include "keyboardhandler.h"

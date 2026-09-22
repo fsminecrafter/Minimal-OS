@@ -98,7 +98,7 @@ src/resources/install3/example.service
 The complete install mapping is:
 
 ```text
-install1 -> 0:/Etc
+install1 -> 0:/etc
 install2 -> 0:/programs
 install3 -> 0:/services
 ```

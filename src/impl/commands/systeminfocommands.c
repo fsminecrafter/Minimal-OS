@@ -135,9 +135,9 @@ static void print_pci_location(const pci_device_t* dev) {
 
 static const char* find_system_conf(void) {
     static const char* paths[] = {
-        "0:/Etc/System.conf",
+        "0:/etc/System.conf",
         "0:/etc/system.conf",
-        "1:/Etc/System.conf",
+        "1:/etc/System.conf",
         "1:/etc/system.conf"
     };
     for (uint32_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
@@ -226,32 +226,25 @@ static bool read_config_dimension_from_file(const minimafs_file_handle_t* file,
 }
 
 bool systeminfo_load_saved_resolution(void) {
-    serial_write_str("System info: locating saved resolution config...\n");
     const char* path = find_system_conf();
     uint32_t width = GPU_DEFAULT_WIDTH;
     uint32_t height = GPU_DEFAULT_HEIGHT;
     if (!path) {
-        serial_write_str("System info: no saved resolution config\n");
         return false;
     }
 
-    serial_write_str("System info: opening saved resolution config...\n");
     minimafs_file_handle_t* file = minimafs_open(path, true);
     if (!file) return false;
 
-    serial_write_str("System info: reading saved resolution config...\n");
     bool has_width = read_config_dimension_from_file(file, "DisplayWidth", &width);
     bool has_height = read_config_dimension_from_file(file, "DisplayHeight", &height);
     minimafs_close(file);
-    serial_write_str("System info: saved resolution config closed\n");
 
     if (!has_width) width = GPU_DEFAULT_WIDTH;
     if (!has_height) height = GPU_DEFAULT_HEIGHT;
 
-    serial_write_str("System info: applying saved resolution...\n");
     if (!gpu_set_resolution(&gpu, width, height)) return false;
-    graphics_set_resolution(width / 8, height / 8);
-    serial_write_str("System info: redrawing terminal...\n");
+    graphics_set_resolution_quiet(width / 8, height / 8);
     graphics_terminal_redraw();
 
     if (!has_width) write_fixed_config_value(path, "DisplayWidth", width);

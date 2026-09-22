@@ -214,6 +214,29 @@ static bool command_build_association_line(const char* assoc_cmd, const char* or
     return needed > 0 && (size_t)needed < out_size;
 }
 
+static bool command_resolve_program(const char* name, char* path, size_t path_size) {
+    if (!name || !*name || strchr(name, '/') || strchr(name, ':') || strchr(name, '.')) {
+        return false;
+    }
+
+    if (snprintf(path, path_size, "0:/programs/%s.run", name) >= (int)path_size) {
+        return false;
+    }
+    return minimafs_exists(path) && !minimafs_is_dir(path);
+}
+
+static bool command_build_program_line(const char* path, const char* original_input,
+                                       char* out, size_t out_size) {
+    const char* rest = original_input;
+    while (*rest == ' ' || *rest == '\t') rest++;
+    while (*rest && *rest != ' ' && *rest != '\t') rest++;
+    while (*rest == ' ' || *rest == '\t') rest++;
+
+    int needed = snprintf(out, out_size, "run %s%s%s", path,
+                          *rest ? " " : "", rest);
+    return needed > 0 && (size_t)needed < out_size;
+}
+
 // ===========================================
 // TOKENIZER
 // ===========================================
@@ -278,6 +301,18 @@ void command_execute(const char* input) {
     for (int i = 0; i < command_count; ++i) {
         if (strcmp(argv[0], commands[i].name) == 0) {
             commands[i].func(argc, (const char**)argv);
+            return;
+        }
+    }
+
+    char program_path[MINIMAFS_MAX_PATH];
+    if (command_resolve_program(argv[0], program_path, sizeof(program_path)) &&
+        g_assoc_depth < COMMAND_ASSOC_MAX_DEPTH) {
+        char rewritten[COMMAND_ASSOC_REWRITE_BUF];
+        if (command_build_program_line(program_path, input, rewritten, sizeof(rewritten))) {
+            g_assoc_depth++;
+            command_execute(rewritten);
+            g_assoc_depth--;
             return;
         }
     }
@@ -381,6 +416,20 @@ uint64_t command_execute_async(const char* input) {
     }
 
     if (!func) {
+        char program_path[MINIMAFS_MAX_PATH];
+        if (command_resolve_program(g_launch_ctx.argv[0], program_path,
+                                     sizeof(program_path)) &&
+            g_assoc_depth < COMMAND_ASSOC_MAX_DEPTH) {
+            char rewritten[COMMAND_ASSOC_REWRITE_BUF];
+            if (command_build_program_line(program_path, input, rewritten,
+                                           sizeof(rewritten))) {
+                g_assoc_depth++;
+                uint64_t pid = command_execute_async(rewritten);
+                g_assoc_depth--;
+                return pid;
+            }
+        }
+
         // No direct command match - same file-association fallback as
         // command_execute(). Note: `input` here is the caller's
         // ORIGINAL string, not g_launch_ctx.input_copy - the tokenizer
@@ -425,6 +474,10 @@ bool command_is_running(void) {
 
 void command_set_last_user_pid(uint64_t pid) {
     g_last_user_pid = pid;
+}
+
+void command_user_process_exited(uint64_t pid) {
+    if (pid != 0 && g_last_user_pid == pid) g_last_user_pid = 0;
 }
 
 void command_kill_last_user_program(void) {

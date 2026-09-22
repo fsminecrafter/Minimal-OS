@@ -37,7 +37,7 @@ The root Makefile packages these directories as `MPKG0001` archives:
 
 | Source | Destination after `format` |
 | --- | --- |
-| `src/resources/install1` | `0:/Etc` |
+| `src/resources/install1` | `0:/etc` |
 | `src/resources/install2` | `0:/programs` |
 | `src/resources/install3` | `0:/services` |
 

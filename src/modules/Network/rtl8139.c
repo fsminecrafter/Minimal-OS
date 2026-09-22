@@ -199,7 +199,10 @@ static void rtl8139_poll(void) {
         uint16_t length = (uint16_t)rx_byte(g_rx_offset + 2) |
                           ((uint16_t)rx_byte(g_rx_offset + 3) << 8);
 
-        if (length < 64 || length > ETH_FRAME_MAX + 4) {
+        // The NIC can report short runt/error frames. They still have a
+        // header and CRC, and must be consumed below; resetting the whole
+        // ring here drops unrelated TCP/TLS traffic under load.
+        if (length < 4 || length > ETH_FRAME_MAX + 4) {
             serial_write_str("RTL8139: corrupt rx header, resetting ring\n");
             rtl8139_reset_rx_ring();
             break;
@@ -216,6 +219,12 @@ static void rtl8139_poll(void) {
         }
 
         static uint8_t linear[ETH_FRAME_MAX];
+        if (length < sizeof(eth_header_t) + 4) {
+            g_rx_offset = packet_end;
+            if (g_rx_offset >= RX_RING_SIZE) g_rx_offset -= RX_RING_SIZE;
+            port_outw(g_io_base + REG_CAPR, (uint16_t)(g_rx_offset - 16));
+            continue;
+        }
         uint16_t payload_len = length - 4; // exclude trailing CRC
         rx_copy(linear, g_rx_offset + 4, payload_len);
 

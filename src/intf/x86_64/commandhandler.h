@@ -72,6 +72,7 @@ void command_poll_running(void);
 void command_kill_running(void);
 
 void command_set_last_user_pid(uint64_t pid);
+void command_user_process_exited(uint64_t pid);
 void command_kill_last_user_program(void);
 void command_terminate_last_user_program(void);
 bool command_has_last_user_program(void);

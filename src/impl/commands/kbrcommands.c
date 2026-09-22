@@ -9,7 +9,7 @@
  *   kbrlayout list                - list built-in layouts and any
  *                                   .kbr files found under 0:/kbr
  *
- * `set` also persists the chosen layout into 0:/Etc/System.conf under
+ * `set` also persists the chosen layout into 0:/etc/System.conf under
  * the KeyboardLayout= key, so it can be inspected later or (manually,
  * by calling `kbrlayout set` again after boot) restored.
  */
@@ -27,7 +27,7 @@
 #include "x86_64/minimafs.h"
 #include "keyboard/usbkeyboard.h"
 
-#define KBRLAYOUT_CONFIG_PATH "0:/Etc/System.conf"
+#define KBRLAYOUT_CONFIG_PATH "0:/etc/System.conf"
 #define KBRLAYOUT_CONFIG_KEY  "KeyboardLayout"
 #define KBRLAYOUT_KBR_DIR     "0:/kbr"
 
@@ -103,7 +103,7 @@ static bool kbrlayout_load_from_file(const char* path) {
 }
 
 /* ============================================================
- * Persist the chosen layout selector into 0:/Etc/System.conf
+ * Persist the chosen layout selector into 0:/etc/System.conf
  *
  * Rewrites the KeyboardLayout= line (or appends it if missing) while
  * preserving every other line in the file. Directly rebuilds the

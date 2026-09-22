@@ -103,7 +103,7 @@ static bool format_install_package(const uint8_t* archive, uint32_t archive_size
 static bool format_install_packages(void) {
     return format_install_package(_binary_install1_mpkg_start,
                                   (uint32_t)(_binary_install1_mpkg_end - _binary_install1_mpkg_start),
-                                  "0:/Etc") &&
+                                  "0:/etc") &&
            format_install_package(_binary_install2_mpkg_start,
                                   (uint32_t)(_binary_install2_mpkg_end - _binary_install2_mpkg_start),
                                   "0:/programs") &&
@@ -207,13 +207,13 @@ void cmd_format_debug(int argc, const char** argv) {
     minimafs_refresh_storage_desc(drive);
 
     serial_write_str("Creating system directory structure...\n");
-    graphics_write_textr("Creating 0:/Etc/System.conf...\n");
+    graphics_write_textr("Creating 0:/etc/System.conf...\n");
 
     minimafs_mkdir("0:/");
-    if (!minimafs_mkdir("0:/Etc")) {
-        serial_write_str("WARNING: Failed to create 0:/Etc (may already exist)\n");
+    if (!minimafs_mkdir("0:/etc")) {
+        serial_write_str("WARNING: Failed to create 0:/etc (may already exist)\n");
     }
-    minimafs_create_file("0:/Etc/System.conf", "text", "conf");
+    minimafs_create_file("0:/etc/System.conf", "text", "conf");
 
     graphics_write_textr("Creating 0:/services...\n");
     if (!minimafs_mkdir("0:/services")) {
@@ -255,7 +255,7 @@ void cmd_format_debug(int argc, const char** argv) {
     uint32_t conf_len = (uint32_t)(p - conf_content);
 
     // Open the file and write the content
-    minimafs_file_handle_t* conf_file = minimafs_open("0:/Etc/System.conf", false);
+    minimafs_file_handle_t* conf_file = minimafs_open("0:/etc/System.conf", false);
     if (!conf_file) {
         serial_write_str("ERROR: Could not open System.conf for writing\n");
     } else {
@@ -282,14 +282,14 @@ void cmd_format_debug(int argc, const char** argv) {
         return;
     }
 
-    if (!minimafs_read_folder_desc(drive, "/Etc", etc_desc)) {
-        serial_write_str("ERROR: Failed to read Etc folder.desc\n");
-        graphics_write_textr("ERROR: Can't read Etc folder!\n");
+    if (!minimafs_read_folder_desc(drive, "/etc", etc_desc)) {
+        serial_write_str("ERROR: Failed to read etc folder.desc\n");
+        graphics_write_textr("ERROR: Can't read etc folder!\n");
         free_mem(etc_desc);
         return;
     }
 
-    serial_write_str("Etc folder has ");
+    serial_write_str("etc folder has ");
     serial_write_dec(etc_desc->entry_count);
     serial_write_str(" entries\n");
 

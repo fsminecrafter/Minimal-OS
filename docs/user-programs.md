@@ -82,7 +82,7 @@ A `.slib` contains:
 The bundle format is `MINISLIB1`. It is package metadata for a future/runtime
 loader; Minimal-OS does not currently dynamically load `.slib` code. The current
 kernel TLS path statically links the freestanding minimaSSL implementation and
-also installs the `.slib` at `0:/Etc/minimaSSL.slib` for distribution.
+also installs the `.slib` at `0:/etc/minimaSSL.slib` for distribution.
 
 ## Writing A Program
 

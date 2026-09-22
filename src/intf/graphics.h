@@ -172,6 +172,7 @@ typedef struct {
 // Set terminal resolution (columns x rows)
 // Automatically calculates char_width and char_height to fill screen
 void graphics_set_resolution(uint32_t cols, uint32_t rows);
+void graphics_set_resolution_quiet(uint32_t cols, uint32_t rows);
 
 // Get current terminal
 terminal_t* graphics_get_terminal(void);

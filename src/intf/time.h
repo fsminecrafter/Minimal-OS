@@ -102,6 +102,7 @@ void time_set_time(uint8_t hour, uint8_t minute, uint8_t second);
 
 // Parse and set from string
 bool time_set_from_str(const char* datetime_str);  // "YYYY-MM-DD HH:MM:SS"
+bool time_set_from_str_if_newer(const char* datetime_str);
 bool time_set_date_from_str(const char* date_str); // "YYYY-MM-DD"
 bool time_set_time_from_str(const char* time_str); // "HH:MM:SS"
 

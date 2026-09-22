@@ -44,6 +44,7 @@ static char command_history_current[INPUT_BUFFER_SIZE];
 //   - ordinary keystrokes are ignored by terminal_keyboard_callback()
 //   - Ctrl+C kills the running command process instead of editing input
 static bool g_command_running = false;
+static bool g_prompt_waiting = false;
 static uint64_t g_last_ctrl_c_ms = 0;
 void terminal_keyboard_callback(uint8_t scancode, char character, bool pressed);
 
@@ -203,10 +204,7 @@ void terminal_keyboard_callback(uint8_t scancode, char character, bool pressed) 
             command_kill_running();
         }
         g_last_ctrl_c_ms = 0;
-        if (!g_command_running) {
-            graphics_write_textr("^C\n");
-            terminalPrompt();
-        }
+        graphics_write_textr("^C\n");
         return;
     }
 
@@ -235,7 +233,7 @@ void terminal_keyboard_callback(uint8_t scancode, char character, bool pressed) 
      * terminal_update()) - there's nowhere for other keystrokes to go, so
      * ignore them until the command finishes or is killed above.
      */
-    if (g_command_running) {
+    if (g_command_running || command_has_last_user_program()) {
         return;
     }
     
@@ -350,6 +348,7 @@ void terminal_process_command(const char* cmd) {
      * submit another command against a launch that hasn't finished.
      */
     g_command_running = true;
+    g_prompt_waiting = true;
 
     uint64_t pid = command_execute_async(cmd);
     if (pid == 0) {
@@ -359,6 +358,7 @@ void terminal_process_command(const char* cmd) {
          * already printed any relevant message. Nothing to wait for.
          */
         g_command_running = false;
+        g_prompt_waiting = false;
         terminalPrompt();
         return;
     }
@@ -399,11 +399,16 @@ void terminal_update(void) {
         // bring the prompt back.
         if (g_command_running) {
             command_poll_running();
-            if (!command_is_running()) {
-                g_command_running = false;
-                graphics_write_textr("\n");
-                terminalPrompt();
-            }
+            if (!command_is_running()) g_command_running = false;
+        }
+
+        bool command_active = g_command_running || command_is_running() ||
+                              command_has_last_user_program();
+        if (!command_active && g_prompt_waiting) {
+            g_command_running = false;
+            g_prompt_waiting = false;
+            graphics_write_textr("\n");
+            terminalPrompt();
         }
 
         sleep(10);
@@ -490,54 +495,41 @@ void terminal_program_entry(void) {
     // Initialize keyboard
     terminal_init_keyboard();
     
-    // Start cursor updater process
-    serial_write_str("Terminal: Starting cursor process...\n");
-    process_t* cursor_process = createProcess("cursorupdater", cursorupdater);
-
-    if (vgaterm_ask_yn("Mount disk?", true)) {
-        vgaterm_print("Mounting disk...\n");
-        command_execute("initdisk");
-        minimafs_disk_device_t* device;
-        device = getminimadrive();
-        if (!device) {
-            vgaterm_print("/cr255g0b0/No disk device found/cr255g255b255/\n");
+    graphics_terminal_clear();
+    graphics_write_textr("MinimalOS startup\n\n");
+    graphics_write_textr("[STARTING] Mounting disk\n");
+    command_execute("initdisk");
+    minimafs_disk_device_t* device = getminimadrive();
+    if (!device) {
+        vgaterm_print_error("No disk device found\n");
+    } else {
+        int success = mountdrive(device, 0);
+        if (success == 1) {
+            vgaterm_print_success("Disk mounted\n");
+            systeminfo_load_saved_resolution();
+            service_manager_init();
+        } else if (success == 2) {
+            vgaterm_print_error("MinimaFS: Drive already mounted\n");
+        } else if (success == 3) {
+            vgaterm_print_error("MinimaFS: Failed to parse storage.desc\n");
+        } else if (success == 4) {
+            vgaterm_print_error("MinimaFS: Invalid root block\n");
+        } else if (success == 5) {
+            vgaterm_print_error("MinimaFS: Drive too large for bitmap\n");
         } else {
-            int success = mountdrive(device, 0);
-            if (success == 1) {
-                vgaterm_print("Mount succeded.\n");
-                serial_write_str("Terminal: mountdrive returned; loading saved resolution...\n");
-                if (systeminfo_load_saved_resolution()) {
-                    vgaterm_print("Loaded saved display resolution.\n");
-                }
-                serial_write_str("Terminal: saved resolution step complete; initializing services...\n");
-                service_manager_init();
-                serial_write_str("Terminal: service initialization complete\n");
-            }else if (success == 2) {
-                vgaterm_print("/cr255g0b0/MinimaFS: Drive already mounted/cr255g255b255/\n");
-            }else if (success == 3) {
-                vgaterm_print("/cr255g0b0/MinimaFS: Failed to parse storage.desc/cr255g255b255/\n");
-            }else if (success == 4) {
-                vgaterm_print("/cr255g0b0/MinimaFS: Invalid root block/cr255g255b255/\n");
-            }else if (success == 5) {
-                vgaterm_print("/cr255g0b0/MinimaFS: Drive too large for bitmap/cr255g255b255/\n");
-            } else {
-                vgaterm_print("/cr255g0b0/Mount failed.\n");
-            }
-        minimafs_drive_t* d = get_drive(0);
-
-        if (!d) {
-            serial_write_str("Drive 0 = NULL\n");
-        } else if (!d->mounted) {
-            serial_write_str("Drive 0 not mounted\n");
-        } else {
-            vgaterm_print("Drive 0 OK\n");
-        }
+            vgaterm_print_error("Mount failed\n");
         }
     }
+
+    // Start cursor updates only after startup drawing and resolution changes.
+    serial_write_str("Terminal: Starting cursor process...\n");
+    createProcess("cursorupdater", cursorupdater);
+
+    graphics_terminal_clear();
     
     // Display welcome message
     graphics_write_textr("========================================\n");
-    graphics_write_textr("  Welcome to MinimalOS Terminal!\n");
+    graphics_write_textr("  Welcome to the MinimalOS Terminal!\n");
     graphics_write_textr("========================================\n\n");
     
     graphics_write_textr("System: ");

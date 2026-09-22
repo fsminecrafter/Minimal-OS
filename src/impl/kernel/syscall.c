@@ -25,6 +25,7 @@
 #include "x86_64/net_syscall.h"
 #include "x86_64/random.h"
 #include "x86_64/runcommand.h"
+#include "fspaths.h"
 
 static uint64_t sys_write_impl(int fd, const char* buf, uint64_t len) {
     if (!buf) return SYS_ERR_INVAL;
@@ -807,6 +808,20 @@ void syscall_dispatch(syscall_regs_t* regs) {
                                              type   ? type   : "binary",
                                              format ? format : "bin")
                         ? SYS_SUCCESS : SYS_ERR_GENERIC;
+            break;
+        }
+
+        case SYS_GETCWD: {
+            char* out = (char*)regs->rdi;
+            uint64_t cap = regs->rsi;
+            const char* cwd = fs_get_current_directory();
+            size_t len = cwd ? strlen(cwd) : 0;
+            if (!out || cap == 0 || !cwd || len + 1 > cap) {
+                regs->rax = SYS_ERR_INVAL;
+                break;
+            }
+            memcpy(out, cwd, len + 1);
+            regs->rax = SYS_SUCCESS;
             break;
         }
 

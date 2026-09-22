@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include "x86_64/proc.h"
 #include "x86_64/scheduler.h"
+#include "x86_64/commandhandler.h"
 #include "time.h"
 #include "panic.h"
 #include "print.h"
@@ -754,6 +755,7 @@ void process_exit(void) {
     serial_write_str(current_process->name);
     serial_write_str("\n");
 
+    command_user_process_exited(current_process->pid);
     current_process->state = PROCESS_TERMINATED;
     schedule();
 

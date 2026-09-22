@@ -1,6 +1,8 @@
 toolchain_home := $(if $(SUDO_USER),$(shell getent passwd $(SUDO_USER) | cut -d: -f6),$(HOME))
 CC := $(toolchain_home)/cross/bin/x86_64-elf-gcc
 LD := $(toolchain_home)/cross/bin/x86_64-elf-ld
+BUILD_DATE := $(shell date '+%Y-%m-%d %H:%M:%S')
+BUILD_DATE_CFLAG := '-DBUILD_DATE="$(BUILD_DATE)"'
 
 QEMU_NETDEV ?= user,id=net0
 QEMU_AUDIO_DRIVER ?= none
@@ -58,9 +60,12 @@ audio_obj_files_build := $(patsubst src/resources/%.wav, build/resources/%.o, $(
 audio_object_files := $(audio_obj_files_build) $(audio_obj_files_src)
 header_files := $(shell find src/intf -name '*.h')
 
+.PHONY: FORCE
+FORCE:
+
 build/modules/%.o: src/modules/%.c $(header_files)
 	mkdir -p $(dir $@)
-	$(CC) -c -I src/intf -ffreestanding $< -o $@
+	$(CC) $(BUILD_DATE_CFLAG) -c -I src/intf -ffreestanding $< -o $@
 
 build/modules/%.o: src/modules/%.asm
 	mkdir -p $(dir $@)
@@ -68,7 +73,9 @@ build/modules/%.o: src/modules/%.asm
 
 build/impl/%.o: src/impl/%.c $(header_files)
 	mkdir -p $(dir $@)
-	$(CC) -c -I src/intf -I Minimal-OS-SDK/libraries/minimaSSL/include -ffreestanding $< -o $@
+	$(CC) $(BUILD_DATE_CFLAG) -c -I src/intf -I Minimal-OS-SDK/libraries/minimaSSL/include -ffreestanding $< -o $@
+
+build/impl/kernel/main.o: FORCE
 
 build/minimaSSL/%.o: Minimal-OS-SDK/libraries/minimaSSL/src/%.c $(header_files)
 	mkdir -p $(dir $@)

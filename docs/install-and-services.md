@@ -4,7 +4,7 @@ Minimal-OS builds three resource packages into the kernel image:
 
 | Source directory | Destination after `format` |
 | --- | --- |
-| `src/resources/install1` | `0:/Etc` |
+| `src/resources/install1` | `0:/etc` |
 | `src/resources/install2` | `0:/programs` |
 | `src/resources/install3` | `0:/services` |
 
@@ -80,7 +80,7 @@ make build-x86_64
 ```
 
 `minimaSSL.slib` is generated into `src/resources/install1` and installed as
-`0:/Etc/minimaSSL.slib` during `format`.
+`0:/etc/minimaSSL.slib` during `format`.
 
 Remove kernel, SDK, generated package, and `.run` build artifacts with:
 

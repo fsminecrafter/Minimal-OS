@@ -61,8 +61,8 @@ summarized in [docs/system-overview.md](docs/system-overview.md).
 
 During `make build-x86_64`, the SDK builds `minimaSSL.slib`, copies it into
 `src/resources/install1`, and packages that directory as an embedded
-`install1.mpkg`. Running `format` extracts the package into `0:/Etc`, so the
-library is installed as `0:/Etc/minimaSSL.slib`. The kernel TLS client is
+`install1.mpkg`. Running `format` extracts the package into `0:/etc`, so the
+library is installed as `0:/etc/minimaSSL.slib`. The kernel TLS client is
 linked with the same freestanding minimaSSL crypto sources; the current OS has
 no dynamic `.slib` loader, so the filesystem copy is not executable code by
 itself.
@@ -244,6 +244,6 @@ More info is found on ```Minimal-OS SDK```s Github Page.
 
 Format / Install Placement
 
-* install1 -> 0:/Etc
-*  install2 -> 0:/programs
+* install1 -> 0:/etc
+* install2 -> 0:/programs
 * install3 -> 0:/services

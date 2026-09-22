@@ -54,7 +54,7 @@ the path as `argv[0]` and the supplied values starting at `argv[1]`.
 
 ## Filesystem Calls
 
-MinimaFS paths are strings such as `0:/Etc/System.conf`. `SYS_OPEN` opens an
+MinimaFS paths are strings such as `0:/etc/System.conf`. `SYS_OPEN` opens an
 existing file; use `mos_create()` before opening a new file for writing.
 
 | Wrapper | Syscall | Contract |
@@ -79,7 +79,7 @@ existing file; use `mos_create()` before opening a new file for writing.
 Example:
 
 ```c
-int fd = mos_open("0:/Etc/config.txt", SYS_O_RDONLY);
+int fd = mos_open("0:/etc/config.txt", SYS_O_RDONLY);
 if (fd >= 0) {
     char buf[128];
     long got = mos_read(fd, buf, sizeof buf - 1);

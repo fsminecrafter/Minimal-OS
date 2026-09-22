@@ -138,7 +138,7 @@ void kernel_main(uint64_t mb2_info_addr) {
         serial_write_str("Network: no supported NIC found\n");
     }
 
-    time_set_from_str("2026-08-19 18:50:30");
+    time_set_from_str_if_newer(BUILD_DATE);
 
     // Seeded after the clock is set so the RTC contributes something
     // real. Userland reaches this through SYS_RANDOM.

@@ -68,6 +68,36 @@ void cmd_dhcp(int argc, const char** argv) {
     }
 }
 
+static void cmd_ifconfig_static(int argc, const char** argv) {
+    if (argc != 4) {
+        graphics_write_textr("Usage: ifconfig static <ip> <netmask> <gateway>\n");
+        return;
+    }
+
+    uint32_t ip = ip_parse(argv[1]);
+    uint32_t netmask = ip_parse(argv[2]);
+    uint32_t gateway = ip_parse(argv[3]);
+    if (!ip || !netmask) {
+        graphics_write_textr("ifconfig: invalid static network configuration\n");
+        return;
+    }
+
+    ip_configure(ip, netmask, gateway);
+    char ip_text[16];
+    ip_to_string(ip, ip_text);
+    graphics_write_textr("Bound static address: ");
+    graphics_write_textr(ip_text);
+    graphics_write_textr("\n");
+}
+
+void cmd_ifconfig_dispatch(int argc, const char** argv) {
+    if (argc > 1 && strcmp(argv[1], "static") == 0) {
+        cmd_ifconfig_static(argc - 1, argv + 1);
+        return;
+    }
+    cmd_ifconfig(argc, argv);
+}
+
 static bool parse_url(const char* url, char* host, size_t host_size,
                       uint16_t* port, char* path, size_t path_size, bool* https) {
     const char* p = url;
@@ -333,7 +363,7 @@ void cmd_wget(int argc, const char** argv) {
 }
 
 void register_net_commands(void) {
-    command_register("ifconfig", cmd_ifconfig);
+    command_register("ifconfig", cmd_ifconfig_dispatch);
     command_register("dhcp", cmd_dhcp);
     command_register("wget", cmd_wget);
 }

@@ -13,7 +13,7 @@
 #include "prochandler.h"
 #include "x86_64/scheduler.h"
 
-#define RUN_STACK_SIZE   (64 * 1024)
+#define RUN_STACK_SIZE   (16 * 1024)
 
 // Bytes carved out of the low end of a launched process's stack
 // allocation to hold its argv pointer array plus the argument string
@@ -172,6 +172,7 @@ process_t* run_launch_file(const char* run_path, int extra_argc, const char** ex
 
     void* stack = alloc_unzeroed(RUN_STACK_SIZE);
     if (!stack) {
+        serial_write_str("run: failed to allocate process stack\n");
         elf_unload(&image);
         return NULL;
     }
@@ -186,6 +187,7 @@ process_t* run_launch_file(const char* run_path, int extra_argc, const char** ex
     char** user_argv = NULL;
     if (!run_build_argv_block(stack, RUN_STACK_SIZE, run_path,
                               extra_argc, extra_argv, &user_argc, &user_argv)) {
+        serial_write_str("run: failed to build process argv\n");
         serial_write_str("run: too many/long arguments, not launching\n");
         free_mem(stack);
         elf_unload(&image);
@@ -203,11 +205,15 @@ process_t* run_launch_file(const char* run_path, int extra_argc, const char** ex
     if (proc) {
         // The process trampoline switches to ring3 using the application's
         // stack. Keep the image and stack alive until the process exits.
-        proc->user_stack = (uint64_t*)((uint8_t*)stack + RUN_STACK_SIZE);
+        // SysV AMD64 requires RSP % 16 == 8 at a function entry point.
+        // proc_enter_ring3 uses iretq directly, so reserve the return-slot
+        // word that a normal call would have placed on the stack.
+        proc->user_stack = (uint64_t*)((uint8_t*)stack + RUN_STACK_SIZE - sizeof(uint64_t));
         proc->user_argc  = user_argc;
         proc->user_argv  = user_argv;
         if (!proc_map_user_range(proc, image.base, image.image_size) ||
             !proc_map_user_range(proc, stack, RUN_STACK_SIZE)) {
+            serial_write_str("run: failed to map process image or stack\n");
             kill(proc);
             proc = NULL;
         } else {
@@ -217,6 +223,7 @@ process_t* run_launch_file(const char* run_path, int extra_argc, const char** ex
         }
     }
     if (!proc) {
+        serial_write_str("run: failed to create user process\n");
         free_mem(stack);
         elf_unload(&image);
         return NULL;

@@ -5,6 +5,7 @@ BUILD_DATE := $(shell date '+%Y-%m-%d %H:%M:%S')
 BUILD_DATE_CFLAG := '-DBUILD_DATE="$(BUILD_DATE)"'
 
 QEMU_NETDEV ?= user,id=net0
+QEMU_TWO_MCAST ?= 230.0.0.1:12345
 QEMU_AUDIO_DRIVER ?= none
 
 .DEFAULT_GOAL := build-x86_64
@@ -176,6 +177,17 @@ src/resources/%.o: src/resources/%.wav
 .PHONY: run
 run: build-x86_64
 	qemu-system-x86_64 -smp 2 -cdrom dist/x86_64/kernel.iso -m 1024M -boot d -d guest_errors,int,cpu_reset,unimp -D qemu.log -serial stdio -usb -device usb-kbd -audiodev $(QEMU_AUDIO_DRIVER),id=speaker -machine pcspk-audiodev=speaker  -audiodev $(QEMU_AUDIO_DRIVER),id=audio0 -device AC97,audiodev=audio0 -device ahci,id=ahci -drive id=disk0,file=sata256.img,if=none,format=raw -device ide-hd,drive=disk0,bus=ahci.0 -netdev $(QEMU_NETDEV) -device rtl8139,netdev=net0,mac=52:54:00:12:34:56
+
+.PHONY: run-two
+run-two: build-x86_64
+	@test -f sata256.img || { echo "run-two: missing sata256.img" >&2; exit 1; }
+	@test -f sata256-2.img || cp sata256.img sata256-2.img
+	@echo "run-two: starting two MOS guests on multicast LAN $(QEMU_TWO_MCAST)"
+	@echo "run-two: addresses are automatic: 192.168.100.2 and 192.168.100.3"
+	@trap 'kill $$qemu1 $$qemu2 2>/dev/null || true; wait $$qemu1 $$qemu2 2>/dev/null || true' INT TERM EXIT; \
+	qemu-system-x86_64 -smp 2 -cdrom dist/x86_64/kernel.iso -m 1024M -boot d -d guest_errors,int,cpu_reset,unimp -D qemu-one.log -serial tcp:127.0.0.1:5566,server=on,wait=off -usb -device usb-kbd -audiodev $(QEMU_AUDIO_DRIVER),id=speaker1 -machine pcspk-audiodev=speaker1 -device ahci,id=ahci1 -drive id=disk0,file=sata256.img,if=none,format=raw -device ide-hd,drive=disk0,bus=ahci1.0 -netdev socket,id=net-one,mcast=$(QEMU_TWO_MCAST) -device rtl8139,netdev=net-one,mac=52:54:00:12:34:56 & qemu1=$$!; \
+	qemu-system-x86_64 -smp 2 -cdrom dist/x86_64/kernel.iso -m 1024M -boot d -d guest_errors,int,cpu_reset,unimp -D qemu-two.log -serial tcp:127.0.0.1:5567,server=on,wait=off -usb -device usb-kbd -audiodev $(QEMU_AUDIO_DRIVER),id=speaker2 -machine pcspk-audiodev=speaker2 -device ahci,id=ahci2 -drive id=disk1,file=sata256-2.img,if=none,format=raw -device ide-hd,drive=disk1,bus=ahci2.0 -netdev socket,id=net-two,mcast=$(QEMU_TWO_MCAST) -device rtl8139,netdev=net-two,mac=52:54:00:12:34:57 & qemu2=$$!; \
+	wait $$qemu1 $$qemu2
 
 .PHONY: run-audio
 run-audio: build-x86_64

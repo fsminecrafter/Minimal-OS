@@ -133,7 +133,17 @@ void kernel_main(uint64_t mb2_info_addr) {
         // Handle table + per-port UDP receive queues that SYS_NET
         // hands to user processes (see net_syscall.c).
         net_syscall_init();
-        serial_write_str("Network: interface ready (run 'dhcp' to get an address)\n");
+        uint8_t mac[6];
+        network_manager_get_mac(mac);
+        if (mac[0] == 0x52 && mac[1] == 0x54 && mac[2] == 0x00 &&
+            mac[3] == 0x12 && mac[4] == 0x34 &&
+            (mac[5] == 0x56 || mac[5] == 0x57)) {
+            uint32_t static_ip = (mac[5] == 0x56) ? 0xC0A86402u : 0xC0A86403u;
+            ip_configure(static_ip, 0xFFFFFF00u, 0);
+            serial_write_str("Network: run-two static LAN address configured\n");
+        } else {
+            serial_write_str("Network: interface ready (run 'dhcp' to get an address)\n");
+        }
     } else {
         serial_write_str("Network: no supported NIC found\n");
     }

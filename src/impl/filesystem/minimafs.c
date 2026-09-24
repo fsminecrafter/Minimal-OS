@@ -1266,9 +1266,11 @@ bool minimafs_create_file(const char* path, const char* filetype,
     /* HEAP — local_path/parent are 1KB each and metadata is ~2.5KB.
      * Combined they overflow the 4KB kernel stack on their own, before
      * counting the caller's or callee's frame. Must never be on-stack. */
-    char* local_path = (char*)alloc_unzeroed(MINIMAFS_MAX_PATH);
-    char* filename    = (char*)alloc_unzeroed(MINIMAFS_MAX_FILENAME);
-    char* parent      = (char*)alloc_unzeroed(MINIMAFS_MAX_PATH);
+    size_t path_storage_size = MINIMAFS_MAX_PATH + MINIMAFS_MAX_FILENAME + MINIMAFS_MAX_PATH;
+    char* path_storage = (char*)alloc_unzeroed(path_storage_size);
+    char* local_path = path_storage;
+    char* filename = path_storage ? local_path + MINIMAFS_MAX_PATH : NULL;
+    char* parent = filename ? filename + MINIMAFS_MAX_FILENAME : NULL;
     minimafs_file_metadata_t* metadata = minimafs_acquire_file_metadata();
     minimafs_folder_desc_t* parent_desc = NULL;
     bool parent_desc_locked = false;
@@ -1350,13 +1352,41 @@ bool minimafs_create_file(const char* path, const char* filetype,
     cleanup:
     if (parent_desc_locked) __sync_lock_release(&g_write_desc_lock);
     if (metadata)    minimafs_release_file_metadata(metadata);
-    if (parent)      free_mem(parent);
-    if (filename)    free_mem(filename);
-    if (local_path)  free_mem(local_path);
+    if (path_storage) free_mem(path_storage);
     return result;
 }
 
 #define MINIMAFS_STREAMING_THRESHOLD (2 * 1024 * 1024)
+
+#define MINIMAFS_PATH_SCRATCH_SLOTS 2
+#define MINIMAFS_PATH_SCRATCH_SIZE (MINIMAFS_MAX_PATH + MINIMAFS_MAX_FILENAME + MINIMAFS_MAX_PATH)
+static char g_path_scratch[MINIMAFS_PATH_SCRATCH_SLOTS][MINIMAFS_PATH_SCRATCH_SIZE];
+static volatile uint32_t g_path_scratch_used;
+static volatile int g_path_scratch_lock;
+
+static char* minimafs_acquire_path_scratch(void) {
+    for (;;) {
+        while (__sync_lock_test_and_set(&g_path_scratch_lock, 1)) { }
+        for (uint32_t i = 0; i < MINIMAFS_PATH_SCRATCH_SLOTS; i++) {
+            uint32_t bit = 1u << i;
+            if (!(g_path_scratch_used & bit)) {
+                g_path_scratch_used |= bit;
+                __sync_lock_release(&g_path_scratch_lock);
+                return g_path_scratch[i];
+            }
+        }
+        __sync_lock_release(&g_path_scratch_lock);
+    }
+}
+
+static void minimafs_release_path_scratch(char* storage) {
+    for (uint32_t i = 0; i < MINIMAFS_PATH_SCRATCH_SLOTS; i++) {
+        if (storage == g_path_scratch[i]) {
+            __sync_fetch_and_and(&g_path_scratch_used, ~(1u << i));
+            return;
+        }
+    }
+}
 
 minimafs_file_handle_t* minimafs_open(const char* path, bool read_only) {
     minimafs_file_handle_t* handle = NULL;
@@ -1364,9 +1394,10 @@ minimafs_file_handle_t* minimafs_open(const char* path, bool read_only) {
     /* HEAP — local_path/parent (1KB each) plus a metadata struct
      * (~2.5KB) used to coexist on the stack in this function and
      * blew the 4KB kernel stack. All moved to heap. */
-    char* local_path = (char*)alloc_unzeroed(MINIMAFS_MAX_PATH);
-    char* filename    = (char*)alloc_unzeroed(MINIMAFS_MAX_FILENAME);
-    char* parent      = (char*)alloc_unzeroed(MINIMAFS_MAX_PATH);
+    char* path_storage = minimafs_acquire_path_scratch();
+    char* local_path = path_storage;
+    char* filename = path_storage ? local_path + MINIMAFS_MAX_PATH : NULL;
+    char* parent = filename ? filename + MINIMAFS_MAX_FILENAME : NULL;
     minimafs_folder_desc_t* parent_desc = NULL;
     bool parent_desc_locked = false;
     uint8_t* first_block = NULL;
@@ -1555,9 +1586,7 @@ minimafs_file_handle_t* minimafs_open(const char* path, bool read_only) {
             free_mem(first_block);
     }
     if (meta)         minimafs_release_file_metadata(meta);
-    if (parent)       free_mem(parent);
-    if (filename)     free_mem(filename);
-    if (local_path)   free_mem(local_path);
+    if (path_storage) minimafs_release_path_scratch(path_storage);
     return handle;
 }
 
@@ -2262,9 +2291,10 @@ bool minimafs_write_file_segments(const char* path,
     /* HEAP — local_path/parent are 1KB each and metadata is ~2.5KB.
      * Combined they overflow the 4KB kernel stack on their own, before
      * counting the caller's or callee's frame. Must never be on-stack. */
-    char* local_path = (char*)alloc_unzeroed(MINIMAFS_MAX_PATH);
-    char* filename    = (char*)alloc_unzeroed(MINIMAFS_MAX_FILENAME);
-    char* parent      = (char*)alloc_unzeroed(MINIMAFS_MAX_PATH);
+    char* path_storage = minimafs_acquire_path_scratch();
+    char* local_path = path_storage;
+    char* filename = path_storage ? local_path + MINIMAFS_MAX_PATH : NULL;
+    char* parent = filename ? filename + MINIMAFS_MAX_FILENAME : NULL;
     minimafs_file_metadata_t* metadata = minimafs_acquire_file_metadata();
     minimafs_folder_desc_t* pd = NULL;
 
@@ -2285,7 +2315,7 @@ bool minimafs_write_file_segments(const char* path,
 
     minimafs_split_local_path(local_path, parent, filename);
 
-    pd = (minimafs_folder_desc_t*)alloc(sizeof(minimafs_folder_desc_t));
+    pd = acquire_folder_desc();
     if (!pd) goto cleanup;
 
     if (!minimafs_read_folder_desc(drive, parent, pd)) goto cleanup;
@@ -2329,11 +2359,9 @@ bool minimafs_write_file_segments(const char* path,
         result = minimafs_write_folder_desc(drive, pd);
 
         cleanup:
-        if (pd)         free_mem(pd);
+        if (pd)         release_folder_desc(pd);
         if (metadata)   minimafs_release_file_metadata(metadata);
-        if (parent)     free_mem(parent);
-        if (filename)   free_mem(filename);
-        if (local_path) free_mem(local_path);
+        if (path_storage) minimafs_release_path_scratch(path_storage);
         return result;
                                   }
 

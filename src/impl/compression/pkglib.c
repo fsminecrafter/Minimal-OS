@@ -342,19 +342,19 @@ bool pkglib_info(const char* archive_path, uint32_t* out_entry_count) {
 
 typedef struct {
     char rel_name[MPKG_NAME_SIZE];
-    char full_path[MINIMAFS_MAX_PATH];
+    char full_path[256];
     bool is_dir;
 } pkg_zip_item_t;
 
+#define PKGLIB_ZIP_MAX_ITEMS 16
+static pkg_zip_item_t g_zip_items[PKGLIB_ZIP_MAX_ITEMS];
+
 static bool pkg_zip_add_item(pkg_zip_item_t** items, uint32_t* count, uint32_t* capacity,
                              const char* rel_name, const char* full_path, bool is_dir) {
+    if (strlen(full_path) >= sizeof(((pkg_zip_item_t*)0)->full_path)) return false;
+
     if (*count >= *capacity) {
-        uint32_t new_cap = (*capacity == 0) ? 16 : (*capacity * 2);
-        pkg_zip_item_t* bigger =
-            (pkg_zip_item_t*)alloc_resize(*items, (size_t)new_cap * sizeof(pkg_zip_item_t));
-        if (!bigger) return false;
-        *items = bigger;
-        *capacity = new_cap;
+        return false;
     }
 
     pkg_zip_item_t* it = &(*items)[(*count)++];
@@ -368,9 +368,7 @@ static bool pkg_zip_add_item(pkg_zip_item_t** items, uint32_t* count, uint32_t* 
 
 static bool pkg_zip_collect_dir(const char* full_dir_path, const char* rel_prefix,
                                 pkg_zip_item_t** items, uint32_t* count, uint32_t* capacity) {
-    minimafs_dir_entry_t* entries = (minimafs_dir_entry_t*)alloc(
-        MINIMAFS_MAX_ROOT_ENTRIES * sizeof(minimafs_dir_entry_t));
-    if (!entries) return false;
+    minimafs_dir_entry_t entries[MINIMAFS_MAX_ROOT_ENTRIES];
 
     uint32_t n = minimafs_list_dir(full_dir_path, entries, MINIMAFS_MAX_ROOT_ENTRIES);
     bool ok = true;
@@ -403,8 +401,6 @@ static bool pkg_zip_collect_dir(const char* full_dir_path, const char* rel_prefi
             }
         }
     }
-
-    free_mem(entries);
     return ok;
 }
 
@@ -422,7 +418,7 @@ static void pkg_zip_free_all(pkg_zip_item_t* items,
     if (raw_sizes)     free_mem(raw_sizes);
     if (methods)       free_mem(methods);
     if (data_offsets)  free_mem(data_offsets);
-    if (items)         free_mem(items);
+    if (items && items != g_zip_items) free_mem(items);
 }
 
 bool pkglib_zip(const char* source_path, const char* algorithm,
@@ -450,8 +446,8 @@ bool pkglib_zip(const char* source_path, const char* algorithm,
         }
     }
 
-    pkg_zip_item_t* items = NULL;
-    uint32_t item_count = 0, item_capacity = 0;
+    pkg_zip_item_t* items = g_zip_items;
+    uint32_t item_count = 0, item_capacity = PKGLIB_ZIP_MAX_ITEMS;
     bool source_is_dir = minimafs_is_dir(source_path);
 
     if (source_is_dir) {

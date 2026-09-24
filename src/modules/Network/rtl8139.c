@@ -86,7 +86,11 @@ static bool rtl8139_init(void) {
     pci_enable_io_busmaster(dev);
 
     if (dev->bar_type[0] != PCI_BAR_IO) {
-        serial_write_str("RTL8139: BAR0 is not I/O space\n");
+        serial_write_str("RTL8139: BAR0 is not I/O space, raw=0x");
+        serial_write_hex(dev->bar[0]);
+        serial_write_str(" type=");
+        serial_write_dec(dev->bar_type[0]);
+        serial_write_str("\n");
         return false;
     }
     g_io_base = (uint16_t)dev->bar[0];

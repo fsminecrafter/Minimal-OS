@@ -40,7 +40,7 @@ static const char* exception_name(uint64_t vector) {
  * with zero diagnostic output. Now they at least produce a readable
  * message before panicking.
  */
-void isr_generic_handler(uint64_t vector, uint64_t error_code) {
+void isr_generic_handler(uint64_t vector, uint64_t error_code, uint64_t saved_rip) {
     if (vector == 14) {
         uint64_t cr2;
         asm volatile("mov %%cr2, %0" : "=r"(cr2));
@@ -63,6 +63,10 @@ void isr_generic_handler(uint64_t vector, uint64_t error_code) {
         serial_write_hex(error_code);
         serial_write_str("\n");
     }
+
+    serial_write_str("  Saved RIP: 0x");
+    serial_write_hex(saved_rip);
+    serial_write_str("\n");
 
     PANIC("Unhandled CPU exception");
 }

@@ -511,14 +511,20 @@ static uint64_t sys_random_impl(void* buf, uint64_t len) {
 }
 
 static uint64_t sys_exec_impl(const char* path, const char** argv, uint64_t argc) {
-    if (!path) return SYS_ERR_INVAL;
-    if (argc > 16) return SYS_ERR_INVAL;      // run_launch_file's own ceiling
+    if (!path) { serial_write_str("SYS_EXEC: missing path\n"); return SYS_ERR_INVAL; }
+    if (argc > 16) { serial_write_str("SYS_EXEC: too many args\n"); return SYS_ERR_INVAL; }
 
     char normalized[MINIMAFS_MAX_PATH];
-    if (!run_normalize_path(path, normalized, sizeof(normalized))) return SYS_ERR_INVAL;
+    if (!run_normalize_path(path, normalized, sizeof(normalized))) {
+        serial_write_str("SYS_EXEC: invalid path\n");
+        return SYS_ERR_INVAL;
+    }
 
     process_t* proc = run_launch_file(normalized, (int)argc, argv);
-    if (!proc) return SYS_ERR_GENERIC;
+    if (!proc) {
+        serial_write_str("SYS_EXEC: launch failed\n");
+        return SYS_ERR_GENERIC;
+    }
     return proc->pid;
 }
 

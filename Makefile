@@ -37,6 +37,8 @@ install1_object := build/resources/install1_mpkg.o
 install2_source := src/resources/install2
 install2_mpkg := build/resources/install2.mpkg
 install2_object := build/resources/install2_mpkg.o
+dlr_source_files := $(shell find Minimal-OS-SDK/programs/dlr -type f \( -name '*.c' -o -name '*.h' \))
+dlr_run := $(install2_source)/dlr.run
 install3_source := src/resources/install3
 install3_mpkg := build/resources/install3.mpkg
 install3_object := build/resources/install3_mpkg.o
@@ -127,9 +129,12 @@ $(install1_object): $(install1_mpkg)
 		--redefine-sym _binary_build_resources_install1_mpkg_end=_binary_install1_mpkg_end \
 		$< $@
 
-$(install2_mpkg): $(install2_source) $(install2_files) tools/mkpkg/mkpkg.py
+$(install2_mpkg): $(install2_source) $(install2_files) $(dlr_run) tools/mkpkg/mkpkg.py
 	mkdir -p $(dir $@)
 	python3 tools/mkpkg/mkpkg.py $(install2_source) $@ --store
+
+$(dlr_run): $(dlr_source_files) Minimal-OS-SDK/build.sh Minimal-OS-SDK/crt0.c Minimal-OS-SDK/link.ld
+	CC=$(CC) LD=$(LD) Minimal-OS-SDK/build.sh Minimal-OS-SDK/programs/dlr
 
 $(install2_object): $(install2_mpkg)
 	mkdir -p $(dir $@)
@@ -207,3 +212,7 @@ ci-test:
 .PHONY: ci-interact
 ci-interact:
 	bash tools/debug/ci_interact.sh
+
+.PHONY: dlr-cli-test
+dlr-cli-test:
+	bash tools/debug/test_dlr_present.sh

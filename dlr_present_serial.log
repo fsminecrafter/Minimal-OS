@@ -1,0 +1,239 @@
+QEMU 10.2.1 monitor - type 'help' for more information
+(qemu) qemu-system-x86_64: terminating on signal 2
+�─────────[04;46H[04;47H────────────────────────────────┐[05;02H│[05;79H│[06;02H│[06;79H│[07;02H│[07;79H│[08;02H│[08;79H│[09;02H│[09;02H[09;79H│[10;02H│[10;79H│[11;02H│[11;79H│[12;02H│[12;79H│[13;02H│[13;79H│[14;02H│[14;79H│[15;02H│[15;79H│[16;02H│[16;79H│[17;02H│[17;79H│[18;02H└─────────────────────────────────────────────[18;47H[18;48H───────────────────────────────┘[20;02H     Use the ↑ and ↓ keys to select which entry is hig[20;55H[20;56Hhlighted.          
+      Press enter to boot the selected OS, `e' to edit the commands    [21;71H[21;72H   
+      before booting or `c' for a command-line.                           [05;80H [05;03H[0;30;47m*Minimal OS[05;13H[05;14H                                                                 [06;03H[0m                            [06;30H[06;31H                                                [07;03H                                                                            [08;03H                                                        [08;58H[08;59H                    [09;03H                                                                       [09;73H[09;74H     [10;03H                                                                            [11;03H    [11;06H[11;07H                                                                        [12;03H                    [12;22H[12;23H                                                        [13;03H                                    [13;38H[13;39H                                        [14;03H                                                     [14;55H[14;56H                       [15;03H                                                                            [16;03H                                                                            [17;03H                                                                            [17;80H 
+
+
+
+
+
+   The highlighted entry will be executed automatically in 3s.                 [05;78H
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                               
+                                                                               [05;78H[01;01H[2J[2JSMP: BSP online (cpu 0). Call smp_start_aps() once the PIT/ACPI are ready to bring up the rest.
+GDT: initialized, 16 TSS slots ready
+Command handler init
+ctors start: 0x0000000000361428
+ctors end: 0x00000000003614F8
+Calling ctor at: 0x0000000000104511
+Calling ctor at: 0x000000000010F49D
+Calling ctor at: 0x0000000000112FA1
+Calling ctor at: 0x0000000000132F02
+Calling ctor at: 0x0000000000134380
+Calling ctor at: 0x000000000013488E
+Calling ctor at: 0x0000000000136F1E
+Calling ctor at: 0x0000000000137765
+Calling ctor at: 0x00000000001386C0
+Calling ctor at: 0x0000000000138757
+Calling ctor at: 0x000000000013A540
+Calling ctor at: 0x000000000013ADB6
+Calling ctor at: 0x000000000013B2F9
+Calling ctor at: 0x000000000013A75B
+Calling ctor at: 0x000000000013A745
+Calling ctor at: 0x000000000013A70A
+Calling ctor at: 0x000000000013A720
+Calling ctor at: 0x000000000013A6E5
+Calling ctor at: 0x000000000013B2D4
+Calling ctor at: 0x000000000013BDB9
+Calling ctor at: 0x000000000013BE85
+Calling ctor at: 0x000000000013C025
+Calling ctor at: 0x000000000013C085
+Calling ctor at: 0x000000000013C7D1
+Calling ctor at: 0x000000000013C7E7
+Calling ctor at: 0x000000000013C7FD
+Total ctors executed: 0x000000000000001A
+Initializing time subsystem...
+Time initialized: 1992-09-17 14:03:00
+!!! IRQ RESTORE WITHOUT CONTEXT !!!
+Allocator: Ready. Heap=0x00000000003E7AE0-0x00000000003E8AE0, free=4064 bytes
+Heap start: 0x0x00000000008E9000
+Allocator: Ready. Heap=0x00000000008E9000-0x000000001FF7EC00, free=526998496 bytes
+PMM initialized: 0x0000000001000000 -> 0x0000000005000000, pages: 16384
+Initializing MMIO subsystem...
+Array locations:
+  page_table_l2_mmio: 0x00000000003E8B20
+  page_table_l1_mmio: 0x00000000003E9B20
+  l2_installed: 0x00000000005E9B20
+  l1_installed: 0x00000000005E9D20
+Zeroing MMIO page table arrays...
+  Zeroing index 0/512
+  Zeroing index 128/512
+  Zeroing index 256/512
+  Zeroing index 384/512
+MMIO arrays zeroed
+MMIO VA range: 0xFFFFFFA000000000 - 0xFFFFFFAFFFFFFFFF
+PML4 entry for MMIO (index 511): 0x0000000000398003
+MMIO page tables ready (initialized by bootloader)
+Enumerating PCI devices starting from bus 0...
+Enumerating bus: 0
+PCI Device found: 0x0000000000000000:0x0000000000000000:0x0000000000000000 Vendor: 0x0000000000008086 Device: 0x0000000000001237
+PCI Device found: 0x0000000000000000:0x0000000000000001:0x0000000000000000 Vendor: 0x0000000000008086 Device: 0x0000000000007000
+PCI Device found: 0x0000000000000000:0x0000000000000001:0x0000000000000001 Vendor: 0x0000000000008086 Device: 0x0000000000007010
+PCI Device found: 0x0000000000000000:0x0000000000000001:0x0000000000000003 Vendor: 0x0000000000008086 Device: 0x0000000000007113
+PCI Device found: 0x0000000000000000:0x0000000000000002:0x0000000000000000 Vendor: 0x0000000000001234 Device: 0x0000000000001111
+PCI Device found: 0x0000000000000000:0x0000000000000003:0x0000000000000000 Vendor: 0x0000000000008086 Device: 0x000000000000100E
+PCI Device found: 0x0000000000000000:0x0000000000000004:0x0000000000000000 Vendor: 0x0000000000008086 Device: 0x0000000000002922
+7Enumerating PCI devices starting from bus 0...
+Enumerating bus: 0
+usb_manager: initializing driver
+USB: Initializing USB subsystem...
+USB: Scanning PCI for USB controllers...
+USB: No supported USB controller found
+Falling back to PS/2
+gpu_manager: initializing driver
+gpu_init: starting GPU...
+gpu_init: Initializing GPU...
+Setting VBE mode: 1280x720x32
+VBE mode set successfully: 1280x720x32
+gpu_init: mapping framebuffer BAR0...
+Requesting VA for framebuffer size: 0x0000000001000000
+mmio_alloc_va: allocated 0x0000000001000000 bytes at 0xFFFFFFA000000000
+mmio_alloc_va returned ptr: 0xFFFFFFA000000000
+After cast to uintptr_t: 0xFFFFFFA000000000
+Attempting to map framebuffer...
+map_mmio_page: virt=0xFFFFFFA000000000 phys=0x00000000FD000000 size=0x0000000001000000
+  L3 index: 0x0000000000000080 L2 index: 0x0000000000000000
+  Allocating L2 table for L3 index 0x0000000000000080
+  L2 table allocated at 0x0000000001000000
+  Mapping as 2 MiB pages...
+  L2[0x0000000000000000] = 0x00000000FD000083
+  Mapped 8 pages successfully
+Framebuffer BAR0 physical: 0x00000000FD000000, virtual: 0xFFFFFFA000000000, size: 0x0000000001000000
+gpu_init: mapping BAR2 (registers)...
+BAR2 size: 0x0000000000001000
+mmio_alloc_va: allocated 0x0000000000001000 bytes at 0xFFFFFFA001000000
+mmio_alloc_va returned for BAR2: 0xFFFFFFA001000000
+Attempting to map BAR2...
+map_mmio_page: virt=0xFFFFFFA001000000 phys=0x00000000FEBB0000 size=0x0000000000001000
+  L3 index: 0x0000000000000080 L2 index: 0x0000000000000008
+  Mapping as 4 KiB page, L1 index: 0x0000000000000000
+  Allocating L1 table...
+  Back in mmio.c after alloc_page_zeroed
+  L1 table allocated and zeroed at 0x0000000001001000
+  L1 table allocated successfully
+  L1[0x0000000000000000] = 0x00000000FEBB0013
+  Mapped 1 pages successfully
+GPU BAR2 mapped safely: physical 0x00000000FEBB0000, virtual 0xFFFFFFA001000000, size 0x0000000000001000
+GPU initialized: resolution 1280x720, pitch 5120
+Clearing framebuffer...
+gpu_clear: clearing 1280x720 framebuffer with color 0x0000000000000000
+gpu_clear: done
+Framebuffer cleared
+gpu_init: GPU initialized, writing test pixels...
+gpu_test_write: drawing color gradient...
+  Row 0/720
+  Row 100/720
+  Row 200/720
+  Row 300/720
+  Row 400/720
+  Row 500/720
+  Row 600/720
+  Row 700/720
+gpu_test_write: gradient complete
+gpu_clear: clearing 1280x720 framebuffer with color 0x0000000000000000
+gpu_clear: done
+Graphics subsystem initialized
+Safety mode: PANIC
+gpu_init: done
+S�network_manager: initializing driver
+RTL8139: not found
+Network: no supported NIC found
+[random] seeded (no RDRAND - TSC/RTC fallback)
+audio_manager: initializing driver
+AC97: Searching for audio controller...
+AC97: No compatible device found
+[AUDIO] No working audio driver found
+ACPI: Locating RSDP...
+ACPI: LAPIC phys=0x0x00000000FEE00000, CPUs=1, IOAPICs=1
+mmio_alloc_va: allocated 0x0000000000001000 bytes at 0xFFFFFFA001001000
+map_mmio_page: virt=0xFFFFFFA001001000 phys=0x00000000FEE00000 size=0x0000000000001000
+  L3 index: 0x0000000000000080 L2 index: 0x0000000000000008
+  Mapping as 4 KiB page, L1 index: 0x0000000000000001
+  L1[0x0000000000000001] = 0x00000000FEE00013
+  Mapped 1 pages successfully
+mmio_alloc_va: allocated 0x0000000000001000 bytes at 0xFFFFFFA001002000
+map_mmio_page: virt=0xFFFFFFA001002000 phys=0x00000000FEC00000 size=0x0000000000001000
+  L3 index: 0x0000000000000080 L2 index: 0x0000000000000008
+  Mapping as 4 KiB page, L1 index: 0x0000000000000002
+  L1[0x0000000000000002] = 0x00000000FEC00013
+  Mapped 1 pages successfully
+IOAPIC: mapped, 24 redirection entries
+SMP: 1 core(s) online
+!!! IRQ RESTORE WITHOUT CONTEXT !!!
+[PROC] Created process: busy@11585A [pid=1] [kernel]
+[PROC] Created process: kernelaudio@11586D [pid=2] [kernel]
+=== TERMINAL STARTING ===
+gpu_clear: clearing 1280x720 framebuffer with color 0x00000000FF000000
+gpu_clear: done
+Terminal resolution set to 160x90 (8x8 pixels per char, max 160x90)
+gpu_clear: clearing 1280x720 framebuffer with color 0x00000000FF000000
+gpu_clear: done
+Terminal: Initializing command system...
+VGATerm: Initializing terminal enhancements
+Terminal: Initializing keyboard...
+USB Keyboard: Initializing...
+USB Keyboard: Ready (no layout loaded)
+USB Mouse: Initializing...
+USB Mouse: Ready (waiting for device)
+USB Keyboard: Loaded layout 'Swedish QWERTY' (sv-SE)
+Terminal: PS/2 keyboard (or no keyboard)
+Terminal: Keyboard ready!
+gpu_clear: clearing 1280x720 framebuffer with color 0x00000000FF000000
+gpu_clear: done
+Executing...=== Initializing Storage System ===
+AHCI: Initializing controller...
+AHCI: Vendor=0x0x0000000000008086 Device=0x0x0000000000002922
+AHCI: ABAR physical = 0x0x00000000FEBB1000
+mmio_alloc_va: allocated 0x0000000000001000 bytes at 0xFFFFFFA001003000
+map_mmio_page: virt=0xFFFFFFA001003000 phys=0x00000000FEBB1000 size=0x0000000000001000
+  L3 index: 0x0000000000000080 L2 index: 0x0000000000000008
+  Mapping as 4 KiB page, L1 index: 0x0000000000000003
+  L1[0x0000000000000003] = 0x00000000FEBB1013
+  Mapped 1 pages successfully
+BAR mapped: 0x0000000000001000 bytes
+AHCI: ABAR virtual  = 0x0xFFFFFFA001003000
+AHCI: Found 6 ports
+AHCI: Probing ports...
+AHCI: Port 0 - Signature: 0x0x0000000000000101
+AHCI: Found SATA drive on port 0
+AHCI: IDENTIFY prdbc=512 w0=0x0x0000000000000040 w1=0x0x0000000000000208 w60=0x0x0000000000000000 w61=0x0x0000000000000008 w83=0x0x0000000000007400 w100=0x0x0000000000000000 w101=0x0x0000000000000008
+AHCI: Found 1 SATA drives
+Found 1 SATA drive(s)
+Disk 0:
+  Model: QEMU HARDDISK
+  Sectors: 524288
+  Sector size: 512 bytes
+MinimaFS: Initializing...
+MinimaFS: Ready
+MinimaFS device wrapper created
+Returning device
+MinimaFS: Self-test...
+MinimaFS: Allocating DMA bounce buffer
+MinimaFS: DMA bounce buffer at 0x0x0000000001025000
+MinimaFS: Self-test OK
+MinimaFS: Reading storage.desc...
+MinimaFS: storage.desc written
+MinimaFS: Drive 0 mounted OK
+Filesystem mounted as drive 0: 
+gpu_clear: clearing 1280x720 framebuffer with color 0x00000000FF000000
+gpu_clear: done
+Terminal: Starting service discovery...
+[SERVICES] Scanning 1 entries in 0:/services
+Executing...DHCP: sending DISCOVER

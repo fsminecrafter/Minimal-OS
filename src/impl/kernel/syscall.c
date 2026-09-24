@@ -27,6 +27,14 @@
 #include "x86_64/runcommand.h"
 #include "fspaths.h"
 
+static minimafs_dir_entry_t g_listdir_entries[MINIMAFS_MAX_ROOT_ENTRIES];
+static volatile int     g_listdir_entries_lock;
+
+static const char* syscall_resolve_path(const char* input, char* resolved) {
+    if (!input || !resolved || !fs_resolve_path(input, resolved)) return NULL;
+    return resolved;
+}
+
 static uint64_t sys_write_impl(int fd, const char* buf, uint64_t len) {
     if (!buf) return SYS_ERR_INVAL;
     if (fd != 1 && fd != 2) return SYS_ERR_BADFD;
@@ -305,12 +313,15 @@ static uint64_t sys_listdir_impl(const char* path, syscall_dirent_t* out,
                                  uint32_t max_entries) {
     if (!path || !out || max_entries == 0) return SYS_ERR_INVAL;
 
+    char resolved[MINIMAFS_MAX_PATH];
+    path = syscall_resolve_path(path, resolved);
+    if (!path) return SYS_ERR_INVAL;
+
     uint32_t cap = max_entries;
     if (cap > MINIMAFS_MAX_ROOT_ENTRIES) cap = MINIMAFS_MAX_ROOT_ENTRIES;
 
-    minimafs_dir_entry_t* entries =
-        (minimafs_dir_entry_t*)alloc(cap * sizeof(minimafs_dir_entry_t));
-    if (!entries) return SYS_ERR_GENERIC;
+    while (__sync_lock_test_and_set(&g_listdir_entries_lock, 1)) { }
+    minimafs_dir_entry_t* entries = (minimafs_dir_entry_t*)g_listdir_entries;
 
     uint32_t count = minimafs_list_dir(path, entries, cap);
     for (uint32_t i = 0; i < count; i++) {
@@ -320,7 +331,7 @@ static uint64_t sys_listdir_impl(const char* path, syscall_dirent_t* out,
         out[i].hidden = entries[i].hidden ? 1 : 0;
     }
 
-    free_mem(entries);
+    __sync_lock_release(&g_listdir_entries_lock);
     return count;
 }
 
@@ -346,26 +357,30 @@ static uint64_t sys_get_metadata_impl(const char* path, syscall_file_metadata_t*
 }
 
 static uint64_t sys_pkg_impl(const syscall_pkg_request_t* request) {
+    serial_write_str("SYS_PKG: dispatch\n");
     if (!request || !request->path) return SYS_ERR_INVAL;
 
-    switch (request->op) {
+    syscall_pkg_request_t local = *request;
+
+    switch (local.op) {
         case SYS_PKG_UNZIP: {
-            if (!request->extra) return SYS_ERR_INVAL;
+            if (!local.extra) return SYS_ERR_INVAL;
             uint32_t installed = 0, failed = 0;
-            bool ok = pkglib_unzip(request->path, request->extra, &installed, &failed);
-            if (request->out_count) *request->out_count = installed;
-            if (request->out_failed) *request->out_failed = failed;
+            bool ok = pkglib_unzip(local.path, local.extra, &installed, &failed);
+            if (local.out_count) *local.out_count = installed;
+            if (local.out_failed) *local.out_failed = failed;
             return ok ? SYS_SUCCESS : SYS_ERR_GENERIC;
         }
         case SYS_PKG_ZIP: {
-            bool ok = pkglib_zip(request->path, request->extra,
-                                 request->out_path, request->out_path_size);
+            serial_write_str("SYS_PKG: zip\n");
+            bool ok = pkglib_zip(local.path, local.extra,
+                                 local.out_path, local.out_path_size);
             return ok ? SYS_SUCCESS : SYS_ERR_GENERIC;
         }
         case SYS_PKG_INFO: {
             uint32_t count = 0;
-            bool ok = pkglib_info(request->path, &count);
-            if (request->out_count) *request->out_count = count;
+            bool ok = pkglib_info(local.path, &count);
+            if (local.out_count) *local.out_count = count;
             return ok ? SYS_SUCCESS : SYS_ERR_GENERIC;
         }
         default:
@@ -667,6 +682,12 @@ void syscall_dispatch(syscall_regs_t* regs) {
                 regs->rax = SYS_ERR_INVAL;
                 break;
             }
+            char resolved[MINIMAFS_MAX_PATH];
+            path = syscall_resolve_path(path, resolved);
+            if (!path) {
+                regs->rax = SYS_ERR_INVAL;
+                break;
+            }
             minimafs_file_handle_t* handle =
                 minimafs_open(path, regs->rsi == SYS_O_RDONLY);
             regs->rax = handle ? (uint64_t)handle : SYS_ERR_NOTFOUND;
@@ -713,18 +734,24 @@ void syscall_dispatch(syscall_regs_t* regs) {
 
         case SYS_EXISTS: {
             const char* path = (const char*)regs->rdi;
+            char resolved[MINIMAFS_MAX_PATH];
+            path = syscall_resolve_path(path, resolved);
             regs->rax = path ? (minimafs_exists(path) ? 1 : 0) : SYS_ERR_INVAL;
             break;
         }
 
         case SYS_IS_DIR: {
             const char* path = (const char*)regs->rdi;
+            char resolved[MINIMAFS_MAX_PATH];
+            path = syscall_resolve_path(path, resolved);
             regs->rax = path ? (minimafs_is_dir(path) ? 1 : 0) : SYS_ERR_INVAL;
             break;
         }
 
         case SYS_MKDIR: {
             const char* path = (const char*)regs->rdi;
+            char resolved[MINIMAFS_MAX_PATH];
+            path = syscall_resolve_path(path, resolved);
             regs->rax = path ? (minimafs_mkdir(path) ? SYS_SUCCESS : SYS_ERR_GENERIC)
                              : SYS_ERR_INVAL;
             break;
@@ -753,6 +780,8 @@ void syscall_dispatch(syscall_regs_t* regs) {
 
         case SYS_DELETE: {
             const char* path = (const char*)regs->rdi;
+            char resolved[MINIMAFS_MAX_PATH];
+            path = syscall_resolve_path(path, resolved);
             regs->rax = path ? (minimafs_delete_file(path) ? SYS_SUCCESS : SYS_ERR_GENERIC)
                              : SYS_ERR_INVAL;
             break;
@@ -760,6 +789,8 @@ void syscall_dispatch(syscall_regs_t* regs) {
 
         case SYS_RMDIR: {
             const char* path = (const char*)regs->rdi;
+            char resolved[MINIMAFS_MAX_PATH];
+            path = syscall_resolve_path(path, resolved);
             regs->rax = path ? (minimafs_rmdir(path) ? SYS_SUCCESS : SYS_ERR_GENERIC)
                              : SYS_ERR_INVAL;
             break;
@@ -768,6 +799,8 @@ void syscall_dispatch(syscall_regs_t* regs) {
         case SYS_GET_METADATA: {
             const char* path = (const char*)regs->rdi;
             syscall_file_metadata_t* out = (syscall_file_metadata_t*)regs->rsi;
+            char resolved[MINIMAFS_MAX_PATH];
+            path = syscall_resolve_path(path, resolved);
             regs->rax = sys_get_metadata_impl(path, out);
             break;
         }
@@ -800,6 +833,12 @@ void syscall_dispatch(syscall_regs_t* regs) {
             const char* path   = (const char*)regs->rdi;
             const char* type   = (const char*)regs->rsi;
             const char* format = (const char*)regs->rdx;
+            if (!path) {
+                regs->rax = SYS_ERR_INVAL;
+                break;
+            }
+            char resolved[MINIMAFS_MAX_PATH];
+            path = syscall_resolve_path(path, resolved);
             if (!path) {
                 regs->rax = SYS_ERR_INVAL;
                 break;

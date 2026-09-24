@@ -507,7 +507,9 @@ void terminal_program_entry(void) {
         if (success == 1) {
             vgaterm_print_success("Disk mounted\n");
             systeminfo_load_saved_resolution();
+            serial_write_str("Terminal: Starting service discovery...\n");
             service_manager_init();
+            serial_write_str("Terminal: Service discovery complete\n");
         } else if (success == 2) {
             vgaterm_print_error("MinimaFS: Drive already mounted\n");
         } else if (success == 3) {

@@ -153,6 +153,7 @@ typedef struct {
     minimafs_file_metadata_t metadata;          // File metadata
     
     uint8_t* data;                              // File data (in memory)
+    uint8_t inline_data[512];                   // Small-file storage without heap fragmentation
     uint32_t data_size;                         // Size of data
     uint32_t position;                          // Current read/write position
     

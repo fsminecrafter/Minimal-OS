@@ -763,10 +763,16 @@ void syscall_dispatch(syscall_regs_t* regs) {
             const void* buf = (const void*)regs->rsi;
             uint64_t len = regs->rdx;
             if (!handle || !buf) {
+                serial_write_str("SYS_FWRITE: invalid handle or buffer\n");
                 regs->rax = SYS_ERR_INVAL;
                 break;
             }
             regs->rax = minimafs_write(handle, buf, (uint32_t)len);
+            serial_write_str("SYS_FWRITE: requested=");
+            serial_write_dec((uint32_t)len);
+            serial_write_str(" wrote=");
+            serial_write_dec((uint32_t)regs->rax);
+            serial_write_str("\n");
             break;
         }
 

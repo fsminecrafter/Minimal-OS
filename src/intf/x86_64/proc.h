@@ -7,7 +7,7 @@
 #include <stdbool.h>
 
 #define MAX_PROCESS_NAME_LEN 128
-#define STACK_SIZE 0x10000  // 64 KB
+#define STACK_SIZE 0x4000   // 16 KB
 
 // Process states
 typedef enum {
@@ -101,6 +101,8 @@ typedef struct process {
     size_t user_image_pages;
     void* user_stack_phys;
     size_t user_stack_pages;
+    bool kernel_stack_page_backed;
+    size_t kernel_stack_pages;
     // argv/argc for a user process's entry point, consumed by
     // proc_enter_ring3() via proc_trampoline(). Set by run_launch_file()
     // (runcommand.c) before the process is first scheduled. Safe to
@@ -148,6 +150,9 @@ uint64_t get_kernel_pml4(void);
 // Copy a user range to process-owned physical pages and map only those pages
 // as user-accessible in the process's private page-table hierarchy.
 int proc_map_user_range(process_t* proc, void* address, size_t length);
+int proc_map_user_range_at(process_t* proc, const void* source,
+                           void* user_address, size_t length);
+int proc_map_user_heap_range(process_t* proc, void* address, size_t length);
 void proc_destroy_address_space(process_t* proc);
 
 // Helper functions (from string.h but needed here)

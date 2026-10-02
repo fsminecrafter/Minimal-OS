@@ -4,7 +4,8 @@ set -euo pipefail
 WORKDIR=$(cd "$(dirname "$0")/../.." && pwd)
 SERIAL_PORT=${SERIAL_PORT:-5566}
 TIMEOUT=${TIMEOUT:-90}
-SERIAL_OUT="$WORKDIR/dlr_present_serial.log"
+SERIAL_OUT=${SERIAL_OUT:-"$WORKDIR/dlr_present_serial.log"}
+DISK_IMAGE=${DISK_IMAGE:-"$WORKDIR/sata256.img"}
 QEMU_BIN=${QEMU_BIN:-qemu-system-x86_64}
 QEMU_PID=""
 READER_PID=""
@@ -30,7 +31,7 @@ rm -f "$SERIAL_OUT"
     -serial "tcp:127.0.0.1:${SERIAL_PORT},server=on,wait=off" \
     -no-reboot -no-shutdown \
     -device ahci,id=ahci \
-    -drive id=disk0,file="$WORKDIR/sata256.img",if=none,format=raw \
+    -drive id=disk0,file="$DISK_IMAGE",if=none,format=raw \
     -device ide-hd,drive=disk0,bus=ahci.0 \
     >"$SERIAL_OUT" 2>&1 &
 QEMU_PID=$!
@@ -66,7 +67,7 @@ wait_for() {
     local pattern=$1
     for _ in $(seq 1 "$TIMEOUT"); do
         if grep -Eq "$pattern" "$SERIAL_OUT" 2>/dev/null; then return 0; fi
-        if grep -Eq 'PAGE FAULT|cannot present' "$SERIAL_OUT" 2>/dev/null; then return 1; fi
+        if grep -Eq 'PAGE FAULT|GENERAL PROTECTION|UNHANDLED CPU EXCEPTION|cannot present' "$SERIAL_OUT" 2>/dev/null; then return 1; fi
         sleep 1
     done
     return 1
@@ -135,6 +136,7 @@ if ! wait_for '\[PROC\] Exiting process: cd@'; then
 fi
 sleep 1
 
+user_exits_before=$(grep -Ec '\[PROC\] Exiting process: 0:/programs/dlr\.run@' "$SERIAL_OUT" || true)
 send "dlr present ./test"
 if ! wait_for 'Presented\. Clients can now install it'; then
     echo "[dlr-test] FAIL: dlr present ./test did not succeed"
@@ -142,4 +144,20 @@ if ! wait_for 'Presented\. Clients can now install it'; then
     exit 1
 fi
 
-echo "[dlr-test] PASS: format -> mdr ./test -> dlr present ./test"
+for _ in $(seq 1 "$TIMEOUT"); do
+    user_exits_now=$(grep -Ec '\[PROC\] Exiting process: 0:/programs/dlr\.run@' "$SERIAL_OUT" || true)
+    if (( user_exits_now > user_exits_before )); then
+        echo "[dlr-test] PASS: format -> mdr ./test -> dlr present ./test (clean exit)"
+        exit 0
+    fi
+    if grep -Eq 'PAGE FAULT|GENERAL PROTECTION|UNHANDLED CPU EXCEPTION' "$SERIAL_OUT" 2>/dev/null; then
+        echo "[dlr-test] FAIL: DLR crashed after presenting the package"
+        tail -n 200 "$SERIAL_OUT" || true
+        exit 1
+    fi
+    sleep 1
+done
+
+echo "[dlr-test] FAIL: present process did not exit cleanly"
+tail -n 200 "$SERIAL_OUT" || true
+exit 1

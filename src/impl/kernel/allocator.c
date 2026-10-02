@@ -618,6 +618,18 @@ void kfree_aligned(void* ptr) {
 size_t allocator_used_bytes(void) { return total_allocated; }
 size_t allocator_free_bytes(void) { return total_free; }
 
+size_t allocator_largest_free_block(void) {
+    size_t largest = 0;
+    uint64_t flags = allocator_lock();
+    block_header* curr = free_list_head;
+    while (curr) {
+        if (curr->size > largest) largest = curr->size;
+        curr = curr->next;
+    }
+    allocator_unlock(flags);
+    return largest > FOOTER_SIZE ? largest - FOOTER_SIZE : 0;
+}
+
 void allocator_stats(void) {
     serial_write_str("=== Allocator Stats ===\n");
     serial_write_str("Heap:        "); serial_write_hex((uintptr_t)heap_start);

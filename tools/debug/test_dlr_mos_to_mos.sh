@@ -3,6 +3,7 @@ set -euo pipefail
 
 WORKDIR=$(cd "$(dirname "$0")/../.." && pwd)
 QEMU_BIN=${QEMU_BIN:-qemu-system-x86_64}
+BASE_DISK=${BASE_DISK:-"$WORKDIR/sata256.img"}
 SERIAL_A=${SERIAL_A:-5566}
 SERIAL_B=${SERIAL_B:-5567}
 DLR_MCAST=${DLR_MCAST:-230.0.0.1:12345}
@@ -22,8 +23,8 @@ cleanup() {
 trap cleanup EXIT
 
 make -C "$WORKDIR" build-x86_64 >/dev/null
-cp "$WORKDIR/sata256.img" "$WORKDIR/mos-dlr-server.img"
-cp "$WORKDIR/sata256.img" "$WORKDIR/mos-dlr-client.img"
+cp "$BASE_DISK" "$WORKDIR/mos-dlr-server.img"
+cp "$BASE_DISK" "$WORKDIR/mos-dlr-client.img"
 rm -f "$OUT_A" "$OUT_B"
 
 boot() {
@@ -67,19 +68,50 @@ wait_client_command() {
 prepare_guest() {
     local fd=$1 out=$2
     wait_for "$out" '=== TERMINAL READY ==='
+    wait_for "$out" 'Found 1 SATA drive\(s\)' || return 1
     sleep 1
     send "$fd" n
-    sleep 1
-    send "$fd" format
-    wait_for "$out" '\[PROC\] Exiting process: format@'
+    for _ in 1 2 3 4 5; do
+        send "$fd" format
+        if wait_for "$out" 'Format succeeded\. Calling minimafs_mount\.\.\.'; then
+            wait_for "$out" '\[PROC\] Exiting process: format@'
+            return 0
+        fi
+        wait_for "$out" '\[PROC\] Exiting process: format@' || true
+    done
+    return 1
 }
 
 boot "$SERIAL_A" "$WORKDIR/mos-dlr-server.img" "$OUT_A" mosserver 52:54:00:12:34:56
-boot "$SERIAL_B" "$WORKDIR/mos-dlr-client.img" "$OUT_B" mosclient 52:54:00:12:34:57
 wait_serial "$SERIAL_A" "$FD_A" "$OUT_A"
-wait_serial "$SERIAL_B" "$FD_B" "$OUT_B"
 prepare_guest "$FD_A" "$OUT_A"
-prepare_guest "$FD_B" "$OUT_B"
+
+# Start the second AHCI guest only after the first guest has opened its
+# terminal and formatted its disk. This avoids a QEMU/kernel device-
+# enumeration race that can leave one VM with an uninitialized AHCI
+# controller.
+client_ready=0
+for attempt in 1 2 3; do
+    attempt_out="$WORKDIR/dlr_mos_client_serial.$attempt.log"
+    rm -f "$attempt_out"
+    boot "$SERIAL_B" "$WORKDIR/mos-dlr-client.img" "$attempt_out" mosclient 52:54:00:12:34:57
+    client_pid=${PIDS[${#PIDS[@]}-1]}
+    if wait_serial "$SERIAL_B" "$FD_B" "$attempt_out" &&
+       wait_for "$attempt_out" '=== TERMINAL READY ==='; then
+        OUT_B="$attempt_out"
+        prepare_guest "$FD_B" "$OUT_B"
+        client_ready=1
+        break
+    fi
+    kill "$client_pid" 2>/dev/null || true
+    wait "$client_pid" 2>/dev/null || true
+    exec 9>&-
+done
+if [[ "$client_ready" != 1 ]]; then
+    echo '[dlr-mos-test] FAIL: client VM did not reach terminal ready' >&2
+    tail -n 120 "$attempt_out" >&2
+    exit 1
+fi
 
 send "$FD_A" 'mdr ./pkg'
 wait_for "$OUT_A" '\[PROC\] Exiting process: mdr@'
@@ -99,6 +131,7 @@ wait_for "$OUT_A" "serving 'mos-server' on port 4242"
 
 echo '[dlr-mos-test] waiting 20 seconds for the server broadcast loop'
 sleep 20
+echo '[dlr-mos-test] client scan'
 send "$FD_B" 'dlr scan'
 if ! wait_for "$OUT_B" "found '"; then
     echo '[dlr-mos-test] FAIL: client scan found no DLR server' >&2
@@ -107,21 +140,25 @@ if ! wait_for "$OUT_B" "found '"; then
 fi
 wait_client_command
 
+echo '[dlr-mos-test] client list'
 send "$FD_B" 'dlr list'
 wait_for "$OUT_B" "Packages on 'mos-server'"
 wait_for "$OUT_B" 'example.*1\.0\.0'
 wait_client_command
 
+echo '[dlr-mos-test] client search'
 send "$FD_B" 'dlr search "example"'
 wait_for "$OUT_B" "Results for 'example'"
 wait_for "$OUT_B" 'example.*1\.0\.0'
 wait_client_command
 
+echo '[dlr-mos-test] client install'
 send "$FD_B" 'dlr install example'
 wait_for "$OUT_B" 'Download verified \(SHA-256 matches\)'
 wait_for "$OUT_B" 'Done\.'
 wait_client_command
 
+echo '[dlr-mos-test] client download'
 send "$FD_B" 'dlr download example'
 wait_for "$OUT_B" 'Download verified \(SHA-256 matches\)'
 wait_for "$OUT_B" 'Saved .*example\.mpkg'

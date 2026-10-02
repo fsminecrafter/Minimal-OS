@@ -63,4 +63,7 @@ size_t allocator_used_bytes(void);
 // Returns current free bytes.
 size_t allocator_free_bytes(void);
 
+// Returns the largest currently available contiguous block.
+size_t allocator_largest_free_block(void);
+
 #endif // ALLOCATOR_H

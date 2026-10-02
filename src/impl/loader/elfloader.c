@@ -1,6 +1,7 @@
 #include "x86_64/loader/elfloader.h"
 #include "x86_64/minimafs.h"
 #include "x86_64/allocator.h"
+#include "x86_64/pmm.h"
 #include "string.h"
 #include "serial.h"
 
@@ -8,14 +9,49 @@
 #define ELF_MAX_PHNUM       64
 #define ELF_MAX_IMAGE_SIZE  (64u * 1024 * 1024)
 
-bool elf_load_buffer(uint8_t* filebuf, uint32_t file_size,
-                     elf_loaded_image_t* out) {
+#define ELF_PAGE_BUFFER_SLOTS 4
+static struct {
+    void* buffer;
+    size_t pages;
+} elf_page_buffers[ELF_PAGE_BUFFER_SLOTS];
+
+bool elf_register_page_buffer(void* buffer, size_t page_count) {
+    if (!buffer || !page_count) return false;
+    for (size_t i = 0; i < ELF_PAGE_BUFFER_SLOTS; i++) {
+        if (!elf_page_buffers[i].buffer) {
+            elf_page_buffers[i].buffer = buffer;
+            elf_page_buffers[i].pages = page_count;
+            return true;
+        }
+    }
+        bool elf_load_buffer(uint8_t* filebuf, uint32_t file_size,
+                             elf_loaded_image_t* out) {
+            return elf_load_buffer_at(filebuf, file_size, 0, out);
+        }
+
+    return false;
+}
+
+static void elf_release_file_buffer(void* buffer) {
+    for (size_t i = 0; i < ELF_PAGE_BUFFER_SLOTS; i++) {
+        if (elf_page_buffers[i].buffer == buffer) {
+            free_pages(buffer, elf_page_buffers[i].pages);
+            elf_page_buffers[i].buffer = NULL;
+            elf_page_buffers[i].pages = 0;
+            return;
+        }
+    }
+    free_mem(buffer);
+}
+
+bool elf_load_buffer_at(uint8_t* filebuf, uint32_t file_size,
+                        uint64_t load_address, elf_loaded_image_t* out) {
     if (!filebuf || !out) return false;
     memset(out, 0, sizeof(*out));
 
     if (file_size < sizeof(Elf64_Ehdr) || file_size > ELF_MAX_FILE_SIZE) {
         serial_write_str("ELF: bad file size\n");
-        free_mem(filebuf);
+        elf_release_file_buffer(filebuf);
         return false;
     }
 
@@ -23,27 +59,27 @@ bool elf_load_buffer(uint8_t* filebuf, uint32_t file_size,
     if (memcmp(eh->e_ident, "\x7f" "ELF", 4) != 0 ||
         eh->e_ident[4] != ELFCLASS64 || eh->e_ident[5] != ELFDATA2LSB) {
         serial_write_str("ELF: bad magic/class (need little-endian ELF64)\n");
-        free_mem(filebuf);
+        elf_release_file_buffer(filebuf);
         return false;
     }
     if (eh->e_machine != EM_X86_64) {
         serial_write_str("ELF: wrong machine (need x86_64)\n");
-        free_mem(filebuf);
+        elf_release_file_buffer(filebuf);
         return false;
     }
     if (eh->e_type != ET_EXEC && eh->e_type != ET_DYN) {
         serial_write_str("ELF: unsupported e_type (need EXEC or DYN)\n");
-        free_mem(filebuf);
+        elf_release_file_buffer(filebuf);
         return false;
     }
     if (eh->e_phnum == 0 || eh->e_phnum > ELF_MAX_PHNUM) {
         serial_write_str("ELF: bad phnum\n");
-        free_mem(filebuf);
+        elf_release_file_buffer(filebuf);
         return false;
     }
     if ((uint64_t)eh->e_phoff + (uint64_t)eh->e_phnum * sizeof(Elf64_Phdr) > file_size) {
         serial_write_str("ELF: program headers out of range\n");
-        free_mem(filebuf);
+        elf_release_file_buffer(filebuf);
         return false;
     }
 
@@ -66,19 +102,19 @@ bool elf_load_buffer(uint8_t* filebuf, uint32_t file_size,
 
         if (ph->p_filesz > ph->p_memsz) {
             serial_write_str("ELF: filesz > memsz\n");
-            free_mem(filebuf);
+            elf_release_file_buffer(filebuf);
             return false;
         }
         if ((uint64_t)ph->p_offset + ph->p_filesz > file_size) {
             serial_write_str("ELF: segment data out of range\n");
-            free_mem(filebuf);
+            elf_release_file_buffer(filebuf);
             return false;
         }
 
         uint64_t seg_end = ph->p_vaddr + ph->p_memsz;
         if (seg_end < ph->p_vaddr) { // overflow
             serial_write_str("ELF: segment overflow\n");
-            free_mem(filebuf);
+            elf_release_file_buffer(filebuf);
             return false;
         }
         if (seg_end > image_end) image_end = seg_end;
@@ -86,23 +122,31 @@ bool elf_load_buffer(uint8_t* filebuf, uint32_t file_size,
 
     if (image_end == 0 || image_end > ELF_MAX_IMAGE_SIZE) {
         serial_write_str("ELF: image empty or too large\n");
-        free_mem(filebuf);
+        elf_release_file_buffer(filebuf);
         return false;
     }
 
     if (entry_offset >= image_end) {
         serial_write_str("ELF: entry point outside image\n");
-        free_mem(filebuf);
+        elf_release_file_buffer(filebuf);
         return false;
     }
 
     // alloc() zero-fills, which is exactly what .bss needs.
     uint8_t* base = (uint8_t*)alloc(image_end);
+    bool page_backed = false;
+    size_t page_count = 0;
     if (!base) {
-        serial_write_str("ELF: OOM allocating image\n");
-        free_mem(filebuf);
-        return false;
+        page_count = (image_end + 0xFFFu) / 0x1000u;
+        base = (uint8_t*)alloc_pages_zeroed(page_count);
+        if (!base) {
+            serial_write_str("ELF: OOM allocating image\n");
+            elf_release_file_buffer(filebuf);
+            return false;
+        }
+        page_backed = true;
     }
+    uint64_t runtime_base = load_address ? load_address : (uint64_t)(uintptr_t)base;
 
     for (uint16_t i = 0; i < eh->e_phnum; i++) {
         Elf64_Phdr* ph = &phdrs[i];
@@ -132,7 +176,7 @@ bool elf_load_buffer(uint8_t* filebuf, uint32_t file_size,
                 uint32_t type = (uint32_t)(r->r_info & 0xffffffffu);
                 if (type == R_X86_64_RELATIVE) {
                     *(uint64_t*)(base + r->r_offset) =
-                        (uint64_t)(uintptr_t)base + (uint64_t)r->r_addend;
+                        runtime_base + (uint64_t)r->r_addend;
                 }
                 // Any other relocation type references an external
                 // symbol we have no dynamic linker to resolve. The SDK
@@ -142,11 +186,13 @@ bool elf_load_buffer(uint8_t* filebuf, uint32_t file_size,
         }
     }
 
-    free_mem(filebuf);
+    elf_release_file_buffer(filebuf);
 
     out->base        = base;
     out->image_size  = image_end;
-    out->entry_point = (uint64_t)(uintptr_t)base + entry_offset;
+    out->page_backed = page_backed;
+    out->page_count  = page_count;
+    out->entry_point = runtime_base + entry_offset;
 
     serial_write_str("ELF: loaded buffer base=0x"); serial_write_hex((uint64_t)(uintptr_t)base);
     serial_write_str(" size="); serial_write_dec(image_end);
@@ -154,6 +200,11 @@ bool elf_load_buffer(uint8_t* filebuf, uint32_t file_size,
     serial_write_str("\n");
 
     return true;
+}
+
+bool elf_load_buffer(uint8_t* filebuf, uint32_t file_size,
+                     elf_loaded_image_t* out) {
+    return elf_load_buffer_at(filebuf, file_size, 0, out);
 }
 
 bool elf_load_file(const char* path, elf_loaded_image_t* out) {
@@ -177,7 +228,7 @@ bool elf_load_file(const char* path, elf_loaded_image_t* out) {
     minimafs_close(f);
     if (got != file_size) {
         serial_write_str("ELF: short read\n");
-        free_mem(filebuf);
+        elf_release_file_buffer(filebuf);
         return false;
     }
     return elf_load_buffer(filebuf, file_size, out);
@@ -185,8 +236,13 @@ bool elf_load_file(const char* path, elf_loaded_image_t* out) {
 
 void elf_unload(elf_loaded_image_t* image) {
     if (!image || !image->base) return;
-    free_mem(image->base);
+    if (image->page_backed)
+        free_pages(image->base, image->page_count);
+    else
+        free_mem(image->base);
     image->base = NULL;
     image->image_size = 0;
     image->entry_point = 0;
+    image->page_backed = false;
+    image->page_count = 0;
 }

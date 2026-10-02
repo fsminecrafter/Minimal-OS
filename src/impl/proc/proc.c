@@ -10,6 +10,7 @@
 #include "panic.h"
 #include "x86_64/safeints.h"
 #include "string.h"
+#include "serial.h"
 
 extern uint64_t pml4_phys_addr;
 
@@ -113,19 +114,66 @@ static int proc_map_user_pages(process_t* proc, uintptr_t address, size_t length
 	return 1;
 }
 
-int proc_map_user_range(process_t* proc, void* address, size_t length) {
+int proc_map_user_heap_range(process_t* proc, void* address, size_t length) {
 	if (!proc || !address || length == 0) return 0;
 	uintptr_t start = (uintptr_t)address & ~0xFFFULL;
 	uintptr_t end = (uintptr_t)address + length;
-	if (end < (uintptr_t)address) return 0;
-	uintptr_t aligned_end = (end + 0xFFFULL) & ~0xFFFULL;
-	size_t pages = (aligned_end - start) / 0x1000;
+	if (end < (uintptr_t)address || end > UINTPTR_MAX - 0xFFFULL) return 0;
+	end = (end + 0xFFFULL) & ~0xFFFULL;
+
+	uint64_t* pml4 = (uint64_t*)(uintptr_t)proc->pml4;
+	uint64_t pml4_index = (start >> 39) & 0x1FF;
+	if ((((end - 1) >> 39) & 0x1FF) != pml4_index || pml4_index != 0) return 0;
+	uint64_t pml4e = pml4[pml4_index];
+	if (!(pml4e & 1)) return 0;
+	pml4[pml4_index] |= 0x4;
+	uint64_t* pdpt = (uint64_t*)(uintptr_t)(pml4e & ~0xFFFULL);
+
+	for (uintptr_t page = start; page < end; page += 0x1000) {
+		uint64_t pdpt_index = (page >> 30) & 0x1FF;
+		uint64_t pdpte = pdpt[pdpt_index];
+		if (!(pdpte & 1) || (pdpte & (1ULL << 7))) return 0;
+		pdpt[pdpt_index] |= 0x4;
+		uint64_t* pd = (uint64_t*)(uintptr_t)(pdpte & ~0xFFFULL);
+
+		uint64_t pd_index = (page >> 21) & 0x1FF;
+		uint64_t pde = pd[pd_index];
+		if (!(pde & 1)) return 0;
+		if (pde & (1ULL << 7)) {
+			uint64_t* pt = (uint64_t*)alloc_page_zeroed();
+			if (!pt) return 0;
+			uint64_t base = pde & 0xFFFFFFE00000ULL;
+			uint64_t flags = pde & 0xFFFULL & ~(1ULL << 7);
+			for (size_t i = 0; i < 512; i++) {
+				pt[i] = (base + i * 0x1000ULL) | flags;
+			}
+			pd[pd_index] = (uint64_t)(uintptr_t)pt | flags;
+		}
+
+		uint64_t* pt = (uint64_t*)(uintptr_t)(pd[pd_index] & ~0xFFFULL);
+		uint64_t pt_index = (page >> 12) & 0x1FF;
+		uint64_t pte = pt[pt_index];
+		if (!(pte & 1) || (pte & ~0xFFFULL) != page) return 0;
+		pt[pt_index] = pte | 0x4;
+		pd[pd_index] |= 0x4;
+		__asm__ volatile("invlpg (%0)" :: "r"(page) : "memory");
+	}
+	return 1;
+}
+
+int proc_map_user_range_at(process_t* proc, const void* source,
+			   void* user_address, size_t length) {
+	if (!proc || !source || !user_address || length == 0) return 0;
+	uintptr_t destination = (uintptr_t)user_address;
+	if (destination & 0xFFFULL) return 0;
+	if (length > SIZE_MAX - 0xFFFULL) return 0;
+	size_t pages = (length + 0xFFFULL) / 0x1000ULL;
 
 	void* physical = alloc_pages_zeroed(pages);
 	if (!physical) return 0;
-	memcpy(physical, (void*)start, pages * 0x1000);
+	memcpy(physical, source, length);
 
-	if (!proc_map_user_pages(proc, (uintptr_t)address, length,
+	if (!proc_map_user_pages(proc, destination, length,
 				(uint64_t)(uintptr_t)physical)) {
 		free_pages(physical, pages);
 		return 0;
@@ -142,6 +190,15 @@ int proc_map_user_range(process_t* proc, void* address, size_t length) {
 		return 0;
 	}
 	return 1;
+}
+
+int proc_map_user_range(process_t* proc, void* address, size_t length) {
+	if (!address || length == 0) return 0;
+	uintptr_t source_start = (uintptr_t)address & ~0xFFFULL;
+	uintptr_t offset = (uintptr_t)address - source_start;
+	if (length > SIZE_MAX - offset) return 0;
+	return proc_map_user_range_at(proc, (void*)source_start,
+				      (void*)source_start, length + offset);
 }
 
 void proc_destroy_address_space(process_t* proc) {
@@ -237,6 +294,7 @@ static void proc_trampoline(void) {
 
 	if (self && self->entry_point) {
 		if (self->privilege == PROC_PRIVILEGE_USER) {
+			serial_write_str("PROC: entering user process\n");
 			proc_enter_ring3(self, self->entry_point, self->user_stack,
 			                  self->user_argc, self->user_argv);
 		}
@@ -332,13 +390,17 @@ process_t* proc_create_ex(const char* file_name, void (*entry_point)(),
 
 	void* stack = alloc(STACK_SIZE);
 	if (!stack) {
-		PANIC("Failed to allocate kernel stack");
+		proc->kernel_stack_pages = (STACK_SIZE + 0xFFFu) / 0x1000u;
+		stack = alloc_pages_zeroed(proc->kernel_stack_pages);
+		if (!stack) PANIC("Failed to allocate kernel stack");
+		proc->kernel_stack_page_backed = true;
 	}
 	proc->kernel_stack = (uint64_t*)((uint8_t*)stack + STACK_SIZE);
 
 	void* user_stack = alloc(STACK_SIZE);
 	if (!user_stack) {
-		PANIC("Failed to allocate user stack");
+		user_stack = alloc_pages_zeroed((STACK_SIZE + 0xFFFu) / 0x1000u);
+		if (!user_stack) PANIC("Failed to allocate user stack");
 	}
 	proc->user_stack = (uint64_t*)((uint8_t*)user_stack + STACK_SIZE);
 

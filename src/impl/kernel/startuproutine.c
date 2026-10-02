@@ -19,6 +19,7 @@
 #include "x86_64/exec_trace.h"
 
 #define HEAP_MIN_START 0x400000  // 4 MiB - fallback if kernel end is lower
+#define PMM_POOL_SIZE  0x4000000ULL
 
 static inline uintptr_t align_up_uintptr(uintptr_t value, uintptr_t alignment) {
     return (value + alignment - 1) & ~(alignment - 1);
@@ -44,7 +45,12 @@ void startroutine(uint64_t total_ram_bytes) {
     if (heap_start >= total_ram_bytes) {
         PANIC("Heap start beyond total RAM");
     }
-    uint64_t uintheapsize = total_ram_bytes - heap_start;
+    uintptr_t pmm_end = (uintptr_t)total_ram_bytes & ~(uintptr_t)0xFFF;
+    if (pmm_end < PMM_POOL_SIZE || pmm_end - PMM_POOL_SIZE <= heap_start) {
+        PANIC("Not enough RAM for separate heap and PMM regions");
+    }
+    uintptr_t pmm_start = pmm_end - PMM_POOL_SIZE;
+    uint64_t uintheapsize = pmm_start - heap_start;
     print_set_color(PRINT_COLOR_WHITE, PRINT_COLOR_BLACK);
     print_str("Startup Routine\n");
     print_str("init rtc\n");
@@ -80,7 +86,7 @@ void startroutine(uint64_t total_ram_bytes) {
     serial_write_hex(heap_start);
     serial_write_str("\n");
     allocator_init((void*)heap_start, uintheapsize);
-    pmm_init((void*)0x1000000, 0x4000000);  // Start at 16MB instead
+    pmm_init((void*)pmm_start, pmm_end - pmm_start);
     print_str("PIT working!\n");
     print_str("Init MMIO subsystem\n");
     extern void mmio_init(void);

@@ -25,6 +25,7 @@
 #include "x86_64/net_syscall.h"
 #include "x86_64/random.h"
 #include "x86_64/runcommand.h"
+#include "x86_64/proc.h"
 #include "fspaths.h"
 
 static minimafs_dir_entry_t g_listdir_entries[MINIMAFS_MAX_ROOT_ENTRIES];
@@ -479,16 +480,32 @@ static uint64_t sys_pslist_impl(syscall_process_info_t* out, uint32_t max_entrie
  * per-process page tables land, this becomes the natural place to
  * carve out a real user heap region instead.
  */
+static bool sys_heap_make_user_accessible(void* ptr, uint64_t size) {
+	if (!isCurrentProcessUser()) return true;
+	uintptr_t address = (uintptr_t)ptr;
+	if (!current_process || !ptr || address < 64 || size > SIZE_MAX - 128) return false;
+	return proc_map_user_heap_range(current_process, (void*)(address - 64),
+					(size_t)size + 128);
+}
+
 static uint64_t sys_heap_impl(uint64_t op, void* ptr, uint64_t size) {
     switch (op) {
         case SYS_HEAP_ALLOC: {
             if (size == 0) return SYS_ERR_INVAL;
             void* mem = alloc_unzeroed((size_t)size);
+            if (mem && !sys_heap_make_user_accessible(mem, size)) {
+                free_mem(mem);
+                return SYS_ERR_GENERIC;
+            }
             return mem ? (uint64_t)(uintptr_t)mem : SYS_ERR_GENERIC;
         }
         case SYS_HEAP_ALLOC_ZEROED: {
             if (size == 0) return SYS_ERR_INVAL;
             void* mem = alloc((size_t)size);
+            if (mem && !sys_heap_make_user_accessible(mem, size)) {
+                free_mem(mem);
+                return SYS_ERR_GENERIC;
+            }
             return mem ? (uint64_t)(uintptr_t)mem : SYS_ERR_GENERIC;
         }
         case SYS_HEAP_FREE:
@@ -497,6 +514,10 @@ static uint64_t sys_heap_impl(uint64_t op, void* ptr, uint64_t size) {
         case SYS_HEAP_RESIZE: {
             void* mem = alloc_resize(ptr, (size_t)size);
             if (size == 0) return SYS_SUCCESS;
+            if (mem && !sys_heap_make_user_accessible(mem, size)) {
+                if (mem != ptr) free_mem(mem);
+                return SYS_ERR_GENERIC;
+            }
             return mem ? (uint64_t)(uintptr_t)mem : SYS_ERR_GENERIC;
         }
         default:
@@ -514,11 +535,25 @@ static uint64_t sys_exec_impl(const char* path, const char** argv, uint64_t argc
     if (!path) { serial_write_str("SYS_EXEC: missing path\n"); return SYS_ERR_INVAL; }
     if (argc > 16) { serial_write_str("SYS_EXEC: too many args\n"); return SYS_ERR_INVAL; }
 
+    serial_write_str("SYS_EXEC: request path=");
+    serial_write_str(path);
+    serial_write_str(" argc=");
+    serial_write_dec(argc);
+    serial_write_str("\n");
+
     char normalized[MINIMAFS_MAX_PATH];
     if (!run_normalize_path(path, normalized, sizeof(normalized))) {
         serial_write_str("SYS_EXEC: invalid path\n");
         return SYS_ERR_INVAL;
     }
+
+    serial_write_str("SYS_EXEC: normalized path=");
+    serial_write_str(normalized);
+    serial_write_str(" exists=");
+    serial_write_dec(minimafs_exists(normalized) ? 1 : 0);
+    serial_write_str(" dir=");
+    serial_write_dec(minimafs_is_dir(normalized) ? 1 : 0);
+    serial_write_str("\n");
 
     process_t* proc = run_launch_file(normalized, (int)argc, argv);
     if (!proc) {

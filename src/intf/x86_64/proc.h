@@ -40,6 +40,8 @@ typedef enum {
     PROC_PRIVILEGE_USER   = 1,   // A loaded .run program (see runcommand.c)
 } process_privilege_t;
 
+struct user_heap_allocation;
+
 // Process control block
 typedef struct process {
     uint64_t pid;                      // Process ID
@@ -118,6 +120,10 @@ typedef struct process {
     uint64_t cleanup_deadline_ms;
     bool cleanup_requested;
     bool cleanup_invoked;
+    struct user_heap_allocation* user_heap_allocations;
+    uint8_t exit_code;
+    bool crashed;
+    uint8_t crash_vector;
 } process_t;
 
 // Global process list head (defined in proc.c)
@@ -153,6 +159,13 @@ int proc_map_user_range(process_t* proc, void* address, size_t length);
 int proc_map_user_range_at(process_t* proc, const void* source,
                            void* user_address, size_t length);
 int proc_map_user_heap_range(process_t* proc, void* address, size_t length);
+int proc_unmap_user_heap_range(process_t* proc, void* address, size_t length);
+int proc_user_heap_track(process_t* proc, void* address, size_t size);
+int proc_user_heap_contains(process_t* proc, void* address);
+int proc_user_heap_untrack(process_t* proc, void* address);
+int proc_user_heap_resize(process_t* proc, void* old_address,
+                          void* new_address, size_t new_size);
+void proc_user_heap_cleanup(process_t* proc);
 void proc_destroy_address_space(process_t* proc);
 
 // Helper functions (from string.h but needed here)

@@ -6,6 +6,7 @@ kernel.bin
 
 *.o
 *.img
+*.log
 
 #Directories
 

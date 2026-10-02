@@ -27,6 +27,12 @@ typedef struct {
 // here and no special mapping is needed to read them.
 bool acpi_init(multiboot2_info_t* mb_info);
 
+// Attempts ACPI S5 poweroff or ACPI/legacy reset. Returns false if the
+// platform does not expose a usable control register or the request fails.
+bool acpi_shutdown(void);
+bool acpi_reboot(void);
+bool acpi_poll_power_button(void);
+
 uintptr_t acpi_get_lapic_phys_addr(void);
 
 uint32_t          acpi_get_cpu_count(void);

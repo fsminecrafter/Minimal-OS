@@ -4,6 +4,7 @@
 #include "panic.h"
 #include "applications/terminal.h"
 #include "x86_64/scheduler.h"
+#include "x86_64/boot_options.h"
 #include "keyboard/usbkeyboard.h"
 #include "usb/usb_stack.h"
 #include "x86_64/commandhandler.h"
@@ -11,6 +12,7 @@
 #include "string.h"
 #include "time.h"
 #include "x86_64/servicemanager.h"
+#include "x86_64/acpi.h"
 
 #include "vgaterm.h"
 #include "minimafshandler.h"
@@ -377,6 +379,14 @@ void terminal_process_command(const char* cmd) {
 void terminal_update(void) {
     while (1) {
         terminal_poll_serial_input();
+
+        if (acpi_poll_power_button()) {
+            graphics_write_textr("ACPI power button pressed; shutting down.\n");
+            serial_write_str("ACPI: power-button shutdown requested\n");
+            if (!acpi_shutdown()) {
+                graphics_write_textr("ACPI shutdown failed.\n");
+            }
+        }
         
         // Process pending command
         if (command_ready) {
@@ -497,29 +507,34 @@ void terminal_program_entry(void) {
     
     graphics_terminal_clear();
     graphics_write_textr("MinimalOS startup\n\n");
-    graphics_write_textr("[STARTING] Mounting disk\n");
-    command_execute("initdisk");
-    minimafs_disk_device_t* device = getminimadrive();
-    if (!device) {
-        vgaterm_print_error("No disk device found\n");
+    if (kernel_boot_no_disk) {
+        graphics_write_textr("[STARTING] Disk mode disabled by boot option\n");
+        serial_write_str("Terminal: disk initialization skipped by boot option\n");
     } else {
-        int success = mountdrive(device, 0);
-        if (success == 1) {
-            vgaterm_print_success("Disk mounted\n");
-            systeminfo_load_saved_resolution();
-            serial_write_str("Terminal: Starting service discovery...\n");
-            service_manager_init();
-            serial_write_str("Terminal: Service discovery complete\n");
-        } else if (success == 2) {
-            vgaterm_print_error("MinimaFS: Drive already mounted\n");
-        } else if (success == 3) {
-            vgaterm_print_error("MinimaFS: Failed to parse storage.desc\n");
-        } else if (success == 4) {
-            vgaterm_print_error("MinimaFS: Invalid root block\n");
-        } else if (success == 5) {
-            vgaterm_print_error("MinimaFS: Drive too large for bitmap\n");
+        graphics_write_textr("[STARTING] Mounting disk\n");
+        command_execute("initdisk");
+        minimafs_disk_device_t* device = getminimadrive();
+        if (!device) {
+            vgaterm_print_error("No disk device found\n");
         } else {
-            vgaterm_print_error("Mount failed\n");
+            int success = mountdrive(device, 0);
+            if (success == 1) {
+                vgaterm_print_success("Disk mounted\n");
+                systeminfo_load_saved_resolution();
+                serial_write_str("Terminal: Starting service discovery...\n");
+                service_manager_init();
+                serial_write_str("Terminal: Service discovery complete\n");
+            } else if (success == 2) {
+                vgaterm_print_error("MinimaFS: Drive already mounted\n");
+            } else if (success == 3) {
+                vgaterm_print_error("MinimaFS: Failed to parse storage.desc\n");
+            } else if (success == 4) {
+                vgaterm_print_error("MinimaFS: Invalid root block\n");
+            } else if (success == 5) {
+                vgaterm_print_error("MinimaFS: Drive too large for bitmap\n");
+            } else {
+                vgaterm_print_error("Mount failed\n");
+            }
         }
     }
 

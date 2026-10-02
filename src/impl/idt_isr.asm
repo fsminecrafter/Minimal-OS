@@ -58,6 +58,7 @@ isr_common_stub:
     mov rdi, [rsp]         ; arg1 = vector
     mov rsi, [rsp + 8]     ; arg2 = error_code
     mov rdx, [rsp + 16]    ; arg3 = saved RIP
+    mov rcx, [rsp + 24]    ; arg4 = saved CS (privilege level)
 
     push rax
     push rcx

@@ -41,12 +41,21 @@ available because there is no dynamic linker or libc at runtime.
 ## Arguments And Exit
 
 The first argument is the program path. Extra arguments follow it. The SDK
-runtime calls `mos_exit()` to terminate; returning from `main()` is not the
-normal exit path in the freestanding environment.
+runtime calls `mos_exit(code)` to terminate, passing the low 8 bits of `code`
+back to the kernel. Returning from `main()` passes its return value as the exit
+code. A user-mode CPU fault terminates the program with code `0xff` and prints
+a crash reason, such as `Program crashed! Code 0xff: Memory page fault.`
 
 Use `mos_register_cleanup()` when a user program needs a chance to save state
 before Ctrl+C or a requested termination. The kernel gives the cleanup callback
 a bounded period before force termination.
+
+Heap allocations made through the SDK are tracked by their owning process.
+Explicitly free allocations when practical; any remaining allocations are
+reclaimed when the process exits or is terminated. Invalid or cross-process
+heap pointers are rejected by the heap syscalls. This is exit-time reclamation,
+not tracing garbage collection, so it does not collect unreachable objects
+while a process is still running.
 
 ## SDK Runtime
 

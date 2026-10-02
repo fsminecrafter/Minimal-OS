@@ -54,6 +54,8 @@ void ready(void);
 void schedulerInit();
 // Exits current process.
 void process_exit(void) __attribute__((__noreturn__));
+void process_exit_with_status(uint8_t exit_code, bool crashed,
+                              uint8_t crash_vector) __attribute__((__noreturn__));
 
 // Sleep/wake functions
 void sleep(uint64_t milliseconds);

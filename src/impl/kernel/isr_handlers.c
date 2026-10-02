@@ -1,6 +1,8 @@
 #include <stdint.h>
 #include "serial.h"
 #include "panic.h"
+#include "x86_64/proc.h"
+#include "x86_64/scheduler.h"
 
 static const char* exception_name(uint64_t vector) {
     switch (vector) {
@@ -37,10 +39,11 @@ static const char* exception_name(uint64_t vector) {
  * (double fault keeps its own dedicated IST1 handler - see idt_init()).
  * Previously these all hit a zeroed/absent IDT gate, which on real
  * hardware and in QEMU means an immediate triple fault / silent reset
- * with zero diagnostic output. Now they at least produce a readable
- * message before panicking.
+ * with zero diagnostic output. Now they produce a readable message;
+ * exceptions from CPL3 terminate only the faulting user process.
  */
-void isr_generic_handler(uint64_t vector, uint64_t error_code, uint64_t saved_rip) {
+void isr_generic_handler(uint64_t vector, uint64_t error_code,
+                         uint64_t saved_rip, uint64_t saved_cs) {
     if (vector == 14) {
         uint64_t cr2;
         asm volatile("mov %%cr2, %0" : "=r"(cr2));
@@ -67,6 +70,15 @@ void isr_generic_handler(uint64_t vector, uint64_t error_code, uint64_t saved_ri
     serial_write_str("  Saved RIP: 0x");
     serial_write_hex(saved_rip);
     serial_write_str("\n");
+
+    if ((saved_cs & 3) == 3 && current_process &&
+        current_process->privilege == PROC_PRIVILEGE_USER &&
+        vector != 2 && vector != 18) {
+        serial_write_str("  Terminating faulting user process: ");
+        serial_write_str(current_process->name);
+        serial_write_str("\n");
+        process_exit_with_status(0xFF, true, (uint8_t)vector);
+    }
 
     PANIC("Unhandled CPU exception");
 }

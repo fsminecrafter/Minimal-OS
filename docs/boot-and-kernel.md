@@ -17,6 +17,11 @@ high MMIO address range. Later device mappings are made by `src/impl/kernel/mmio
 The Multiboot memory-map tag is parsed by `multiboot2parse.c` to determine the
 available RAM reported to the allocator and system information commands.
 
+The GRUB menu provides three entries: `Minimal-OS` for normal startup,
+`Minimal-OS Memory Tester x64` for a standalone pattern test of free PMM pages,
+and `Minimal-OS (No Disk)` to boot without probing or mounting storage. The
+memory test reserves only free PMM pages and halts after reporting PASS or FAIL.
+
 ## Startup Order
 
 `kernel_main()` in `src/impl/kernel/main.c` performs the high-level startup:
@@ -30,9 +35,9 @@ available RAM reported to the allocator and system information commands.
 - audio and AHCI storage-driver registration;
 - AP startup, interrupts, kernel background processes, and the terminal.
 
-The terminal owns the disk interaction prompt. It asks whether to mount a disk,
-starts keyboard update tasks, and calls `service_manager_init()` after the boot
-disk is mounted.
+The terminal owns the disk interaction. In normal mode it probes and mounts the
+disk and starts services; no-disk mode skips that path and still starts the
+terminal and keyboard tasks.
 
 ## Memory
 

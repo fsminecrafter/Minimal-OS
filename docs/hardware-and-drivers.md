@@ -33,10 +33,18 @@ assumptions.
 
 ## Graphics
 
-The Bochs/VBE graphics driver provides a framebuffer and register BAR. The GPU
-manager initializes it, after which the terminal uses graphics/text helpers for
-its display. The framebuffer is also exposed to user programs through the
-`SYS_GRAPHICS` syscall family.
+The preferred graphics path uses the linear framebuffer selected by the
+Multiboot2 bootloader (VBE on legacy BIOS or GOP on UEFI), so it does not need a
+GPU-specific register driver for basic display output. The renderer supports
+32-bit RGB layouts and uses the bootloader-provided pitch and channel masks.
+The Bochs/VBE driver remains as a fallback for the Bochs `1234:1111` device; it
+is not probed against arbitrary display controllers. This is a software
+framebuffer path, not accelerated 3D support. If the bootloader cannot supply a
+32-bit RGB framebuffer, generic graphics initialization is unavailable.
+
+After initialization, the terminal uses the shared graphics/text helpers. The
+framebuffer is also exposed to user programs through the `SYS_GRAPHICS` syscall
+family.
 
 The terminal sets a text-grid resolution over the framebuffer. Graphics commands
 and SDK wrappers operate on pixels, primitives, text, resolution, and terminal

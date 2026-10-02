@@ -17,6 +17,12 @@ extern uint64_t pml4_phys_addr;
 process_t* proc_list_head = NULL;
 static uint64_t pid_counter = 1;
 
+struct user_heap_allocation {
+	void* address;
+	size_t size;
+	struct user_heap_allocation* next;
+};
+
 uint64_t get_next_pid() {
 	return pid_counter++;
 }
@@ -159,6 +165,144 @@ int proc_map_user_heap_range(process_t* proc, void* address, size_t length) {
 		__asm__ volatile("invlpg (%0)" :: "r"(page) : "memory");
 	}
 	return 1;
+}
+
+int proc_unmap_user_heap_range(process_t* proc, void* address, size_t length) {
+	if (!proc || !address || length == 0) return 0;
+	uintptr_t start = (uintptr_t)address & ~0xFFFULL;
+	uintptr_t end = (uintptr_t)address + length;
+	if (end < (uintptr_t)address || end > UINTPTR_MAX - 0xFFFULL) return 0;
+	end = (end + 0xFFFULL) & ~0xFFFULL;
+	uint64_t* pml4 = (uint64_t*)(uintptr_t)proc->pml4;
+	uint64_t pml4_index = (start >> 39) & 0x1FF;
+	if ((((end - 1) >> 39) & 0x1FF) != pml4_index || pml4_index != 0) return 0;
+	uint64_t pml4e = pml4[pml4_index];
+	if (!(pml4e & 1)) return 1;
+	uint64_t* pdpt = (uint64_t*)(uintptr_t)(pml4e & ~0xFFFULL);
+
+	for (uintptr_t page = start; page < end; page += 0x1000) {
+		uint64_t pdpte = pdpt[(page >> 30) & 0x1FF];
+		if (!(pdpte & 1) || (pdpte & (1ULL << 7))) continue;
+		uint64_t* pd = (uint64_t*)(uintptr_t)(pdpte & ~0xFFFULL);
+		uint64_t pde = pd[(page >> 21) & 0x1FF];
+		if (!(pde & 1) || (pde & (1ULL << 7))) continue;
+		uint64_t* pt = (uint64_t*)(uintptr_t)(pde & ~0xFFFULL);
+		uint64_t pt_index = (page >> 12) & 0x1FF;
+		pt[pt_index] &= ~0x4ULL;
+		__asm__ volatile("invlpg (%0)" :: "r"(page) : "memory");
+	}
+	return 1;
+}
+
+static int proc_user_heap_valid_range(void* address, size_t size) {
+	uintptr_t start = (uintptr_t)address;
+	if (!address || start < 64 || size == 0 || size > SIZE_MAX - 128) return 0;
+	uintptr_t available = UINTPTR_MAX - start;
+	if (size > available || 64 > available - size) return 0;
+	uintptr_t end = start + size + 64;
+	return end <= UINTPTR_MAX - 0xFFFULL;
+}
+
+static void proc_user_heap_unmap_unused_pages(process_t* proc,
+						       uintptr_t start,
+						       uintptr_t end) {
+	uintptr_t first_page = start & ~0xFFFULL;
+	uintptr_t end_page = (end + 0xFFFULL) & ~0xFFFULL;
+	for (uintptr_t page = first_page; page < end_page; page += 0x1000) {
+		bool still_owned = false;
+		for (struct user_heap_allocation* item = proc->user_heap_allocations;
+		     item; item = item->next) {
+			uintptr_t item_start = (uintptr_t)item->address - 64;
+			uintptr_t item_end = (uintptr_t)item->address + item->size + 64;
+			if (item_start < page + 0x1000 && item_end > page) {
+				still_owned = true;
+				break;
+			}
+		}
+		if (!still_owned) proc_unmap_user_heap_range(proc, (void*)page, 0x1000);
+	}
+}
+
+int proc_user_heap_contains(process_t* proc, void* address) {
+	if (!proc || !address) return 0;
+	for (struct user_heap_allocation* item = proc->user_heap_allocations;
+	     item; item = item->next) {
+		if (item->address == address) return 1;
+	}
+	return 0;
+}
+
+int proc_user_heap_track(process_t* proc, void* address, size_t size) {
+	if (!proc || !proc_user_heap_valid_range(address, size) ||
+	    proc_user_heap_contains(proc, address)) return 0;
+	struct user_heap_allocation* item = alloc(sizeof(*item));
+	if (!item) return 0;
+	item->address = address;
+	item->size = size;
+	item->next = proc->user_heap_allocations;
+	proc->user_heap_allocations = item;
+	return 1;
+}
+
+int proc_user_heap_untrack(process_t* proc, void* address) {
+	if (!proc || !address) return 0;
+	struct user_heap_allocation** link = &proc->user_heap_allocations;
+	while (*link && (*link)->address != address) link = &(*link)->next;
+	if (!*link) return 0;
+	struct user_heap_allocation* item = *link;
+	*link = item->next;
+	uintptr_t start = (uintptr_t)item->address - 64;
+	uintptr_t end = (uintptr_t)item->address + item->size + 64;
+	proc_user_heap_unmap_unused_pages(proc, start, end);
+	free_mem(item);
+	return 1;
+}
+
+int proc_user_heap_resize(process_t* proc, void* old_address,
+			  void* new_address, size_t new_size) {
+	if (!proc || !proc_user_heap_valid_range(new_address, new_size)) return 0;
+	if (!old_address) return proc_user_heap_track(proc, new_address, new_size);
+	for (struct user_heap_allocation* item = proc->user_heap_allocations;
+	     item; item = item->next) {
+		if (item->address != old_address) continue;
+		if (new_address != old_address &&
+		    proc_user_heap_contains(proc, new_address)) return 0;
+		uintptr_t old_start = (uintptr_t)item->address - 64;
+		uintptr_t old_end = (uintptr_t)item->address + item->size + 64;
+		item->address = new_address;
+		item->size = new_size;
+		proc_user_heap_unmap_unused_pages(proc, old_start, old_end);
+		return 1;
+	}
+	return 0;
+}
+
+void proc_user_heap_cleanup(process_t* proc) {
+	if (!proc) return;
+	struct user_heap_allocation* item = proc->user_heap_allocations;
+	uint64_t allocation_count = 0;
+	uint64_t reclaimed_bytes = 0;
+	while (item) {
+		struct user_heap_allocation* next = item->next;
+		size_t item_size = item->size;
+		free_mem(item->address);
+		free_mem(item);
+		allocation_count++;
+		if (UINT64_MAX - reclaimed_bytes < item_size) {
+			reclaimed_bytes = UINT64_MAX;
+		} else {
+			reclaimed_bytes += item_size;
+		}
+		item = next;
+	}
+	proc->user_heap_allocations = NULL;
+	if (allocation_count) {
+		serial_write_str("[GC] reclaimed ");
+		serial_write_dec(reclaimed_bytes);
+		serial_write_str(" bytes in ");
+		serial_write_dec(allocation_count);
+		serial_write_str(" allocations\n");
+	}
 }
 
 int proc_map_user_range_at(process_t* proc, const void* source,

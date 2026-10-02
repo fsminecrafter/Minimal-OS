@@ -1,6 +1,8 @@
 #include "print.h"
 #include "x86_64/commandhandler.h"
 #include "x86_64/multiboot2parse.h"
+#include "x86_64/boot_options.h"
+#include "x86_64/memory_test.h"
 #include "x86_64/startuproutine.h"
 #include "x86_64/proc.h"
 #include "x86_64/scheduler.h"
@@ -35,6 +37,8 @@
 #include "net/tcp.h"
 #include "x86_64/net_syscall.h"
 #include "x86_64/random.h"
+
+bool kernel_boot_no_disk;
 
 
 void busy(void) {
@@ -78,6 +82,7 @@ void kernel_main(uint64_t mb2_info_addr) {
     smp_init_bsp();
     gdt_init();
     multiboot2_info_t* mb_info = (multiboot2_info_t*)mb2_info_addr;
+    kernel_boot_no_disk = multiboot2_has_cmdline_token(mb_info, "no-disk");
     uint64_t total_ram_bytes = get_total_memory(mb_info);
     print_clear();
     commandhandler_init();
@@ -115,9 +120,14 @@ void kernel_main(uint64_t mb2_info_addr) {
     // Registers every built-in gpu_hw_driver_t with gpu_manager and
     // initializes whichever one is actually present. See
     // gpu_manager.h / gpu_hw.h for the module interface.
+    gpu_multiboot2_set_info(mb_info);
+    gpu_manager_register_driver(gpu_multiboot2_get_driver());
     gpu_manager_register_driver(gpu_bochs_vbe_get_driver());
     if (!gpu_manager_init()) {
         serial_write_str("No display driver available - continuing headless\n");
+    }
+    if (multiboot2_has_cmdline_token(mb_info, "memtest")) {
+        memory_test_run();
     }
     const char* proc_list[32];
     getprocslistNames(proc_list, 32);

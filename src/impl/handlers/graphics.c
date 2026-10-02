@@ -251,8 +251,8 @@ void graphics_terminal_putchar(char c, uint32_t col, uint32_t row, color_t fg, c
     uint32_t px = col * g_terminal.char_width;
     uint32_t py = row * g_terminal.char_height;
     if (px >= g_gpu->width || py >= g_gpu->height) return;
-    uint32_t fg_pixel = graphics_color_to_u32(fg);
-    uint32_t bg_pixel = graphics_color_to_u32(bg);
+    uint32_t fg_pixel = gpu_pack_color(g_gpu, graphics_color_to_u32(fg));
+    uint32_t bg_pixel = gpu_pack_color(g_gpu, graphics_color_to_u32(bg));
 
     for (uint32_t y = 0; y < 8 && y < g_terminal.char_height; y++) {
         uint8_t row_data = font8x8_basic[char_index][y];
@@ -465,10 +465,10 @@ void graphics_terminal_scroll(void) {
         }
     }
 
-    uint32_t background = 0xFF000000 |
+    uint32_t background = gpu_pack_color(g_gpu, 0xFF000000 |
         ((uint32_t)g_terminal.bg_color.r << 16) |
         ((uint32_t)g_terminal.bg_color.g << 8) |
-        g_terminal.bg_color.b;
+        g_terminal.bg_color.b);
     for (uint32_t y = pixel_height - g_terminal.char_height; y < pixel_height; y++) {
         volatile uint32_t* row = framebuffer +
             (y * pitch) / sizeof(uint32_t);

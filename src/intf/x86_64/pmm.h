@@ -13,6 +13,10 @@ void pmm_init(void* base, size_t size);
 // Allocate a single 4 KiB zeroed page
 void* alloc_page_zeroed(void);
 
+// Try to allocate a contiguous run of zeroed pages without panicking.
+// Returns NULL if the requested run is unavailable.
+void* pmm_try_alloc_pages_zeroed(size_t count);
+
 // Allocate/free contiguous runs of 4 KiB pages
 void* alloc_pages_zeroed(size_t count);
 void free_pages(void* base, size_t count);

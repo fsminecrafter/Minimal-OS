@@ -41,7 +41,7 @@ rather than comparing against a raw magic number.
 | `mos_write(fd, buf, len)` | `SYS_WRITE` | writes to terminal output; SDK programs normally use fd 1 or 2 |
 | `mos_puts(text)` | `SYS_WRITE` | convenience wrapper for a NUL-terminated string |
 | `mos_getpid()` | `SYS_GETPID` | returns the current process ID |
-| `mos_exit(code)` | `SYS_EXIT` | terminates and does not return |
+| `mos_exit(code)` | `SYS_EXIT` | terminates and reports the low 8 bits of `code`; does not return |
 | `mos_sleep(ms)` | `SYS_SLEEP` | yields/sleeps for approximately the requested interval |
 | `mos_uptime()` | `SYS_UPTIME` | returns uptime in milliseconds |
 | `mos_gettime()` | `SYS_GETTIME` | returns the current kernel time representation |

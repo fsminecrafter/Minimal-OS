@@ -478,6 +478,8 @@ void schedule() {
                     free_mem(stack_base);
             }
 
+                    proc_user_heap_cleanup(to_free);
+
             if (to_free->user_image_phys) {
                 free_pages(to_free->user_image_phys, to_free->user_image_pages);
             }
@@ -768,16 +770,22 @@ void scheduler_print_stats() {
     print_str("\n============================\n");
 }
 
-void process_exit(void) {
+void process_exit_with_status(uint8_t exit_code, bool crashed,
+                              uint8_t crash_vector) {
     if (!current_process) {
         PANIC("process_exit() called with no current process");
     }
+
+    current_process->exit_code = exit_code;
+    current_process->crashed = crashed;
+    current_process->crash_vector = crash_vector;
 
     serial_write_str("[PROC] Exiting process: ");
     serial_write_str(current_process->name);
     serial_write_str("\n");
 
-    command_user_process_exited(current_process->pid);
+    command_user_process_exited(current_process->pid, exit_code, crashed,
+                                crash_vector);
     current_process->state = PROCESS_TERMINATED;
     schedule();
 
@@ -786,4 +794,8 @@ void process_exit(void) {
     for (;;) {
         asm volatile("sti; hlt" ::: "memory");
     }
+}
+
+void process_exit(void) {
+    process_exit_with_status(0, false, 0);
 }

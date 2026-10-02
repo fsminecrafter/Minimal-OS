@@ -99,42 +99,49 @@ void pmm_init(void* base, size_t size) {
 // ALLOC / FREE PAGE
 // ===========================================
 
-void* alloc_page_zeroed(void) {
+void* pmm_try_alloc_pages_zeroed(size_t count) {
+    if (count == 0 || count > page_pool_pages) return NULL;
     uint64_t flags = pmm_lock();
 
-    // Find first free page using bitmap
-    size_t found = PMM_MAX_PAGES;
+    size_t run_start = PMM_MAX_PAGES;
+    size_t run_len = 0;
     for (size_t i = 0; i < page_pool_pages; i++) {
         if (pmm_is_free(i)) {
-            found = i;
-            break;
+            if (run_len == 0) run_start = i;
+            if (++run_len == count) break;
+        } else {
+            run_start = PMM_MAX_PAGES;
+            run_len = 0;
         }
     }
 
-    if (found == PMM_MAX_PAGES) {
+    if (run_len < count || run_start == PMM_MAX_PAGES) {
         pmm_unlock(flags);
-        PANIC("Out of physical pages in PMM");
+        return NULL;
     }
 
-    pmm_mark_used(found);
-    void* page = pmm_idx_to_ptr(found);
-
-    // Check we're not about to zero our own stack
     uintptr_t rsp;
     __asm__ volatile("mov %%rsp, %0" : "=r"(rsp));
-    uintptr_t page_start = (uintptr_t)page;
-    uintptr_t page_end   = page_start + PAGE_SIZE;
+    uintptr_t page_start = page_pool_base + run_start * PAGE_SIZE;
+    uintptr_t page_end = page_start + count * PAGE_SIZE;
     if (rsp >= page_start && rsp < page_end) {
-        pmm_mark_free(found);  // undo the allocation
         pmm_unlock(flags);
-        PANIC("alloc_page_zeroed: page overlaps with stack");
+        return NULL;
     }
 
+    for (size_t i = run_start; i < run_start + count; i++) {
+        pmm_mark_used(i);
+    }
+    void* pages = pmm_idx_to_ptr(run_start);
     pmm_unlock(flags);
 
-    // Zero outside the lock — safe since we own the page now
-    memset(page, 0, PAGE_SIZE);
+    memset(pages, 0, count * PAGE_SIZE);
+    return pages;
+}
 
+void* alloc_page_zeroed(void) {
+    void* page = pmm_try_alloc_pages_zeroed(1);
+    if (!page) PANIC("Out of physical pages in PMM");
     return page;
 }
 
@@ -142,37 +149,9 @@ void* alloc_page_zeroed(void) {
 // Allocate N contiguous pages, all zeroed
 void* alloc_pages_zeroed(size_t count) {
     if (count == 0) return NULL;
-    if (count == 1) return alloc_page_zeroed();
-
-    uint64_t flags = pmm_lock();
-
-    // Find a contiguous run of `count` free pages
-    size_t run_start = PMM_MAX_PAGES;
-    size_t run_len = 0;
-    for (size_t i = 0; i < page_pool_pages; i++) {
-        if (pmm_is_free(i)) {
-            if (run_len == 0) run_start = i;
-            run_len++;
-            if (run_len >= count) break;
-        } else {
-            run_len = 0;
-        }
-    }
-
-    if (run_len < count) {
-        pmm_unlock(flags);
-        PANIC("alloc_pages_zeroed: not enough contiguous pages");
-    }
-
-    for (size_t i = run_start; i < run_start + count; i++) {
-        pmm_mark_used(i);
-    }
-
-    void* base = pmm_idx_to_ptr(run_start);
-    pmm_unlock(flags);
-
-    memset(base, 0, count * PAGE_SIZE);
-    return base;
+    void* pages = pmm_try_alloc_pages_zeroed(count);
+    if (!pages) PANIC("alloc_pages_zeroed: not enough contiguous pages");
+    return pages;
 }
 
 void free_page(void* page) {

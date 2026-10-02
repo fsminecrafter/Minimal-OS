@@ -476,8 +476,33 @@ void command_set_last_user_pid(uint64_t pid) {
     g_last_user_pid = pid;
 }
 
-void command_user_process_exited(uint64_t pid) {
-    if (pid != 0 && g_last_user_pid == pid) g_last_user_pid = 0;
+static const char* user_crash_reason(uint8_t vector) {
+    switch (vector) {
+        case 0: return "Divide error";
+        case 6: return "Invalid opcode";
+        case 13: return "General protection fault";
+        case 14: return "Memory page fault";
+        default: return "CPU exception";
+    }
+}
+
+void command_user_process_exited(uint64_t pid, uint8_t exit_code,
+                                 bool crashed, uint8_t crash_vector) {
+    if (pid == 0 || g_last_user_pid != pid) return;
+    g_last_user_pid = 0;
+
+    if (crashed) {
+        graphics_write_textr("Program crashed! Code ");
+        graphics_write_textr_hex(exit_code);
+        graphics_write_textr(": ");
+        graphics_write_textr(user_crash_reason(crash_vector));
+        graphics_write_textr(".\n");
+        return;
+    }
+
+    graphics_write_textr("Program exited with code ");
+    graphics_write_textr_hex(exit_code);
+    graphics_write_textr(".\n");
 }
 
 void command_kill_last_user_program(void) {

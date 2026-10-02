@@ -20,5 +20,6 @@
         "gpu.h": "c",
         "mmio.h": "c",
         "pci.h": "c"
-    }
+    },
+    "python-envs.defaultEnvManager": "ms-python.python:system"
 }

@@ -313,16 +313,10 @@ void initializeGraphicsDevice() {
  * ============================================================ */
 
 static bool gpu_bochs_vbe_init(void) {
-    pci_device_t* gpu_pci = NULL;
-    for (int i = 0; i < pci_device_count; i++) {
-        if (pci_devices[i].class_code == 0x03) {
-            gpu_pci = &pci_devices[i];
-            break;
-        }
-    }
+    pci_device_t* gpu_pci = pci_find_device(0x1234, 0x1111);
 
     if (!gpu_pci) {
-        serial_write_str("GPU (Bochs/VBE): no PCI display controller found\n");
+        serial_write_str("GPU (Bochs/VBE): matching Bochs display device not found\n");
         return false;
     }
 

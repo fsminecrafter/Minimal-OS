@@ -465,21 +465,9 @@ static uint64_t sys_pslist_impl(syscall_process_info_t* out, uint32_t max_entrie
  * needs denying, so adding a new syscall doesn't require remembering
  * to update this table or it silently becomes forbidden.
  * ============================================================ */
-/*
- * SYS_HEAP - userland dynamic memory.
- *
- * Until now a .run program had no heap at all: no malloc, no sbrk, no
- * mmap, just whatever fit in .bss and its stack. That rules out any
- * program whose working set is not known at compile time.
- *
- * Because every process still shares the kernel's PML4 (see
- * proc_create()), this is a direct shim over the kernel allocator
- * rather than a separate user address space. That means a buggy .run
- * program can corrupt the kernel heap - which is already true of
- * everything else it can do, so this adds no new trust boundary. When
- * per-process page tables land, this becomes the natural place to
- * carve out a real user heap region instead.
- */
+/* User allocations use the kernel heap, but ownership is tracked per
+ * process so free/resize can be validated and leaked blocks reclaimed
+ * when the scheduler reaps that process. */
 static bool sys_heap_make_user_accessible(void* ptr, uint64_t size) {
 	if (!isCurrentProcessUser()) return true;
 	uintptr_t address = (uintptr_t)ptr;
@@ -493,32 +481,76 @@ static uint64_t sys_heap_impl(uint64_t op, void* ptr, uint64_t size) {
         case SYS_HEAP_ALLOC: {
             if (size == 0) return SYS_ERR_INVAL;
             void* mem = alloc_unzeroed((size_t)size);
-            if (mem && !sys_heap_make_user_accessible(mem, size)) {
-                free_mem(mem);
-                return SYS_ERR_GENERIC;
+            if (mem && isCurrentProcessUser()) {
+                if (!proc_user_heap_track(current_process, mem, (size_t)size)) {
+                    free_mem(mem);
+                    return SYS_ERR_GENERIC;
+                }
+                if (!sys_heap_make_user_accessible(mem, size)) {
+                    proc_user_heap_untrack(current_process, mem);
+                    free_mem(mem);
+                    return SYS_ERR_GENERIC;
+                }
             }
             return mem ? (uint64_t)(uintptr_t)mem : SYS_ERR_GENERIC;
         }
         case SYS_HEAP_ALLOC_ZEROED: {
             if (size == 0) return SYS_ERR_INVAL;
             void* mem = alloc((size_t)size);
-            if (mem && !sys_heap_make_user_accessible(mem, size)) {
-                free_mem(mem);
-                return SYS_ERR_GENERIC;
+            if (mem && isCurrentProcessUser()) {
+                if (!proc_user_heap_track(current_process, mem, (size_t)size)) {
+                    free_mem(mem);
+                    return SYS_ERR_GENERIC;
+                }
+                if (!sys_heap_make_user_accessible(mem, size)) {
+                    proc_user_heap_untrack(current_process, mem);
+                    free_mem(mem);
+                    return SYS_ERR_GENERIC;
+                }
             }
             return mem ? (uint64_t)(uintptr_t)mem : SYS_ERR_GENERIC;
         }
         case SYS_HEAP_FREE:
-            free_mem(ptr);          // already NULL-safe
+            if (isCurrentProcessUser()) {
+                if (!ptr) return SYS_SUCCESS;
+                if (!proc_user_heap_contains(current_process, ptr)) {
+                    return SYS_ERR_INVAL;
+                }
+                if (!proc_user_heap_untrack(current_process, ptr)) {
+                    return SYS_ERR_GENERIC;
+                }
+            }
+            free_mem(ptr);
             return SYS_SUCCESS;
         case SYS_HEAP_RESIZE: {
-            void* mem = alloc_resize(ptr, (size_t)size);
-            if (size == 0) return SYS_SUCCESS;
-            if (mem && !sys_heap_make_user_accessible(mem, size)) {
-                if (mem != ptr) free_mem(mem);
-                return SYS_ERR_GENERIC;
+            bool user_process = isCurrentProcessUser();
+            if (user_process && ptr &&
+                !proc_user_heap_contains(current_process, ptr)) {
+                return SYS_ERR_INVAL;
             }
-            return mem ? (uint64_t)(uintptr_t)mem : SYS_ERR_GENERIC;
+            if (size == 0) {
+                if (user_process && ptr &&
+                    !proc_user_heap_untrack(current_process, ptr)) {
+                    return SYS_ERR_GENERIC;
+                }
+                alloc_resize(ptr, 0);
+                return SYS_SUCCESS;
+            }
+            void* mem = alloc_resize(ptr, (size_t)size);
+            if (!mem) return SYS_ERR_GENERIC;
+            if (user_process) {
+                if (!proc_user_heap_resize(current_process, ptr, mem,
+                                           (size_t)size)) {
+                    free_mem(mem);
+                    return SYS_ERR_GENERIC;
+                }
+                if (!sys_heap_make_user_accessible(mem, size)) {
+                    proc_user_heap_untrack(current_process, mem);
+                    free_mem(mem);
+                    return SYS_ERR_GENERIC;
+                }
+            }
+            return (uint64_t)(uintptr_t)mem;
         }
         default:
             return SYS_ERR_INVAL;
@@ -686,7 +718,7 @@ void syscall_dispatch(syscall_regs_t* regs) {
             // noreturn - tears this process down and context-switches
             // away for good. Nothing after this ever runs, including
             // isr_syscall_wrapped's iretq.
-            process_exit();
+            process_exit_with_status((uint8_t)regs->rdi, false, 0);
             break;
         }
 

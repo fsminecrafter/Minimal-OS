@@ -4,6 +4,7 @@
 #include "panic.h"
 #include "x86_64/port.h"
 #include "graphics.h"
+#include "prochandler.h"
 
 #define GPU_FB_BAR_INDEX 0
 #define GPU_REG_BAR_INDEX 2
@@ -168,6 +169,12 @@ bool gpu_init(gpu_device_t* gpu, pci_device_t* pci_dev, uint32_t width, uint32_t
     gpu->height = height;
     gpu->bpp = 4;
     gpu->pitch = width * gpu->bpp;
+    gpu->red_position = 16;
+    gpu->red_mask_size = 8;
+    gpu->green_position = 8;
+    gpu->green_mask_size = 8;
+    gpu->blue_position = 0;
+    gpu->blue_mask_size = 8;
 
     serial_write_str("GPU initialized: resolution ");
     serial_write_dec(width);
@@ -214,13 +221,32 @@ void gpu_put_pixel(gpu_device_t* gpu, uint32_t x, uint32_t y, uint32_t color) {
         return;
     }
 
-    uint32_t offset = (y * gpu->pitch + x * gpu->bpp) / 4;
-    volatile uint32_t* pixel = gpu->fb + offset;
-    *pixel = color;
+    volatile uint32_t* pixel = (volatile uint32_t*)((uintptr_t)gpu->fb +
+        (size_t)y * gpu->pitch) + x;
+    *pixel = gpu_pack_color(gpu, color);
+}
+
+static uint32_t gpu_pack_channel(uint8_t channel, uint8_t position,
+                                 uint8_t mask_size) {
+    if (mask_size == 0 || mask_size > 16 || position + mask_size > 32) return 0;
+    uint64_t maximum = (1ULL << mask_size) - 1;
+    return (uint32_t)(((uint64_t)channel * maximum / 255) << position);
+}
+
+uint32_t gpu_pack_color(const gpu_device_t* gpu, uint32_t color) {
+    if (!gpu || (gpu->red_mask_size == 0 && gpu->green_mask_size == 0 &&
+                 gpu->blue_mask_size == 0)) return color;
+    return gpu_pack_channel((uint8_t)(color >> 16), gpu->red_position,
+                            gpu->red_mask_size) |
+           gpu_pack_channel((uint8_t)(color >> 8), gpu->green_position,
+                            gpu->green_mask_size) |
+           gpu_pack_channel((uint8_t)color, gpu->blue_position,
+                            gpu->blue_mask_size);
 }
 
 void gpu_clear(gpu_device_t* gpu, uint32_t color) {
     if (!gpu || !gpu->fb) PANIC("gpu_clear: framebuffer NULL");
+    uint32_t packed_color = gpu_pack_color(gpu, color);
 
     serial_write_str("gpu_clear: clearing ");
     serial_write_dec(gpu->width);
@@ -233,7 +259,7 @@ void gpu_clear(gpu_device_t* gpu, uint32_t color) {
     for (size_t y = 0; y < gpu->height; y++) {
         volatile uint32_t* row = (volatile uint32_t*)((uintptr_t)gpu->fb + y * gpu->pitch);
         for (size_t x = 0; x < gpu->width; x++) {
-            row[x] = color;
+            row[x] = packed_color;
         }
     }
 
@@ -337,6 +363,7 @@ void gpu_initialize_g(gpu_device_t* gpu, pci_device_t* pci_dev, uint32_t width, 
     gpu_test_write(gpu);
     gpu_clear(gpu, 0x00000000);
     graphics_set_gpu(gpu);
+    setSystemGPU(gpu);
     graphics_init();
     serial_write_str("gpu_init: done\n");
 }

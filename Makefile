@@ -9,6 +9,8 @@ QEMU_TWO_MCAST ?= 230.0.0.1:12345
 QEMU_AUDIO_DRIVER ?= none
 HOSTCC ?= gcc
 HOST_CFLAGS ?= -std=c11 -Wall -Wextra -Werror -I src/intf
+MOSDESK_REPO ?= https://github.com/fsminecrafter/MOSdesk.git
+MOSDESK_DIR ?= build/mosdesk-src
 
 .DEFAULT_GOAL := build-x86_64
 
@@ -37,15 +39,24 @@ minimassl_slib := dist/x86_64/minimaSSL.slib
 install1_source := src/resources/install1
 install1_mpkg := build/resources/install1.mpkg
 install1_object := build/resources/install1_mpkg.o
-install2_source := src/resources/install2
+install2_base_source := src/resources/install2
+install2_source := $(install2_base_source)
 install2_mpkg := build/resources/install2.mpkg
 install2_object := build/resources/install2_mpkg.o
 dlr_source_files := $(shell find Minimal-OS-SDK/programs/dlr -type f \( -name '*.c' -o -name '*.h' \))
 dlr_run := $(install2_source)/dlr.run
 dlrconnect_run := $(install2_source)/dlrconnect.run
-install3_source := src/resources/install3
+install3_base_source := src/resources/install3
+install3_source := $(install3_base_source)
 install3_mpkg := build/resources/install3.mpkg
 install3_object := build/resources/install3_mpkg.o
+
+ifeq ($(MOSDESK),1)
+install2_source := build/resources/mosdesk-install/install2
+install3_source := build/resources/mosdesk-install/install3
+mosdesk_install_dep := mosdesk-stage
+endif
+
 install2_files := $(shell find $(install2_source) -type f 2>/dev/null)
 install3_files := $(shell find $(install3_source) -type f 2>/dev/null)
 
@@ -133,7 +144,7 @@ $(install1_object): $(install1_mpkg)
 		--redefine-sym _binary_build_resources_install1_mpkg_end=_binary_install1_mpkg_end \
 		$< $@
 
-$(install2_mpkg): $(install2_source) $(install2_files) $(dlr_run) $(dlrconnect_run) tools/mkpkg/mkpkg.py
+$(install2_mpkg): $(mosdesk_install_dep) $(install2_source) $(install2_files) $(dlr_run) $(dlrconnect_run) tools/mkpkg/mkpkg.py
 	mkdir -p $(dir $@)
 	python3 tools/mkpkg/mkpkg.py $(install2_source) $@ --store
 
@@ -150,7 +161,7 @@ $(install2_object): $(install2_mpkg)
 		--redefine-sym _binary_build_resources_install2_mpkg_end=_binary_install2_mpkg_end \
 		$< $@
 
-$(install3_mpkg): $(install3_source) $(install3_files) tools/mkpkg/mkpkg.py
+$(install3_mpkg): $(mosdesk_install_dep) $(install3_source) $(install3_files) tools/mkpkg/mkpkg.py
 	mkdir -p $(dir $@)
 	python3 tools/mkpkg/mkpkg.py $(install3_source) $@ --store
 
@@ -183,6 +194,33 @@ src/resources/%.o: src/resources/%.wav
 .PHONY: run
 run: build-x86_64
 	qemu-system-x86_64 -smp 2 -cdrom dist/x86_64/kernel.iso -m 1024M -boot d -d guest_errors,int,cpu_reset,unimp -D qemu.log -serial stdio -usb -device usb-kbd -audiodev $(QEMU_AUDIO_DRIVER),id=speaker -machine pcspk-audiodev=speaker  -audiodev $(QEMU_AUDIO_DRIVER),id=audio0 -device AC97,audiodev=audio0 -device ahci,id=ahci -drive id=disk0,file=sata256.img,if=none,format=raw -device ide-hd,drive=disk0,bus=ahci.0 -netdev $(QEMU_NETDEV) -device rtl8139,netdev=net0,mac=52:54:00:12:34:56
+
+.PHONY: mosdesk-build mosdesk-stage run-mosdesk
+mosdesk-build:
+	mkdir -p $(dir $(MOSDESK_DIR))
+	@if ! git submodule update --init --recursive Minimal-OS-SDK; then \
+		git -C Minimal-OS-SDK fetch origin && \
+		git -C Minimal-OS-SDK checkout --detach FETCH_HEAD; \
+	fi
+	@if [ ! -d "$(MOSDESK_DIR)/.git" ]; then \
+		git clone --depth 1 "$(MOSDESK_REPO)" "$(MOSDESK_DIR)"; \
+	fi
+	git -C "$(MOSDESK_DIR)" submodule update --init Minimal-OS Minimal-OS-SDK
+	CC=$(CC) LD=$(LD) $(MOSDESK_DIR)/mosdesk/build.sh
+
+mosdesk-stage: mosdesk-build $(dlr_run) $(dlrconnect_run)
+	rm -rf build/resources/mosdesk-install
+	mkdir -p build/resources/mosdesk-install/install2/mosdesk \
+		build/resources/mosdesk-install/install2/mosWM \
+		build/resources/mosdesk-install/install3
+	cp -a $(install2_base_source)/. build/resources/mosdesk-install/install2/
+	cp -a $(install3_base_source)/. build/resources/mosdesk-install/install3/
+	cp -a $(MOSDESK_DIR)/mosdesk/dist/mosdesk/. build/resources/mosdesk-install/install2/mosdesk/
+	cp -a $(MOSDESK_DIR)/mosWM/dist/mosWM/programs/mosWM/. build/resources/mosdesk-install/install2/mosWM/
+	cp $(MOSDESK_DIR)/mosWM/dist/mosWM/services/mosWM.service build/resources/mosdesk-install/install3/mosWM.service
+
+run-mosdesk:
+	$(MAKE) MOSDESK=1 run
 
 .PHONY: run-two
 run-two: build-x86_64

@@ -232,6 +232,18 @@ fallocate -l 256M sata256.img
 If audio doesnt work use either
 ```make run-sdl``` or ```make run-alsa```
 
+To fetch and build MOSDesk and mosWM, include them in the install packages, and
+boot the desktop-enabled image, run:
+
+```sh
+make run-mosdesk
+```
+
+This uses the same cross-compiler and `sata256.img` prerequisites above. The
+desktop files and mosWM startup service are installed when `format` is run in
+Minimal-OS; formatting erases the selected disk, so back up an existing disk
+before formatting it.
+
 ## Development For Minimal-OS Via .run Executables
 Now you can create .run files for Minimal-OS viaaa... (Drumroll)
 

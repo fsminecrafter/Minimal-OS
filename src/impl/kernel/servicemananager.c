@@ -40,8 +40,6 @@ typedef struct {
 
     bool has_exec;
     char exec_path[SERVICE_MAX_CMD];     // [STARTUP] exec path or command
-    bool startup_ran;                    // command-style startup already ran
-
     bool has_script;
     char startup_script[SERVICE_MAX_CMD]; // [STARTUP] script
 
@@ -251,8 +249,6 @@ static void service_run_and_wait(service_entry_t* svc) {
     char target_path[MINIMAFS_MAX_PATH];
     const char* raw_path = NULL;
 
-    if (svc->startup_ran) return;
-
     if (svc->has_exec) {
         char run_arg[MINIMAFS_MAX_PATH];
         if (service_script_run_path(svc->exec_path, run_arg, sizeof(run_arg))) {
@@ -267,7 +263,11 @@ static void service_run_and_wait(service_entry_t* svc) {
             serial_write_str("' executing command: ");
             serial_write_str(svc->exec_path);
             serial_write_str("\n");
-            command_execute(svc->exec_path);
+            if (!command_execute_async(svc->exec_path)) {
+                serial_write_str("[SERVICES] Failed to launch startup command for ");
+                serial_write_str(service_display_name(svc));
+                serial_write_str("\n");
+            }
             return;
         }
     } else if (svc->has_script) {
@@ -285,7 +285,11 @@ static void service_run_and_wait(service_entry_t* svc) {
             serial_write_str(service_display_name(svc));
             serial_write_str("': script is not a 'run <path>' command, "
                               "running once with no exit tracking\n");
-            command_execute(svc->startup_script);
+            if (!command_execute_async(svc->startup_script)) {
+                serial_write_str("[SERVICES] Failed to launch startup script for ");
+                serial_write_str(service_display_name(svc));
+                serial_write_str("\n");
+            }
             return;
         }
     }
@@ -420,16 +424,6 @@ void service_manager_init(void) {
         graphics_write_textr("[STARTING] ");
         graphics_write_textr(service_display_name(svc));
         graphics_write_textr("\n");
-
-        char run_arg[MINIMAFS_MAX_PATH];
-        bool direct_run = svc->has_exec &&
-                          service_script_run_path(svc->exec_path, run_arg,
-                                                  sizeof(run_arg));
-        if (svc->has_exec && !direct_run && svc->exec_path[0] != '/' &&
-            svc->exec_path[0] != '.' && !strchr(svc->exec_path, ':')) {
-            command_execute(svc->exec_path);
-            svc->startup_ran = true;
-        }
 
         process_t* proc = createProcess(svc->filename, service_monitor_entry);
         if (!proc) {

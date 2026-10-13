@@ -193,7 +193,7 @@ src/resources/%.o: src/resources/%.wav
 
 .PHONY: run
 run: build-x86_64
-	qemu-system-x86_64 -smp 2 -cdrom dist/x86_64/kernel.iso -m 1024M -boot d -d guest_errors,int,cpu_reset,unimp -D qemu.log -serial stdio -usb -device usb-kbd -audiodev $(QEMU_AUDIO_DRIVER),id=speaker -machine pcspk-audiodev=speaker  -audiodev $(QEMU_AUDIO_DRIVER),id=audio0 -device AC97,audiodev=audio0 -device ahci,id=ahci -drive id=disk0,file=sata256.img,if=none,format=raw -device ide-hd,drive=disk0,bus=ahci.0 -netdev $(QEMU_NETDEV) -device rtl8139,netdev=net0,mac=52:54:00:12:34:56
+	qemu-system-x86_64 -smp 2 -cdrom dist/x86_64/kernel.iso -m 1024M -boot d -d guest_errors,int,cpu_reset,unimp -D qemu.log -serial stdio -usb -device usb-kbd -device usb-mouse -audiodev $(QEMU_AUDIO_DRIVER),id=speaker -machine pcspk-audiodev=speaker  -audiodev $(QEMU_AUDIO_DRIVER),id=audio0 -device AC97,audiodev=audio0 -device ahci,id=ahci -drive id=disk0,file=sata256.img,if=none,format=raw -device ide-hd,drive=disk0,bus=ahci.0 -netdev $(QEMU_NETDEV) -device rtl8139,netdev=net0,mac=52:54:00:12:34:56
 
 .PHONY: mosdesk-build mosdesk-stage run-mosdesk
 mosdesk-build:
@@ -229,21 +229,21 @@ run-two: build-x86_64
 	@echo "run-two: starting two MOS guests on multicast LAN $(QEMU_TWO_MCAST)"
 	@echo "run-two: addresses are automatic: 192.168.100.2 and 192.168.100.3"
 	@trap 'kill $$qemu1 $$qemu2 2>/dev/null || true; wait $$qemu1 $$qemu2 2>/dev/null || true' INT TERM EXIT; \
-	qemu-system-x86_64 -smp 2 -cdrom dist/x86_64/kernel.iso -m 1024M -boot d -d guest_errors,int,cpu_reset,unimp -D qemu-one.log -serial tcp:127.0.0.1:5566,server=on,wait=off -usb -device usb-kbd -audiodev $(QEMU_AUDIO_DRIVER),id=speaker1 -machine pcspk-audiodev=speaker1 -device ahci,id=ahci1 -drive id=disk0,file=sata256.img,if=none,format=raw -device ide-hd,drive=disk0,bus=ahci1.0 -netdev socket,id=net-one,mcast=$(QEMU_TWO_MCAST) -device rtl8139,netdev=net-one,mac=52:54:00:12:34:56 & qemu1=$$!; \
-	qemu-system-x86_64 -smp 2 -cdrom dist/x86_64/kernel.iso -m 1024M -boot d -d guest_errors,int,cpu_reset,unimp -D qemu-two.log -serial tcp:127.0.0.1:5567,server=on,wait=off -usb -device usb-kbd -audiodev $(QEMU_AUDIO_DRIVER),id=speaker2 -machine pcspk-audiodev=speaker2 -device ahci,id=ahci2 -drive id=disk1,file=sata256-2.img,if=none,format=raw -device ide-hd,drive=disk1,bus=ahci2.0 -netdev socket,id=net-two,mcast=$(QEMU_TWO_MCAST) -device rtl8139,netdev=net-two,mac=52:54:00:12:34:57 & qemu2=$$!; \
+	qemu-system-x86_64 -smp 2 -cdrom dist/x86_64/kernel.iso -m 1024M -boot d -d guest_errors,int,cpu_reset,unimp -D qemu-one.log -serial tcp:127.0.0.1:5566,server=on,wait=off -usb -device usb-kbd -device usb-mouse -audiodev $(QEMU_AUDIO_DRIVER),id=speaker1 -machine pcspk-audiodev=speaker1 -device ahci,id=ahci1 -drive id=disk0,file=sata256.img,if=none,format=raw -device ide-hd,drive=disk0,bus=ahci1.0 -netdev socket,id=net-one,mcast=$(QEMU_TWO_MCAST) -device rtl8139,netdev=net-one,mac=52:54:00:12:34:56 & qemu1=$$!; \
+	qemu-system-x86_64 -smp 2 -cdrom dist/x86_64/kernel.iso -m 1024M -boot d -d guest_errors,int,cpu_reset,unimp -D qemu-two.log -serial tcp:127.0.0.1:5567,server=on,wait=off -usb -device usb-kbd -device usb-mouse -audiodev $(QEMU_AUDIO_DRIVER),id=speaker2 -machine pcspk-audiodev=speaker2 -device ahci,id=ahci2 -drive id=disk1,file=sata256-2.img,if=none,format=raw -device ide-hd,drive=disk1,bus=ahci2.0 -netdev socket,id=net-two,mcast=$(QEMU_TWO_MCAST) -device rtl8139,netdev=net-two,mac=52:54:00:12:34:57 & qemu2=$$!; \
 	wait $$qemu1 $$qemu2
 
 .PHONY: run-audio
 run-audio: build-x86_64
-	qemu-system-x86_64 -smp 2 -cdrom dist/x86_64/kernel.iso -m 1024M -boot d -d guest_errors,int,cpu_reset,unimp -D qemu.log  -usb -device usb-kbd -serial stdio -audiodev wav,id=speaker,path=speaker.wav -machine pcspk-audiodev=speaker -audiodev wav,id=audio0,path=ac97.wav -device AC97,audiodev=audio0,audiodev=audio0 -device ahci,id=ahci -drive id=disk0,file=sata256.img,if=none,format=raw -device ide-hd,drive=disk0,bus=ahci.0 -netdev tap,id=net0,ifname=tap0,script=no,downscript=no -device rtl8139,netdev=net0,mac=52:54:00:12:34:56
+	qemu-system-x86_64 -smp 2 -cdrom dist/x86_64/kernel.iso -m 1024M -boot d -d guest_errors,int,cpu_reset,unimp -D qemu.log  -usb -device usb-kbd -device usb-mouse -serial stdio -audiodev wav,id=speaker,path=speaker.wav -machine pcspk-audiodev=speaker -audiodev wav,id=audio0,path=ac97.wav -device AC97,audiodev=audio0,audiodev=audio0 -device ahci,id=ahci -drive id=disk0,file=sata256.img,if=none,format=raw -device ide-hd,drive=disk0,bus=ahci.0 -netdev tap,id=net0,ifname=tap0,script=no,downscript=no -device rtl8139,netdev=net0,mac=52:54:00:12:34:56
 
 .PHONY: run-sdl
 run-sdl: build-x86_64
-	qemu-system-x86_64 -smp 2 -cdrom dist/x86_64/kernel.iso -m 1024M -boot d -serial stdio -audiodev sdl,id=speaker -machine pcspk-audiodev=speaker -usb -device usb-kbd -audiodev sdl,id=audio0 -device AC97,audiodev=audio0 -device ahci,id=ahci -drive id=disk0,file=sata256.img,if=none,format=raw -device ide-hd,drive=disk0,bus=ahci.0 -netdev tap,id=net0,ifname=tap0,script=no,downscript=no -device rtl8139,netdev=net0,mac=52:54:00:12:34:56
+	qemu-system-x86_64 -smp 2 -cdrom dist/x86_64/kernel.iso -m 1024M -boot d -serial stdio -audiodev sdl,id=speaker -machine pcspk-audiodev=speaker -usb -device usb-kbd -device usb-mouse -audiodev sdl,id=audio0 -device AC97,audiodev=audio0 -device ahci,id=ahci -drive id=disk0,file=sata256.img,if=none,format=raw -device ide-hd,drive=disk0,bus=ahci.0 -netdev tap,id=net0,ifname=tap0,script=no,downscript=no -device rtl8139,netdev=net0,mac=52:54:00:12:34:56
 
 .PHONY: run-alsa
 run-alsa: build-x86_64
-	qemu-system-x86_64 -smp 2 -cdrom dist/x86_64/kernel.iso -m 1024M -boot d -serial stdio -audiodev alsa,id=speaker -machine pcspk-audiodev=speaker -usb -device usb-kbd -audiodev alsa,id=audio0 -device AC97,audiodev=audio0 -device ahci,id=ahci -drive id=disk0,file=sata256.img,if=none,format=raw -device ide-hd,drive=disk0,bus=ahci.0 -netdev tap,id=net0,ifname=tap0,script=no,downscript=no -device rtl8139,netdev=net0,mac=52:54:00:12:34:56
+	qemu-system-x86_64 -smp 2 -cdrom dist/x86_64/kernel.iso -m 1024M -boot d -serial stdio -audiodev alsa,id=speaker -machine pcspk-audiodev=speaker -usb -device usb-kbd -device usb-mouse -audiodev alsa,id=audio0 -device AC97,audiodev=audio0 -device ahci,id=ahci -drive id=disk0,file=sata256.img,if=none,format=raw -device ide-hd,drive=disk0,bus=ahci.0 -netdev tap,id=net0,ifname=tap0,script=no,downscript=no -device rtl8139,netdev=net0,mac=52:54:00:12:34:56
 
 .PHONY: run-ps2
 run-ps2: build-x86_64
@@ -251,15 +251,15 @@ run-ps2: build-x86_64
 
 .PHONY: run-int
 run-int: build-x86_64
-	qemu-system-x86_64 -smp 2 -cdrom dist/x86_64/kernel.iso -m 1024M -boot d -serial stdio -d int -audiodev pa,id=speaker -machine pcspk-audiodev=speaker -usb -device usb-kbd -netdev tap,id=net0,ifname=tap0,script=no,downscript=no -device rtl8139,netdev=net0,mac=52:54:00:12:34:56
+	qemu-system-x86_64 -smp 2 -cdrom dist/x86_64/kernel.iso -m 1024M -boot d -serial stdio -d int -audiodev pa,id=speaker -machine pcspk-audiodev=speaker -usb -device usb-kbd -device usb-mouse -netdev tap,id=net0,ifname=tap0,script=no,downscript=no -device rtl8139,netdev=net0,mac=52:54:00:12:34:56
 
 .PHONY: run-de
 run-de: build-x86_64
-	qemu-system-x86_64 -smp 2 -cdrom dist/x86_64/kernel.iso -m 1024M -boot d -d guest_errors,int,cpu_reset,unimp -D qemu.log --no-reboot -serial stdio -audiodev pa,id=speaker -machine pcspk-audiodev=speaker -usb -device usb-kbd -netdev tap,id=net0,ifname=tap0,script=no,downscript=no -device rtl8139,netdev=net0,mac=52:54:00:12:34:56
+	qemu-system-x86_64 -smp 2 -cdrom dist/x86_64/kernel.iso -m 1024M -boot d -d guest_errors,int,cpu_reset,unimp -D qemu.log --no-reboot -serial stdio -audiodev pa,id=speaker -machine pcspk-audiodev=speaker -usb -device usb-kbd -device usb-mouse -netdev tap,id=net0,ifname=tap0,script=no,downscript=no -device rtl8139,netdev=net0,mac=52:54:00:12:34:56
 
 .PHONY: run-dex
 run-dex: build-x86_64
-	qemu-system-x86_64 -smp 2 -cdrom dist/x86_64/kernel.iso -m 1024M -boot d -d guest_errors,int,cpu_reset,unimp -D qemu.log --no-reboot -serial stdio -S -s -usb -device usb-kbd -netdev tap,id=net0,ifname=tap0,script=no,downscript=no -device rtl8139,netdev=net0,mac=52:54:00:12:34:56
+	qemu-system-x86_64 -smp 2 -cdrom dist/x86_64/kernel.iso -m 1024M -boot d -d guest_errors,int,cpu_reset,unimp -D qemu.log --no-reboot -serial stdio -S -s -usb -device usb-kbd -device usb-mouse -netdev tap,id=net0,ifname=tap0,script=no,downscript=no -device rtl8139,netdev=net0,mac=52:54:00:12:34:56
 
 .PHONY: ci-test
 ci-test:

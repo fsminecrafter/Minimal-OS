@@ -525,6 +525,14 @@ void terminal_program_entry(void) {
                 serial_write_str("Terminal: Starting service discovery...\n");
                 service_manager_init();
                 serial_write_str("Terminal: Service discovery complete\n");
+
+                if (minimafs_exists("0:/services/mosWM.service") ||
+                    minimafs_exists("0:/programs/mosWM/mosWM.run")) {
+                    serial_write_str("Terminal: mosWM desktop service detected; exiting text terminal to let the desktop own the screen.\n");
+                    graphics_write_textr("MOSdesk detected; exiting terminal UI.\n");
+                    schedulerInit();
+                    return;
+                }
             } else if (success == 2) {
                 vgaterm_print_error("MinimaFS: Drive already mounted\n");
             } else if (success == 3) {

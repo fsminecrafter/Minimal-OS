@@ -43,6 +43,71 @@ static uint32_t format_pkg_u32(const uint8_t* p) {
            ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
+static bool format_name_is_safe(const char* name) {
+    if (!name || name[0] == '\0') return false;
+    if (name[0] == '/') return false;
+
+    const char* p = name;
+    while (*p) {
+        if (p[0] == '.' && p[1] == '.' &&
+            (p == name || p[-1] == '/') &&
+            (p[2] == '/' || p[2] == '\0')) {
+            return false;
+        }
+        p++;
+    }
+    return true;
+}
+
+static bool format_mkdir_p(const char* path) {
+    if (!path) return false;
+
+    size_t len = strlen(path);
+    if (len == 0 || len >= MINIMAFS_MAX_PATH) return false;
+
+    char buf[MINIMAFS_MAX_PATH];
+    strncpy(buf, path, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+
+    const char* colon = strchr(buf, ':');
+    if (!colon || colon[1] != '/') return false;
+    size_t min_len = (size_t)(colon - buf) + 2;
+    if (min_len > len) return false;
+
+    for (size_t i = min_len; i <= len; i++) {
+        if (buf[i] == '/' || buf[i] == '\0') {
+            bool at_end = (buf[i] == '\0');
+            char saved = buf[i];
+            buf[i] = '\0';
+            if (i > min_len) {
+                if (!minimafs_is_dir(buf) && !minimafs_mkdir(buf)) {
+                    return false;
+                }
+            }
+            buf[i] = saved;
+            if (at_end) break;
+        }
+    }
+    return true;
+}
+
+static bool format_parent_dir(const char* full_path, char* out, size_t out_size) {
+    const char* colon = strchr(full_path, ':');
+    if (!colon || colon[1] != '/') return false;
+    const char* root_slash = colon + 1;
+    const char* last_slash = strrchr(full_path, '/');
+    if (!last_slash) return false;
+
+    size_t len = (last_slash == root_slash)
+        ? (size_t)(last_slash - full_path) + 1
+        : (size_t)(last_slash - full_path);
+
+    if (len >= out_size) return false;
+    memcpy(out, full_path, len);
+    out[len] = '\0';
+    return true;
+}
+
 static bool format_install_package(const uint8_t* archive, uint32_t archive_size,
                                    const char* target_dir) {
     if (archive_size < MPKG_HEADER_SIZE ||
@@ -52,10 +117,17 @@ static bool format_install_package(const uint8_t* archive, uint32_t archive_size
         return false;
     }
 
+    if (!minimafs_is_dir(target_dir) && !format_mkdir_p(target_dir)) {
+        serial_write_str("FORMAT: unable to create target directory ");
+        serial_write_str(target_dir);
+        serial_write_str("\n");
+        return false;
+    }
+
     uint32_t count = format_pkg_u32(archive + 12);
     uint64_t table_end = (uint64_t)MPKG_HEADER_SIZE +
                          (uint64_t)count * MPKG_ENTRY_SIZE;
-    if (table_end > archive_size) return false;
+    if (count == 0 || table_end > archive_size) return false;
 
     for (uint32_t i = 0; i < count; i++) {
         const uint8_t* entry = archive + MPKG_HEADER_SIZE + i * MPKG_ENTRY_SIZE;
@@ -67,14 +139,28 @@ static bool format_install_package(const uint8_t* archive, uint32_t archive_size
         uint32_t raw_size = format_pkg_u32(entry + MPKG_NAME_SIZE + 8);
         uint32_t packed_size = format_pkg_u32(entry + MPKG_NAME_SIZE + 12);
         uint32_t offset = format_pkg_u32(entry + MPKG_NAME_SIZE + 16);
-        if (flags & MPKG_FLAG_DIRECTORY) continue;
-        if (!name[0] || name[0] == '/' || strstr(name, "..")) return false;
+
+        if (flags & MPKG_FLAG_DIRECTORY) {
+            char dir_path[MINIMAFS_MAX_PATH];
+            int written = snprintf(dir_path, sizeof(dir_path), "%s/%s", target_dir, name);
+            if (written <= 0 || (size_t)written >= sizeof(dir_path)) return false;
+            if (!format_name_is_safe(name) || !format_mkdir_p(dir_path)) return false;
+            continue;
+        }
+
+        if (!format_name_is_safe(name)) return false;
         if ((uint64_t)offset < table_end ||
             (uint64_t)offset + packed_size > archive_size) return false;
 
         char path[MINIMAFS_MAX_PATH];
         int written = snprintf(path, sizeof(path), "%s/%s", target_dir, name);
         if (written <= 0 || (size_t)written >= sizeof(path)) return false;
+
+        char parent[MINIMAFS_MAX_PATH];
+        if (format_parent_dir(path, parent, sizeof(parent)) && !format_mkdir_p(parent)) {
+            return false;
+        }
+
         const uint8_t* payload = archive + offset;
         uint8_t* expanded = NULL;
         const uint8_t* data = payload;
@@ -82,10 +168,17 @@ static bool format_install_package(const uint8_t* archive, uint32_t archive_size
         if (method == MPKG_METHOD_STORE) {
             if (raw_size != packed_size) return false;
         } else if (method == MPKG_METHOD_LZSS) {
-            expanded = (uint8_t*)alloc_unzeroed(raw_size);
-            if (raw_size && !expanded) return false;
+            if (raw_size == 0) {
+                expanded = NULL;
+            } else {
+                expanded = (uint8_t*)alloc_unzeroed(raw_size);
+                if (!expanded) return false;
+            }
             data_size = lzss_decompress(payload, packed_size, expanded, raw_size);
-            if (data_size != raw_size) { if (expanded) free_mem(expanded); return false; }
+            if (data_size != raw_size) {
+                if (expanded) free_mem(expanded);
+                return false;
+            }
             data = expanded;
         } else return false;
 

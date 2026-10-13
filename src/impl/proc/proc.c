@@ -81,7 +81,7 @@ static int proc_map_user_pages(process_t* proc, uintptr_t address, size_t length
 
 	uint64_t* pml4 = (uint64_t*)(uintptr_t)proc->pml4;
 	uint64_t pml4_index = (start >> 39) & 0x1FF;
-	if (((end - 1) >> 39) & 0x1FF != pml4_index || pml4_index != 0) {
+	if ((((end - 1) >> 39) & 0x1FF) != pml4_index || pml4_index != 0) {
 		return 0;
 	}
 
@@ -626,11 +626,26 @@ process_t* proc_create_ex(const char* file_name, void (*entry_point)(),
 	scheduler_unlock(proc_list_flags);
 	irq_restore(proc_list_flags, __FILE__, __func__, __LINE__);
 
+	// A user process has no image or stack mapped into its address space
+	// yet. Queueing it now would let another core dispatch it into the
+	// kernel's supervisor-only identity mapping before the caller finishes
+	// proc_map_user_range_at(), so it stays parked until proc_start().
+	if (privilege == PROC_PRIVILEGE_USER) {
+		proc->state = PROCESS_PAUSED;
+		return proc;
+	}
+
 	// Places this process on some core's per-CPU ready queue - it is
 	// NOT actually schedulable until this runs. See scheduler.c.
 	scheduler_enqueue_new(proc);
 
 	return proc;
+}
+
+void proc_start(process_t* proc) {
+	if (!proc || proc->state != PROCESS_PAUSED) return;
+	proc->state = PROCESS_READY;
+	scheduler_enqueue_new(proc);
 }
 
 process_t* proc_create(const char* file_name, void (*entry_point)()) {

@@ -149,6 +149,11 @@ process_t* proc_create(const char* file_name, void (*entry_point)());
 process_t* proc_create_ex(const char* file_name, void (*entry_point)(),
                           process_privilege_t privilege);
 
+// PROC_PRIVILEGE_USER processes are created parked (PROCESS_PAUSED, on
+// no run queue) so their image and stack can be mapped first. Call this
+// once the address space is complete to make the process schedulable.
+void proc_start(process_t* proc);
+
 void kill(process_t* proc);
 process_t* get_proc_by_name(const char* name);
 process_t** get_procs(size_t* count);

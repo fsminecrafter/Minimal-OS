@@ -91,8 +91,7 @@ static bool push_event(managed_window_t* window,
         event->type == SYSCALL_WINDOW_EVENT_RESTORED ||
         event->type == SYSCALL_WINDOW_EVENT_FOCUS_GAINED ||
         event->type == SYSCALL_WINDOW_EVENT_FOCUS_LOST ||
-        event->type == SYSCALL_WINDOW_EVENT_CLOSE_REQUEST ||
-        event->type == SYSCALL_WINDOW_EVENT_MOUSE) {
+        event->type == SYSCALL_WINDOW_EVENT_CLOSE_REQUEST) {
         for (uint32_t i = 0; i < window->event_count; i++) {
             uint32_t index = (window->event_head + i) %
                              SYSCALL_WINDOW_MAX_EVENTS;
@@ -101,6 +100,20 @@ static bool push_event(managed_window_t* window,
                 window->events[index].id = window->info.id;
                 return true;
             }
+        }
+    }
+    // Pointer motion only replaces the newest queued event, and only when
+    // the buttons are unchanged. Merging across a button change would let a
+    // quick click (press, then release) reach the application as a release
+    // alone.
+    if (event->type == SYSCALL_WINDOW_EVENT_MOUSE && window->event_count) {
+        uint32_t newest = (window->event_head + window->event_count - 1u) %
+                          SYSCALL_WINDOW_MAX_EVENTS;
+        if (window->events[newest].type == SYSCALL_WINDOW_EVENT_MOUSE &&
+            window->events[newest].buttons == event->buttons) {
+            window->events[newest] = *event;
+            window->events[newest].id = window->info.id;
+            return true;
         }
     }
     if (window->event_count == SYSCALL_WINDOW_MAX_EVENTS) return false;
@@ -383,7 +396,10 @@ uint64_t window_manager_syscall(const syscall_window_request_t* request,
             window->info.style = request->style;
             break;
         case SYS_WINDOW_PRESENT: {
-            if (is_manager || !request->pixels ||
+            // The manager composites other processes' windows but must not
+            // draw into them; it may still present its own (File Browser).
+            if ((is_manager && window->info.owner_pid != caller_pid) ||
+                !request->pixels ||
                 !request->width || !request->height ||
                 request->x > window->info.width ||
                 request->y > window->info.height ||

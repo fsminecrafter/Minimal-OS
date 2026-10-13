@@ -3,6 +3,9 @@ CC := $(toolchain_home)/cross/bin/x86_64-elf-gcc
 LD := $(toolchain_home)/cross/bin/x86_64-elf-ld
 BUILD_DATE := $(shell date '+%Y-%m-%d %H:%M:%S')
 BUILD_DATE_CFLAG := '-DBUILD_DATE="$(BUILD_DATE)"'
+# Interrupts taken in ring 0 push their frame onto the interrupted stack,
+# which is exactly where the SysV red zone keeps a leaf function's locals.
+KERNEL_CFLAGS := -ffreestanding -mno-red-zone
 
 QEMU_NETDEV ?= user,id=net0
 QEMU_TWO_MCAST ?= 230.0.0.1:12345
@@ -10,7 +13,8 @@ QEMU_AUDIO_DRIVER ?= none
 HOSTCC ?= gcc
 HOST_CFLAGS ?= -std=c11 -Wall -Wextra -Werror -I src/intf
 MOSDESK_REPO ?= https://github.com/fsminecrafter/MOSdesk.git
-MOSDESK_DIR ?= build/mosdesk-src
+# The MOSdesk submodule; override to build some other checkout.
+MOSDESK_DIR ?= MOSdesk
 
 .DEFAULT_GOAL := build-x86_64
 
@@ -82,7 +86,7 @@ FORCE:
 
 build/modules/%.o: src/modules/%.c $(header_files)
 	mkdir -p $(dir $@)
-	$(CC) $(BUILD_DATE_CFLAG) -c -I src/intf -ffreestanding $< -o $@
+	$(CC) $(BUILD_DATE_CFLAG) -c -I src/intf $(KERNEL_CFLAGS) $< -o $@
 
 build/modules/%.o: src/modules/%.asm
 	mkdir -p $(dir $@)
@@ -90,7 +94,7 @@ build/modules/%.o: src/modules/%.asm
 
 build/impl/%.o: src/impl/%.c $(header_files)
 	mkdir -p $(dir $@)
-	$(CC) $(BUILD_DATE_CFLAG) -c -I src/intf -I Minimal-OS-SDK/libraries/minimaSSL/include -ffreestanding $< -o $@
+	$(CC) $(BUILD_DATE_CFLAG) -c -I src/intf -I Minimal-OS-SDK/libraries/minimaSSL/include $(KERNEL_CFLAGS) $< -o $@
 
 build/impl/kernel/main.o: FORCE
 
@@ -99,7 +103,7 @@ build/minimaSSL/%.o: Minimal-OS-SDK/libraries/minimaSSL/src/%.c $(header_files)
 	$(CC) -c -I src/intf \
 		-I Minimal-OS-SDK/libraries/minimaSSL/include \
 		-I Minimal-OS-SDK/libraries/minimaSSL/src \
-		-ffreestanding -fno-builtin $< -o $@
+		$(KERNEL_CFLAGS) -fno-builtin $< -o $@
 
 build/impl/%.o: src/impl/%.asm
 	mkdir -p $(dir $@)
@@ -202,7 +206,8 @@ mosdesk-build:
 		git -C Minimal-OS-SDK fetch origin && \
 		git -C Minimal-OS-SDK checkout --detach FETCH_HEAD; \
 	fi
-	@if [ ! -d "$(MOSDESK_DIR)/.git" ]; then \
+	@if [ ! -e "$(MOSDESK_DIR)/.git" ]; then \
+		git submodule update --init "$(MOSDESK_DIR)" 2>/dev/null || \
 		git clone --depth 1 "$(MOSDESK_REPO)" "$(MOSDESK_DIR)"; \
 	fi
 	git -C "$(MOSDESK_DIR)" submodule update --init Minimal-OS Minimal-OS-SDK

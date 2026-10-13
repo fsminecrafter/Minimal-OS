@@ -39,6 +39,7 @@
 #include "x86_64/random.h"
 
 bool kernel_boot_no_disk;
+bool kernel_boot_debug;
 
 
 void busy(void) {
@@ -83,6 +84,7 @@ void kernel_main(uint64_t mb2_info_addr) {
     gdt_init();
     multiboot2_info_t* mb_info = (multiboot2_info_t*)mb2_info_addr;
     kernel_boot_no_disk = multiboot2_has_cmdline_token(mb_info, "no-disk");
+    kernel_boot_debug = multiboot2_has_cmdline_token(mb_info, "--debug");
     uint64_t total_ram_bytes = get_total_memory(mb_info);
     print_clear();
     commandhandler_init();

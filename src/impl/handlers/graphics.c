@@ -859,6 +859,15 @@ bool graphics_backbuffer_present(const gfx_rect_t* rect) {
         volatile uint32_t* dst = (volatile uint32_t*)((uintptr_t)g_gpu->fb +
             (size_t)row * g_gpu->pitch);
         const uint32_t* src = g_backbuffer + (size_t)row * g_backbuffer_width;
+        if (fast_format) {
+            // Same layout as the framebuffer (its top byte is unused), so
+            // the row can be copied as-is. This runs with interrupts off,
+            // and a per-pixel loop here was costing most timer ticks.
+            memcpy((void*)(dst + (uint32_t)clipped.x),
+                   src + (uint32_t)clipped.x,
+                   (size_t)clipped.w * sizeof(uint32_t));
+            continue;
+        }
         for (int32_t x = 0; x < clipped.w; ++x) {
             const uint32_t color = src[(uint32_t)clipped.x + (uint32_t)x];
             dst[(uint32_t)clipped.x + (uint32_t)x] = fast_format

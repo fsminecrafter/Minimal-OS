@@ -185,7 +185,8 @@ static uint64_t sys_graphics_impl(const syscall_graphics_request_t* request) {
 
             const size_t row_bytes = (size_t)blit->sw * sizeof(uint32_t);
             const size_t staging_bytes = row_bytes * (size_t)blit->sh;
-            uint32_t* staging = alloc(staging_bytes);
+            // Every byte is overwritten by the row copy below.
+            uint32_t* staging = alloc_unzeroed(staging_bytes);
             if (!staging) {
                 serial_write_str("SYS_GRAPHICS_BLIT: staging allocation failed\n");
                 return SYS_ERR_GENERIC;

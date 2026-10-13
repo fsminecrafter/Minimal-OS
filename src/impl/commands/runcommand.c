@@ -367,6 +367,7 @@ process_t* run_launch_file(const char* run_path, int extra_argc, const char** ex
             // The process now owns PMM-backed copies of both ranges.
             elf_unload(&image);
             run_release_buffer(stack, stack_page_backed, stack_page_count);
+            proc_start(proc);
         }
     }
     if (!proc) {

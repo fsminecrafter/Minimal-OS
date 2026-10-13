@@ -51,7 +51,8 @@ static process_t* createProcessWithPrivilege(const char* file_name,
         return NULL;
     }
 
-    proc->state = PROCESS_READY;
+    // User processes stay parked until the loader calls proc_start().
+    if (privilege != PROC_PRIVILEGE_USER) proc->state = PROCESS_READY;
 
     serial_write_str("[PROC] Created process: ");
     serial_write_str(proc->name);

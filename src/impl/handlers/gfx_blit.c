@@ -1,4 +1,5 @@
 #include "gfx_blit.h"
+#include "string.h"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -141,6 +142,14 @@ static bool gfx_blit(gfx_surface_t* dst, const gfx_surface_t* src,
     for (int64_t y = y0; y < y1; ++y) {
         const size_t src_row = (size_t)((int64_t)src_rect->y + y) * src->stride;
         const size_t dst_row = (size_t)((int64_t)dst_y + y) * dst->stride;
+        if (!alpha) {
+            // Opaque rows are whole-frame compositor copies; move them in
+            // one go instead of a pixel at a time.
+            memcpy(dst->pixels + dst_row + (size_t)((int64_t)dst_x + x0),
+                   src->pixels + src_row + (size_t)((int64_t)src_rect->x + x0),
+                   (size_t)(x1 - x0) * sizeof(uint32_t));
+            continue;
+        }
         for (int64_t x = x0; x < x1; ++x) {
             const size_t src_index = src_row + (size_t)((int64_t)src_rect->x + x);
             const size_t dst_index = dst_row + (size_t)((int64_t)dst_x + x);

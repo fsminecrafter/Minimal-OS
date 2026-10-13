@@ -17,6 +17,7 @@
 #include "serial.h"
 #include "x86_64/safeints.h"
 #include "x86_64/spinlock.h"
+#include "x86_64/boot_options.h"
 
 #define SCHED_DEBUG 0   // 0 = off, 1 = important, 2 = verbose
 
@@ -562,7 +563,9 @@ void schedule() {
     if (tss && next->kernel_stack) {
         tss->rsp0 = (uint64_t)(uintptr_t)next->kernel_stack;
     }
-    if (next->privilege == PROC_PRIVILEGE_USER) {
+    // Fires on every user context switch (60+ times a second for mosWM),
+    // so it is only worth the serial I/O when booted with --debug.
+    if (kernel_boot_debug && next->privilege == PROC_PRIVILEGE_USER) {
         serial_write_str("SCHED: dispatch user pid=");
         serial_write_dec(next->pid);
         serial_write_str("\n");
@@ -726,6 +729,27 @@ void scheduler_tick() {
 
     uint32_t level = current_process->sched_level;
     if (level >= SCHED_NUM_LEVELS) level = SCHED_NUM_LEVELS - 1; // defensive
+
+    // A process queued at a better level than the one running gets the
+    // core now, not when the current quantum runs out. Without this a
+    // freshly woken sleeper (mosWM's 16 ms frame sleep, the USB and
+    // terminal pollers) sat behind whatever CPU-bound process held the
+    // core - in practice the boot thread spinning at the end of
+    // kernel_main(), which lives at the background level with a 10-tick
+    // quantum and so capped every sleeper at one run per 100 ms.
+    if (cpu_id < MAX_CPUS) {
+        percpu_runqueue_t* rq = &g_runqueues[cpu_id];
+        uint64_t rq_flags = spinlock_acquire(&rq->lock);
+        bool better_ready = false;
+        for (uint32_t i = 0; i < level && !better_ready; i++) {
+            better_ready = rq->count[i] != 0;
+        }
+        spinlock_release(&rq->lock, rq_flags);
+        if (better_ready) {
+            schedule();
+            return;
+        }
+    }
 
     if (current_process->sched_ticks_used >= sched_level_quantum_ticks[level]) {
         // Used its whole slice without blocking - looks CPU-bound, so

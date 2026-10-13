@@ -164,6 +164,7 @@ static uint32_t* frame_list = NULL;
 static uhci_qh_t* control_qh = NULL;
 static uhci_qh_t* bulk_qh = NULL;
 static uhci_qh_t* interrupt_qh = NULL;
+static uhci_qh_t* mouse_qh = NULL;
 
 // Device tracking
 static uint8_t next_address = 1;
@@ -1201,11 +1202,14 @@ void usb_init_keyboard_polling(usb_device_t* dev) {
     uhci_keyboard_interrupt_init(dev);
 }
 
-// Mouse TD shares the interrupt queue with the keyboard TD (if any):
-// interrupt_qh -> keyboard_td -> mouse_td -> keyboard_td (circular), so
-// both get polled by the controller every frame. If no keyboard is
-// present, the mouse TD self-loops and is the sole entry, same pattern
-// as the keyboard-only case.
+// The mouse TD gets its own queue head, linked into the schedule right
+// after the keyboard's:
+//   frame -> interrupt_qh (keyboard TD) -> mouse_qh (mouse TD) -> control_qh
+// A UHCI controller only advances a QH's element pointer when the TD it
+// points at completes, so chaining both TDs under one QH makes each
+// device wait for a report from the other (the mouse froze until a key
+// was pressed). With one self-looping TD per QH both are polled every
+// frame.
 void uhci_mouse_interrupt_init(usb_device_t* dev) {
     if (g_usb_hc.type == USB_HC_TYPE_OHCI) {
         ohci_mouse_interrupt_init(dev);
@@ -1213,6 +1217,17 @@ void uhci_mouse_interrupt_init(usb_device_t* dev) {
     }
 
     serial_write_str("UHCI: Setting up persistent mouse interrupt TD\n");
+
+    if (!mouse_qh) {
+        mouse_qh = uhci_alloc_qh();
+        if (!mouse_qh) {
+            serial_write_str("UHCI: CRITICAL - Failed to allocate mouse QH!\n");
+            return;
+        }
+        mouse_qh->head_ptr = interrupt_qh->head_ptr;
+        mouse_qh->element_ptr = 1;  // Terminate until the TD is ready
+        interrupt_qh->head_ptr = ((uint32_t)(uintptr_t)mouse_qh) | 0x2;
+    }
 
     mouse_int_td = uhci_alloc_td();
     if (!mouse_int_td) {
@@ -1252,13 +1267,8 @@ void uhci_mouse_interrupt_init(usb_device_t* dev) {
     mouse_int_td->buffer_ptr = (uint32_t)(uintptr_t)mouse_int_buffer;
     mouse_int_td->buffer_virt = mouse_int_buffer;
 
-    if (keyboard_int_td) {
-        mouse_int_td->link_ptr = ((uint32_t)(uintptr_t)keyboard_int_td) & ~0xF;
-        keyboard_int_td->link_ptr = td_phys;
-    } else {
-        mouse_int_td->link_ptr = td_phys;   // self-loop, sole entry
-        interrupt_qh->element_ptr = td_phys;
-    }
+    mouse_int_td->link_ptr = td_phys;   // loop to itself
+    mouse_qh->element_ptr = td_phys;
 
     mouse_toggle = 0;
 

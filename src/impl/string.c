@@ -89,35 +89,31 @@ char* strstr(const char* haystack, const char* needle) {
     return NULL;
 }
 
+// memset/memcpy run on whole framebuffers every frame, so they fill and
+// copy eight bytes at a time and leave only the tail to the byte loop.
 void* memset(void* s, int c, size_t n) {
-    unsigned char* p = (unsigned char*)s;
-    unsigned char byte = (unsigned char)c;
-    
-    if (byte == 0 && n >= 8 && ((uintptr_t)p & 7) == 0) {
-        uint64_t* p64 = (uint64_t*)p;
-        size_t qwords = n / 8;
-        
-        for (size_t i = 0; i < qwords; i++) {
-            p64[i] = 0;
-        }
-        
-        p = (unsigned char*)(p64 + qwords);
-        n = n & 7;
-    }
-    
-    for (size_t i = 0; i < n; i++) {
-        p[i] = byte;
-    }
-    
+    void* p = s;
+    uint64_t pattern = 0x0101010101010101ULL * (unsigned char)c;
+    size_t qwords = n / 8;
+    size_t tail = n & 7;
+
+    __asm__ volatile("rep stosq"
+                     : "+D"(p), "+c"(qwords) : "a"(pattern) : "memory");
+    __asm__ volatile("rep stosb"
+                     : "+D"(p), "+c"(tail) : "a"(pattern) : "memory");
     return s;
 }
 
 void* memcpy(void* dest, const void* src, size_t n) {
-    unsigned char* d = dest;
-    const unsigned char* s = src;
-    while (n--) {
-        *d++ = *s++;
-    }
+    void* d = dest;
+    const void* s = src;
+    size_t qwords = n / 8;
+    size_t tail = n & 7;
+
+    __asm__ volatile("rep movsq"
+                     : "+D"(d), "+S"(s), "+c"(qwords) : : "memory");
+    __asm__ volatile("rep movsb"
+                     : "+D"(d), "+S"(s), "+c"(tail) : : "memory");
     return dest;
 }
 

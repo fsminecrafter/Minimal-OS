@@ -400,6 +400,9 @@ void service_manager_init(void) {
         char path[MINIMAFS_MAX_PATH];
         snprintf(path, sizeof(path), "%s/%s", SERVICES_DIR, entries[i].name);
 
+        serial_write_str("[SERVICES] Parsing ");
+        serial_write_str(entries[i].name);
+        serial_write_str("\n");
         service_entry_t* svc = &g_services[g_service_count];
         if (!service_parse_file(path, svc)) {
             serial_write_str("[SERVICES] Failed to parse ");
@@ -407,6 +410,9 @@ void service_manager_init(void) {
             serial_write_str("\n");
             continue;
         }
+        serial_write_str("[SERVICES] Parsed ");
+        serial_write_str(entries[i].name);
+        serial_write_str("\n");
 
         strncpy(svc->filename, entries[i].name, sizeof(svc->filename) - 1);
         svc->filename[sizeof(svc->filename) - 1] = '\0';

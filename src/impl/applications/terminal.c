@@ -522,14 +522,21 @@ void terminal_program_entry(void) {
             if (success == 1) {
                 vgaterm_print_success("Disk mounted\n");
                 systeminfo_load_saved_resolution();
+
+                // Check inside the success branch, because the disk must be mounted first.
+                bool desktop = minimafs_exists("0:/services/mosWM.service") &&
+                               minimafs_exists("0:/programs/mosWM/mosWM.run");
+
+                if (desktop) graphics_terminal_clear();   // wipe boot text + stale pixels before mosWM claims the screen
+
                 serial_write_str("Terminal: Starting service discovery...\n");
                 service_manager_init();
                 serial_write_str("Terminal: Service discovery complete\n");
 
-                if (minimafs_exists("0:/services/mosWM.service") ||
-                    minimafs_exists("0:/programs/mosWM/mosWM.run")) {
-                    serial_write_str("Terminal: mosWM desktop service detected; exiting text terminal to let the desktop own the screen.\n");
-                    graphics_write_textr("MOSdesk detected; exiting terminal UI.\n");
+                if (desktop) {
+                    serial_write_str("Terminal: mosWM detected; skipping terminal UI.\n");
+                    createProcess("terminal_update", terminal_update);
+                    createProcess("usb_keyboard_update", usb_keyboard_update_task);
                     schedulerInit();
                     return;
                 }

@@ -64,10 +64,12 @@ typedef struct {
 static percpu_runqueue_t g_runqueues[MAX_CPUS];
 static process_t* g_deferred_reap[MAX_CPUS];
 
+// In scheduler ticks, which are 1 ms each (see pit_init(1000) in
+// startuproutine.c; the APs' LAPIC timers are calibrated to the same rate).
 const uint32_t sched_level_quantum_ticks[SCHED_NUM_LEVELS] = {
-    2,   // interactive: short quantum, dispatched first
-    5,   // normal
-    10,  // background: long quantum, only runs once higher levels are empty
+    20,   // interactive: short quantum, dispatched first
+    50,   // normal
+    100,  // background: long quantum, only runs once higher levels are empty
 };
 
 // How often (in scheduler ticks) to run the anti-starvation boost and
@@ -75,8 +77,8 @@ const uint32_t sched_level_quantum_ticks[SCHED_NUM_LEVELS] = {
 // g_global_tick_count below) so these fire exactly once per interval
 // total, not once per interval PER CORE - every online core's LAPIC
 // timer calls scheduler_tick() independently.
-#define SCHED_BOOST_INTERVAL_TICKS      2000
-#define SCHED_REBALANCE_INTERVAL_TICKS  20
+#define SCHED_BOOST_INTERVAL_TICKS      20000
+#define SCHED_REBALANCE_INTERVAL_TICKS  200
 
 static void rq_push(percpu_runqueue_t* rq, process_t* proc, uint32_t level) {
     proc->rq_next = NULL;
@@ -703,7 +705,7 @@ void scheduler_tick() {
         }
         cpu->usage_window_ticks++;
         if (busy) cpu->usage_window_busy_ticks++;
-        if (cpu->usage_window_ticks >= 100) {
+        if (cpu->usage_window_ticks >= 1000) {
             uint32_t percent = (cpu->usage_window_busy_ticks * 100) /
                                cpu->usage_window_ticks;
             __atomic_store_n(&cpu->usage_last_percent, percent,

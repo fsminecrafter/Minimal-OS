@@ -1185,8 +1185,9 @@ void usb_poll_keyboard(usb_device_t* dev) {
         usb_keyboard_process_report(report);
     }
     
-    // Print detailed stats less frequently
-    if ((g_interrupt_polls % 1000) == 0 && g_interrupt_polls > 0) {
+    // Print detailed stats less frequently (polled once per 1 ms timer
+    // tick, so this is every 10 seconds)
+    if ((g_interrupt_polls % 10000) == 0 && g_interrupt_polls > 0) {
         serial_write_str("USB: Stats - polls=");
         serial_write_dec(g_interrupt_polls);
         serial_write_str(" success=");

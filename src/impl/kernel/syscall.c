@@ -183,32 +183,19 @@ static uint64_t sys_graphics_impl(const syscall_graphics_request_t* request) {
                 return SYS_ERR_INVAL;
             }
 
-            const size_t row_bytes = (size_t)blit->sw * sizeof(uint32_t);
-            const size_t staging_bytes = row_bytes * (size_t)blit->sh;
-            // Every byte is overwritten by the row copy below.
-            uint32_t* staging = alloc_unzeroed(staging_bytes);
-            if (!staging) {
-                serial_write_str("SYS_GRAPHICS_BLIT: staging allocation failed\n");
-                return SYS_ERR_GENERIC;
-            }
-            const uint32_t* source_pixels = blit->src +
-                (size_t)blit->sy * (blit->src_pitch / sizeof(uint32_t)) +
-                (size_t)blit->sx;
-            for (int32_t row = 0; row < blit->sh; row++) {
-                memcpy((uint8_t*)staging + (size_t)row * row_bytes,
-                       source_pixels + (size_t)row * (blit->src_pitch / sizeof(uint32_t)),
-                       row_bytes);
-            }
+            // The source range was validated above and stays mapped for the
+            // length of this syscall, so blit straight out of it. This used
+            // to go through a kernel staging buffer first: one more
+            // full-size copy per frame, plus free_mem() zeroing it after.
             gfx_surface_t source = {
-                staging, staging_bytes, (uint32_t)blit->sw,
-                (uint32_t)blit->sh, (uint32_t)blit->sw
+                (uint32_t*)blit->src, (size_t)source_bytes, blit->src_w,
+                blit->src_h, blit->src_pitch / (uint32_t)sizeof(uint32_t)
             };
             gfx_rect_t source_rect = {
-                0, 0, blit->sw, blit->sh
+                blit->sx, blit->sy, blit->sw, blit->sh
             };
             bool ok = graphics_backbuffer_blit(&source, &source_rect,
                 blit->dx, blit->dy, blit->flags == SYS_GRAPHICS_BLIT_ALPHA);
-            free_mem(staging);
             if (!ok) {
                 serial_write_str("SYS_GRAPHICS_BLIT: backbuffer blit failed\n");
                 return SYS_ERR_GENERIC;

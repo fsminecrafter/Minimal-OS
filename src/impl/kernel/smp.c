@@ -115,7 +115,7 @@ void smp_assert_master_core(const char* subsystem) {
 
 static void busy_wait_us_approx(uint32_t us) {
     // No microsecond timer wired up yet (PIT tick is ~1ms via
-    // pit_init(100) in startroutine.c). This is a calibration-free
+    // pit_init(1000) in startroutine.c). This is a calibration-free
     // spin, not a real microsecond delay - fine here since the MP
     // spec's ~200us gap between SIPIs is a conservative legacy figure;
     // being longer than needed is harmless, only being too short

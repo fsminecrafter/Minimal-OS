@@ -58,7 +58,10 @@ void startroutine(uint64_t total_ram_bytes) {
     print_str("Time subsystem init\n");
     time_init();
     print_str("init pit: ");
-    pit_init(100);
+    // 1 kHz: one tick per millisecond, which is also the resolution of
+    // sleep() and of time_get_uptime_ms(). At 100 Hz a 16 ms sleep could
+    // only end on a 10 ms boundary, capping 60 Hz programs at 50 fps.
+    pit_init(1000);
     print_str("Setting up kernel ints\n");
     setup_kernel_interrupts();
     print_str("Setting IDT handler\n");

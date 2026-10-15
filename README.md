@@ -244,13 +244,19 @@ desktop files and mosWM startup service are installed when `format` is run in
 Minimal-OS; formatting erases the selected disk, so back up an existing disk
 before formatting it.
 
+### MOSdesk (Minimal-OS Desktop Enviroment)
+Now you can find Minimal-OS's's's's's's completly own desktop enviroment (mosWM not included... Im joking)
+
+at [MOSdesk](https://github.com/fsminecrafter/MOSdesk)
+
+Have fun!
+
 ## Development For Minimal-OS Via .run Executables
 Now you can create .run files for Minimal-OS viaaa... (Drumroll)
 
 [Minimal-OS SDK](https://github.com/fsminecrafter/Minimal-OS-SDK)
 
 More info is found on ```Minimal-OS SDK```s Github Page.
-
 
 # Development Stuff
 

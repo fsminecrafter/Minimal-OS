@@ -1,267 +1,233 @@
-# Minimal-OS
-Is a OS made in C and Assembly made for x86_64 processors, It currently runs with 1024MB (I havent tested lower yet)
+# Minimal-OS SDK (v1.1)
 
-find roadmap in roadmap.txt or below (might be old or un-synced!)
+Minimal-OS SDK is a Software Development Kit for Minimal-OS, Linked here: [Minimal-OS](https://github.com/fsminecrafter/Minimal-OS).
 
-User application developers can find the syscall and SDK integration guide in
-[docs/user-sdk-syscalls.md](docs/user-sdk-syscalls.md).
-Install packages and service definitions are documented in
-[docs/install-and-services.md](docs/install-and-services.md).
-The full kernel, boot, storage, networking, process, and build architecture is
-summarized in [docs/system-overview.md](docs/system-overview.md).
+Every function in the SDK headers is documented in [`docs/`](docs/README.md):
+its signature, parameters, return values, errors and an example, grouped by
+header. The same reference is on the website under Docs → SDK functions, and
+in Run Studio's docs panel.
 
-<details>
 
-<summary>Commands in Terminal</summary>
+Install the native compiler and linker tools on Debian or Ubuntu:
 
-### Commands in MinimalOS terminal
+    ./install-toolchain.sh
 
-#### General
-* ```help``` [-c | --classic] Shows grouped, paged command help. Press Enter for the next category or `q` to exit. Use -c or --classic to use the old list.
-* ```echo``` [Text] Echoes text back to the terminal.
-* ```clear``` Clears the terminal.
-* ```sleep``` [Seconds | milliseconds"ms"] Pauses for seconds or milliseconds.
-* ```systime``` Shows the current system time.
+Build a C or C++ program and package it as a `.run`:
 
-#### System information
-* ```info``` Shows system, CPU, PCI, and memory information.
-* ```cpu``` Shows CPU information.
-* ```gpu``` Shows GPU information.
-* ```memsize``` Returns the size of available memory in MB.
-* ```usage``` Shows memory and process usage.
-* ```chgres``` [Width] [Height] Changes the display resolution.
+    ./build.sh examples/hello.c
 
--------------------------------------------------------
-#### Audio related commands
-* ```play``` [File path] Plays `.adi` files from the disk.
-* ```stop``` Stops music or audio playback.
-* ```pause``` Toggles pause and resume of music or audio playback.
-* ```volume``` [0 - 100] Sets the system volume.
--------------------------------------------------------
-#### Files and directories
-* ```list```, ```ls``` [Path] [--recursive] Lists the current or entered path.
-* ```listroot```, ```lsroot``` Shows the root of the disk, including metadata.
-* ```cd``` [Path] Changes the current directory.
-* ```mdr``` [Path] [--hidden] Creates a folder at the entered path.
-* ```insert``` [File Path] [Text] Creates or replaces a file with [Text].
-* ```read```, ```rd``` [Path] [--metadata] Reads a file.
-* ```remove```, ```rm``` [Path] [-r | --recursive] Removes a file or folder.
-* ```meta``` [Option] [File] Views or edits file metadata.
+This creates `hello.run` as a single file containing the program bundle. For
+C++, use the same command with a `.cpp` file:
 
-#### Storage and packages
-* ```initdisk``` [Index] Searches for and initializes an available disk.
-* ```format``` [Index] Formats the selected disk as MinimaFS.
-* ```mount``` [Index] Mounts the selected disk.
-* ```importmusic``` Copies the built-in music file to the disk as `music.adi`.
-* ```pkg``` Extracts or creates a package archive.
-  * ```unzip``` [Archive] [Target] Extracts to a folder named after the archive by default.
-  * ```zip``` [File or folder] [lzss | store] Creates a package archive.
-* ```pkginfo``` [Archive] Displays package information.
-  * ```installpkg``` [Archive] [Target] Alias for `pkg unzip`.
+    ./build.sh examples/hello.cpp
 
-During `make build-x86_64`, the SDK builds `minimaSSL.slib`, copies it into
-`src/resources/install1`, and packages that directory as an embedded
-`install1.mpkg`. Running `format` extracts the package into `0:/etc`, so the
-library is installed as `0:/etc/minimaSSL.slib`. The kernel TLS client is
-linked with the same freestanding minimaSSL crypto sources; the current OS has
-no dynamic `.slib` loader, so the filesystem copy is not executable code by
-itself.
+You can also pass a project folder. It uses `main.cpp` or `main.c` as the
+program entry source, or select another source explicitly:
 
-#### Keyboard and programs
-* ```kbrlayout``` [set | get | list] Manages keyboard layouts.
-* ```run``` [File] Runs a `.run` executable.
-* ```services``` Lists registered services.
+    ./build.sh programs
+    ./build.sh programs --main programs/main.cpp
 
-#### Adding a service
+`-h`/`--help` prints usage. `--output <path>` selects the generated `.run` or
+`-h`/`--help` prints usage. `--output <path>` selects the generated `.run` or
+`.slib` path.
 
-Put a file ending in `.service` in `src/resources/install3`. It is packaged
-automatically and installed to `0:/services` when `format` runs. Services are
-registered automatically after the boot disk is mounted; no C registration
-call is needed.
+### Install the MSDK command
 
-Example `src/resources/install3/example.service`:
+From this directory, run:
 
-```ini
-[GENERAL]
-name="Example Service"
-desc="Starts an example program"
-exit=Restart
+    ./install.sh
 
-[STARTUP]
-exec="0:/programs/example.run"
-```
+The installer links both `MSDK` and `msdk` into `~/.local/bin` and adds that
+directory to `~/.bashrc` once. Apply the PATH update in the current terminal
+with `source ~/.bashrc`, or open a new terminal.
 
-Use exactly one `[STARTUP]` entry. `exec` can load a `.run` bundle directly or
-run a terminal command such as `exec="echo service started"`.
-`script="run 0:/programs/example.run"` starts through the command system.
-Command-style entries run once without PID tracking. The `services` command
-lists successfully parsed and registered services.
+Both command spellings accept the SDK build options:
 
-#### Diagnostics
-* ```testwrite``` Runs the MinimaFS write test.
-* ```verifyfile``` Verifies a file on disk.
-* ```diskusage``` Shows disk usage.
-* ```trace_on``` Enables execution tracing.
-* ```trace_off``` Disables execution tracing.
-* ```trace_stack``` Shows the execution trace stack.
+    MSDK --help
+    MSDK projectfolder --main entry.cpp
+    msdk main.cpp
 
--------------------------------------------------------
+The same launcher works when invoked directly as `./msdk` from the SDK folder.
 
-#### Keyboard related commands
-* ```kbrlayout``` Handles kbr layout stuff.
-  * ```set``` [inbuiltlayout | kbr file path] sets the current and default keyboard layout.
-  * ```get``` Outputs the currently used keyboard layout.
-  * ```list``` lists all available keyboard layouts.
+The Minimal-OS `dlr`/`deliver` program is placed directly into the OS image's
+program package when built from this checkout:
 
--------------------------------------------------------
+    ./build.sh programs/dlr
 
-#### Path formatting
+This writes `../src/resources/install2/dlr.run`, which is installed as
+`0:/programs/dlr.run` by the normal image build. Its HTTPS transport uses the
+same kernel-linked minimaSSL implementation as `wget`; the matching library
+bundle is installed at `0:/etc/minimaSSL.slib`.
 
-0:/Dir/example.txt
+Build a shared library with `--slib`:
 
-0: is the disk
+    ./build.sh --slib libraries/math
 
-0:/ is the root of that disk or the top directory.
+Example library:
 
-0:/Dir is a folder inside disk 0
+    ./build.sh --slib examples/example-slib
 
-0:/Dir/example.txt is a file with .txt suffix which is called "example"
+The `.slib` bundle contains the linked ELF, an export manifest of global
+symbols, and public `.h`/`.hpp` files. When a library has an `include/`
+directory, those headers are stored relative to it under the bundle's
+`include/` path; otherwise headers are stored relative to the library folder.
+Headers are kept as public interface metadata for the runtime loader; `static`
+symbols are not exported. The bundle format is `MINISLIB1`; kernel-side loading and
+per-process shared/private mapping are provided by the operating system, not
+by this packaging script.
 
-</details>
+The build script compiles `crt0.c`, compiles the selected source, links
+`main.elf` with `link.ld`, and packages it with `mkrun.sh`. It uses `gcc`,
+`g++`, and `ld` by default. Set `CC`, `CXX`, or `LD` to use a cross-toolchain, for
+example `CC=x86_64-elf-gcc CXX=x86_64-elf-g++ LD=x86_64-elf-ld`.
 
-## ROADMAP
+The equivalent manual steps are:
 
-Last synced 2026 - Sep 15 - 09:24
+    x86_64-elf-gcc -std=gnu11 -ffreestanding -fno-builtin -fno-stack-protector \
+        -fno-asynchronous-unwind-tables -fno-unwind-tables -fPIE \
+        -Iinclude -c crt0.c -o crt0.o
 
-#### X = Done
-#### C = Come back later
-#### N = New plans
+    x86_64-elf-gcc -std=gnu11 -ffreestanding -fno-builtin -fno-stack-protector \
+        -fno-asynchronous-unwind-tables -fno-unwind-tables -fPIE \
+        -Iinclude -c examples/hello.c -o hello.o
 
-<details>
+    x86_64-elf-ld -pie --no-dynamic-linker -T link.ld -e _start \
+        -o main.elf crt0.o hello.o
 
-<summary>Finished</summary>
+    ./mkrun.sh main.elf hello.run
 
-#### V 0.4.00
+Import the `hello.run` file itself into MinimaFS. Then inside Minimal-OS run:
 
-- [x] Panic screen 
-- [x] simple audio [C]
-- [x] allocator 
-- [x] startupRoutine 
-- [x] Processes and ProcessManager 
-- [x] GRAPHICS!!! 🥳🥳🥳
+    run 0:/programs/hello.run
 
-#### V 0.4.05
+The `.run` file uses the `MINIRUN1` format. Its manifest contains `main.elf`
+and every file below a `Resources` directory when those files exist. The
+manifest and payload are stored in the same regular file, so copying or
+importing the bundle does not require creating a directory tree.
 
-- [x] Better allocator 
-- [x] Time Scheduler 
-- [x] Improved scheduler and proc 
-- [x] Graphics handler (display.h) 
-- [x] Time handler (time.h) 
+For the C++ example, compile with the same freestanding flags plus the C++
+runtime restrictions:
 
-- [x] Displaying and reading images !limited support!
-- [x] Fonts !also a little limited for now!
+    x86_64-elf-g++ -std=gnu++11 -ffreestanding -fno-builtin -fno-stack-protector \
+        -fno-asynchronous-unwind-tables -fno-unwind-tables -fno-exceptions \
+        -fno-rtti -fno-threadsafe-statics -fPIE -Iinclude \
+        -c examples/hello.cpp -o hello.o
 
-- [x] USB 1.1 
-- [x] Keyboard
-- [x] Simple Audio ! 
-- [x] File system !!! (MinimaFS)
+The C and C++ examples can use `printf` from `include/stdio.h` and
+`std::cout` from `include/iostream`. They are header-only and write through
+`mos_write`; no libc or C++ standard library is linked. The supported printf
+formats are `%s`, `%c`, `%d`, `%i`, `%u`, `%x`, `%X`, `%ld`, `%lu`, and `%%`.
 
-</details>
+## Requirements on the ELF
+- x86_64, ELF64, PIE (`ET_DYN`), linked at base address 0 (link.ld does this).
+- No external symbols - everything the program needs must be compiled
+  into it. There's no dynamic linker; only `R_X86_64_RELATIVE`
+  relocations are processed at load time.
 
-#### V 0.4.4X
+## C++
+`-fno-exceptions -fno-rtti -fno-threadsafe-statics`. Global objects with
+non-trivial constructors now work: `crt0.c` walks `.init_array` before
+calling `main()`, using the same ctor-section-walk pattern
+`commandhandler.c` uses for `REGISTER_COMMAND`. Destructors
+(`.fini_array`) are still not run - a program ends via `mos_exit()`,
+which does not return.
 
-- [X] Multithreading And Multicore usage 
-- [X] Services manager 
-- [X] Syscalls and User layer
-- [X] .run executable file
+## Syscalls available
+- `mos_write(fd, buf, len)` - fd 1/2 only, goes to the terminal + serial.
+- `mos_exit(code)`
+- `mos_register_cleanup(callback)`
+- `mos_getpid()`
+- `mos_uptime()` and `mos_sleep(ticks)`
+- `mos_open(path, flags)`, `mos_read(fd, buf, len)`, `mos_close(fd)`
+- `mos_exists(path)`, `mos_is_dir(path)`, and `mos_mkdir(path)`
+- `mos_gettime()`, `mos_seek(fd, offset)`, and `mos_size(fd)`
 
-#### V 0.4.5X
+When the terminal receives Ctrl+C once for a running user program, its
+registered cleanup callback is requested. The callback should save any needed
+state and call `mos_exit()`. If it does not exit within one second, the kernel
+force-terminates the program. A second Ctrl+C within 800 ms force-terminates
+it immediately. Programs without a callback are terminated immediately.
 
-- [ ] Simple Desktop 
-- [ ] Window Manager 
-- [ ] MinimaFS file browser (within minimal-os) 
-- [ ] Text editor 
+Process kill and force-termination controls remain kernel/terminal operations;
+the SDK does not expose a syscall for killing arbitrary processes.
 
-## Usage
+The current x86_64 user syscall API is also available through the subsystem
+headers under `include/x86_64/`:
 
-To run Minimal-OS (direct iso) download from github releases ( [Minimal-OS Downloads](https://github.com/fsminecrafter/Minimal-OS/releases) )
-Then after downloading the .iso file of any version use qemu-system-x86_64 which can be downloaded using the systems package manager or Mingw on windows.
-And before running the operating system create a disk file for it to use in the same directory as you are running from by using this command ```fallocate -l 256M sata256.img```
-Then run this command for the suitable configuration for current Minimal-OS support.
-```
-qemu-system-x86_64 -cdrom kernel.iso -m 1024M -boot d -d guest_errors,int,cpu_reset,unimp -serial -usb -device usb-kbd stdio \
--audiodev pa,id=speaker -machine pcspk-audiodev=speaker  -audiodev pa,id=audio0 -device AC97,audiodev=audio0 -device ahci,id=ahci \
--drive id=disk0,file=sata256.img,if=none,format=raw -device ide-hd,drive=disk0,bus=ahci.0
-```
+- `x86_64/user_syscalls.h` - uint64_t syscall wrappers, graphics dispatch,
+    manager dispatch, and USB dispatch.
+- `x86_64/user_graphics.h` - primitive drawing, text, and resolution wrappers.
+- `x86_64/user_managers.h` - GPU, audio, storage, and USB manager operations.
+- `x86_64/user_usb.h` - USB initialization, polling, keyboard translation, and
+    copied keyboard metadata.
 
-### Building from Source
+For a shorter graphics API, include `graphics.h` and use the corresponding
+`graphics_*` names. It is usable from both C and C++ without libc or the C++
+standard library:
 
- 1. Download the source code, ```git clone https://github.com/fsminecrafter/Minimal-OS.git```
- 2. Enter the folder and run the dependency install command (this one is for debian 13, Ubuntu 24.04/26.04 or at least tested on them)
-```
-sudo apt update
-sudo apt install -y \
-  build-essential \
-  bison \
-  flex \
-  libgmp3-dev \
-  libmpc-dev \
-  libmpfr-dev \
-  texinfo \
-  libisl-dev \
-  wget \
-  curl \
-  make \
-  nasm \
-  xorriso \
-  grub-pc-bin \
-  grub-common \
-  mtools \
-  qemu-system
-```
-3. Run the included gcc / binutils installer
-```
-./build_gccbinutils.sh
-```
-4. Create a sata256.img file in root of Minimal-OS project folder.
-```
-fallocate -l 256M sata256.img
-```
-5. Compile and run using make
-```make run -j$(nproc)```
-If audio doesnt work use either
-```make run-sdl``` or ```make run-alsa```
+        #include "graphics.h"
 
-To fetch and build MOSDesk and mosWM, include them in the install packages, and
-boot the desktop-enabled image, run:
+        void main(void) {
+                graphics_clear(0, 0, 0);
+                graphics_fill_rectangle(10, 10, 100, 60, 40, 160, 240);
+                graphics_text("hello", 20, 20, 255, 255, 255);
+                mos_exit();
+        }
 
-```sh
-make run-mosdesk
-```
+The new raw syscall numbers are `SYS_GRAPHICS` (15), `SYS_MANAGER` (16), and
+`SYS_USB` (17). The request structures and operation constants are available
+from `x86_64/syscall.h`.
 
-This uses the same cross-compiler and `sata256.img` prerequisites above. The
-desktop files and mosWM startup service are installed when `format` is run in
-Minimal-OS; formatting erases the selected disk, so back up an existing disk
-before formatting it.
+The syscall constants, error values, and kernel-side register frame are also
+available from `include/syscall.h`. `SYS_O_RDONLY` is the only open flag
+currently defined.
 
-### MOSdesk (Minimal-OS Desktop Enviroment)
-Now you can find Minimal-OS's's's's's's completly own desktop enviroment (mosWM not included... Im joking)
+## Networking, heap, and randomness (SDK v1.1)
 
-at [MOSdesk](https://github.com/fsminecrafter/MOSdesk)
+Three syscalls were added so userland can do more than draw and read
+files. Include `net.h` for networking, `stdlib.h` for memory, and
+`string.h` for the usual string/memory helpers.
 
-Have fun!
+- `SYS_NET` (30) - `net.h`. TCP connect/send/recv/close, UDP
+  bind/recv/send (broadcast included), DNS resolution, interface
+  status, and an explicit poll. Addresses are host-order `uint32_t`
+  throughout; `mos_ip_parse()` and `mos_ip_to_string()` convert.
+  Connections are integer handles, not kernel pointers.
+- `SYS_HEAP` (31) - `stdlib.h`. `malloc`, `calloc`, `realloc`, `free`.
+  Backed by the kernel allocator, since every process still shares the
+  kernel PML4. Before this there was no heap at all.
+- `SYS_RANDOM` (32) - `stdlib.h`. `mos_random_bytes()`. RDRAND where the
+  CPU has it, TSC/RTC-derived otherwise.
 
-## Development For Minimal-OS Via .run Executables
-Now you can create .run files for Minimal-OS viaaa... (Drumroll)
+The interface must already have an address: run `dhcp` in the terminal
+first. A `.run` program calling `mos_net_dhcp()` gets `SYS_ERR_PERM` on
+purpose - acquiring a lease rewrites the address for every process on
+the machine, so it stays an operator action.
 
-[Minimal-OS SDK](https://github.com/fsminecrafter/Minimal-OS-SDK)
+`SYS_ERR_BUSY` is new and is not a failure. The network stack builds its
+frames in file-static buffers, so only one caller can be inside it at a
+time; a caller that gets `BUSY` should retry rather than give up.
 
-More info is found on ```Minimal-OS SDK```s Github Page.
+`examples/nettest.c` exercises all of it:
 
-# Development Stuff
+    ./build.sh examples/nettest.c
+    # then, inside Minimal-OS:
+    dhcp
+    run 0:/programs/nettest.run                 # DNS + HTTP HEAD
+    run 0:/programs/nettest.run --discover      # UDP broadcast discovery
 
-Format / Install Placement
+Note for QEMU: under `-netdev user` the guest is NATed and LAN
+broadcasts never reach it, so `--discover` will find nothing however
+correct your code is. Use a tap or bridge netdev to test discovery.
 
-* install1 -> 0:/etc
-* install2 -> 0:/programs
-* install3 -> 0:/services
+`crt0.c` now also defines out-of-line `memcpy`/`memmove`/`memset`/
+`memcmp` (GCC emits calls to these on its own, even under
+`-fno-builtin`) and walks `.init_array`, so C++ globals with non-trivial
+constructors work - the restriction the C++ section above describes no
+longer applies. Destructors still do not run.
+
+## If you didnt know
+
+This SDK is designed for fsminecrafter/Minimal-OS.
+
+(:

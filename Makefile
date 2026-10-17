@@ -15,6 +15,9 @@ HOST_CFLAGS ?= -std=c11 -Wall -Wextra -Werror -I src/intf
 MOSDESK_REPO ?= https://github.com/fsminecrafter/MOSdesk.git
 # The MOSdesk submodule; override to build some other checkout.
 MOSDESK_DIR ?= MOSdesk
+# Package builder: compresses on every core and skips unchanged packages.
+MKPKG_JOBS ?= $(shell nproc 2>/dev/null || echo 1)
+MKPKG := python3 tools/mkpkg/mkpkg.py -j$(MKPKG_JOBS)
 
 .DEFAULT_GOAL := build-x86_64
 
@@ -47,7 +50,7 @@ install2_base_source := src/resources/install2
 install2_source := $(install2_base_source)
 install2_mpkg := build/resources/install2.mpkg
 install2_object := build/resources/install2_mpkg.o
-dlr_source_files := $(shell find Minimal-OS-SDK/programs/dlr -type f \( -name '*.c' -o -name '*.h' \))
+dlr_source_files := $(shell find Minimal-OS-SDK/programs/dlr -type f \( -name '*.c' -o -name '*.h' \) 2>/dev/null)
 dlr_run := $(install2_source)/dlr.run
 dlrconnect_run := $(install2_source)/dlrconnect.run
 install3_base_source := src/resources/install3
@@ -148,7 +151,7 @@ $(install1_source)/minimaSSL.slib: minimaSSL-slib
 
 $(install1_mpkg): $(install1_source)/minimaSSL.slib tools/mkpkg/mkpkg.py
 	mkdir -p $(dir $@)
-	python3 tools/mkpkg/mkpkg.py $(install1_source) $@ --store
+	$(MKPKG) $(install1_source) $@ --store
 
 $(install1_object): $(install1_mpkg)
 	mkdir -p $(dir $@)
@@ -157,9 +160,9 @@ $(install1_object): $(install1_mpkg)
 		--redefine-sym _binary_build_resources_install1_mpkg_end=_binary_install1_mpkg_end \
 		$< $@
 
-$(install2_mpkg): $(mosdesk_install_dep) $(install2_tree_deps) $(dlr_run) $(dlrconnect_run) tools/mkpkg/mkpkg.py $(install3_mpkg): $(mosdesk_install_dep) $(install3_tree_deps) tools/mkpkg/mkpkg.py
+$(install2_mpkg): $(mosdesk_install_dep) $(install2_tree_deps) $(dlr_run) $(dlrconnect_run) tools/mkpkg/mkpkg.py
 	mkdir -p $(dir $@)
-	python3 tools/mkpkg/mkpkg.py $(install2_source) $@ --store
+	$(MKPKG) $(install2_source) $@ --store
 
 $(dlr_run): $(dlr_source_files) Minimal-OS-SDK/build.sh Minimal-OS-SDK/crt0.c Minimal-OS-SDK/link.ld
 	CC=$(CC) LD=$(LD) Minimal-OS-SDK/build.sh Minimal-OS-SDK/programs/dlr
@@ -174,9 +177,9 @@ $(install2_object): $(install2_mpkg)
 		--redefine-sym _binary_build_resources_install2_mpkg_end=_binary_install2_mpkg_end \
 		$< $@
 
-$(install3_mpkg): $(mosdesk_install_dep) $(install3_source) $(install3_files) tools/mkpkg/mkpkg.py
+$(install3_mpkg): $(mosdesk_install_dep) $(install3_tree_deps) tools/mkpkg/mkpkg.py
 	mkdir -p $(dir $@)
-	python3 tools/mkpkg/mkpkg.py $(install3_source) $@ --store
+	$(MKPKG) $(install3_source) $@ --store
 
 $(install3_object): $(install3_mpkg)
 	mkdir -p $(dir $@)
@@ -226,16 +229,17 @@ mosdesk-build:
 			git -C "$(MOSDESK_DIR)/$$sub" checkout --detach FETCH_HEAD || exit 1; \
 		fi; \
 	done
-	CC=$(CC) LD=$(LD) $(MOSDESK_DIR)/mosdesk/build.sh
+	CC=$(CC) LD=$(LD) MKPKG_TOOL=$(CURDIR)/tools/mkpkg/mkpkg.py MKPKG_JOBS=$(MKPKG_JOBS) \
+		$(MOSDESK_DIR)/mosdesk/build.sh
 
 mosdesk-stage: mosdesk-build $(dlr_run) $(dlrconnect_run)
 	rm -rf build/resources/mosdesk-install
-	mkdir -p build/resources/mosdesk-install/install2/mosdesk \
-		build/resources/mosdesk-install/install2/mosWM \
+	mkdir -p build/resources/mosdesk-install/install2/mosWM \
 		build/resources/mosdesk-install/install3
 	cp -a $(install2_base_source)/. build/resources/mosdesk-install/install2/
 	cp -a $(install3_base_source)/. build/resources/mosdesk-install/install3/
-	cp -a $(MOSDESK_DIR)/mosdesk/dist/mosdesk/. build/resources/mosdesk-install/install2/mosdesk/
+	# The MOSdesk package is rooted at 0:/; install2 is unpacked into 0:/programs.
+	cp -a $(MOSDESK_DIR)/mosdesk/dist/mosdesk/programs/. build/resources/mosdesk-install/install2/
 	cp -a $(MOSDESK_DIR)/mosWM/dist/mosWM/programs/mosWM/. build/resources/mosdesk-install/install2/mosWM/
 	cp $(MOSDESK_DIR)/mosWM/dist/mosWM/services/mosWM.service build/resources/mosdesk-install/install3/mosWM.service
 

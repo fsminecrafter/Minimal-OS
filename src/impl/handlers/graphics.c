@@ -554,7 +554,11 @@ void graphics_terminal_set_color(color_t fg, color_t bg) {
     g_terminal.bg_color = bg;
 }
 
+// Set by root.c: takes the text a captured command prints (see SYS_ROOT).
+bool (*graphics_text_capture)(char c) = NULL;
+
 void graphics_write_textr_char(char c) {
+    if (graphics_text_capture && graphics_text_capture(c)) return;
     if (graphics_has_screen_owner()) return;
     invalidate_cursor();
 

@@ -584,6 +584,72 @@ typedef struct __attribute__((packed)) {
 #define SYS_SYSINFO 26
 
 // ===========================================
+// INTERNET TIME (SYS_TIMESYNC)
+// ===========================================
+//
+// rdi = syscall_timesync_t*. The kernel polls an HTTP(S) address that
+// answers with the current Unix time in MILLISECONDS (for example
+// https://timeapi.io/api/v1/time/current/unix_ms) and sets the system
+// clock, in UTC, from it. CONFIGURE replaces the settings (enabled, url,
+// interval_s 5-60); STATUS fills in the result fields.
+#define SYS_TIMESYNC 38
+
+#define SYS_TIMESYNC_CONFIGURE 1u
+#define SYS_TIMESYNC_STATUS    2u
+#define SYS_TIMESYNC_URL_SIZE   192u
+#define SYS_TIMESYNC_ERROR_SIZE 64u
+#define SYS_TIMESYNC_MIN_INTERVAL 5u
+#define SYS_TIMESYNC_MAX_INTERVAL 60u
+
+typedef struct {
+    uint32_t op;
+    uint32_t enabled;
+    uint32_t interval_s;
+    uint32_t synced;            // STATUS: 1 once a sync has succeeded
+    char url[SYS_TIMESYNC_URL_SIZE];
+    uint64_t last_unix_ms;      // STATUS: time from the last good answer
+    uint64_t last_sync_age_ms;  // STATUS: how long ago that was
+    uint64_t attempts;          // STATUS: requests made since boot
+    char error[SYS_TIMESYNC_ERROR_SIZE]; // STATUS: last failure, "" if none
+} syscall_timesync_t;
+
+// ===========================================
+// RUN A KERNEL COMMAND (SYS_ROOT)
+// ===========================================
+//
+// rdi = syscall_root_t*. Lets a user program (the MOSdesk Terminal) run a
+// kernel terminal command as root (like sudo). The kernel checks the password of a
+// MOSdesk account itself (0:/programs/mosdesk/accounts.dat) and then gives
+// the calling process a ticket for SYS_ROOT_TICKET_MS, so the password is
+// asked for once and not for every command.
+//   AUTH   username + password -> status 0 and a ticket, or an error
+//   RUN    command (needs a ticket) -> starts it; one command at a time
+//   READ   copies the output printed since the last READ; running = 0
+//          once the command has finished
+//   STATUS ticket_ms_left for the caller
+//   DROP   ends the caller's ticket (root -k)
+#define SYS_ROOT 39
+
+#define SYS_ROOT_AUTH   1u
+#define SYS_ROOT_RUN    2u
+#define SYS_ROOT_READ   3u
+#define SYS_ROOT_STATUS 4u
+#define SYS_ROOT_DROP   5u
+#define SYS_ROOT_TICKET_MS (5u * 60u * 1000u)
+#define SYS_ROOT_OUTPUT_SIZE 2048u
+
+typedef struct {
+    uint32_t op;
+    uint32_t running;           // READ: 1 while the command still runs
+    char username[32];
+    char password[64];
+    char command[256];
+    uint64_t ticket_ms_left;    // STATUS/AUTH/RUN
+    uint32_t output_length;     // READ
+    char output[SYS_ROOT_OUTPUT_SIZE];
+} syscall_root_t;
+
+// ===========================================
 // PROCESS LIST (SYS_PSLIST)
 // ===========================================
 //

@@ -23,6 +23,8 @@
 #include "x86_64/pmm.h"
 #include "x86_64/globaldatatable.h"
 #include "x86_64/net_syscall.h"
+#include "net/timesync.h"
+#include "x86_64/root.h"
 #include "x86_64/random.h"
 #include "x86_64/runcommand.h"
 #include "x86_64/proc.h"
@@ -1323,6 +1325,20 @@ void syscall_dispatch(syscall_regs_t* regs) {
         case SYS_SYSINFO:
             regs->rax = sys_sysinfo_impl(regs->rdi);
             break;
+
+        case SYS_ROOT: {
+            syscall_root_t* request = (syscall_root_t*)regs->rdi;
+            regs->rax = user_range_ok(request, sizeof(*request), true)
+                ? root_syscall(request) : SYS_ERR_INVAL;
+            break;
+        }
+
+        case SYS_TIMESYNC: {
+            syscall_timesync_t* request = (syscall_timesync_t*)regs->rdi;
+            regs->rax = user_range_ok(request, sizeof(*request), true)
+                ? timesync_syscall(request) : SYS_ERR_INVAL;
+            break;
+        }
 
         default: {
             regs->rax = SYS_ERR_GENERIC;

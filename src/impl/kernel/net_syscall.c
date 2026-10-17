@@ -101,6 +101,14 @@ static bool net_claim_wait(void) {
     return false;
 }
 
+bool net_stack_claim(void) {
+    return net_claim_wait();
+}
+
+void net_stack_release(void) {
+    net_release();
+}
+
 // ---------------------------------------------------------------------------
 // TCP handle table
 // ---------------------------------------------------------------------------

@@ -211,6 +211,9 @@ void graphics_write_textr_hex(uint64_t value);
 void graphics_write_textr_hex64(uint64_t value);
 void graphics_write_textr_bin(uint64_t value);
 void graphics_write_textr_char(char c);
+// When set and it returns true, the character was taken by a capture
+// (SYS_ROOT) instead of being drawn on the kernel terminal.
+extern bool (*graphics_text_capture)(char c);
 
 // Demo helper used by gpu_test()
 void graphics_complete_demo(gpu_device_t* gpu);

@@ -157,7 +157,7 @@ $(install1_object): $(install1_mpkg)
 		--redefine-sym _binary_build_resources_install1_mpkg_end=_binary_install1_mpkg_end \
 		$< $@
 
-$(install2_mpkg): $(mosdesk_install_dep) $(install2_source) $(install2_files) $(dlr_run) $(dlrconnect_run) tools/mkpkg/mkpkg.py
+$(install2_mpkg): $(mosdesk_install_dep) $(install2_tree_deps) $(dlr_run) $(dlrconnect_run) tools/mkpkg/mkpkg.py $(install3_mpkg): $(mosdesk_install_dep) $(install3_tree_deps) tools/mkpkg/mkpkg.py
 	mkdir -p $(dir $@)
 	python3 tools/mkpkg/mkpkg.py $(install2_source) $@ --store
 

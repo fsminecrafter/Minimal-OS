@@ -210,7 +210,13 @@ mosdesk-build:
 		git submodule update --init "$(MOSDESK_DIR)" 2>/dev/null || \
 		git clone --depth 1 "$(MOSDESK_REPO)" "$(MOSDESK_DIR)"; \
 	fi
-	git -C "$(MOSDESK_DIR)" submodule update --init Minimal-OS Minimal-OS-SDK
+		@for sub in Minimal-OS Minimal-OS-SDK; do \
+		if ! git -C "$(MOSDESK_DIR)" submodule update --init "$$sub"; then \
+			echo "mosdesk-build: pinned $$sub commit is not on the remote; using its latest default branch" >&2; \
+			git -C "$(MOSDESK_DIR)/$$sub" fetch origin && \
+			git -C "$(MOSDESK_DIR)/$$sub" checkout --detach FETCH_HEAD || exit 1; \
+		fi; \
+	done
 	CC=$(CC) LD=$(LD) $(MOSDESK_DIR)/mosdesk/build.sh
 
 mosdesk-stage: mosdesk-build $(dlr_run) $(dlrconnect_run)

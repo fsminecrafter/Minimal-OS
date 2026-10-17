@@ -63,6 +63,15 @@ endif
 
 install2_files := $(shell find $(install2_source) -type f 2>/dev/null)
 install3_files := $(shell find $(install3_source) -type f 2>/dev/null)
+install2_tree_deps := $(install2_source) $(install2_files)
+install3_tree_deps := $(install3_source) $(install3_files)
+
+# In MOSdesk mode the install trees are created by mosdesk-stage, so they
+# cannot be listed as prerequisites (make -j would look for them too early).
+ifeq ($(MOSDESK),1)
+install2_tree_deps :=
+install3_tree_deps :=
+endif
 
 impl_asm_source_files := $(filter-out src/impl/boot/ap_trampoline.asm, $(shell find src/impl -name '*.asm'))
 impl_asm_object_files := $(patsubst src/impl/%.asm, build/impl/%.o, $(impl_asm_source_files))

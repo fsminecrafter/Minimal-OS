@@ -17,7 +17,9 @@
  * kernel itself has checked a MOSdesk account's password.
  *
  * The password check happens here rather than in the program asking, so a
- * program cannot skip it. A good password gives the calling process a
+ * program cannot skip it. An account with password sign-in turned off (auto
+ * login) is granted on an empty password: such an account already gives
+ * anyone at the keyboard everything, and the terminal asks y/N first. A good password gives the calling process a
  * ticket for SYS_ROOT_TICKET_MS; commands it runs meanwhile need no
  * password. Each command runs in its own kernel process, and whatever it
  * prints on the kernel terminal is captured for the caller to READ.
@@ -198,7 +200,13 @@ uint64_t root_syscall(syscall_root_t* request) {
             if (load_accounts(&accounts)) {
                 for (uint32_t i = 0; i < accounts.count && !ok; i++) {
                     accounts.list[i].username[USERNAME_SIZE - 1u] = '\0';
-                    if (!strcmp(accounts.list[i].username, request->username))
+                    if (strcmp(accounts.list[i].username, request->username))
+                        continue;
+                    /* An auto-login account has no password to check; its
+                     * terminal asks the user to confirm instead. */
+                    if (!accounts.list[i].password_enabled)
+                        ok = request->password[0] == '\0';
+                    else
                         ok = password_matches(&accounts.list[i],
                                               request->password);
                 }

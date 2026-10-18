@@ -168,8 +168,6 @@ Last synced 2026 - oct 18, 21:08
 - [x] Simple Audio ! 
 - [x] File system !!! (MinimaFS)
 
-</details>
-
 #### V 0.4.4X
 
 - [X] Multithreading And Multicore usage 
@@ -177,12 +175,22 @@ Last synced 2026 - oct 18, 21:08
 - [X] Syscalls and User layer
 - [X] .run executable file
 
+</details>
+
 #### V 0.4.5X
 
 - [X] Simple Desktop 
 - [X] Window Manager 
-- [X]  MinimaFS file browser (within minimal-os) 
-- [X] Text editor 
+- [X] MinimaFS file browser (within minimal-os) 
+- [X] Text editor
+
+##### V 0.4.52
+
+- [ ] Pong
+
+##### V 0.4.53
+
+- [ ] Web browser?
 
 ## Usage
 

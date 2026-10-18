@@ -131,7 +131,7 @@ lists successfully parsed and registered services.
 
 ## ROADMAP
 
-Last synced 2026 - Sep 15 - 09:24
+Last synced 2026 - oct 18, 21:08
 
 #### X = Done
 #### C = Come back later
@@ -177,10 +177,10 @@ Last synced 2026 - Sep 15 - 09:24
 
 #### V 0.4.5X
 
-- [ ] Simple Desktop 
-- [ ] Window Manager 
-- [ ] MinimaFS file browser (within minimal-os) 
-- [ ] Text editor 
+- [X] Simple Desktop 
+- [X] Window Manager 
+- [X]  MinimaFS file browser (within minimal-os) 
+- [X] Text editor 
 
 ## Usage
 

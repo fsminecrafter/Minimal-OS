@@ -218,17 +218,14 @@ mosdesk-build:
 		git -C Minimal-OS-SDK fetch origin && \
 		git -C Minimal-OS-SDK checkout --detach FETCH_HEAD; \
 	fi
-	@if [ ! -e "$(MOSDESK_DIR)/.git" ]; then \
-		git submodule update --init "$(MOSDESK_DIR)" 2>/dev/null || \
-		git clone --depth 1 "$(MOSDESK_REPO)" "$(MOSDESK_DIR)"; \
+	@if ! git submodule update --init "$(MOSDESK_DIR)"; then \
+		echo "mosdesk-build: pinned MOSdesk commit is not on the remote; using its latest default branch" >&2; \
+		git submodule update --init --remote --force "$(MOSDESK_DIR)"; \
 	fi
-		@for sub in Minimal-OS Minimal-OS-SDK; do \
-		if ! git -C "$(MOSDESK_DIR)" submodule update --init "$$sub"; then \
-			echo "mosdesk-build: pinned $$sub commit is not on the remote; using its latest default branch" >&2; \
-			git -C "$(MOSDESK_DIR)/$$sub" fetch origin && \
-			git -C "$(MOSDESK_DIR)/$$sub" checkout --detach FETCH_HEAD || exit 1; \
-		fi; \
-	done
+	@if ! git -C "$(MOSDESK_DIR)" submodule update --init; then \
+		echo "mosdesk-build: a pinned nested commit is not on the remote; using the latest default branches" >&2; \
+		git -C "$(MOSDESK_DIR)" submodule update --init --remote --force; \
+	fi
 	CC=$(CC) LD=$(LD) MKPKG_TOOL=$(CURDIR)/tools/mkpkg/mkpkg.py MKPKG_JOBS=$(MKPKG_JOBS) \
 		$(MOSDESK_DIR)/mosdesk/build.sh
 

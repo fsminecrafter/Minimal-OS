@@ -537,8 +537,12 @@ void tcp_handle_packet(uint32_t src_ip, const uint8_t* seg, uint16_t len) {
         tcp_send_segment(conn, TCP_FLAG_ACK, NULL, 0);
     }
 
-    if (hdr->flags & TCP_FLAG_FIN) {
-        conn->rcv_nxt = seq + data_len + 1;
+    // Only take the FIN once every byte before it is in rx_buf. Jumping
+    // rcv_nxt over a lost segment would ACK data we never got and hand
+    // the reader (TLS) a stream with a hole in it; ignoring the FIN makes
+    // the peer retransmit both.
+    if ((hdr->flags & TCP_FLAG_FIN) && seq + data_len == conn->rcv_nxt) {
+        conn->rcv_nxt++;
         conn->remote_closed = true;
         tcp_send_segment(conn, TCP_FLAG_ACK, NULL, 0);
         if (conn->state == TCP_ESTABLISHED) conn->state = TCP_CLOSE_WAIT;

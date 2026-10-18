@@ -37,8 +37,13 @@
 #define RCR_AB   (1 << 3)
 #define RCR_WRAP (1 << 7)
 
-#define RX_RING_SIZE (8192 + 16)
-#define RX_BUFFER_SIZE (RX_RING_SIZE + 16 + 1500)
+// RCR.RBLEN = 00 selects an 8 KiB ring. The NIC wraps its write pointer
+// (and every packet header offset) at exactly 8192; the "+16" in the
+// datasheet is slack, not part of the ring. With RCR_WRAP set, a frame
+// that starts near the end is written linearly past 8192 instead of
+// wrapping, so the buffer needs room for one maximum frame of overrun.
+#define RX_RING_SIZE 8192
+#define RX_BUFFER_SIZE (RX_RING_SIZE + 16 + 1536)
 #define TX_BUFFER_SIZE 1536
 #define NUM_TX_DESC 4
 
@@ -56,13 +61,6 @@ static inline void wr32(uint16_t reg, uint32_t v) { port_outl(g_io_base + reg, v
 static inline uint8_t  rd8(uint16_t reg)  { return port_inb(g_io_base + reg); }
 static inline uint32_t rd32(uint16_t reg) { return port_inl(g_io_base + reg); }
 
-static uint8_t rx_byte(uint32_t offset) {
-    return g_rx_buffer[offset % RX_RING_SIZE];
-}
-
-static void rx_copy(uint8_t* dst, uint32_t offset, uint32_t len) {
-    for (uint32_t i = 0; i < len; i++) dst[i] = rx_byte(offset + i);
-}
 
 static pci_device_t* find_rtl8139(void) {
     extern pci_device_t pci_devices[];
@@ -198,10 +196,11 @@ static void rtl8139_poll(void) {
     if (!g_present) return;
 
     while (!(rd8(REG_CMD) & CMD_BUFE)) {
-        uint16_t status = (uint16_t)rx_byte(g_rx_offset) |
-                          ((uint16_t)rx_byte(g_rx_offset + 1) << 8);
-        uint16_t length = (uint16_t)rx_byte(g_rx_offset + 2) |
-                          ((uint16_t)rx_byte(g_rx_offset + 3) << 8);
+        // g_rx_offset is 4-aligned and below RX_RING_SIZE, so the header
+        // and (thanks to RCR_WRAP) the whole frame are contiguous.
+        const uint8_t* pkt = g_rx_buffer + g_rx_offset;
+        uint16_t status = (uint16_t)pkt[0] | ((uint16_t)pkt[1] << 8);
+        uint16_t length = (uint16_t)pkt[2] | ((uint16_t)pkt[3] << 8);
 
         // The NIC can report short runt/error frames. They still have a
         // header and CRC, and must be consumed below; resetting the whole
@@ -212,12 +211,11 @@ static void rtl8139_poll(void) {
             break;
         }
 
-        uint32_t packet_end = (g_rx_offset + length + 4 + 3) & ~3u;
+        uint32_t packet_end = ((g_rx_offset + length + 4 + 3) & ~3u) % RX_RING_SIZE;
         if (!(status & 0x01)) {
             // Error frames still have a valid length and must be consumed;
             // rewinding CAPR makes the same frame appear forever.
             g_rx_offset = packet_end;
-            if (g_rx_offset >= RX_RING_SIZE) g_rx_offset -= RX_RING_SIZE;
             port_outw(g_io_base + REG_CAPR, (uint16_t)(g_rx_offset - 16));
             continue;
         }
@@ -225,17 +223,15 @@ static void rtl8139_poll(void) {
         static uint8_t linear[ETH_FRAME_MAX];
         if (length < sizeof(eth_header_t) + 4) {
             g_rx_offset = packet_end;
-            if (g_rx_offset >= RX_RING_SIZE) g_rx_offset -= RX_RING_SIZE;
             port_outw(g_io_base + REG_CAPR, (uint16_t)(g_rx_offset - 16));
             continue;
         }
         uint16_t payload_len = length - 4; // exclude trailing CRC
-        rx_copy(linear, g_rx_offset + 4, payload_len);
+        memcpy(linear, pkt + 4, payload_len);
 
         eth_handle_frame(linear, payload_len);
 
         g_rx_offset = packet_end;
-        if (g_rx_offset >= RX_RING_SIZE) g_rx_offset -= RX_RING_SIZE;
         port_outw(g_io_base + REG_CAPR, (uint16_t)(g_rx_offset - 16));
     }
 }

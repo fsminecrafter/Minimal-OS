@@ -10,7 +10,7 @@ Install packages and service definitions are documented in
 The full kernel, boot, storage, networking, process, and build architecture is
 summarized in [docs/system-overview.md](docs/system-overview.md).
 
-<img width="500" height="500" alt="Icon" src="https://github.com/user-attachments/assets/f2401784-fcd3-4002-bbe0-02d16b9652d1" />
+<img width="250" height="250" alt="Icon" src="https://github.com/user-attachments/assets/f2401784-fcd3-4002-bbe0-02d16b9652d1" />
 
 <details>
 

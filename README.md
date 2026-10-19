@@ -177,18 +177,18 @@ Last synced 2026 - oct 18, 21:08
 
 </details>
 
-#### V 0.4.5X
+#### V 0.4.50
 
 - [X] Simple Desktop 
 - [X] Window Manager 
 - [X] MinimaFS file browser (within minimal-os) 
 - [X] Text editor
 
-##### V 0.4.52
+##### V 0.4.51
 
 - [ ] Pong
 
-##### V 0.4.53
+##### V 0.4.52
 
 - [ ] Web browser?
 

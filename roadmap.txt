@@ -36,9 +36,21 @@ Services manager [X]
 Syscalls and User layer  [X]
 Executable .run file [X]
 
-V 0.4.5X
+V 0.4.50
 
-Simple Desktop []
-Window Manager []
-MinimaFS file browser (within minimal-os) []
-Text editor []
+Simple Desktop [X]
+Window Manager [X]
+MinimaFS file browser (within minimal-os) [X]
+Text editor [X]
+
+V 0.4.51
+
+Golf [X]
+GPU support (not just display adapter) [ ]
+MiniGL (Minimal-OS Graphics Library) [ ]
+Partitions & Larger disk's [ ]
+Installer & Disk bootable installs [ ]
+
+##### V 0.4.52
+
+Web browser? [ ]

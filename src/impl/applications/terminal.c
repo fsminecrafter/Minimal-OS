@@ -408,10 +408,11 @@ void terminal_update(void) {
 
         // Notice when the in-flight command process has finished and
         // bring the prompt back.
-        if (g_command_running) {
-            command_poll_running();
-            if (!command_is_running()) g_command_running = false;
-        }
+        // Poll even when the terminal did not start the command itself:
+        // services launch commands too (dhcp.service), and until this
+        // notices they finished, no other command can start.
+        command_poll_running();
+        if (g_command_running && !command_is_running()) g_command_running = false;
 
         bool command_active = g_command_running || command_is_running() ||
                               command_has_last_user_program();
@@ -521,6 +522,8 @@ void terminal_program_entry(void) {
             int success = mountdrive(device, 0);
             if (success == 1) {
                 vgaterm_print_success("Disk mounted\n");
+                // Every other MinimaFS volume becomes 1:, 2:, ...
+                storage_automount_others();
                 systeminfo_load_saved_resolution();
 
                 // Check inside the success branch, because the disk must be mounted first.
@@ -547,7 +550,7 @@ void terminal_program_entry(void) {
             } else if (success == 4) {
                 vgaterm_print_error("MinimaFS: Invalid root block\n");
             } else if (success == 5) {
-                vgaterm_print_error("MinimaFS: Drive too large for bitmap\n");
+                vgaterm_print_error("MinimaFS: Invalid volume\n");
             } else {
                 vgaterm_print_error("Mount failed\n");
             }

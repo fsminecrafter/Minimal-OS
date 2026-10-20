@@ -80,3 +80,7 @@ bool multiboot2_get_framebuffer(multiboot2_info_t* mb_info,
                                 multiboot2_framebuffer_info_t* framebuffer);
 bool multiboot2_has_cmdline_token(multiboot2_info_t* mb_info,
                                   const char* token);
+// Copies the value of a "key=value" word on the kernel command line
+// (key includes the '='). Returns false when the word is absent.
+bool multiboot2_get_cmdline_value(multiboot2_info_t* mb_info, const char* key,
+                                  char* out, size_t out_size);

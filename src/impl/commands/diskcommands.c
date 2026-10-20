@@ -20,16 +20,8 @@
 // FORMAT COMMAND
 // ===========================================
 
-/*
- * MinimaFS's block allocation bitmap (MINIMAFS_BITMAP_SIZE in minimafs.c)
- * can only address 8192*8 = 65536 blocks. At the fixed 4KB block size
- * that's a hard ceiling of 256 MB - trying to format anything larger
- * will make minimafs_format() itself refuse ("Drive too large for
- * bitmap"). Clamp to that here so we fail predictably with a clear
- * message instead of silently truncating inside minimafs_format().
- */
-#define DISKCMD_MAX_FORMAT_SIZE (256ULL * 1024 * 1024)
-#define DISKCMD_FALLBACK_SIZE   (128ULL * 1024 * 1024)
+#include "x86_64/storage_setup.h"
+#include "x86_64/blockdev.h"
 
 extern const uint8_t _binary_install1_mpkg_start[];
 extern const uint8_t _binary_install1_mpkg_end[];
@@ -193,149 +185,90 @@ static bool format_install_package(const uint8_t* archive, uint32_t archive_size
     return true;
 }
 
-static bool format_install_packages(void) {
+static bool format_install_packages(uint8_t drive_number) {
+    char etc[16], programs[16], services[16];
+    snprintf(etc, sizeof(etc), "%u:/etc", (unsigned)drive_number);
+    snprintf(programs, sizeof(programs), "%u:/programs", (unsigned)drive_number);
+    snprintf(services, sizeof(services), "%u:/services", (unsigned)drive_number);
     return format_install_package(_binary_install1_mpkg_start,
                                   (uint32_t)(_binary_install1_mpkg_end - _binary_install1_mpkg_start),
-                                  "0:/etc") &&
+                                  etc) &&
            format_install_package(_binary_install2_mpkg_start,
                                   (uint32_t)(_binary_install2_mpkg_end - _binary_install2_mpkg_start),
-                                  "0:/programs") &&
+                                  programs) &&
            format_install_package(_binary_install3_mpkg_start,
                                   (uint32_t)(_binary_install3_mpkg_end - _binary_install3_mpkg_start),
-                                  "0:/services");
+                                  services);
 }
 
-void cmd_format_debug(int argc, const char** argv) {
-    serial_write_str("\n=== FORMAT DEBUG ===\n");
-    graphics_write_textr("Formatting drive...\n");
+static void setup_say(storage_progress_fn progress, uint32_t percent, const char* text) {
+    serial_write_str("setup: ");
+    serial_write_str(text);
+    serial_write_str("\n");
+    if (progress) progress(percent, text);
+}
 
-    minimafs_disk_device_t* device = getminimadrive();
-    if (!device) {
-        graphics_write_textr("ERROR: No device!\n");
-        serial_write_str("ERROR: getminimadrive() returned NULL\n");
-        return;
+bool storage_format_volume(blockdev_t* device, uint8_t drive_number,
+                           const char* label) {
+    if (!device) return false;
+    if (device->mounted_drive >= 0) {
+        serial_write_str("format: unmounting the volume first\n");
+        minimafs_unmount((uint8_t)device->mounted_drive);
     }
+    minimafs_drive_t* existing = get_drive(drive_number);
+    if (existing && existing->mounted) minimafs_unmount(drive_number);
 
-    serial_write_str("Device OK\n");
-    minimafs_drive_t* existing = get_drive(0);
-    if (existing && existing->mounted) {
-        serial_write_str("Drive 0 already mounted, unmounting before format...\n");
-        minimafs_unmount(0);
-    }
-
-    // Pull the real capacity from the underlying AHCI drive instead of
-    // hardcoding 128MB. ahci_identify() (called during ahci_probe_ports())
-    // already populated sectors/sector_size for us.
-    uint64_t size;
-    ahci_drive_t* ahci_drive = device->ahci_drive;
-
-    if (ahci_drive && ahci_drive->sectors > 0 && ahci_drive->sector_size > 0) {
-        size = (uint64_t)ahci_drive->sectors * (uint64_t)ahci_drive->sector_size;
-
-        serial_write_str("Detected disk size: ");
-        serial_write_dec((uint32_t)(size / (1024 * 1024)));
-        serial_write_str(" MB (");
-        serial_write_dec(ahci_drive->sectors);
-        serial_write_str(" sectors x ");
-        serial_write_dec(ahci_drive->sector_size);
-        serial_write_str(" bytes)\n");
-
-        if (size > DISKCMD_MAX_FORMAT_SIZE) {
-            serial_write_str("WARNING: Disk larger than MinimaFS bitmap can address, "
-                              "clamping to 256 MB\n");
-            graphics_write_textr("Disk larger than supported; using 256 MB\n");
-            size = DISKCMD_MAX_FORMAT_SIZE;
-        }
-    } else {
-        serial_write_str("WARNING: Could not detect drive size (no AHCI drive info), "
-                          "falling back to 128 MB\n");
-        graphics_write_textr("Could not detect disk size; using 128 MB\n");
-        size = DISKCMD_FALLBACK_SIZE;
-    }
-
-    serial_write_str("Calling minimafs_format...\n");
-    if (!minimafs_format(device, size, 0, "maindisk")) {
-        graphics_write_textr("ERROR: Formatting failed!\n");
-        serial_write_str("ERROR: minimafs_format returned false\n");
-        return;
-    }
-
-    graphics_write_textr("Format OK. Mounting...\n");
-    if (!minimafs_format(device, size, 0, "maindisk")) {
-        graphics_write_textr("ERROR: Formatting failed!\n");
-        serial_write_str("ERROR: minimafs_format returned false\n");
-        return;
-    }
-
-    graphics_write_textr("Format OK. Mounting...\n");
-    serial_write_str("Format succeeded. Calling minimafs_mount...\n");
-
-    int mount_result = minimafs_mount(device, 0);
-    if (mount_result != 1) {
-        graphics_write_textr("ERROR: Mount failed! Code=");
-        char buf[16];
-        snprintf(buf, sizeof(buf), "%d", mount_result);
-        graphics_write_textr(buf);
-        graphics_write_textr("\n");
-        serial_write_str("ERROR: minimafs_mount returned ");
-        serial_write_dec(mount_result);
-        serial_write_str("\n");
-        return;
-    }
-
-    graphics_write_textr("Mounted OK.\n");
-    serial_write_str("Mount succeeded.\n");
-
-    minimafs_drive_t* drive = get_drive(0);
-    if (!drive || !drive->mounted) {
-        serial_write_str("ERROR: Drive 0 not accessible\n");
-        graphics_write_textr("ERROR: Drive not accessible!\n");
-        return;
-    }
-
-    serial_write_str("Drive 0 is mounted. Root block=");
-    serial_write_dec(drive->storage_desc.root_block);
+    uint64_t size = blockdev_size_bytes(device);
+    char human[24];
+    blockdev_format_size(size, human, sizeof(human));
+    serial_write_str("format: ");
+    serial_write_str(device->name);
+    serial_write_str(" ");
+    serial_write_str(human);
     serial_write_str("\n");
 
-    minimafs_refresh_storage_desc(drive);
-
-    serial_write_str("Creating system directory structure...\n");
-    graphics_write_textr("Creating 0:/etc/System.conf...\n");
-
-    minimafs_mkdir("0:/");
-    if (!minimafs_mkdir("0:/etc")) {
-        serial_write_str("WARNING: Failed to create 0:/etc (may already exist)\n");
+    if (!minimafs_format(device, size, drive_number, label ? label : "maindisk")) {
+        return false;
     }
-    minimafs_create_file("0:/etc/System.conf", "text", "conf");
+    if (minimafs_mount(device, drive_number) != 1) return false;
+    device->fs = BLOCKDEV_FS_MINIMAFS;
+    minimafs_drive_t* drive = get_drive(drive_number);
+    if (drive) minimafs_refresh_storage_desc(drive);
+    return true;
+}
 
-    graphics_write_textr("Creating 0:/services...\n");
-    if (!minimafs_mkdir("0:/services")) {
-        serial_write_str("WARNING: Failed to create 0:/services (may already exist)\n");
+bool storage_populate_system(uint8_t drive_number, storage_progress_fn progress) {
+    minimafs_drive_t* drive = get_drive(drive_number);
+    if (!drive || !drive->mounted) return false;
+
+    char path[64];
+    setup_say(progress, 70, "Creating system folders");
+    const char* dirs[] = { "etc", "services", "programs" };
+    for (uint32_t i = 0; i < 3; i++) {
+        snprintf(path, sizeof(path), "%u:/%s", (unsigned)drive_number, dirs[i]);
+        if (!minimafs_is_dir(path) && !minimafs_mkdir(path)) {
+            serial_write_str("setup: could not create ");
+            serial_write_str(path);
+            serial_write_str("\n");
+            return false;
+        }
     }
 
-    graphics_write_textr("Creating 0:/programs...\n");
-    if (!minimafs_mkdir("0:/programs")) {
-        serial_write_str("WARNING: Failed to create 0:/services (may already exist)\n");
-    }
+    snprintf(path, sizeof(path), "%u:/etc/System.conf", (unsigned)drive_number);
+    if (!minimafs_exists(path)) minimafs_create_file(path, "text", "conf");
 
-    // Build System.conf content — SYSTEMVER is a string from systeminfo.h
     char date_str[32];
     minimafs_get_datetime(date_str, sizeof(date_str));
-
-    char* conf_content = (char*)alloc(512);
-    if (!conf_content) {
-        serial_write_str("ERROR: OOM for conf_content\n");
-        return;
-    }
-
-    char* p = conf_content;
+    char* conf = (char*)alloc(512);
+    if (!conf) return false;
+    char* p = conf;
     p += sprintf(p, "# MinimalOS System Configuration\n");
     p += sprintf(p, "# Auto-generated by format\n");
     p += sprintf(p, "#\n");
-    p += sprintf(p, "version=%s\n",     SYSTEMVER);
-    p += sprintf(p, "formatted=%s\n",   date_str);
+    p += sprintf(p, "version=%s\n", SYSTEMVER);
+    p += sprintf(p, "formatted=%s\n", date_str);
     p += sprintf(p, "hostname=MinimalDevice\n");
-    p += sprintf(p, "drive=%u\n",       (unsigned int)drive->drive_number);
+    p += sprintf(p, "drive=%u\n", (unsigned int)drive_number);
     p += sprintf(p, "fs=MinimaFS\n");
     p += sprintf(p, "DisplayWidth=1280\n");
     p += sprintf(p, "DisplayHeight=720\n");
@@ -344,61 +277,98 @@ void cmd_format_debug(int argc, const char** argv) {
      * Change with the 'kbrlayout set <name|path>' terminal command,
      * which keeps this line in sync automatically. */
     p += sprintf(p, "KeyboardLayout=SE\n");
+    bool ok = minimafs_write_file_segments(path, conf, (uint32_t)(p - conf),
+                                           NULL, 0, "text", "conf");
+    free_mem(conf);
+    if (!ok) return false;
 
-    uint32_t conf_len = (uint32_t)(p - conf_content);
-
-    // Open the file and write the content
-    minimafs_file_handle_t* conf_file = minimafs_open("0:/etc/System.conf", false);
-    if (!conf_file) {
-        serial_write_str("ERROR: Could not open System.conf for writing\n");
-    } else {
-        minimafs_write(conf_file, conf_content, conf_len);
-        minimafs_close(conf_file);
-        serial_write_str("System.conf written (");
-        serial_write_dec(conf_len);
-        serial_write_str(" bytes)\n");
-    }
-
-    free_mem(conf_content);
-    graphics_write_textr("File created OK.\n");
-
-    if (!format_install_packages()) {
+    setup_say(progress, 80, "Installing system packages");
+    if (!format_install_packages(drive_number)) {
         serial_write_str("FORMAT: failed to install resource package\n");
-        graphics_write_textr("Failed to install resource package.\n");
+        return false;
+    }
+    minimafs_refresh_storage_desc(drive);
+    return true;
+}
+
+static void format_progress_print(uint32_t percent, const char* text) {
+    (void)percent;
+    graphics_write_textr(text);
+    graphics_write_textr("...\n");
+}
+
+// format                         the boot volume (or first disk) as 0: + system
+// format <device> [drive] [label] [--system]
+void cmd_format_debug(int argc, const char** argv) {
+    blockdev_t* device = NULL;
+    uint8_t drive_number = 0;
+    const char* label = "maindisk";
+    bool system = false;
+
+    if (argc < 2) {
+        initializeminimafs(0);
+        device = getminimadrive();
+        system = true;
+        if (!device) {
+            graphics_write_textr("ERROR: No disk found!\n");
+            return;
+        }
+    } else {
+        initializeminimafs(0);
+        device = blockdev_find(argv[1]);
+        if (!device) {
+            graphics_write_textr("format: unknown device (see 'disks')\n");
+            return;
+        }
+        int n = storage_free_drive_number(1);
+        drive_number = n < 0 ? 1 : (uint8_t)n;
+        int pos = 0;
+        for (int i = 2; i < argc; i++) {
+            if (strcmp(argv[i], "--system") == 0) { system = true; continue; }
+            if (pos == 0 && argv[i][0] >= '0' && argv[i][0] <= '9') {
+                uint32_t v = 0;
+                for (const char* c = argv[i]; *c >= '0' && *c <= '9'; c++) v = v * 10 + (uint32_t)(*c - '0');
+                if (v >= MINIMAFS_MAX_DRIVES) {
+                    graphics_write_textr("format: drive number must be 0-98\n");
+                    return;
+                }
+                drive_number = (uint8_t)v;
+                pos = 1;
+            } else {
+                label = argv[i];
+            }
+        }
+        if (device->kind == BLOCKDEV_KIND_DISK && device->fs == BLOCKDEV_FS_PARTITIONED) {
+            graphics_write_textr("Note: this erases the partition table of ");
+            graphics_write_textr(device->name);
+            graphics_write_textr(".\n");
+        }
+        if (drive_number == 0) system = true;
+    }
+
+    char human[24];
+    blockdev_format_size(blockdev_size_bytes(device), human, sizeof(human));
+    graphics_write_textr("Formatting ");
+    graphics_write_textr(device->name);
+    graphics_write_textr(" (");
+    graphics_write_textr(human);
+    graphics_write_textr(")...\n");
+
+    if (!storage_format_volume(device, drive_number, label)) {
+        graphics_write_textr("ERROR: Formatting failed!\n");
         return;
     }
+    char msg[64];
+    snprintf(msg, sizeof(msg), "Mounted as %u:\n", (unsigned)drive_number);
+    graphics_write_textr(msg);
 
-    // Verify the file was registered in the Etc folder
-    minimafs_folder_desc_t* etc_desc = (minimafs_folder_desc_t*)alloc(sizeof(minimafs_folder_desc_t));
-    if (!etc_desc) {
-        serial_write_str("ERROR: OOM for etc_desc\n");
-        return;
+    if (system) {
+        if (!storage_populate_system(drive_number, format_progress_print)) {
+            graphics_write_textr("Failed to install system files.\n");
+            return;
+        }
     }
-
-    if (!minimafs_read_folder_desc(drive, "/etc", etc_desc)) {
-        serial_write_str("ERROR: Failed to read etc folder.desc\n");
-        graphics_write_textr("ERROR: Can't read etc folder!\n");
-        free_mem(etc_desc);
-        return;
-    }
-
-    serial_write_str("etc folder has ");
-    serial_write_dec(etc_desc->entry_count);
-    serial_write_str(" entries\n");
-
-    for (uint32_t i = 0; i < etc_desc->entry_count; i++) {
-        serial_write_str("  Entry ");
-        serial_write_dec(i);
-        serial_write_str(": ");
-        serial_write_str(etc_desc->entries[i].name);
-        serial_write_str(" (block ");
-        serial_write_dec(etc_desc->entries[i].block_offset);
-        serial_write_str(")\n");
-    }
-
-    free_mem(etc_desc);
     graphics_write_textr("Format complete!\n");
-    serial_write_str("=== FORMAT DEBUG DONE ===\n\n");
 }
 
 // ===========================================
@@ -861,54 +831,6 @@ void register_fs_navigation_commands(void) {
 
 REGISTER_COMMAND(register_fs_navigation_commands);
 
-void cmd_mount(int argc, const char** argv) {
-    minimafs_disk_device_t* device;
-    device = getminimadrive();
-    uint8_t drive = 1;
-    if (argc >= 2) {
-        drive = parse_u8(argv[1], 1);
-    }
-    int success = mountdrive(device, drive);
-    if (success == 1) {
-        graphics_write_textr("Mount succeded.\n");
-    }else if (success == 2) {
-        graphics_write_textr("MinimaFS: Drive already mounted\n");
-    }else if (success == 3) {
-        graphics_write_textr("MinimaFS: Failed to parse storage.desc\n");
-    }else if (success == 4) {
-        graphics_write_textr("MinimaFS: Invalid root block\n");
-    }else if (success == 5) {
-        graphics_write_textr("MinimaFS: Drive too large for bitmap\n");
-    } else {
-        graphics_write_textr("Mount failed.\n");
-    }
-
-    serial_write_str("DEBUG: listing drive ");
-    serial_write_dec(drive);
-    serial_write_str("\n");
-    minimafs_drive_t* d = get_drive(drive);
-
-    if (!d) {
-        serial_write_str("Drive = NULL\n");
-    } else if (!d->mounted) {
-        serial_write_str("Drive not mounted\n");
-    } else {
-        serial_write_str("Drive OK\n");
-    }
-
-}
-
-void cmd_initdisk(int argc, const char** argv) {
-    uint8_t drive = 0;
-    if (argc >= 2) {
-        drive = parse_u8(argv[1], 0);
-    } else {
-        graphics_write_textr("No drive number specified, defaulting to 0.\n");
-        drive = 0;
-    }
-    initializeminimafs(drive);
-}
-
 void register_list(void) {
     command_register("list", cmd_list);
     command_register("ls", cmd_list);
@@ -923,13 +845,6 @@ void register_listroot_debug(void) {
     command_register("lsroot", cmd_listroot_debug);
 }
 
-void register_mount(void) {
-    command_register("mount", cmd_mount);
-}
-
-void register_initdisk(void) {
-    command_register("initdisk", cmd_initdisk);
-}
 
 // ===========================================
 // REMOVE (rm) COMMAND
@@ -1314,8 +1229,6 @@ void register_remove(void) {
 }
 
 REGISTER_COMMAND(register_remove);
-REGISTER_COMMAND(register_initdisk);
-REGISTER_COMMAND(register_mount);
 REGISTER_COMMAND(register_format_debug);
 REGISTER_COMMAND(register_listroot_debug);
 REGISTER_COMMAND(register_list);

@@ -134,3 +134,47 @@ bool multiboot2_has_cmdline_token(multiboot2_info_t* mb_info,
     }
     return false;
 }
+
+bool multiboot2_get_cmdline_value(multiboot2_info_t* mb_info, const char* key,
+                                  char* out, size_t out_size) {
+    if (!mb_info || !key || !out || out_size == 0) return false;
+    out[0] = '\0';
+    size_t key_length = 0;
+    while (key[key_length]) key_length++;
+
+    uintptr_t start = (uintptr_t)mb_info;
+    uintptr_t end = start + mb_info->total_size;
+    uintptr_t cursor = (uintptr_t)mb_info->tags;
+    while (cursor <= end && end - cursor >= sizeof(multiboot2_tag_t)) {
+        const multiboot2_tag_t* tag = (const multiboot2_tag_t*)cursor;
+        if (tag->size < sizeof(*tag) || tag->size > end - cursor) return false;
+        if (tag->type == 0) return false;
+        if (tag->type == 1) {
+            const char* line = (const char*)(tag + 1);
+            size_t length = tag->size - sizeof(*tag);
+            size_t pos = 0;
+            while (pos < length && line[pos]) {
+                while (pos < length && cmdline_is_space(line[pos])) pos++;
+                size_t word = pos;
+                while (pos < length && line[pos] && !cmdline_is_space(line[pos])) pos++;
+                if (pos - word > key_length) {
+                    size_t i = 0;
+                    while (i < key_length && line[word + i] == key[i]) i++;
+                    if (i == key_length) {
+                        size_t o = 0;
+                        for (size_t j = word + key_length; j < pos && o + 1 < out_size; j++) {
+                            out[o++] = line[j];
+                        }
+                        out[o] = '\0';
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+        uintptr_t advance = ((uintptr_t)tag->size + 7) & ~(uintptr_t)7;
+        if (advance > end - cursor) return false;
+        cursor += advance;
+    }
+    return false;
+}

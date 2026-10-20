@@ -632,12 +632,11 @@ static int vsnprintf_internal(char* buffer, size_t size, const char* fmt, va_lis
                 fmt++;
             }
 
+            // 'l' and 'll' are both 64-bit on x86_64.
             if (*fmt == 'l') {
                 fmt++;
-                if (*fmt == 'l') {
-                    longlong = true;
-                    fmt++;
-                }
+                longlong = true;
+                if (*fmt == 'l') fmt++;
             }
 
             switch (*fmt) {

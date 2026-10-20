@@ -25,6 +25,7 @@
 #include "applications/terminal.h"
 #include "x86_64/ahci.h"
 #include "x86_64/storage_manager.h"
+#include "minimafshandler.h"
 #include "x86_64/global_audio_state.h"
 #include "x86_64/smp.h"
 
@@ -85,6 +86,8 @@ void kernel_main(uint64_t mb2_info_addr) {
     multiboot2_info_t* mb_info = (multiboot2_info_t*)mb2_info_addr;
     kernel_boot_no_disk = multiboot2_has_cmdline_token(mb_info, "no-disk");
     kernel_boot_debug = multiboot2_has_cmdline_token(mb_info, "--debug");
+    multiboot2_get_cmdline_value(mb_info, "root=", kernel_boot_root,
+                                 sizeof(kernel_boot_root));
     uint64_t total_ram_bytes = get_total_memory(mb_info);
     print_clear();
     commandhandler_init();

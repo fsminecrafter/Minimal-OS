@@ -28,6 +28,9 @@
 #define MINIMAFS_MAX_DRIVES         99          // 0: through 99:
 #define MINIMAFS_MAX_ROOT_ENTRIES   64          // Max entries per folder
 #define MINIMAFS_MAGIC              0x4D494E46  // "MINF"
+// Block numbers are 32-bit and 0xFFFFFFFF means "no block", so a volume
+// holds at most 0xFFFFFFFE blocks of 4 KiB: just under 16 TiB.
+#define MINIMAFS_MAX_BLOCKS         0xFFFFFFFEu
 
 #define MINIMAFS_FOLDER_DESC        "folder.desc"
 #define MINIMAFS_STORAGE_DESC       "storage.desc"

@@ -137,6 +137,12 @@ static void pci_config_write_word(uint8_t bus, uint8_t device, uint8_t function,
 }
 
 void pci_enumerate_all() {
+    // Both the startup routine and kernel_main call this. A second walk
+    // would append every device again (and the AHCI disks would show up
+    // twice), so only the first call scans.
+    static bool enumerated = false;
+    if (enumerated) return;
+    enumerated = true;
     serial_write_str("Enumerating PCI devices starting from bus 0...\n");
     if (printtodisplay) {
         print_clear();

@@ -7,12 +7,11 @@
 #include "x86_64/ahci.h"
 #include "x86_64/exec_trace.h"
 #include "x86_64/safeints.h"
+#include "x86_64/blockdev.h"
 
-/* Disk device wrapper */
-typedef struct {
-    ahci_drive_t* ahci_drive;
-    uint32_t      sector_size;
-} minimafs_disk_device_t;
+/* A drive's device_handle is the blockdev_t (whole disk or partition) it
+ * lives on. */
+typedef blockdev_t minimafs_disk_device_t;
 
 /* ================================================================
  * HEAP-ALLOCATION HELPERS
@@ -297,12 +296,10 @@ static bool ensure_dma_bounce(uint8_t drive_number) {
 
     void* base = alloc_pages_zeroed(MINIMAFS_DMA_BOUNCE_BLOCKS);
     if (!base) {
-        serial_write_str("MinimaFS: alloc_pages_zeroed failed, trying single page\n");
-        base = alloc_page_zeroed();
-        if (!base) {
-            serial_write_str("MinimaFS: even single page failed!\n");
-            return false;
-        }
+        // Every transfer uses up to MINIMAFS_DMA_BOUNCE_BLOCKS blocks, so a
+        // smaller buffer would be overrun.
+        serial_write_str("MinimaFS: alloc_pages_zeroed failed\n");
+        return false;
     }
 
     if ((uintptr_t)base & 0xFFF) {
@@ -578,7 +575,7 @@ static bool minimafs_read_blocks(minimafs_drive_t* drive, uint32_t block_num,
                                  uint32_t count, void* buffer) {
     if (!drive || !drive->device_handle) return false;
     minimafs_disk_device_t* disk = (minimafs_disk_device_t*)drive->device_handle;
-    if (!disk->ahci_drive || disk->sector_size == 0) return false;
+    if (disk->sector_size == 0 || (MINIMAFS_BLOCK_SIZE % disk->sector_size) != 0) return false;
     if (!ensure_dma_bounce(drive->drive_number)) return false;
     if (!buffer || count == 0) return count == 0;
 
@@ -597,7 +594,7 @@ static bool minimafs_read_blocks(minimafs_drive_t* drive, uint32_t block_num,
         uint64_t start_sector      = (uint64_t)cur_block * sectors_per_block;
         uint32_t sector_count      = chunk * sectors_per_block;
 
-        if (!ahci_read(disk->ahci_drive, start_sector, sector_count, bounce)) {
+        if (!blockdev_read(disk, start_sector, sector_count, bounce)) {
             __sync_lock_release(&g_block_io_lock);
             return false;
         }
@@ -615,7 +612,7 @@ static bool minimafs_write_blocks(minimafs_drive_t* drive, uint32_t block_num,
                                   uint32_t count, const void* buffer) {
     if (!drive || !drive->device_handle) return false;
     minimafs_disk_device_t* disk = (minimafs_disk_device_t*)drive->device_handle;
-    if (!disk->ahci_drive || disk->sector_size == 0) return false;
+    if (disk->sector_size == 0) return false;
     if (!ensure_dma_bounce(drive->drive_number)) return false;
     if (!buffer || count == 0) return count == 0;
     if ((MINIMAFS_BLOCK_SIZE % disk->sector_size) != 0) return false;
@@ -641,7 +638,7 @@ static bool minimafs_write_blocks(minimafs_drive_t* drive, uint32_t block_num,
         /* Enable interrupts around the AHCI call so the PIT/scheduler
          * can still tick while we wait for DMA completion. */
         uint64_t flags = irq_save(__FILE__, "minimafs_write_blocks", __LINE__);
-        bool ok = ahci_write(disk->ahci_drive, start_sector, sector_count, bounce);
+        bool ok = blockdev_write(disk, start_sector, sector_count, bounce);
         irq_restore(flags, __FILE__, "minimafs_write_blocks", __LINE__);
 
         if (!ok) {
@@ -653,14 +650,10 @@ static bool minimafs_write_blocks(minimafs_drive_t* drive, uint32_t block_num,
         }
 
         in        += chunk * MINIMAFS_BLOCK_SIZE;
-    __sync_lock_release(&g_block_io_lock);
         cur_block += chunk;
         remaining -= chunk;
-
-        /* Brief delay between chunks */
-        if (remaining > 0)
-            minimafs_sleep_ms(5);
     }
+    __sync_lock_release(&g_block_io_lock);
     return true;
 }
 
@@ -668,59 +661,136 @@ static bool minimafs_write_blocks(minimafs_drive_t* drive, uint32_t block_num,
  * BLOCK ALLOCATOR
  * ================================================================ */
 
-#define MINIMAFS_BITMAP_SIZE 8192  /* 64 K blocks = 256 MB max */
+/*
+ * Free space is tracked as a sorted list of used extents (start, count),
+ * rebuilt from the directory tree at mount time. Files are contiguous, so
+ * the list has about one entry per file and its size does not depend on
+ * the volume size. (The old bitmap was a fixed 8 KiB per drive, which
+ * capped a volume at 64 Ki blocks = 256 MiB.) Block numbers are 32-bit,
+ * so a volume holds up to 2^32 4 KiB blocks = 16 TiB.
+ */
 
 typedef struct {
-    uint8_t  bitmap[MINIMAFS_BITMAP_SIZE];
+    uint32_t start;
+    uint32_t count;
+} minimafs_extent_t;
+
+typedef struct {
+    minimafs_extent_t* ext;
+    uint32_t n;
+    uint32_t cap;
     uint32_t total_blocks;
     uint32_t free_blocks;
+    volatile int lock;
 } minimafs_block_alloc_t;
 
 static minimafs_block_alloc_t g_block_alloc[MINIMAFS_MAX_DRIVES];
 
+static void ba_lock(minimafs_block_alloc_t* a) {
+    while (__sync_lock_test_and_set(&a->lock, 1)) { __asm__ volatile("pause"); }
+}
+
+static void ba_unlock(minimafs_block_alloc_t* a) {
+    __sync_lock_release(&a->lock);
+}
+
+static bool ba_reserve(minimafs_block_alloc_t* a, uint32_t need) {
+    if (need <= a->cap) return true;
+    uint32_t cap = a->cap ? a->cap : 256;
+    while (cap < need) cap *= 2;
+    minimafs_extent_t* grown =
+        (minimafs_extent_t*)alloc_unzeroed((size_t)cap * sizeof(minimafs_extent_t));
+    if (!grown) {
+        serial_write_str("MinimaFS: OOM growing extent list\n");
+        return false;
+    }
+    if (a->ext) {
+        memcpy(grown, a->ext, (size_t)a->n * sizeof(minimafs_extent_t));
+        free_mem(a->ext);
+    }
+    a->ext = grown;
+    a->cap = cap;
+    return true;
+}
+
 static void block_alloc_init(uint8_t drive_num, uint32_t total_blocks) {
     minimafs_block_alloc_t* a = &g_block_alloc[drive_num];
-    memset(a->bitmap, 0, MINIMAFS_BITMAP_SIZE);
+    ba_lock(a);
+    a->n = 0;
     a->total_blocks = total_blocks;
-    a->free_blocks  = total_blocks;
-    /* block 0 = storage.desc, always used */
-    a->bitmap[0] |= 1;
-    a->free_blocks--;
+    a->free_blocks = total_blocks;
+    ba_unlock(a);
+}
+
+// Adds [start, start+count) to the used list. Caller holds the lock.
+static void ba_mark_used_locked(minimafs_block_alloc_t* a, uint32_t start,
+                                uint32_t count) {
+    if (count == 0 || start >= a->total_blocks) return;
+    uint64_t s = start;
+    uint64_t e = (uint64_t)start + count;
+    if (e > a->total_blocks) e = a->total_blocks;
+
+    // First extent that ends at or after s (touching extents merge too).
+    uint32_t i = 0;
+    while (i < a->n && (uint64_t)a->ext[i].start + a->ext[i].count < s) i++;
+
+    uint64_t ms = s, me = e;
+    uint64_t already = 0;
+    uint32_t j = i;
+    while (j < a->n && a->ext[j].start <= me) {
+        uint64_t xs = a->ext[j].start;
+        uint64_t xe = xs + a->ext[j].count;
+        uint64_t os = xs > s ? xs : s;
+        uint64_t oe = xe < e ? xe : e;
+        if (oe > os) already += oe - os;
+        if (xs < ms) ms = xs;
+        if (xe > me) me = xe;
+        j++;
+    }
+
+    uint64_t newly = (e - s) - already;
+    a->free_blocks = a->free_blocks > newly ? a->free_blocks - (uint32_t)newly : 0;
+
+    if (j == i) {
+        if (!ba_reserve(a, a->n + 1)) return;
+        memmove(&a->ext[i + 1], &a->ext[i], (size_t)(a->n - i) * sizeof(minimafs_extent_t));
+        a->n++;
+    } else if (j > i + 1) {
+        memmove(&a->ext[i + 1], &a->ext[j], (size_t)(a->n - j) * sizeof(minimafs_extent_t));
+        a->n -= (j - i - 1);
+    }
+    a->ext[i].start = (uint32_t)ms;
+    a->ext[i].count = (uint32_t)(me - ms);
 }
 
 static void block_alloc_mark_used(uint8_t drive_num, uint32_t block_num, uint32_t count) {
     minimafs_block_alloc_t* a = &g_block_alloc[drive_num];
-    for (uint32_t i = 0; i < count; i++) {
-        uint32_t b    = block_num + i;
-        uint32_t byte = b / 8;
-        uint8_t  bit  = b % 8;
-        if (byte >= MINIMAFS_BITMAP_SIZE) return;
-        if (!(a->bitmap[byte] & (1 << bit))) {
-            a->bitmap[byte] |= (1 << bit);
-            if (a->free_blocks > 0) a->free_blocks--;
-        }
-    }
+    ba_lock(a);
+    ba_mark_used_locked(a, block_num, count);
+    ba_unlock(a);
 }
 
+// First fit. Block 0 (storage.desc) is never handed out.
 static uint32_t block_alloc_run(uint8_t drive_num, uint32_t count) {
     if (count == 0) return 0xFFFFFFFF;
     minimafs_block_alloc_t* a = &g_block_alloc[drive_num];
-    uint32_t max_b = MINIMAFS_BITMAP_SIZE * 8;
-    uint32_t run_start = 0, run_len = 0;
-
-    for (uint32_t b = 1; b < max_b; b++) {
-        bool used = (a->bitmap[b/8] & (1 << (b%8))) != 0;
-        if (!used) {
-            if (run_len == 0) run_start = b;
-            if (++run_len >= count) {
-                block_alloc_mark_used(drive_num, run_start, count);
-                return run_start;
-            }
-        } else {
-            run_len = 0;
+    ba_lock(a);
+    uint64_t cursor = 1;
+    uint32_t found = 0xFFFFFFFF;
+    for (uint32_t i = 0; i <= a->n; i++) {
+        uint64_t gap_end = (i < a->n) ? a->ext[i].start : a->total_blocks;
+        if (gap_end > cursor && gap_end - cursor >= count) {
+            found = (uint32_t)cursor;
+            break;
+        }
+        if (i < a->n) {
+            uint64_t xe = (uint64_t)a->ext[i].start + a->ext[i].count;
+            if (xe > cursor) cursor = xe;
         }
     }
-    return 0xFFFFFFFF;
+    if (found != 0xFFFFFFFF) ba_mark_used_locked(a, found, count);
+    ba_unlock(a);
+    return found;
 }
 
 static uint32_t block_alloc(uint8_t drive_num) {
@@ -728,17 +798,42 @@ static uint32_t block_alloc(uint8_t drive_num) {
 }
 
 static void block_free_run(uint8_t drive_num, uint32_t block_num, uint32_t count) {
+    if (count == 0) return;
     minimafs_block_alloc_t* a = &g_block_alloc[drive_num];
-    for (uint32_t i = 0; i < count; i++) {
-        uint32_t b    = block_num + i;
-        uint32_t byte = b / 8;
-        uint8_t  bit  = b % 8;
-        if (byte >= MINIMAFS_BITMAP_SIZE) return;
-        if (a->bitmap[byte] & (1 << bit)) {
-            a->bitmap[byte] &= ~(1 << bit);
-            a->free_blocks++;
+    uint64_t s = block_num, e = (uint64_t)block_num + count;
+    ba_lock(a);
+    for (uint32_t i = 0; i < a->n; i++) {
+        uint64_t xs = a->ext[i].start;
+        uint64_t xe = xs + a->ext[i].count;
+        if (xe <= s) continue;
+        if (xs >= e) break;
+        uint64_t os = xs > s ? xs : s;
+        uint64_t oe = xe < e ? xe : e;
+        a->free_blocks += (uint32_t)(oe - os);
+        bool left = xs < s, right = xe > e;
+        if (left && right) {
+            if (!ba_reserve(a, a->n + 1)) break;
+            memmove(&a->ext[i + 2], &a->ext[i + 1],
+                    (size_t)(a->n - i - 1) * sizeof(minimafs_extent_t));
+            a->n++;
+            a->ext[i].count = (uint32_t)(s - xs);
+            a->ext[i + 1].start = (uint32_t)e;
+            a->ext[i + 1].count = (uint32_t)(xe - e);
+            break;
+        } else if (left) {
+            a->ext[i].count = (uint32_t)(s - xs);
+        } else if (right) {
+            a->ext[i].start = (uint32_t)e;
+            a->ext[i].count = (uint32_t)(xe - e);
+            break;
+        } else {
+            memmove(&a->ext[i], &a->ext[i + 1],
+                    (size_t)(a->n - i - 1) * sizeof(minimafs_extent_t));
+            a->n--;
+            i--;
         }
     }
+    ba_unlock(a);
 }
 
 /* ================================================================
@@ -2062,13 +2157,13 @@ bool minimafs_is_dir(const char* path) {
 static bool minimafs_self_test_drive(minimafs_drive_t* drive) {
     if (!drive || !drive->device_handle) return false;
     minimafs_disk_device_t* disk = (minimafs_disk_device_t*)drive->device_handle;
-    if (!disk->ahci_drive || disk->sector_size == 0) return false;
+    if (disk->sector_size == 0) return false;
     if (!ensure_dma_bounce(drive->drive_number)) return false;
     if ((MINIMAFS_BLOCK_SIZE % disk->sector_size) != 0) return false;
 
     uint8_t*  bounce           = (uint8_t*)g_dma_bounce[drive->drive_number];
     uint32_t  sectors_per_block = MINIMAFS_BLOCK_SIZE / disk->sector_size;
-    return ahci_read(disk->ahci_drive, 0, sectors_per_block, bounce);
+    return blockdev_read(disk, 0, sectors_per_block, bounce);
 }
 
 /* ================================================================
@@ -2080,6 +2175,11 @@ int minimafs_mount(void* device_handle, uint8_t drive_number) {
 
     minimafs_drive_t* drive = get_drive(drive_number);
     if (drive->mounted) { serial_write_str("MinimaFS: Already mounted\n"); return 2; }
+    blockdev_t* bdev = (blockdev_t*)device_handle;
+    if (bdev->mounted_drive >= 0) {
+        serial_write_str("MinimaFS: volume already mounted as another drive\n");
+        return 2;
+    }
 
     drive->device_handle = device_handle;
 
@@ -2117,6 +2217,11 @@ int minimafs_mount(void* device_handle, uint8_t drive_number) {
         free_mem(sd); return 4;
     }
 
+    if ((uint64_t)sd->total_blocks * MINIMAFS_BLOCK_SIZE > blockdev_size_bytes(bdev)) {
+        serial_write_str("MinimaFS: volume is bigger than its device\n");
+        free_mem(sd); return 5;
+    }
+
     drive->storage_desc = *sd;
     free_mem(sd);
 
@@ -2137,6 +2242,7 @@ int minimafs_mount(void* device_handle, uint8_t drive_number) {
                           sizeof(drive->storage_desc.last_mounted));
 
     drive->mounted = true;
+    bdev->mounted_drive = drive_number;
     serial_write_str("MinimaFS: Drive ");
     serial_write_dec(drive_number);
     serial_write_str(" mounted OK\n");
@@ -2155,6 +2261,9 @@ bool minimafs_unmount(uint8_t drive_number) {
         g_dma_bounce[drive_number] = NULL;
     }
 
+    if (drive->device_handle) {
+        ((blockdev_t*)drive->device_handle)->mounted_drive = -1;
+    }
     drive->mounted        = false;
     drive->device_handle  = NULL;
     return true;
@@ -2168,9 +2277,13 @@ bool minimafs_format(void* device_handle, uint64_t size,
     serial_write_dec((uint32_t)(size / (1024 * 1024)));
     serial_write_str(" MB)\n");
 
+    if (size / MINIMAFS_BLOCK_SIZE > MINIMAFS_MAX_BLOCKS) {
+        serial_write_str("MinimaFS: volume larger than 16 TiB, using the first 16 TiB\n");
+        size = (uint64_t)MINIMAFS_MAX_BLOCKS * MINIMAFS_BLOCK_SIZE;
+    }
     uint32_t total_blocks = (uint32_t)(size / MINIMAFS_BLOCK_SIZE);
-    if (total_blocks > MINIMAFS_BITMAP_SIZE * 8) {
-        serial_write_str("MinimaFS: Drive too large for bitmap\n");
+    if (total_blocks < 16) {
+        serial_write_str("MinimaFS: volume too small\n");
         return false;
     }
 

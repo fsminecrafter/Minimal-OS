@@ -1,3 +1,4 @@
+#include "x86_64/fgpu.h"
 // src/impl/handlers/prochandler.c
 #include "x86_64/scheduler.h"
 #include "x86_64/proc.h"
@@ -109,6 +110,7 @@ bool killProcess(uint64_t pid) {
     // just be left to happen lazily anymore now that queues are
     // per-CPU linked lists rather than one global list scan.
     window_manager_process_exit(proc->pid);
+    fgpu_process_exit(proc->pid);
     graphics_release_screen_for_pid(proc->pid);
     proc->state = PROCESS_ZOMBIE;
     scheduler_dequeue(proc);

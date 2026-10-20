@@ -2,6 +2,7 @@
 #define SYSCALL_H
 
 #include <stdint.h>
+#include "fgpu_abi.h"
 
 #define SYS_WRITE   1
 #define SYS_EXIT    2
@@ -80,6 +81,7 @@
 #define SYS_GETCWD        35
 #define SYS_INPUT_READ    36
 #define SYS_WINDOW        37
+// SYS_GPU (40) and its structures: see fgpu_abi.h
 
 #define SYS_O_RDONLY 0
 // Anything non-zero opens writable; SYS_OPEN maps flags==SYS_O_RDONLY
@@ -103,6 +105,8 @@
 // Non-blocking call with nothing to report yet (SYS_NET_TCP_ACCEPT with
 // an empty backlog). Not an error: call again.
 #define SYS_ERR_AGAIN    ((uint64_t)-7)
+// Out of memory (kernel heap or video memory).
+#define SYS_ERR_NOMEM    ((uint64_t)-8)
 
 typedef enum {
     SYS_GRAPHICS_GET_WIDTH = 1,

@@ -5,6 +5,7 @@
 #include "x86_64/scheduler.h"
 #include "x86_64/minimafs.h"
 #include "x86_64/gpu_manager.h"
+#include "x86_64/fgpu.h"
 #include "x86_64/audio_manager.h"
 #include "x86_64/storage_manager.h"
 #include "x86_64/usb_manager.h"
@@ -57,6 +58,10 @@ static bool user_range_ok(const void* ptr, size_t len, bool write) {
     }
 
     return true;
+}
+
+bool syscall_user_range_ok(const void* ptr, size_t len, bool write) {
+    return user_range_ok(ptr, len, write);
 }
 
 static uint64_t sys_write_impl(int fd, const char* buf, uint64_t len) {
@@ -987,6 +992,10 @@ static bool syscall_user_may_call(uint64_t syscall_num, const syscall_regs_t* re
             return user_range_ok((const void*)regs->rdi,
                                  sizeof(syscall_window_request_t), false);
 
+        case SYS_GPU:
+            return user_range_ok((const void*)regs->rdi,
+                                 sizeof(syscall_gpu_request_t), true);
+
         default:
             // Everything else (SYS_WRITE, file I/O, graphics drawing,
             // process/time queries, MinimaFS extensions, SYS_PKG, etc)
@@ -1018,6 +1027,9 @@ void syscall_dispatch(syscall_regs_t* regs) {
     }
 
     switch (regs->rax) {
+        case SYS_GPU:
+            regs->rax = fgpu_syscall((syscall_gpu_request_t*)regs->rdi);
+            return;
         case SYS_WRITE: {
             int fd          = (int)regs->rdi;
             const char* buf = (const char*)regs->rsi;

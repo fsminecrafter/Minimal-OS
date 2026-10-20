@@ -1,3 +1,4 @@
+#include "x86_64/fgpu.h"
 #include "mmu_tables.h"
 // src/impl/proc/proc.c
 #include <stdint.h>
@@ -664,6 +665,7 @@ process_t* proc_create(const char* file_name, void (*entry_point)()) {
 void kill(process_t* proc) {
 	if (!proc) return;
 	window_manager_process_exit(proc->pid);
+	fgpu_process_exit(proc->pid);
 	graphics_release_screen_for_pid(proc->pid);
 	proc->state = PROCESS_ZOMBIE;
 	// Pull it out of whatever per-CPU run queue it's sitting in so it

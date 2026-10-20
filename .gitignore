@@ -18,3 +18,6 @@ planning
 
 # Ignore vendored SDK subtree until it is intentionally used
 Minimal-OS-SDK/
+
+# Built from Minimal-OS-SDK/programs/fglcube
+src/resources/install2/fglcube.run

@@ -1,3 +1,4 @@
+#include "x86_64/fgpu.h"
 // src/impl/proc/scheduler.c
 #include <stdint.h>
 #include <stddef.h>
@@ -675,6 +676,7 @@ static void expire_cleanup_requests(void) {
         serial_write_str(proc->name);
         serial_write_str("\n");
         window_manager_process_exit(proc->pid);
+        fgpu_process_exit(proc->pid);
         graphics_release_screen_for_pid(proc->pid);
         proc->state = PROCESS_ZOMBIE;
         scheduler_dequeue(proc);
@@ -810,6 +812,7 @@ void process_exit_with_status(uint8_t exit_code, bool crashed,
     current_process->crashed = crashed;
     current_process->crash_vector = crash_vector;
     window_manager_process_exit(current_process->pid);
+    fgpu_process_exit(current_process->pid);
     graphics_release_screen_for_pid(current_process->pid);
 
     serial_write_str("[PROC] Exiting process: ");

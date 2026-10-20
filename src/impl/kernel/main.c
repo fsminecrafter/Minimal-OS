@@ -144,6 +144,9 @@ void kernel_main(uint64_t mb2_info_addr) {
     } else {
         serial_write_str("Falling back to PS/2\n");
     }
+    // USB 3 controllers (every recent PC): keyboards and mice on them.
+    extern uint32_t xhci_init_all(void);
+    xhci_init_all();
     // Always set the 8042 up: without a USB keyboard driver for the
     // machine's controller (e.g. xHCI) PS/2 is the only way keys arrive,
     // and UEFI firmware may leave it disabled.

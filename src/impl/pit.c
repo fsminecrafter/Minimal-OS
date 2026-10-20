@@ -51,6 +51,8 @@ void pit_irq_handler() {
 
     // Usb poll
     usb_poll();
+    extern void xhci_poll(void);
+    xhci_poll();
     
     // Audio update (mix into HW buffer)
     audio_update();

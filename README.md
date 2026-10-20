@@ -188,13 +188,14 @@ Last synced 2026 - oct 20, 15:29
 
 - [X] Golf
 - [ ] GPU support (not just display adapter)
-- [ ] MiniGL (Minimal-OS Graphics Library)
+- [ ] FarcadeGL (Minimal-OS Graphics Library)
 - [ ] Partitions & Larger disk's
 - [ ] Installer & Disk bootable installs
 
 ##### V 0.4.52
 
-- [ ] Web browser?
+- [ ] GPU engine and GLSL style shaders
+- [ ] Fix various apps.
 
 ## Usage
 

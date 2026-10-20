@@ -125,7 +125,8 @@ static inline uint32_t pack_color(const float c[4]) {
     uint32_t r = (uint32_t)(f_clamp01(c[0]) * 255.0f + 0.5f);
     uint32_t g = (uint32_t)(f_clamp01(c[1]) * 255.0f + 0.5f);
     uint32_t b = (uint32_t)(f_clamp01(c[2]) * 255.0f + 0.5f);
-    return (r << 16) | (g << 8) | b;
+    // Opaque: window compositors read the top byte as alpha.
+    return 0xFF000000u | (r << 16) | (g << 8) | b;
 }
 
 static inline float edge(float ax, float ay, float bx, float by, float px, float py) {
@@ -293,7 +294,8 @@ void fgpu_raster_clear(const fgpu_target_t* t, uint32_t flags, uint32_t color, f
     if ((flags & FGPU_CLEAR_COLOR) && t->color) {
         for (uint32_t y = 0; y < t->height; y++) {
             uint32_t* row = t->color + (size_t)y * t->color_pitch;
-            for (uint32_t x = 0; x < t->width; x++) row[x] = color & 0x00FFFFFFu;
+            uint32_t opaque = color | 0xFF000000u;
+            for (uint32_t x = 0; x < t->width; x++) row[x] = opaque;
         }
     }
     if ((flags & FGPU_CLEAR_DEPTH) && t->depth) {

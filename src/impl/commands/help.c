@@ -35,7 +35,8 @@ static void help_system_information(void) {
     help_section("System information");
     help_item("info", "Show system, CPU, PCI, and memory information.");
     help_item("cpu", "Show CPU information.");
-    help_item("gpu", "Show GPU information.");
+    help_item("gpu", "Show GPU adapters, VRAM and capabilities.");
+    help_item("fglcube [seconds]", "FarcadeGL 3D demo: a rotating, lit cube.");
     help_item("memsize", "Show available memory in megabytes.");
     help_item("usage", "Show memory and process usage.");
     help_item("chgres <width> <height>", "Change the display resolution.");
@@ -59,9 +60,14 @@ static void help_files_and_directories(void) {
 
 static void help_storage_and_packages(void) {
     help_section("Storage and packages");
-    help_item("initdisk [index]", "Detect and initialize a disk.");
-    help_item("mount [index]", "Mount a MinimaFS disk.");
-    help_item("format [index]", "Format a disk as MinimaFS.");
+    help_item("disks (lsblk)", "List disks, partitions and filesystems.");
+    help_item("part <disk> [init|add|del] ...", "Show or edit a partition table (MBR/GPT).");
+    help_item("format [device] [drive] [label]", "Format a disk or partition as MinimaFS.");
+    help_item("mount [device] [drive]", "Mount a volume as N: (no arguments: list).");
+    help_item("umount <drive>", "Unmount drive N:.");
+    help_item("drives", "List mounted drives and their usage.");
+    help_item("install <disk> [--mbr] [--yes]", "Install Minimal-OS so the disk boots (BIOS + UEFI).");
+    help_item("initdisk", "Rescan disks.");
     help_item("importmusic", "Copy the built-in music file to the disk.");
     help_item("pkg <unzip|zip> ...", "Extract or create a package archive.");
     help_item("pkg unzip <archive> [target]", "Extract into an archive-named folder by default.");

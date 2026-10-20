@@ -126,6 +126,44 @@ static bool load_accounts(accounts_t* accounts) {
            accounts->count <= MAX_ACCOUNTS;
 }
 
+/*
+ * Current MOSdesk keeps its single account in settings.dat
+ * (mosdesk/settings.h, mosdesk_settings_t) instead of accounts.dat:
+ * login_enabled, password salt and hash near the start, the username at
+ * the end (files from before usernames existed have none).
+ */
+#define SETTINGS_PATH "0:/programs/mosdesk/settings.dat"
+#define SETTINGS_MAGIC 0x4D445331u
+#define SETTINGS_LOGIN_OFFSET 32u
+#define SETTINGS_SALT_OFFSET 36u
+#define SETTINGS_HASH_OFFSET 52u
+#define SETTINGS_USERNAME_OFFSET 828u
+#define SETTINGS_SIZE (SETTINGS_USERNAME_OFFSET + USERNAME_SIZE)
+
+static bool load_settings_account(account_t* account) {
+    static uint8_t raw[SETTINGS_SIZE];
+    memset(raw, 0, sizeof(raw));
+    minimafs_file_handle_t* file = minimafs_open(SETTINGS_PATH, true);
+    if (!file) return false;
+    uint32_t got = minimafs_read(file, raw, sizeof(raw));
+    minimafs_close(file);
+    uint32_t magic;
+    memcpy(&magic, raw, 4);
+    if (got < SETTINGS_HASH_OFFSET + HASH_SIZE || magic != SETTINGS_MAGIC) return false;
+    memset(account, 0, sizeof(*account));
+    uint32_t login;
+    memcpy(&login, raw + SETTINGS_LOGIN_OFFSET, 4);
+    account->password_enabled = login ? 1u : 0u;
+    memcpy(account->password_salt, raw + SETTINGS_SALT_OFFSET, SALT_SIZE);
+    memcpy(account->password_hash, raw + SETTINGS_HASH_OFFSET, HASH_SIZE);
+    if (got >= SETTINGS_SIZE) {
+        memcpy(account->username, raw + SETTINGS_USERNAME_OFFSET, USERNAME_SIZE);
+        account->username[USERNAME_SIZE - 1u] = '\0';
+    }
+    memset(raw, 0, sizeof(raw));
+    return true;
+}
+
 /* ---------------------------------------------------------------- tickets */
 
 static ticket_t* find_ticket(uint64_t pid) {
@@ -197,7 +235,16 @@ uint64_t root_syscall(syscall_root_t* request) {
             request->password[sizeof(request->password) - 1u] = '\0';
             static accounts_t accounts;
             bool ok = false;
-            if (load_accounts(&accounts)) {
+            static account_t settings_account;
+            if (!ok && load_settings_account(&settings_account) &&
+                (!settings_account.username[0] ||
+                 !strcmp(settings_account.username, request->username))) {
+                ok = settings_account.password_enabled
+                    ? password_matches(&settings_account, request->password)
+                    : request->password[0] == '\0';
+            }
+            memset(&settings_account, 0, sizeof(settings_account));
+            if (!ok && load_accounts(&accounts)) {
                 for (uint32_t i = 0; i < accounts.count && !ok; i++) {
                     accounts.list[i].username[USERNAME_SIZE - 1u] = '\0';
                     if (strcmp(accounts.list[i].username, request->username))

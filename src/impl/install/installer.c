@@ -12,8 +12,7 @@
 #include "serial.h"
 #include "string.h"
 
-#define ESP_BYTES_512   (64ULL * 1024 * 1024)
-#define ESP_BYTES_4K    (300ULL * 1024 * 1024)
+#define ESP_BYTES       (256ULL * 1024 * 1024)   // kernel (tens of MiB with MOSdesk) + GRUB
 #define BIOS_BOOT_BYTES (1024ULL * 1024)
 #define MIN_SYSTEM_BYTES (64ULL * 1024 * 1024)
 
@@ -45,10 +44,17 @@ static bool payload_module(const uint8_t** data, uint32_t* size) {
     return memcmp(*data, MPKG_MAGIC, MPKG_MAGIC_SIZE) == 0;
 }
 
+static bool kernel_image(payload_file_t* out);
+static void payload_release(payload_file_t* f);
+
 bool installer_payload_available(void) {
     const uint8_t* d;
     uint32_t s;
-    return payload_module(&d, &s);
+    if (!payload_module(&d, &s)) return false;
+    payload_file_t k;
+    bool ok = kernel_image(&k);
+    if (ok) payload_release(&k);
+    return ok;
 }
 
 static uint32_t rd32(const uint8_t* p) {
@@ -94,6 +100,19 @@ static bool payload_get(const char* name, payload_file_t* out) {
         return false;
     }
     return false;
+}
+
+// The running kernel's file: GRUB's "moskernel" module, or (older
+// payloads) a kernel.bin inside the payload.
+static bool kernel_image(payload_file_t* out) {
+    memset(out, 0, sizeof(*out));
+    memlayout_module_t m;
+    if (memlayout_find_module(kernel_multiboot_info, "moskernel", &m) && m.end > m.start) {
+        out->data = (const uint8_t*)(uintptr_t)m.start;
+        out->size = (uint32_t)(m.end - m.start);
+        return true;
+    }
+    return payload_get("kernel.bin", out);
 }
 
 static void payload_release(payload_file_t* f) {
@@ -215,8 +234,8 @@ static bool write_bios_boot(blockdev_t* disk, uint64_t core_lba, uint64_t room_s
 static bool write_boot_partition(blockdev_t* esp, const char* root_id,
                                  char* err, size_t err_size) {
     payload_file_t kernel, efi;
-    if (!payload_get("kernel.bin", &kernel)) {
-        fail(err, err_size, "install payload has no kernel.bin");
+    if (!kernel_image(&kernel)) {
+        fail(err, err_size, "the kernel image was not loaded (boot entry lacks 'moskernel')");
         return false;
     }
     bool have_efi = payload_get("bootx64.efi", &efi);
@@ -241,18 +260,21 @@ static bool write_boot_partition(blockdev_t* esp, const char* root_id,
              "\n"
              "menuentry \"Minimal-OS\" {\n"
              "\tmultiboot2 /boot/kernel.bin root=%s\n"
+             "\tmodule2 /boot/kernel.bin moskernel\n"
              "\tmodule2 /boot/mosinst.mpk mosinst\n"
              "\tboot\n"
              "}\n"
              "\n"
              "menuentry \"Minimal-OS (Debug)\" {\n"
              "\tmultiboot2 /boot/kernel.bin root=%s --debug\n"
+             "\tmodule2 /boot/kernel.bin moskernel\n"
              "\tmodule2 /boot/mosinst.mpk mosinst\n"
              "\tboot\n"
              "}\n"
              "\n"
              "menuentry \"Minimal-OS (No Disk)\" {\n"
              "\tmultiboot2 /boot/kernel.bin no-disk\n"
+             "\tmodule2 /boot/kernel.bin moskernel\n"
              "\tmodule2 /boot/mosinst.mpk mosinst\n"
              "\tboot\n"
              "}\n",
@@ -318,7 +340,7 @@ bool installer_run(const install_options_t* opt, storage_progress_fn progress,
             return false;
         }
         if (blockdev_size_bytes(disk) < INSTALLER_MIN_DISK_BYTES) {
-            fail(err, err_size, "disk is too small (needs 256 MiB)");
+            fail(err, err_size, "disk is too small (needs 512 MiB)");
             return false;
         }
         mbr = opt->use_mbr;
@@ -332,7 +354,7 @@ bool installer_run(const install_options_t* opt, storage_progress_fn progress,
             fail(err, err_size, "could not write the partition table");
             return false;
         }
-        uint64_t esp_bytes = disk->sector_size == 512 ? ESP_BYTES_512 : ESP_BYTES_4K;
+        uint64_t esp_bytes = ESP_BYTES;
         esp = partition_add(disk, 0, esp_bytes / disk->sector_size, PART_KIND_ESP, "MOSBOOT");
         if (!esp) {
             fail(err, err_size, "could not create the boot partition");

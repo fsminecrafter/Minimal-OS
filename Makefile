@@ -68,6 +68,14 @@ install3_source := build/resources/mosdesk-install/install3
 mosdesk_install_dep := mosdesk-stage
 endif
 
+# The packages are rebuilt when switching between plain and MOSDESK=1 builds.
+build_mode := $(if $(filter 1,$(MOSDESK)),mosdesk,plain)
+mode_stamp := build/resources/mode-$(build_mode).stamp
+$(mode_stamp):
+	mkdir -p $(dir $@)
+	rm -f build/resources/mode-*.stamp
+	touch $@
+
 install2_files := $(shell find $(install2_source) -type f 2>/dev/null)
 install3_files := $(shell find $(install3_source) -type f 2>/dev/null)
 install2_tree_deps := $(install2_source) $(install2_files)
@@ -164,7 +172,7 @@ $(install1_object): $(install1_mpkg)
 		--redefine-sym _binary_build_resources_install1_mpkg_end=_binary_install1_mpkg_end \
 		$< $@
 
-$(install2_mpkg): $(mosdesk_install_dep) $(install2_tree_deps) $(dlr_run) $(dlrconnect_run) $(fglcube_run) tools/mkpkg/mkpkg.py
+$(install2_mpkg): $(mode_stamp) $(mosdesk_install_dep) $(install2_tree_deps) $(dlr_run) $(dlrconnect_run) $(fglcube_run) tools/mkpkg/mkpkg.py
 	mkdir -p $(dir $@)
 	$(MKPKG) $(install2_source) $@ --store
 
@@ -184,7 +192,7 @@ $(install2_object): $(install2_mpkg)
 		--redefine-sym _binary_build_resources_install2_mpkg_end=_binary_install2_mpkg_end \
 		$< $@
 
-$(install3_mpkg): $(mosdesk_install_dep) $(install3_tree_deps) tools/mkpkg/mkpkg.py
+$(install3_mpkg): $(mode_stamp) $(mosdesk_install_dep) $(install3_tree_deps) tools/mkpkg/mkpkg.py
 	mkdir -p $(dir $@)
 	$(MKPKG) $(install3_source) $@ --store
 
@@ -195,8 +203,8 @@ $(install3_object): $(install3_mpkg)
 		--redefine-sym _binary_build_resources_install3_mpkg_end=_binary_install3_mpkg_end \
 		$< $@
 
-# Install payload: what the 'install' command writes to a disk so it boots
-# by itself. GRUB loads it as the boot module "mosinst". GRUB's BIOS core
+# Install payload: GRUB's boot images for the 'install' command. GRUB loads
+# it as the boot module "mosinst" (and the kernel file as "moskernel"). GRUB's BIOS core
 # looks for its files on partition 1 of the boot disk; GRUB for UEFI uses
 # the partition it was started from (the EFI System Partition).
 GRUB_PC_DIR ?= /usr/lib/grub/i386-pc
@@ -210,7 +218,8 @@ installer_mpkg := targets/x86_64/iso/boot/mosinst.mpkg
 installer-payload:
 	rm -rf $(installer_dir)
 	mkdir -p $(installer_dir)
-	cp dist/x86_64/kernel.bin $(installer_dir)/kernel.bin
+	# The kernel itself is not in here: GRUB loads boot/kernel.bin a second
+	# time as the "moskernel" module, so it is not stored twice.
 	cp $(GRUB_PC_DIR)/boot.img $(installer_dir)/boot.img
 	grub-mkimage -d $(GRUB_PC_DIR) -O i386-pc -o $(installer_dir)/core.img \
 		-p '(,1)/boot/grub' biosdisk $(GRUB_INSTALL_MODULES)
@@ -245,27 +254,48 @@ audio: $(audio_obj_files_build) $(audio_obj_files_src)
 src/resources/%.o: src/resources/%.wav
 	python3 tools/audioconverter/wavtoheader.py $< $@
 
+# 'run' also attaches an empty second disk (sparse file, takes no space
+# until written) for the installer, and gives the virtual GPU 64 MiB VRAM.
+INSTALL_DISK ?= install-target.img
+INSTALL_DISK_SIZE ?= 8G
+QEMU_VGA ?= -vga none -device VGA,vgamem_mb=64
+QEMU_INSTALL_DISK = -drive id=disk1,file=$(INSTALL_DISK),if=none,format=raw -device ide-hd,drive=disk1,bus=ahci.1
+OVMF_CODE ?= /usr/share/OVMF/OVMF_CODE_4M.fd
+OVMF_VARS ?= /usr/share/OVMF/OVMF_VARS_4M.fd
+
+$(INSTALL_DISK):
+	truncate -s $(INSTALL_DISK_SIZE) $@
+
 .PHONY: run
-run: build-x86_64
-	qemu-system-x86_64 -smp 2 -cdrom dist/x86_64/kernel.iso -m 1024M -boot d -d guest_errors,int,cpu_reset,unimp -D qemu.log -serial stdio -device piix3-usb-uhci,id=uhci -device usb-kbd,bus=uhci.0,port=1 -device usb-mouse,bus=uhci.0,port=2 -audiodev $(QEMU_AUDIO_DRIVER),id=speaker -machine pcspk-audiodev=speaker  -audiodev $(QEMU_AUDIO_DRIVER),id=audio0 -device AC97,audiodev=audio0 -device ahci,id=ahci -drive id=disk0,file=sata256.img,if=none,format=raw -device ide-hd,drive=disk0,bus=ahci.0 -netdev $(QEMU_NETDEV) -device rtl8139,netdev=net0,mac=52:54:00:12:34:56
+run: build-x86_64 $(INSTALL_DISK)
+	qemu-system-x86_64 -smp 2 -cdrom dist/x86_64/kernel.iso -m 1024M $(QEMU_VGA) $(QEMU_INSTALL_DISK) -boot d -d guest_errors,int,cpu_reset,unimp -D qemu.log -serial stdio -device piix3-usb-uhci,id=uhci -device usb-kbd,bus=uhci.0,port=1 -device usb-mouse,bus=uhci.0,port=2 -audiodev $(QEMU_AUDIO_DRIVER),id=speaker -machine pcspk-audiodev=speaker  -audiodev $(QEMU_AUDIO_DRIVER),id=audio0 -device AC97,audiodev=audio0 -device ahci,id=ahci -drive id=disk0,file=sata256.img,if=none,format=raw -device ide-hd,drive=disk0,bus=ahci.0 -netdev $(QEMU_NETDEV) -device rtl8139,netdev=net0,mac=52:54:00:12:34:56
 
 .PHONY: mosdesk-build mosdesk-stage run-mosdesk
+# MOSDESK_USE_LOCAL=1 builds the checkouts as they are (no submodule
+# fetching), e.g. when MOSdesk and the SDK have unpushed changes.
+MOSDESK_USE_LOCAL ?= 0
+
 mosdesk-build:
 	mkdir -p $(dir $(MOSDESK_DIR))
-	@if ! git submodule update --init --recursive Minimal-OS-SDK; then \
+	@if [ "$(MOSDESK_USE_LOCAL)" = 1 ]; then exit 0; fi; \
+	if ! git submodule update --init --recursive Minimal-OS-SDK; then \
 		git -C Minimal-OS-SDK fetch origin && \
 		git -C Minimal-OS-SDK checkout --detach FETCH_HEAD; \
 	fi
-	@if ! git submodule update --init "$(MOSDESK_DIR)"; then \
+	@if [ "$(MOSDESK_USE_LOCAL)" = 1 ]; then exit 0; fi; \
+	if ! git submodule update --init "$(MOSDESK_DIR)"; then \
 		echo "mosdesk-build: pinned MOSdesk commit is not on the remote; using its latest default branch" >&2; \
 		git submodule update --init --remote --force "$(MOSDESK_DIR)"; \
 	fi
-	@if ! git -C "$(MOSDESK_DIR)" submodule update --init; then \
+	@if [ "$(MOSDESK_USE_LOCAL)" = 1 ]; then exit 0; fi; \
+	if ! git -C "$(MOSDESK_DIR)" submodule update --init; then \
 		echo "mosdesk-build: a pinned nested commit is not on the remote; using the latest default branches" >&2; \
 		git -C "$(MOSDESK_DIR)" submodule update --init --remote --force; \
 	fi
+	# MOSdesk is built with this checkout's SDK: its apps talk to this
+	# kernel, so they must use the same syscall headers.
 	CC=$(CC) LD=$(LD) MKPKG_TOOL=$(CURDIR)/tools/mkpkg/mkpkg.py MKPKG_JOBS=$(MKPKG_JOBS) \
-		$(MOSDESK_DIR)/mosdesk/build.sh
+		MOSDESK_SDK_DIR=$(CURDIR)/Minimal-OS-SDK $(MOSDESK_DIR)/mosdesk/build.sh
 
 mosdesk-stage: mosdesk-build $(dlr_run) $(dlrconnect_run) $(fglcube_run)
 	rm -rf build/resources/mosdesk-install
@@ -280,6 +310,22 @@ mosdesk-stage: mosdesk-build $(dlr_run) $(dlrconnect_run) $(fglcube_run)
 
 run-mosdesk:
 	$(MAKE) MOSDESK=1 run
+
+# Boots the disk the installer wrote ($(INSTALL_DISK)) without the CD.
+.PHONY: run-installed run-installed-uefi
+run-installed:
+	qemu-system-x86_64 -smp 2 -m 1024M $(QEMU_VGA) -boot c -serial stdio \
+		-device piix3-usb-uhci,id=uhci -device usb-kbd,bus=uhci.0,port=1 -device usb-mouse,bus=uhci.0,port=2 \
+		-device ahci,id=ahci -drive id=disk0,file=$(INSTALL_DISK),if=none,format=raw -device ide-hd,drive=disk0,bus=ahci.0 \
+		-netdev $(QEMU_NETDEV) -device rtl8139,netdev=net0,mac=52:54:00:12:34:56
+
+# Same with UEFI firmware (needs the ovmf package).
+run-installed-uefi:
+	cp $(OVMF_VARS) build/ovmf-vars.fd
+	qemu-system-x86_64 -machine q35 -smp 2 -m 1024M $(QEMU_VGA) -serial stdio \
+		-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) -drive if=pflash,format=raw,file=build/ovmf-vars.fd \
+		-drive id=disk0,file=$(INSTALL_DISK),if=none,format=raw -device ide-hd,drive=disk0,bus=ide.0 \
+		-netdev $(QEMU_NETDEV) -device rtl8139,netdev=net0,mac=52:54:00:12:34:56
 
 .PHONY: run-two
 run-two: build-x86_64

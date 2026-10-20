@@ -996,6 +996,10 @@ static bool syscall_user_may_call(uint64_t syscall_num, const syscall_regs_t* re
             return user_range_ok((const void*)regs->rdi,
                                  sizeof(syscall_gpu_request_t), true);
 
+        case SYS_STORAGE:
+            return user_range_ok((const void*)regs->rdi,
+                                 sizeof(syscall_storage_request_t), true);
+
         default:
             // Everything else (SYS_WRITE, file I/O, graphics drawing,
             // process/time queries, MinimaFS extensions, SYS_PKG, etc)
@@ -1030,6 +1034,11 @@ void syscall_dispatch(syscall_regs_t* regs) {
         case SYS_GPU:
             regs->rax = fgpu_syscall((syscall_gpu_request_t*)regs->rdi);
             return;
+        case SYS_STORAGE: {
+            extern uint64_t storage_syscall(syscall_storage_request_t* r);
+            regs->rax = storage_syscall((syscall_storage_request_t*)regs->rdi);
+            return;
+        }
         case SYS_WRITE: {
             int fd          = (int)regs->rdi;
             const char* buf = (const char*)regs->rsi;

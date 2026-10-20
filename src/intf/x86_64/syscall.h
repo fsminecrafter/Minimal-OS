@@ -716,4 +716,55 @@ typedef enum {
 // syscall policy remains a separate capability boundary.
 void syscall_dispatch(syscall_regs_t* regs);
 
+
+// ===========================================
+// STORAGE DEVICES (SYS_STORAGE)
+// ===========================================
+//
+// rdi = syscall_storage_request_t*. Read-only view of the disks and
+// partitions the kernel knows (the 'disks' command shows the same). Used
+// by the MOSdesk Installer. Changing disks goes through SYS_ROOT commands
+// (part, format, install), which need an account password.
+#define SYS_STORAGE 41
+#define SYS_STORAGE_ABI_VERSION 1u
+
+#define SYS_STORAGE_LIST   1u   // fill devices[capacity], returns the count
+#define SYS_STORAGE_STATUS 2u   // install_payload, boot_device
+
+#define SYSCALL_STORAGE_KIND_DISK      0u
+#define SYSCALL_STORAGE_KIND_PARTITION 1u
+
+#define SYSCALL_STORAGE_TABLE_NONE 0u
+#define SYSCALL_STORAGE_TABLE_MBR  1u
+#define SYSCALL_STORAGE_TABLE_GPT  2u
+
+// fs: 0 unknown, 1 empty, 2 MinimaFS, 3 FAT, 4 partitioned
+#define SYSCALL_STORAGE_FLAG_BOOT  (1u << 0)   // holds the running system (0:)
+#define SYSCALL_STORAGE_FLAG_IN_USE (1u << 1)  // it or a partition on it is mounted
+
+typedef struct {
+    char name[16];          // "sata0", "nvme0p2"
+    char parent[16];        // partitions: their disk
+    char model[41];
+    char label[37];
+    uint8_t kind;
+    uint8_t table;          // disks
+    uint8_t fs;
+    uint8_t part_kind;      // partitions: 0 minimafs, 1 esp, 2 biosboot, 3 fat, 4 other
+    int32_t mounted_drive;  // -1 if not mounted
+    uint32_t flags;
+    uint32_t sector_size;
+    uint64_t size_bytes;
+} syscall_storage_device_t;
+
+typedef struct {
+    uint32_t size;          // sizeof(syscall_storage_request_t)
+    uint32_t version;       // SYS_STORAGE_ABI_VERSION
+    uint32_t op;
+    uint32_t capacity;
+    syscall_storage_device_t* devices;
+    uint32_t install_payload;   // STATUS: 1 when 'install' can run
+    char boot_device[16];       // STATUS: device mounted as 0:
+} syscall_storage_request_t;
+
 #endif // SYSCALL_H

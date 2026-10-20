@@ -22,8 +22,9 @@
  * on a disk. grub.cfg passes root=<partition GUID> so the kernel mounts
  * the right volume as 0:.
  *
- * The kernel, GRUB's boot images and GRUB for UEFI come from the install
- * payload: an .mpkg that GRUB loads as the boot module "mosinst" (see
+ * GRUB's boot images and GRUB for UEFI come from the install payload, an
+ * .mpkg that GRUB loads as the boot module "mosinst"; the kernel file is
+ * loaded a second time as the module "moskernel" (see
  * targets/x86_64/iso/boot/grub/grub.cfg).
  */
 
@@ -48,4 +49,4 @@ bool installer_run(const install_options_t* options,
                    storage_progress_fn progress, char* err, size_t err_size);
 
 // Smallest disk the installer accepts, in bytes.
-#define INSTALLER_MIN_DISK_BYTES (256ULL * 1024 * 1024)
+#define INSTALLER_MIN_DISK_BYTES (512ULL * 1024 * 1024)

@@ -1,6 +1,8 @@
 #include "print.h"
 #include "x86_64/commandhandler.h"
 #include "x86_64/multiboot2parse.h"
+#include "x86_64/memlayout.h"
+#include "panic.h"
 #include "x86_64/boot_options.h"
 #include "x86_64/memory_test.h"
 #include "x86_64/startuproutine.h"
@@ -40,6 +42,7 @@
 #include "x86_64/random.h"
 
 bool kernel_boot_no_disk;
+multiboot2_info_t* kernel_multiboot_info;
 bool kernel_boot_debug;
 
 
@@ -83,7 +86,12 @@ void kernel_main(uint64_t mb2_info_addr) {
     serial_init();
     smp_init_bsp();
     gdt_init();
-    multiboot2_info_t* mb_info = (multiboot2_info_t*)mb2_info_addr;
+    // Keep a private copy: GRUB put the original somewhere in free RAM,
+    // which the heap may later reuse.
+    multiboot2_info_t* mb_info =
+        memlayout_save_multiboot((multiboot2_info_t*)mb2_info_addr);
+    kernel_multiboot_info = mb_info;
+    memlayout_apply_cache_policy(mb_info);
     kernel_boot_no_disk = multiboot2_has_cmdline_token(mb_info, "no-disk");
     kernel_boot_debug = multiboot2_has_cmdline_token(mb_info, "--debug");
     multiboot2_get_cmdline_value(mb_info, "root=", kernel_boot_root,
@@ -102,7 +110,18 @@ void kernel_main(uint64_t mb2_info_addr) {
     print_str("\n");
     //init allocator only beyond - 0x300000
     //allocator_init((void*)0x300000, 1024);
-    startroutine(total_ram_bytes);
+    extern char _kernel_end;
+    uint64_t heap_region_start = 0, heap_region_end = 0;
+    if (!memlayout_pick_heap_region(mb_info, (uintptr_t)&_kernel_end,
+                                    &heap_region_start, &heap_region_end)) {
+        PANIC("No usable RAM region in the memory map");
+    }
+    serial_write_str("memlayout: heap region 0x");
+    serial_write_hex(heap_region_start);
+    serial_write_str(" - 0x");
+    serial_write_hex(heap_region_end);
+    serial_write_str("\n");
+    startroutine(heap_region_start, heap_region_end);
     //verify_memory_initialization((void*)0x400000, (void*)total_ram_bytes);
 
     //memory_scanner_init();

@@ -1,3 +1,4 @@
+#include "mmu_tables.h"
 // src/impl/proc/proc.c
 #include <stdint.h>
 #include <stddef.h>
@@ -54,14 +55,18 @@ static uint64_t clone_kernel_pml4(void) {
 		if (!dst_pdpt) return 0;
 		memcpy(dst_pdpt, src_pdpt, 512 * sizeof(uint64_t));
 
-		uint64_t pdpte = src_pdpt[0];
-		if (pdpte & 1) {
+		// Every identity-mapped GiB gets its own page directory copy, so
+		// user mappings (which split 2 MiB pages) never touch the
+		// kernel's tables.
+		for (size_t gib = 0; gib < IDENTITY_MAP_GIB; gib++) {
+			uint64_t pdpte = src_pdpt[gib];
+			if (!(pdpte & 1) || (pdpte & (1ULL << 7))) continue;
 			uint64_t* src_pd = (uint64_t*)(uintptr_t)(pdpte & ~0xFFFULL);
 			uint64_t* dst_pd = (uint64_t*)alloc_page_zeroed();
 			if (!dst_pd) return 0;
 			memcpy(dst_pd, src_pd, 512 * sizeof(uint64_t));
 
-			dst_pdpt[0] = (uint64_t)(uintptr_t)dst_pd | (pdpte & 0xFFFULL);
+			dst_pdpt[gib] = (uint64_t)(uintptr_t)dst_pd | (pdpte & 0xFFFULL);
 		}
 
 		dst[0] = (uint64_t)(uintptr_t)dst_pdpt | (pml4e & 0xFFFULL);
@@ -392,8 +397,9 @@ void proc_destroy_address_space(process_t* proc) {
 	uint64_t pml4e = pml4[0];
 	if (pml4e & 1) {
 		uint64_t* pdpt = (uint64_t*)(uintptr_t)(pml4e & ~0xFFFULL);
-		uint64_t pdpte = pdpt[0];
-		if (pdpte & 1) {
+		for (size_t gib = 0; gib < IDENTITY_MAP_GIB; gib++) {
+			uint64_t pdpte = pdpt[gib];
+			if (!(pdpte & 1) || (pdpte & (1ULL << 7))) continue;
 			uint64_t* pd = (uint64_t*)(uintptr_t)(pdpte & ~0xFFFULL);
 			for (size_t i = 0; i < 512; i++) {
 				if ((pd[i] & 1) && !(pd[i] & (1ULL << 7))) {

@@ -36,17 +36,17 @@ void print_pic_masks() {
     print_str("\n");
 }
 
-void startroutine(uint64_t total_ram_bytes) {
-    extern char _kernel_end;
-    uintptr_t heap_start = align_up_uintptr((uintptr_t)&_kernel_end, 0x1000);
+// region_start/region_end: the free RAM block picked by
+// memlayout_pick_heap_region(). The heap gets the bottom of it and the
+// page pool the top PMM_POOL_SIZE bytes.
+void startroutine(uint64_t region_start, uint64_t region_end) {
+    uintptr_t heap_start = align_up_uintptr((uintptr_t)region_start, 0x1000);
     if (heap_start < HEAP_MIN_START) {
         heap_start = HEAP_MIN_START;
     }
-    if (heap_start >= total_ram_bytes) {
-        PANIC("Heap start beyond total RAM");
-    }
-    uintptr_t pmm_end = (uintptr_t)total_ram_bytes & ~(uintptr_t)0xFFF;
-    if (pmm_end < PMM_POOL_SIZE || pmm_end - PMM_POOL_SIZE <= heap_start) {
+    uintptr_t pmm_end = (uintptr_t)region_end & ~(uintptr_t)0xFFF;
+    if (pmm_end < PMM_POOL_SIZE || pmm_end - PMM_POOL_SIZE <= heap_start ||
+        pmm_end - PMM_POOL_SIZE - heap_start < 0x1000000) {
         PANIC("Not enough RAM for separate heap and PMM regions");
     }
     uintptr_t pmm_start = pmm_end - PMM_POOL_SIZE;

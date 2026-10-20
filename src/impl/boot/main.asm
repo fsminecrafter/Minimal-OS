@@ -106,9 +106,21 @@ setup_page_tables:
     or eax, 0b11
     mov [page_table_l4], eax
 
+    ; Identity map the first 4 GiB with 2 MiB pages: RAM above 1 GiB and
+    ; the ACPI tables firmware keeps near the top of low memory must be
+    ; reachable. Four page directories, one per GiB.
     mov eax, page_table_l2
     or eax, 0b11
     mov [page_table_l3], eax
+    mov eax, page_table_l2 + 4096
+    or eax, 0b11
+    mov [page_table_l3 + 8], eax
+    mov eax, page_table_l2 + 8192
+    or eax, 0b11
+    mov [page_table_l3 + 16], eax
+    mov eax, page_table_l2 + 12288
+    or eax, 0b11
+    mov [page_table_l3 + 24], eax
 
     ; MMIO high mapping
     mov eax, page_table_l3_mmio
@@ -123,12 +135,13 @@ setup_page_tables:
 
 .loop:
     mov eax, 0x200000
-    mul ecx
+    mul ecx              ; edx:eax = ecx * 2 MiB (edx is 0 below 4 GiB)
     or eax, 0b10000011   ; present + writable + huge
     mov [page_table_l2 + ecx * 8], eax
+    mov dword [page_table_l2 + ecx * 8 + 4], 0
 
     inc ecx
-    cmp ecx, 512
+    cmp ecx, 2048
     jne .loop
 
     ret
@@ -186,7 +199,7 @@ page_table_l3:
 
 align 4096
 page_table_l2:
-    times 512 dq 0
+    times 2048 dq 0
 
 align 4096
 page_table_l3_mmio:

@@ -140,8 +140,9 @@ static bool acpi_gas_valid(const acpi_gas_t* gas, uint8_t min_width) {
                gas->address + ((gas->bit_width + 7) / 8) <= 0x10000ULL;
     }
     if (gas->address_space_id == 0) {
-        return gas->address <= 0x3FFFFFFFULL &&
-               gas->address + ((gas->bit_width + 7) / 8) <= 0x40000000ULL;
+        // Physical memory below 4 GiB is identity mapped (main.asm).
+        return gas->address <= 0xFFFFFFFFULL &&
+               gas->address + ((gas->bit_width + 7) / 8) <= 0x100000000ULL;
     }
     return false;
 }

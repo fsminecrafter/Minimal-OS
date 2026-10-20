@@ -2,6 +2,7 @@
 #include "x86_64/commandhandler.h"
 #include "x86_64/multiboot2parse.h"
 #include "x86_64/memlayout.h"
+#include "x86_64/mmio.h"
 #include "panic.h"
 #include "x86_64/boot_options.h"
 #include "x86_64/memory_test.h"
@@ -12,6 +13,7 @@
 #include "x86_64/gdt.h"
 #include "x86_64/gpu.h"
 #include "x86_64/gpu_manager.h"
+#include "x86_64/gpucore.h"
 #include "time.h"
 #include "prochandler.h"
 #include "usb/uhci.h"
@@ -93,6 +95,7 @@ void kernel_main(uint64_t mb2_info_addr) {
         memlayout_save_multiboot((multiboot2_info_t*)mb2_info_addr);
     kernel_multiboot_info = mb_info;
     memlayout_apply_cache_policy(mb_info);
+    pat_init();
     kernel_boot_no_disk = multiboot2_has_cmdline_token(mb_info, "no-disk");
     kernel_boot_debug = multiboot2_has_cmdline_token(mb_info, "--debug");
     multiboot2_get_cmdline_value(mb_info, "root=", kernel_boot_root,
@@ -162,6 +165,8 @@ void kernel_main(uint64_t mb2_info_addr) {
     if (!gpu_manager_init()) {
         serial_write_str("No display driver available - continuing headless\n");
     }
+    // Graphics adapters beyond the framebuffer: VRAM, chip drivers.
+    gpu_core_init();
     if (multiboot2_has_cmdline_token(mb_info, "memtest")) {
         memory_test_run();
     }

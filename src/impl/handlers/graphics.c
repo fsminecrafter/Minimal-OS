@@ -16,6 +16,7 @@ static uint32_t* g_backbuffer = NULL;
 static size_t g_backbuffer_bytes = 0;
 static uint32_t g_backbuffer_width = 0;
 static uint32_t g_backbuffer_height = 0;
+static bool g_backbuffer_external = false;   // lives in VRAM, not the heap
 static spinlock_t g_graphics_lock = SPINLOCK_INIT;
 bool graphics_safety_mode = true;
 static terminal_t g_terminal = {0};
@@ -760,11 +761,32 @@ static bool graphics_backbuffer_ensure_locked(void) {
     memset(replacement, 0, bytes);
 
     uint32_t* previous = g_backbuffer;
+    bool previous_external = g_backbuffer_external;
     g_backbuffer = replacement;
     g_backbuffer_bytes = bytes;
     g_backbuffer_width = g_gpu->width;
     g_backbuffer_height = g_gpu->height;
-    free_mem(previous);
+    g_backbuffer_external = false;
+    if (!previous_external) free_mem(previous);
+    return true;
+}
+
+// Switches the back buffer to caller-owned memory (VRAM, see gpucore.c),
+// keeping its contents. Used only when CPU reads of that memory are fast.
+bool graphics_use_backbuffer_memory(uint32_t* memory, size_t bytes) {
+    if (!memory) return false;
+    uint64_t flags = spinlock_acquire(&g_graphics_lock);
+    if (!graphics_backbuffer_ensure_locked() || bytes < g_backbuffer_bytes) {
+        spinlock_release(&g_graphics_lock, flags);
+        return false;
+    }
+    memcpy(memory, g_backbuffer, g_backbuffer_bytes);
+    uint32_t* previous = g_backbuffer;
+    bool previous_external = g_backbuffer_external;
+    g_backbuffer = memory;
+    g_backbuffer_external = true;
+    if (!previous_external) free_mem(previous);
+    spinlock_release(&g_graphics_lock, flags);
     return true;
 }
 
@@ -773,7 +795,8 @@ void graphics_set_gpu(gpu_device_t* gpu) {
     uint64_t flags = spinlock_acquire(&g_graphics_lock);
     g_gpu = gpu;
     if (!gpu) {
-        free_mem(g_backbuffer);
+        if (!g_backbuffer_external) free_mem(g_backbuffer);
+        g_backbuffer_external = false;
         g_backbuffer = NULL;
         g_backbuffer_bytes = 0;
         g_backbuffer_width = 0;

@@ -25,6 +25,12 @@ typedef struct {
     uint8_t header_type;
     uint32_t bar[PCI_NUM_BARS];              // Store BAR addresses
     pci_bar_type_t bar_type[PCI_NUM_BARS];  // IO or MEM type per BAR
+    // Full BAR information. A 64-bit memory BAR occupies two slots; the
+    // first holds the whole address and size, the second is UNUSED.
+    uint64_t bar_address[PCI_NUM_BARS];
+    uint64_t bar_length[PCI_NUM_BARS];
+    bool bar_is_64[PCI_NUM_BARS];
+    bool bar_prefetchable[PCI_NUM_BARS];
 } pci_device_t;
 
 extern pci_device_t pci_devices[PCI_MAX_DEVICES];
@@ -47,6 +53,9 @@ int pci_get_device_count(void);
 pci_device_t* pci_find_device(uint16_t vendor_id, uint16_t device_id);
 pci_device_t* pci_find_class(uint8_t class_code, uint8_t subclass);
 void pci_enable_io_busmaster(pci_device_t* dev);
+
+// Index of the memory BAR that contains [phys, phys+len), or -1.
+int pci_bar_containing(const pci_device_t* dev, uint64_t phys, uint64_t len);
 
 // Returns the gpu_hw_driver_t vtable for registration with
 // gpu_manager_register_driver(). Prefer this + gpu_manager_init()

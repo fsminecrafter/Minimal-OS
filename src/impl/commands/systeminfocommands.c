@@ -9,6 +9,9 @@
 #include "x86_64/pci.h"
 #include "x86_64/smp.h"
 #include "x86_64/gpu.h"
+#include "prochandler.h"
+#include "x86_64/mmio.h"
+#include "x86_64/gpucore.h"
 #include "x86_64/scheduler.h"
 #include "x86_64/minimafs.h"
 #include "time.h"
@@ -344,56 +347,71 @@ void cmd_cpu(int argc, const char** argv) {
     info_text("\n");
 }
 
+static void gpu_size_text(uint64_t bytes) {
+    char buf[24];
+    if (bytes >= (1ull << 30) && (bytes % (1ull << 30)) == 0)
+        snprintf(buf, sizeof(buf), "%llu GiB", bytes >> 30);
+    else
+        snprintf(buf, sizeof(buf), "%llu MiB", bytes >> 20);
+    info_text(buf);
+}
+
 void cmd_gpu(int argc, const char** argv) {
-    uint32_t display_count = 0;
-    for (int i = 0; i < pci_device_count; i++) {
-        const pci_device_t* dev = &pci_devices[i];
-        if (dev->class_code != 0x03) continue;
-        display_count++;
-        info_text("GPU ");
-        info_number(display_count);
-        info_text(" at ");
-        print_pci_location(dev);
-        info_text("\n  Vendor ID: 0x");
-        info_hex(dev->vendor_id);
-        info_text("\n  Device ID: 0x");
-        info_hex(dev->device_id);
-        info_text("\n  Class: 0x");
-        info_hex(((uint64_t)dev->class_code << 16) | ((uint64_t)dev->subclass << 8) | dev->prog_if);
-        info_text("\n  BARs:");
-        for (int bar = 0; bar < PCI_NUM_BARS; bar++) {
-            if (dev->bar_type[bar] == PCI_BAR_UNUSED) continue;
-            info_text("\n    BAR");
-            info_number(bar);
-            info_text(" = 0x");
-            info_hex(dev->bar[bar]);
-            info_text(dev->bar_type[bar] == PCI_BAR_IO ? " (I/O)" : " (MMIO)");
+    (void)argc; (void)argv;
+    uint32_t count = gpu_adapter_count();
+    if (count == 0) info_text("No GPU adapter found.\n");
+    for (uint32_t i = 0; i < count; i++) {
+        gpu_adapter_t* a = gpu_adapter_get(i);
+        char line[160];
+        snprintf(line, sizeof(line), "GPU %u: %s\n", i, a->name);
+        info_text(line);
+        snprintf(line, sizeof(line), "  Family:  %s   driver: %s   PCI %x:%x\n",
+                 a->family, a->driver, (unsigned)a->pci->vendor_id,
+                 (unsigned)a->pci->device_id);
+        info_text(line);
+        info_text("  VRAM:    ");
+        if (a->vram_size) gpu_size_text(a->vram_size); else info_text("unknown");
+        info_text("   window ");
+        gpu_size_text(a->aperture_size);
+        snprintf(line, sizeof(line), " at 0x%llx\n", a->aperture_phys);
+        info_text(line);
+        if (a->scanout_in_vram) {
+            snprintf(line, sizeof(line), "  Screen:  framebuffer in VRAM at offset 0x%llx (",
+                     a->scanout_offset);
+            info_text(line);
+            gpu_size_text(a->scanout_size);
+            info_text(")\n");
+        }
+        if (a->caps & GPU_CAP_VRAM_HEAP) {
+            info_text("  Heap:    ");
+            gpu_size_text(gpu_vram_used(a));
+            info_text(" used of ");
+            gpu_size_text(a->heap_end - a->heap_start);
+            info_text("\n");
+        }
+        info_text("  Can:    ");
+        if (a->caps & GPU_CAP_SCANOUT) info_text(" display");
+        if (a->caps & GPU_CAP_VRAM_HEAP) info_text(" vram-buffers");
+        if (a->caps & GPU_CAP_PAGE_FLIP) info_text(" page-flip");
+        if (a->caps & GPU_CAP_MODESET) info_text(" modeset");
+        if (a->caps & GPU_CAP_HW_3D) info_text(" hw-3d");
+        info_text("\n");
+        if (a->notes[0]) {
+            info_text("  Notes:   ");
+            info_text(a->notes);
+            info_text("\n");
         }
     }
 
-    info_text("Display controllers: ");
-    info_number(display_count);
-    info_text("\n");
-
-    if (display_count == 0) {
-        info_text("No PCI display controller found.\n");
-        return;
+    gpu_device_t* screen = getSystemGPU();
+    if (screen && screen->fb) {
+        char line[96];
+        snprintf(line, sizeof(line), "Display: %ux%u, %u bpp, pitch %u, %s\n",
+                 screen->width, screen->height, (unsigned)screen->bpp * 8,
+                 screen->pitch,
+                 pat_write_combining_available() ? "write-combining" : "uncached");
+        info_text(line);
     }
-
-    info_text("Active framebuffer: ");
-    if (!gpu.pci_dev) {
-        info_text("not initialized\n");
-        return;
-    }
-    info_text(" ");
-    info_number(gpu.width);
-    info_text("x");
-    info_number(gpu.height);
-    info_text(" at ");
-    info_number(gpu.bpp * 8);
-    info_text(" bpp, pitch ");
-    info_number(gpu.pitch);
-    info_text(" bytes\n");
 }
 
 void cmd_cgres(int argc, const char** argv) {

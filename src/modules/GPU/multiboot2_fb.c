@@ -61,8 +61,10 @@ static bool framebuffer_init(void) {
     size_t mapping_size = (physical_offset + (size_t)framebuffer_size + 0xFFF) &
                           ~(size_t)0xFFF;
     void* virtual_base = mmio_alloc_va(mapping_size);
-    if (!virtual_base || !map_mmio_page_cached((uintptr_t)virtual_base,
-                                                physical_base, mapping_size)) {
+    // Write-combining: pixel writes go out in bursts instead of one bus
+    // transaction each (a large speedup on real graphics cards).
+    if (!virtual_base || !map_mmio_page_wc((uintptr_t)virtual_base,
+                                            physical_base, mapping_size)) {
         serial_write_str("GPU (Multiboot2): framebuffer mapping failed\n");
         return false;
     }
@@ -80,6 +82,7 @@ static bool framebuffer_init(void) {
         .green_mask_size = info.green_mask_size,
         .blue_position = info.blue_position,
         .blue_mask_size = info.blue_mask_size,
+        .fb_phys = info.address,
     };
 
     gpu_clear(&g_framebuffer_gpu, 0xFF000000);

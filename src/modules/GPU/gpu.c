@@ -111,7 +111,7 @@ bool gpu_init(gpu_device_t* gpu, pci_device_t* pci_dev, uint32_t width, uint32_t
 
     serial_write_str("Attempting to map framebuffer...\n");
     
-    if (!map_mmio_page_cached(fb_va, fb_phys, fb_size)) {
+    if (!map_mmio_page_wc(fb_va, fb_phys, fb_size)) {
         PANIC("gpu_init: failed to map framebuffer BAR0");
     }
 
@@ -165,6 +165,7 @@ bool gpu_init(gpu_device_t* gpu, pci_device_t* pci_dev, uint32_t width, uint32_t
     // Fill GPU struct
     gpu->pci_dev = pci_dev;
     gpu->fb = (volatile uint32_t*)fb_va;
+    gpu->fb_phys = fb_phys;
     gpu->width = width;
     gpu->height = height;
     gpu->bpp = 4;

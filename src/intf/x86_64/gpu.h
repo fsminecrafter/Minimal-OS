@@ -16,6 +16,7 @@ typedef struct {
     uint8_t green_mask_size;
     uint8_t blue_position;
     uint8_t blue_mask_size;
+    uint64_t fb_phys;         // physical address of fb (0 if unknown)
 } gpu_device_t;
 
 extern gpu_device_t gpu;

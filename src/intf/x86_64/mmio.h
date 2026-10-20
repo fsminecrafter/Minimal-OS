@@ -16,6 +16,12 @@ void* mmio_alloc_va(size_t size);
 // Map physical address to virtual address with specified size
 bool map_mmio_page(uintptr_t virt_addr, uintptr_t phys_addr, size_t size);
 bool map_mmio_page_cached(uintptr_t virt_addr, uintptr_t phys_addr, size_t size);
+// Write-combining (falls back to uncached without PAT). For framebuffers.
+bool map_mmio_page_wc(uintptr_t virt_addr, uintptr_t phys_addr, size_t size);
+
+// Programs the PAT (entry 1 = write-combining). Call once per core.
+void pat_init(void);
+bool pat_write_combining_available(void);
 
 // Map a PCI BAR to virtual memory
 volatile void* pci_map_bar_mmio(pci_device_t* dev, int bar_num);

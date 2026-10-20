@@ -8,6 +8,8 @@
 #include "x86_64/mmio.h"
 #include "x86_64/port.h"
 #include "x86_64/allocator.h"
+
+extern void pci_config_write32(uint8_t bus, uint8_t device, uint8_t function, uint8_t offset, uint32_t value);
 #include "graphics.h"
 #include "print.h"
 #include "string.h"
@@ -175,6 +177,16 @@ pci_device_t* pci_find_class(uint8_t class_code, uint8_t subclass) {
     return NULL;
 }
 
+int pci_bar_containing(const pci_device_t* dev, uint64_t phys, uint64_t len) {
+    if (!dev) return -1;
+    for (int i = 0; i < PCI_NUM_BARS; i++) {
+        if (dev->bar_type[i] != PCI_BAR_MEM || !dev->bar_length[i]) continue;
+        uint64_t s = dev->bar_address[i], e = s + dev->bar_length[i];
+        if (phys >= s && phys + len <= e) return i;
+    }
+    return -1;
+}
+
 void pci_enable_io_busmaster(pci_device_t* dev) {
     if (!dev) return;
     uint16_t cmd = pci_config_read_word(dev->bus, dev->device, dev->function, 0x04);
@@ -229,21 +241,66 @@ void pci_enumerate_bus(uint8_t bus) {
             dev->prog_if = prog_if;
             dev->header_type = header_type;
 
-            // Read BARs
+            // BARs. Sizing writes all ones to each BAR, so memory and I/O
+            // decoding is switched off meanwhile (the device must not
+            // answer at the temporary all-ones address).
+            uint8_t own_header = (pci_config_read(bus, device, function, 0x0C) >> 16) & 0x7F;
+            int bar_count = own_header == 0 ? 6 : (own_header == 1 ? 2 : 0);
+            uint16_t command = pci_config_read_word(bus, device, function, 0x04);
+            if (bar_count) pci_config_write_word(bus, device, function, 0x04,
+                                                 (uint16_t)(command & ~0x3u));
             for (int bar_num = 0; bar_num < PCI_NUM_BARS; bar_num++) {
-                uint32_t bar_val = pci_config_read(bus, device, function, 0x10 + bar_num * 4);
-                dev->bar[bar_num] = bar_val;
+                dev->bar[bar_num] = 0;
+                dev->bar_type[bar_num] = PCI_BAR_UNUSED;
+                dev->bar_address[bar_num] = 0;
+                dev->bar_length[bar_num] = 0;
+                dev->bar_is_64[bar_num] = false;
+                dev->bar_prefetchable[bar_num] = false;
+            }
+            for (int bar_num = 0; bar_num < bar_count; bar_num++) {
+                uint8_t off = (uint8_t)(0x10 + bar_num * 4);
+                uint32_t bar_val = pci_config_read(bus, device, function, off);
+                pci_config_write32(bus, device, function, off, 0xFFFFFFFF);
+                uint32_t mask = pci_config_read(bus, device, function, off);
+                pci_config_write32(bus, device, function, off, bar_val);
 
-                if (bar_val == 0) {
-                    dev->bar_type[bar_num] = PCI_BAR_UNUSED;
-                } else if (bar_val & 0x1) {
+                if (bar_val & 0x1) {
                     dev->bar_type[bar_num] = PCI_BAR_IO;
                     dev->bar[bar_num] = bar_val & 0xFFFFFFFC;
-                } else {
-                    dev->bar_type[bar_num] = PCI_BAR_MEM;
-                    dev->bar[bar_num] = bar_val & 0xFFFFFFF0;
+                    dev->bar_address[bar_num] = bar_val & 0xFFFFFFFC;
+                    uint32_t m = mask & 0xFFFFFFFC;
+                    dev->bar_length[bar_num] = m ? (uint64_t)((~m + 1) & 0xFFFF) : 0;
+                    if (dev->bar[bar_num] == 0) dev->bar_type[bar_num] = PCI_BAR_UNUSED;
+                    continue;
                 }
+
+                bool is64 = ((bar_val >> 1) & 0x3) == 0x2 && bar_num + 1 < bar_count;
+                uint64_t address = bar_val & 0xFFFFFFF0u;
+                uint64_t size_mask = (uint64_t)(mask & 0xFFFFFFF0u);
+                if (is64) {
+                    uint8_t hoff = (uint8_t)(off + 4);
+                    uint32_t high = pci_config_read(bus, device, function, hoff);
+                    pci_config_write32(bus, device, function, hoff, 0xFFFFFFFF);
+                    uint32_t hmask = pci_config_read(bus, device, function, hoff);
+                    pci_config_write32(bus, device, function, hoff, high);
+                    address |= (uint64_t)high << 32;
+                    size_mask |= (uint64_t)hmask << 32;
+                } else {
+                    size_mask |= 0xFFFFFFFF00000000ull;
+                }
+                uint64_t length = size_mask ? (~size_mask + 1) : 0;
+
+                dev->bar[bar_num] = (uint32_t)address;
+                dev->bar_address[bar_num] = address;
+                dev->bar_length[bar_num] = length;
+                dev->bar_is_64[bar_num] = is64;
+                dev->bar_prefetchable[bar_num] = (bar_val & 0x8) != 0;
+                dev->bar_type[bar_num] = (address || length) && bar_val ? PCI_BAR_MEM
+                                                                        : PCI_BAR_UNUSED;
+                if (address == 0) dev->bar_type[bar_num] = PCI_BAR_UNUSED;
+                if (is64) bar_num++;    // the upper half is not a BAR of its own
             }
+            if (bar_count) pci_config_write_word(bus, device, function, 0x04, command);
 
             // Let any registered pci_class_driver_t auto-attach to this
             // device (opt-in - see pci_manager.h; no-op if nothing has

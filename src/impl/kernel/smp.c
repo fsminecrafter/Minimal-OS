@@ -4,6 +4,7 @@
 #include "x86_64/lapic.h"
 #include "x86_64/lapic_timer.h"
 #include "x86_64/ioapic.h"
+#include "x86_64/mmio.h"
 #include "x86_64/ap_trampoline.h"
 #include "x86_64/gdt.h"
 #include "x86_64/idt.h"
@@ -222,6 +223,7 @@ uint32_t smp_start_aps(multiboot2_info_t* mb_info) {
 void ap_entry_c(uint32_t cpu_id) __attribute__((__noreturn__));
 void ap_entry_c(uint32_t cpu_id) {
     gdt_load_this_cpu(cpu_id);
+    pat_init();           // same memory types as the BSP
     idt_load(&idt_ptr);   // shares the BSP's single IDT - fine, entries only encode handler addr/selector
     lapic_init();
 

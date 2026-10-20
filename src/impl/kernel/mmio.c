@@ -37,6 +37,8 @@ static size_t map_index   = 0;
 size_t pci_get_bar_size(pci_device_t* dev, int bar_num) {
     if (!dev || bar_num < 0 || bar_num >= PCI_NUM_BARS)
         return 0;
+    // Sized once during enumeration with decoding switched off.
+    if (dev->bar_length[bar_num]) return (size_t)dev->bar_length[bar_num];
 
     uint8_t bus      = dev->bus;
     uint8_t device   = dev->device;
@@ -191,7 +193,8 @@ void* mmio_alloc_va(size_t size) {
         return NULL;
     }
     
-    mmio_next_va = align_up(mmio_next_va, MMIO_VA_ALIGN);
+    mmio_next_va = align_up(mmio_next_va,
+                            size >= MMIO_PAGE_SIZE_2M ? MMIO_PAGE_SIZE_2M : MMIO_VA_ALIGN);
     
     if (mmio_next_va + size > MMIO_VA_END) {
         serial_write_str("ERROR: MMIO VA space exhausted\n");
@@ -213,8 +216,51 @@ void* mmio_alloc_va(size_t size) {
 /* --------------------------------------------------
  * MMIO page mapping
  * -------------------------------------------------- */
+/* --------------------------------------------------
+ * Page attribute table
+ *
+ * The default PAT has write-through in entry 1 (PWT=1, PCD=0). Nothing in
+ * the kernel uses write-through, so entry 1 becomes write-combining:
+ * framebuffer/VRAM writes are then collected and sent in bursts instead
+ * of one uncached bus transaction per pixel. Must run on every core.
+ * -------------------------------------------------- */
+
+#define IA32_PAT_MSR 0x277
+#define PAGE_WRITE_THROUGH 0x008
+static bool g_pat_wc;
+
+void pat_init(void) {
+    uint32_t a, b, c, d;
+    __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(1), "c"(0));
+    if (!(d & (1u << 16))) return;      // no PAT
+    // PA0 WB(06) PA1 WC(01) PA2 UC-(07) PA3 UC(00), same again for PA4-7.
+    uint64_t pat = 0x0007010600070106ULL;
+    __asm__ volatile("wrmsr" :: "c"(IA32_PAT_MSR), "a"((uint32_t)pat),
+                     "d"((uint32_t)(pat >> 32)));
+    // Flush caches and TLBs so no stale attribute is used.
+    uint64_t cr3;
+    __asm__ volatile("wbinvd; mov %%cr3, %0; mov %0, %%cr3" : "=r"(cr3) :: "memory");
+    g_pat_wc = true;
+}
+
+bool pat_write_combining_available(void) {
+    return g_pat_wc;
+}
+
+// mode: 0 = write-back, 1 = uncached, 2 = write-combining
+static bool map_mmio_page_attr(uintptr_t virt_addr, uintptr_t phys_addr,
+                               size_t size, int mode);
+
 static bool map_mmio_page_mode(uintptr_t virt_addr, uintptr_t phys_addr,
                                size_t size, bool cache_disable) {
+    return map_mmio_page_attr(virt_addr, phys_addr, size, cache_disable ? 1 : 0);
+}
+
+static bool map_mmio_page_attr(uintptr_t virt_addr, uintptr_t phys_addr,
+                               size_t size, int mode) {
+    if (mode == 2 && !g_pat_wc) mode = 1;
+    uint64_t cache_bits = mode == 1 ? PAGE_CACHE_DISABLE :
+                          mode == 2 ? PAGE_WRITE_THROUGH : 0;
     serial_write_str("map_mmio_page: virt=");
     serial_write_hex(virt_addr);
     serial_write_str(" phys=");
@@ -283,8 +329,7 @@ static bool map_mmio_page_mode(uintptr_t virt_addr, uintptr_t phys_addr,
             
             l2_table[l2_index] =
                 (current_phys & ~(MMIO_PAGE_SIZE_2M - 1)) |
-                PAGE_PRESENT | PAGE_WRITABLE |
-                (cache_disable ? PAGE_CACHE_DISABLE : 0) | PAGE_SIZE_FLAG;
+                PAGE_PRESENT | PAGE_WRITABLE | cache_bits | PAGE_SIZE_FLAG;
 
             if (verbose) {
                 serial_write_str("  L2[");
@@ -347,8 +392,7 @@ static bool map_mmio_page_mode(uintptr_t virt_addr, uintptr_t phys_addr,
             
             l1_array[l1_index] =
                 (current_phys & ~(MMIO_PAGE_SIZE_4K - 1)) |
-                PAGE_PRESENT | PAGE_WRITABLE |
-                (cache_disable ? PAGE_CACHE_DISABLE : 0);
+                PAGE_PRESENT | PAGE_WRITABLE | cache_bits;
 
             if (verbose) {
                 serial_write_str("  L1[");
@@ -380,6 +424,10 @@ bool map_mmio_page(uintptr_t virt_addr, uintptr_t phys_addr, size_t size) {
 
 bool map_mmio_page_cached(uintptr_t virt_addr, uintptr_t phys_addr, size_t size) {
     return map_mmio_page_mode(virt_addr, phys_addr, size, false);
+}
+
+bool map_mmio_page_wc(uintptr_t virt_addr, uintptr_t phys_addr, size_t size) {
+    return map_mmio_page_attr(virt_addr, phys_addr, size, 2);
 }
 
 /* --------------------------------------------------

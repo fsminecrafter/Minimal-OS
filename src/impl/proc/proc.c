@@ -610,7 +610,10 @@ process_t* proc_create_ex(const char* file_name, void (*entry_point)(),
 	proc->entry_point = entry_point;
 
 	// Then set the important ones
-	proc->regs[6] = (uint64_t)proc->kernel_stack;  // RSP
+	// RSP. The trampoline is entered with a jmp, so make it look like a
+	// call happened: 16-byte aligned minus the return address slot. GCC
+	// emits aligned SSE stores (movaps) to the stack.
+	proc->regs[6] = (((uint64_t)proc->kernel_stack) & ~0xFULL) - 8;
 	proc->regs[7] = (uint64_t)proc_trampoline;     // RIP
 	proc->regs[8] = 0x202;                         // RFLAGS (IF=1, reserved bit 1)
 

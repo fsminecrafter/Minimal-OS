@@ -31,9 +31,15 @@ global %1_wrapped
     push r14
     push r15
 
-    sub rsp, 8
+    ; Save the interrupted code's SSE/x87 state (C code here may use
+    ; SSE) and call with a 16-byte aligned stack, as the ABI requires.
+    mov rbp, rsp
+    sub rsp, 512
+    and rsp, -16
+    fxsave64 [rsp]
     call %1
-    add rsp, 8
+    fxrstor64 [rsp]
+    mov rsp, rbp
 
     pop r15
     pop r14

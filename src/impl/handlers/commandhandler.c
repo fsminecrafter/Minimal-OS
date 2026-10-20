@@ -287,8 +287,9 @@ static int command_tokenize(char* buffer, char** argv, int max_args) {
 
 void command_execute(const char* input) {
     serial_write_str("Executing...");
-    // Tokenize
-    static char buffer[256];
+    // Tokenize. On the stack: services run commands from their own
+    // processes, so this must be reentrant.
+    char buffer[256];
     strncpy(buffer, input, sizeof(buffer));
     buffer[sizeof(buffer)-1] = 0;
 

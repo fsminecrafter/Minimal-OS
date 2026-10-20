@@ -67,9 +67,17 @@ isr_common_stub:
     push r9
     push r10
     push r11
+    push rbp
 
+    mov rbp, rsp
+    sub rsp, 512
+    and rsp, -16
+    fxsave64 [rsp]
     call isr_generic_handler
+    fxrstor64 [rsp]
+    mov rsp, rbp
 
+    pop rbp
     pop r11
     pop r10
     pop r9

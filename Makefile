@@ -188,12 +188,43 @@ $(install3_object): $(install3_mpkg)
 		--redefine-sym _binary_build_resources_install3_mpkg_end=_binary_install3_mpkg_end \
 		$< $@
 
+# Install payload: what the 'install' command writes to a disk so it boots
+# by itself. GRUB loads it as the boot module "mosinst". GRUB's BIOS core
+# looks for its files on partition 1 of the boot disk; GRUB for UEFI uses
+# the partition it was started from (the EFI System Partition).
+GRUB_PC_DIR ?= /usr/lib/grub/i386-pc
+GRUB_EFI_DIR ?= /usr/lib/grub/x86_64-efi
+GRUB_INSTALL_MODULES := part_gpt part_msdos fat normal multiboot2 configfile \
+	all_video boot echo test
+installer_dir := build/installer
+installer_mpkg := targets/x86_64/iso/boot/mosinst.mpkg
+
+.PHONY: installer-payload
+installer-payload:
+	rm -rf $(installer_dir)
+	mkdir -p $(installer_dir)
+	cp dist/x86_64/kernel.bin $(installer_dir)/kernel.bin
+	cp $(GRUB_PC_DIR)/boot.img $(installer_dir)/boot.img
+	grub-mkimage -d $(GRUB_PC_DIR) -O i386-pc -o $(installer_dir)/core.img \
+		-p '(,1)/boot/grub' biosdisk $(GRUB_INSTALL_MODULES)
+	@if [ -d "$(GRUB_EFI_DIR)" ]; then \
+		grub-mkimage -d $(GRUB_EFI_DIR) -O x86_64-efi -o $(installer_dir)/bootx64.efi \
+			-p /boot/grub $(GRUB_INSTALL_MODULES); \
+	else \
+		echo "installer: $(GRUB_EFI_DIR) missing (install grub-efi-amd64-bin);" \
+			"installed disks and the ISO will boot with BIOS only" >&2; \
+	fi
+	$(MKPKG) $(installer_dir) $(installer_mpkg) --store
+
 .PHONY: build-x86_64
 build-x86_64: minimaSSL-slib $(source_object_files) $(audio_object_files)
 	mkdir -p dist/x86_64
 	$(LD) -o dist/x86_64/kernel.bin -T targets/x86_64/linker.ld $(source_object_files) $(audio_object_files)
 	cp dist/x86_64/kernel.bin targets/x86_64/iso/boot/kernel.bin
-	grub-mkrescue /usr/lib/grub/i386-pc -o dist/x86_64/kernel.iso targets/x86_64/iso
+	$(MAKE) --no-print-directory installer-payload
+	# grub-mkrescue makes a BIOS + UEFI hybrid image when both GRUB
+	# platforms are installed (grub-pc-bin, grub-efi-amd64-bin, mtools).
+	grub-mkrescue -o dist/x86_64/kernel.iso targets/x86_64/iso
 
 .PHONY: clean
 clean:

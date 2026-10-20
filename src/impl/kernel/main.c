@@ -27,6 +27,7 @@
 #include "applications/terminal.h"
 #include "x86_64/ahci.h"
 #include "x86_64/storage_manager.h"
+#include "x86_64/ps2.h"
 #include "minimafshandler.h"
 #include "x86_64/global_audio_state.h"
 #include "x86_64/smp.h"
@@ -139,6 +140,17 @@ void kernel_main(uint64_t mb2_info_addr) {
         serial_write_str("USB keyboard available!\n");
     } else {
         serial_write_str("Falling back to PS/2\n");
+    }
+    // Always set the 8042 up: without a USB keyboard driver for the
+    // machine's controller (e.g. xHCI) PS/2 is the only way keys arrive,
+    // and UEFI firmware may leave it disabled.
+    {
+        uint64_t rflags;
+        __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags) :: "memory");
+        ps2_controller_init();
+        extern void ps2_keyboard_bridge_init(void);
+        ps2_keyboard_bridge_init();
+        if (rflags & 0x200) __asm__ volatile("sti");
     }
 
     // Registers every built-in gpu_hw_driver_t with gpu_manager and

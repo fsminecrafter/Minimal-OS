@@ -24,7 +24,15 @@ isr_syscall_wrapped:
     push rax
 
     mov rdi, rsp        ; syscall_regs_t*
+    ; User code expects its SSE registers to survive the int 0x80 (the
+    ; SDK's inline asm does not list them as clobbered), so save them.
+    mov rbp, rsp
+    sub rsp, 512
+    and rsp, -16
+    fxsave64 [rsp]
     call syscall_dispatch
+    fxrstor64 [rsp]
+    mov rsp, rbp
 
     pop rax
     pop rbx

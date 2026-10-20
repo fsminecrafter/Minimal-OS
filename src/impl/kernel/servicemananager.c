@@ -263,11 +263,10 @@ static void service_run_and_wait(service_entry_t* svc) {
             serial_write_str("' executing command: ");
             serial_write_str(svc->exec_path);
             serial_write_str("\n");
-            if (!command_execute_async(svc->exec_path)) {
-                serial_write_str("[SERVICES] Failed to launch startup command for ");
-                serial_write_str(service_display_name(svc));
-                serial_write_str("\n");
-            }
+            // Run it here in the service's own process. Going through
+            // command_execute_async() would take the terminal's single
+            // command slot and silently block the user's commands.
+            command_execute(svc->exec_path);
             return;
         }
     } else if (svc->has_script) {
@@ -285,11 +284,7 @@ static void service_run_and_wait(service_entry_t* svc) {
             serial_write_str(service_display_name(svc));
             serial_write_str("': script is not a 'run <path>' command, "
                               "running once with no exit tracking\n");
-            if (!command_execute_async(svc->startup_script)) {
-                serial_write_str("[SERVICES] Failed to launch startup script for ");
-                serial_write_str(service_display_name(svc));
-                serial_write_str("\n");
-            }
+            command_execute(svc->startup_script);
             return;
         }
     }

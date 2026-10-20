@@ -90,7 +90,7 @@ int main(int argc, char** argv) {
     fgpu_target_t t = { color, W, depth, W, W, H };
 
     fgpu_raster_clear(&t, FGPU_CLEAR_COLOR | FGPU_CLEAR_DEPTH, 0x102030, 1.0f);
-    CHECK(color[0] == 0x102030 && depth[W * H - 1] == 1.0f, "clear");
+    CHECK(color[0] == 0xFF102030 && depth[W * H - 1] == 1.0f, "clear (opaque)");
 
     fgpu_pipeline_t p;
     memset(&p, 0, sizeof(p));
@@ -121,11 +121,11 @@ int main(int argc, char** argv) {
     CHECK(drawn == 12, "12 triangles submitted");
 
     uint32_t center = color[(H / 2) * W + W / 2];
-    CHECK(center != 0x102030, "cube covers the center");
-    CHECK(color[0] == 0x102030, "corner stays background");
+    CHECK(center != 0xFF102030 && (center >> 24) == 0xFF, "cube covers the center, opaque");
+    CHECK(color[0] == 0xFF102030, "corner stays background");
     CHECK(depth[(H / 2) * W + W / 2] < 1.0f, "depth written");
     int covered = 0;
-    for (int i = 0; i < W * H; i++) covered += color[i] != 0x102030;
+    for (int i = 0; i < W * H; i++) covered += color[i] != 0xFF102030;
     CHECK(covered > 5000 && covered < 40000, "plausible coverage");
     if (argc > 1) write_ppm(argv[1], color, W, H);
 
@@ -140,7 +140,7 @@ int main(int argc, char** argv) {
     float tri_far[30]  = { -1,-1, 0.5f, 0,0,1, 0,1,0,1,  1,-1, 0.5f, 0,0,1, 0,1,0,1,  0,1, 0.5f, 0,0,1, 0,1,0,1 };
     fgpu_raster_draw(&t, &p, tri_near, 3, NULL, 3);
     fgpu_raster_draw(&t, &p, tri_far, 3, NULL, 3);
-    CHECK(color[(H / 2) * W + W / 2] == 0xFF0000, "near triangle wins depth test");
+    CHECK(color[(H / 2) * W + W / 2] == 0xFFFF0000, "near triangle wins depth test");
 
     // Bad index must be skipped, not read out of bounds.
     uint32_t bad_idx[3] = { 0, 1, 7 };
@@ -154,7 +154,7 @@ int main(int argc, char** argv) {
     p.state = 0;
     fgpu_raster_draw(&t, &p, crossing, 3, NULL, 3);
     covered = 0;
-    for (int i = 0; i < W * H; i++) covered += color[i] != 0;
+    for (int i = 0; i < W * H; i++) covered += color[i] != 0xFF000000;
     CHECK(covered > 0, "clipped triangle still draws");
 
     free(color);

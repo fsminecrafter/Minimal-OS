@@ -28,7 +28,8 @@ summarized in [docs/system-overview.md](docs/system-overview.md).
 #### System information
 * ```info``` Shows system, CPU, PCI, and memory information.
 * ```cpu``` Shows CPU information.
-* ```gpu``` Shows GPU information.
+* ```gpu``` Shows GPU adapters (NVIDIA GTX 10 / RTX 20 and QEMU drivers), VRAM, and capabilities.
+* ```fglcube``` [seconds] FarcadeGL 3D demo: a rotating, lit cube.
 * ```memsize``` Returns the size of available memory in MB.
 * ```usage``` Shows memory and process usage.
 * ```chgres``` [Width] [Height] Changes the display resolution.
@@ -51,9 +52,17 @@ summarized in [docs/system-overview.md](docs/system-overview.md).
 * ```meta``` [Option] [File] Views or edits file metadata.
 
 #### Storage and packages
-* ```initdisk``` [Index] Searches for and initializes an available disk.
-* ```format``` [Index] Formats the selected disk as MinimaFS.
-* ```mount``` [Index] Mounts the selected disk.
+* ```disks```, ```lsblk``` Lists disks (SATA and NVMe), partitions and filesystems.
+* ```part``` [Disk] Shows or edits a partition table (MBR or GPT).
+  * ```part <disk> init [gpt|mbr] --yes``` Writes a new, empty table.
+  * ```part <disk> add <size|rest> [minimafs|esp|fat|biosboot] [label]``` Adds a partition (sizes like 512M, 20G, 2T).
+  * ```part <disk> del <number>``` Deletes a partition.
+* ```format``` [Device] [Drive] [Label] Formats a disk or partition as MinimaFS (up to 16 TiB). Without arguments: the system volume as 0: with system files.
+* ```mount``` [Device] [Drive] Mounts a volume as N: (for example ```mount sata1p2 2```). Without arguments it lists the mounted drives.
+* ```umount``` [Drive] Unmounts a drive.
+* ```drives``` Lists mounted drives and how full they are.
+* ```install``` [Disk] [--mbr] [--yes] Installs Minimal-OS on a disk so it boots by itself on BIOS and UEFI PCs (see [docs/installing.md](docs/installing.md)).
+* ```initdisk``` Rescans the disks.
 * ```importmusic``` Copies the built-in music file to the disk as `music.adi`.
 * ```pkg``` Extracts or creates a package archive.
   * ```unzip``` [Archive] [Target] Extracts to a folder named after the archive by default.
@@ -121,7 +130,7 @@ lists successfully parsed and registered services.
 
 0:/Dir/example.txt
 
-0: is the disk
+0: is the drive (the system volume; other volumes and partitions are 1:, 2:, ...)
 
 0:/ is the root of that disk or the top directory.
 
@@ -188,7 +197,7 @@ Last synced 2026 - oct 20, 15:29
 
 - [X] Golf
 - [ ] GPU support (not just display adapter)
-- [ ] FarcadeGL (Minimal-OS Graphics Library)
+- [ ] MiniGL (Minimal-OS Graphics Library)
 - [ ] Partitions & Larger disk's
 - [ ] Installer & Disk bootable installs
 

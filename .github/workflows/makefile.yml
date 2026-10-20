@@ -30,6 +30,8 @@ jobs:
             curl \
             nasm \
             grub-pc-bin \
+            grub-efi-amd64-bin \
+            mtools \
             xorriso \
             qemu-system-x86 \
             python3
@@ -111,6 +113,10 @@ jobs:
       # ===== Build project =====
       - name: Build
         run: make
+
+      # ===== Host unit tests =====
+      - name: Host tests
+        run: make test-host
 
       # ===== Verify output =====
       - name: Verify ISO exists

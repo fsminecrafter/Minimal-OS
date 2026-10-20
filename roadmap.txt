@@ -46,10 +46,10 @@ Text editor [X]
 V 0.4.51
 
 Golf [X]
-GPU support (not just display adapter) [ ]
-MiniGL (Minimal-OS Graphics Library) [ ]
-Partitions & Larger disk's [ ]
-Installer & Disk bootable installs [ ]
+GPU support (not just display adapter) [X] VRAM, NVIDIA Pascal/Turing + QEMU drivers; 3D runs on the CPU for now
+FarcadeGL (Minimal-OS 3D library, was MiniGL) [X]
+Partitions & Larger disk's [X] MBR/GPT, up to 16 TiB volumes, NVMe
+Installer & Disk bootable installs [X] install command + MOSdesk Installer, BIOS + UEFI
 
 ##### V 0.4.52
 

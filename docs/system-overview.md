@@ -9,7 +9,9 @@ matches the layer you are changing.
 | --- | --- |
 | [Boot and kernel](boot-and-kernel.md) | Boot transition, memory, processes, SMP, scheduling, and syscalls |
 | [Hardware](hardware-and-drivers.md) | PCI, graphics, USB, audio, storage, and driver managers |
-| [Storage and packages](storage-and-packages.md) | MinimaFS, disk commands, `.mpkg`, install directories, and format |
+| [Storage and packages](storage-and-packages.md) | Disks, partitions, MinimaFS, drive numbers, `.mpkg`, format |
+| [Installing](installing.md) | Installing to a disk so it boots on BIOS and UEFI PCs, real hardware notes |
+| [GPU and 3D](gpu.md) | GPU adapters, VRAM, the FGPU command processor and FarcadeGL |
 | [Networking](networking.md) | Ethernet, IPv4, ARP, UDP, DHCP, DNS, TCP, and TLS |
 | [Services](services.md) | `.service` files, startup commands, supervision, and registration |
 | [User programs](user-programs.md) | SDK, `.run`, `.slib`, ELF loading, and user/kernel boundaries |
@@ -22,7 +24,9 @@ matches the layer you are changing.
 | `src/impl/boot` | Multiboot2 entry, page tables, long-mode transition |
 | `src/impl/kernel` | Startup, memory, scheduler, syscalls, services |
 | `src/impl/proc` | Processes, threads, context switching, run queues |
-| `src/impl/filesystem` | MinimaFS and AHCI-backed disk operations |
+| `src/impl/filesystem` | MinimaFS and the AHCI driver |
+| `src/impl/storage` | Block devices, MBR/GPT, FAT32 writer, NVMe, SYS_STORAGE |
+| `src/impl/install` | The installer |
 | `src/impl/net` | Network stack and TLS client |
 | `src/modules` | Hardware drivers and device managers |
 | `src/impl/commands` | Terminal commands |

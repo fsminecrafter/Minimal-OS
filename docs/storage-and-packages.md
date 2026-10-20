@@ -12,24 +12,36 @@ The filesystem API is declared in `src/intf/x86_64/minimafs.h`. Commands should
 use resolved MinimaFS paths and the API rather than constructing raw disk
 structures.
 
-## Disk Workflow
-
-The usual first-use sequence is:
+## Disks, partitions and drives
 
 ```text
-initdisk
-format
-mount
+disks                                  list disks, partitions, filesystems
+part sata1                             show sata1's partition table
+part sata1 init gpt --yes              new empty GPT (or mbr)
+part sata1 add 500G minimafs data      add a partition (sizes: 512M, 20G, 2T, rest)
+part sata1 del 2                       delete partition 2
+format sata1p1 1 data                  MinimaFS on sata1p1, mounted as 1:
+mount sata1p2 2                        mount an existing volume as 2:
+umount 2
+drives                                 mounted drives and their usage
+format                                 (no arguments) the boot volume as 0:, with system files
 ```
 
-`initdisk` probes storage and creates the kernel disk wrapper. `format` erases
-the selected filesystem area, writes MinimaFS metadata, creates standard
-folders, and installs embedded resource packages. `mount` attaches an existing
-filesystem without erasing it.
+At boot the system volume is mounted as `0:` (the one named by
+`root=<partition GUID or device>` on the kernel command line, else the
+first MinimaFS volume found), and every other MinimaFS volume as `1:`,
+`2:`, ... in disk order.
 
-The current allocation bitmap supports at most 256 MiB. The QEMU workflow uses
-a `sata256.img` disk image. Formatting a larger physical device is clamped to
-the supported size.
+A MinimaFS volume can hold up to 2^32 - 2 blocks of 4 KiB, just under
+16 TiB. Free space is tracked as a list of used extents rebuilt at mount
+time, so memory use does not grow with the volume size. MBR can address
+disks up to 2 TiB; use GPT beyond that (the default).
+
+MinimaFS partitions use GPT type `4D696E69-6D61-4653-B0A7-4D4F534D4653`
+or MBR type `0x7F`.
+
+To make a disk boot by itself, use `install` (see
+[Installing](installing.md)).
 
 ## Embedded Install Packages
 

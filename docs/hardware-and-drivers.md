@@ -33,34 +33,40 @@ assumptions.
 
 ## Graphics
 
-The preferred graphics path uses the linear framebuffer selected by the
-Multiboot2 bootloader (VBE on legacy BIOS or GOP on UEFI), so it does not need a
-GPU-specific register driver for basic display output. The renderer supports
-32-bit RGB layouts and uses the bootloader-provided pitch and channel masks.
-The Bochs/VBE driver remains as a fallback for the Bochs `1234:1111` device; it
-is not probed against arbitrary display controllers. This is a software
-framebuffer path, not accelerated 3D support. If the bootloader cannot supply a
-32-bit RGB framebuffer, generic graphics initialization is unavailable.
+The display itself still comes from the linear framebuffer the bootloader
+set up (VBE on BIOS, GOP on UEFI); the Bochs/VBE driver can also set modes
+on QEMU's `1234:1111` device. Framebuffers are mapped write-combining (PAT
+entry 1), which makes pixel writes to a real graphics card much faster.
 
-After initialization, the terminal uses the shared graphics/text helpers. The
-framebuffer is also exposed to user programs through the `SYS_GRAPHICS` syscall
-family.
+On top of that, `gpucore.c` turns each display-class PCI device into a GPU
+adapter with video memory: total VRAM, the PCI BAR that is the CPU's window
+onto it, where the visible framebuffer sits in VRAM, and a VRAM allocator
+for the rest. Drivers:
 
-The terminal sets a text-grid resolution over the framebuffer. Graphics commands
-and SDK wrappers operate on pixels, primitives, text, resolution, and terminal
-clear operations.
+| Driver | Devices | What it knows |
+| --- | --- | --- |
+| `gpu_nvidia.c` | NVIDIA, tuned for GTX 10 (Pascal) and RTX 20 / GTX 16 (Turing) | chip and board name, VRAM size from the memory controller, BAR1 window, temperature |
+| `gpu_bochs.c` | QEMU/Bochs standard VGA | VRAM size, page flipping |
+| `gpu_generic.c` | everything else | the framebuffer's BAR as VRAM window |
+
+Drawing commands go through the FGPU command processor (`SYS_GPU`,
+`fgpu.c`), whose current backend renders 3D on the CPU. See
+[GPU and 3D](gpu.md).
 
 ## USB
 
-The USB host path supports UHCI and OHCI controllers, initializes their frame
-schedules, enumerates directly attached devices, and detects HID boot keyboards
-and mice. USB manager code registers the controller driver and exposes keyboard
-state to the terminal. USB hubs and EHCI/XHCI controllers are not yet supported.
+UHCI and OHCI (USB 1.1) and xHCI (USB 3, every recent PC) controllers are
+driven. Directly attached HID boot keyboards and mice work on all three;
+hubs, EHCI, and USB storage are not supported yet. On xHCI the kernel takes
+the controller over from the firmware (legacy hand-off) and polls its event
+ring from the timer interrupt.
+
+PS/2 keyboards work too: the 8042 controller is initialised at boot and its
+scan codes are converted to the same HID reports, so layouts and key repeat
+behave the same as with USB.
 
 User programs use `SYS_USB` wrappers for initialization, polling, keyboard
-presence, key translation, and keyboard metadata. USB polling is intentionally
-explicit because the kernel must service the controller while user code is
-running.
+presence, key translation, and keyboard metadata.
 
 ## Audio
 
@@ -72,15 +78,16 @@ terminal.
 If no compatible audio controller is present, initialization reports that state
 and the rest of the system continues.
 
-## AHCI Storage
+## Storage
 
-AHCI probing identifies SATA devices and exposes sector size/capacity to the
-MinimaFS disk wrapper. `initdisk` owns disk discovery and device initialization;
-`format` and `mount` operate on the selected MinimaFS drive.
+Disks are block devices (`blockdev.c`): every SATA disk on every AHCI
+controller (`sata0`, `sata1`, ...) and every NVMe namespace (`nvme0`, ...).
+MBR and GPT partitions become child devices (`sata0p1`, `nvme0p2`).
+MinimaFS works on any block device, so a volume can be a whole disk (the
+original layout) or a partition. See [Storage and packages](storage-and-packages.md).
 
-The filesystem uses a DMA bounce buffer for block I/O. Storage operations are
-kept behind MinimaFS APIs so commands and package extraction do not manipulate
-AHCI descriptors directly.
+The filesystem uses a DMA bounce buffer for block I/O; the NVMe driver
+builds PRP lists and is polled.
 
 ## Adding A Driver
 

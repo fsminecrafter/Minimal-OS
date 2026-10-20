@@ -186,7 +186,11 @@ Last synced 2026 - oct 18, 21:08
 
 ##### V 0.4.51
 
-- [ ] Pong
+- [X] Golf
+- [ ] GPU support (not just display adapter)
+- [ ] MiniGL (Minimal-OS Graphics Library)
+- [ ] Partitions & Larger disk's
+- [ ] Installer & Disk bootable installs
 
 ##### V 0.4.52
 

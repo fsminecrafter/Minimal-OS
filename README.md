@@ -207,8 +207,8 @@ Last synced 2026 - oct 20, 15:29
 
 ##### V 0.4.52
 
-- [ ] GPU engine and GLSL style shaders
-- [ ] Fix various apps.
+- [X] GPU engine and GLSL style shaders (Pascal)
+- [X] Fix various apps.
 
 ## Usage
 

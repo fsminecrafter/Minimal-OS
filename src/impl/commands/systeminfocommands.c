@@ -1,3 +1,4 @@
+#include "x86_64/hyperv.h"
 #include <stdint.h>
 #include <stdbool.h>
 #include "string.h"
@@ -494,11 +495,17 @@ void cmd_usage(int argc, const char** argv) {
     }
 }
 
+void cmd_hyperv(int argc, const char** argv) {
+    (void)argc; (void)argv;
+    hyperv_report(info_text);
+}
+
 void register_system_info_commands(void) {
     command_register("clear", cmd_clear);
     command_register("info", cmd_info);
     command_register("cpu", cmd_cpu);
     command_register("gpu", cmd_gpu);
+    command_register("hyperv", cmd_hyperv);
     command_register("chgres", cmd_cgres);
     command_register("usage", cmd_usage);
 }

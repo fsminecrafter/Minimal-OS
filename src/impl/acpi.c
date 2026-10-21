@@ -1,4 +1,5 @@
 #include "x86_64/acpi.h"
+#include "mmu_tables.h"
 #include "x86_64/port.h"
 #include "serial.h"
 #include "string.h"
@@ -473,6 +474,40 @@ static const acpi_sdt_header_t* find_table(const acpi_rsdp_t* rsdp, const char* 
         }
     }
 
+    return NULL;
+}
+
+// N-th table with a signature (DSDT through the FADT), or NULL. Works
+// before acpi_init(): it only needs the multiboot information.
+const void* acpi_find_table(multiboot2_info_t* mb_info, const char* signature, uint32_t index) {
+    const acpi_rsdp_t* rsdp = find_mb2_rsdp(mb_info);
+    if (!rsdp) rsdp = find_legacy_rsdp();
+    if (!rsdp || acpi_checksum(rsdp, 20) != 0) return NULL;
+
+    if (strncmp(signature, "DSDT", 4) == 0) {
+        if (index != 0) return NULL;
+        const uint8_t* fadt = (const uint8_t*)find_table(rsdp, "FACP");
+        if (!fadt) return NULL;
+        uint32_t fadt_length = ((const acpi_sdt_header_t*)fadt)->length;
+        uint64_t dsdt = acpi_read_u32(fadt + 40);
+        if (fadt_length >= 148 && acpi_read_u64(fadt + 140)) dsdt = acpi_read_u64(fadt + 140);
+        if (!dsdt || dsdt >= ((uint64_t)IDENTITY_MAP_GIB << 30)) return NULL;
+        return (const void*)(uintptr_t)dsdt;
+    }
+
+    bool use_xsdt = rsdp->revision >= 2 && rsdp->xsdt_address;
+    const acpi_sdt_header_t* root = (const acpi_sdt_header_t*)(uintptr_t)
+        (use_xsdt ? rsdp->xsdt_address : rsdp->rsdt_address);
+    if (!root) return NULL;
+    uint32_t entry = use_xsdt ? 8 : 4;
+    uint32_t count = (root->length - sizeof(acpi_sdt_header_t)) / entry;
+    const uint8_t* list = (const uint8_t*)root + sizeof(acpi_sdt_header_t);
+    for (uint32_t i = 0; i < count; i++) {
+        uint64_t address = use_xsdt ? acpi_read_u64(list + i * 8) : acpi_read_u32(list + i * 4);
+        if (!address || address >= ((uint64_t)IDENTITY_MAP_GIB << 30)) continue;
+        const acpi_sdt_header_t* t = (const acpi_sdt_header_t*)(uintptr_t)address;
+        if (strncmp(t->signature, signature, 4) == 0 && index-- == 0) return t;
+    }
     return NULL;
 }
 

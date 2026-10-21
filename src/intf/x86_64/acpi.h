@@ -33,6 +33,10 @@ bool acpi_shutdown(void);
 bool acpi_reboot(void);
 bool acpi_poll_power_button(void);
 
+// N-th table with this signature ("DSDT" included), or NULL. Usable
+// before acpi_init(). Tables are identity mapped (below 4 GiB).
+const void* acpi_find_table(multiboot2_info_t* mb_info, const char* signature, uint32_t index);
+
 uintptr_t acpi_get_lapic_phys_addr(void);
 
 uint32_t          acpi_get_cpu_count(void);

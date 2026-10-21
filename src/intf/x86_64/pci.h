@@ -54,6 +54,21 @@ pci_device_t* pci_find_device(uint16_t vendor_id, uint16_t device_id);
 pci_device_t* pci_find_class(uint8_t class_code, uint8_t subclass);
 void pci_enable_io_busmaster(pci_device_t* dev);
 
+/* Virtual buses: devices that are not reached through the 0xCF8/0xCFC
+ * ports (for example PCI devices passed through to a Hyper-V VM, whose
+ * config space goes through VMBus). Buses from PCI_VBUS_FIRST up are
+ * routed to the accessors registered here; offsets are dword aligned. */
+#define PCI_VBUS_FIRST 0xF0
+typedef uint32_t (*pci_vbus_read_t)(uint8_t bus, uint8_t device, uint8_t function, uint16_t offset);
+typedef void (*pci_vbus_write_t)(uint8_t bus, uint8_t device, uint8_t function, uint16_t offset,
+                                 uint32_t value);
+void pci_set_vbus_accessors(pci_vbus_read_t read, pci_vbus_write_t write);
+bool pci_vbus_read(uint8_t bus, uint8_t device, uint8_t function, uint16_t offset, uint32_t* value);
+bool pci_vbus_write(uint8_t bus, uint8_t device, uint8_t function, uint16_t offset, uint32_t value);
+// Appends a device found outside the normal scan and lets class drivers
+// attach. NULL if the table is full.
+pci_device_t* pci_add_device(const pci_device_t* dev);
+
 // Index of the memory BAR that contains [phys, phys+len), or -1.
 int pci_bar_containing(const pci_device_t* dev, uint64_t phys, uint64_t len);
 

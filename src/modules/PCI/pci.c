@@ -40,9 +40,31 @@ static inline void pci_write_address(uint32_t address) {
     port_outl(PCI_CONFIG_ADDRESS, address);
 }
 
+static pci_vbus_read_t g_vbus_read;
+static pci_vbus_write_t g_vbus_write;
+
+void pci_set_vbus_accessors(pci_vbus_read_t read, pci_vbus_write_t write) {
+    g_vbus_read = read;
+    g_vbus_write = write;
+}
+
+bool pci_vbus_read(uint8_t bus, uint8_t device, uint8_t function, uint16_t offset, uint32_t* value) {
+    if (bus < PCI_VBUS_FIRST) return false;
+    *value = g_vbus_read ? g_vbus_read(bus, device, function, offset & 0xFFC) : 0xFFFFFFFFu;
+    return true;
+}
+
+bool pci_vbus_write(uint8_t bus, uint8_t device, uint8_t function, uint16_t offset, uint32_t value) {
+    if (bus < PCI_VBUS_FIRST) return false;
+    if (g_vbus_write) g_vbus_write(bus, device, function, offset & 0xFFC, value);
+    return true;
+}
+
 // --- PCI config dword read ---
 uint32_t pci_read_config_dword(uint8_t bus, uint8_t device, uint8_t function, uint8_t offset) {
     if (offset & 3) return 0xFFFFFFFF; // must be dword aligned
+    uint32_t vvalue;
+    if (pci_vbus_read(bus, device, function, offset, &vvalue)) return vvalue;
 
     uint32_t address = (1U << 31)
     | ((uint32_t)bus << 16)
@@ -57,6 +79,7 @@ uint32_t pci_read_config_dword(uint8_t bus, uint8_t device, uint8_t function, ui
 // --- PCI config dword write ---
 void pci_write_config_dword(uint8_t bus, uint8_t device, uint8_t function, uint8_t offset, uint32_t value) {
     if (offset & 3) return;
+    if (pci_vbus_write(bus, device, function, offset, value)) return;
 
     uint32_t address = (1U << 31)
     | ((uint32_t)bus << 16)
@@ -101,6 +124,8 @@ static inline uint32_t mmio_read32(volatile void* base, uint32_t offset) {
 }
 
 uint32_t pci_config_read(uint8_t bus, uint8_t device, uint8_t function, uint8_t offset) {
+    uint32_t vvalue;
+    if (pci_vbus_read(bus, device, function, offset, &vvalue)) return vvalue;
     // Align offset to 4 bytes
     uint32_t address = (1U << 31)               // Enable bit
     | ((uint32_t)bus << 16)
@@ -151,6 +176,14 @@ void pci_enumerate_all() {
         print_str("Enumerating PCI devices starting from bus 0...\n");
     }
     pci_enumerate_bus(0);
+}
+
+pci_device_t* pci_add_device(const pci_device_t* dev) {
+    if (!dev || pci_device_count >= MAX_PCI_DEVICES) return NULL;
+    pci_device_t* slot = &pci_devices[pci_device_count++];
+    *slot = *dev;
+    pci_manager_notify(slot);
+    return slot;
 }
 
 int pci_get_device_count(void) {

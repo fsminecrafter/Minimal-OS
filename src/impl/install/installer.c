@@ -277,6 +277,13 @@ static bool write_boot_partition(blockdev_t* esp, const char* root_id,
              "\tmodule2 /boot/kernel.bin moskernel\n"
              "\tmodule2 /boot/mosinst.mpk mosinst\n"
              "\tboot\n"
+             "}\n"
+             "\n"
+             "menuentry \"Minimal-OS (RamFS)\" {\n"
+             "\tmultiboot2 /boot/kernel.bin ramfs\n"
+             "\tmodule2 /boot/kernel.bin moskernel\n"
+             "\tmodule2 /boot/mosinst.mpk mosinst\n"
+             "\tboot\n"
              "}\n",
              root_id, root_id);
 

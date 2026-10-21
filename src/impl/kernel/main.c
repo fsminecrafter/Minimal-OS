@@ -1,3 +1,5 @@
+#include "x86_64/ramdisk.h"
+#include "x86_64/hyperv.h"
 #include "print.h"
 #include "x86_64/commandhandler.h"
 #include "x86_64/multiboot2parse.h"
@@ -45,6 +47,8 @@
 #include "x86_64/random.h"
 
 bool kernel_boot_no_disk;
+bool kernel_boot_ramfs;
+uint32_t kernel_boot_ramfs_mib;
 multiboot2_info_t* kernel_multiboot_info;
 bool kernel_boot_debug;
 
@@ -98,6 +102,15 @@ void kernel_main(uint64_t mb2_info_addr) {
     pat_init();
     kernel_boot_no_disk = multiboot2_has_cmdline_token(mb_info, "no-disk");
     kernel_boot_debug = multiboot2_has_cmdline_token(mb_info, "--debug");
+    {
+        char mib[12];
+        bool sized = multiboot2_get_cmdline_value(mb_info, "ramfs=", mib, sizeof(mib));
+        kernel_boot_ramfs = sized || multiboot2_has_cmdline_token(mb_info, "ramfs");
+        kernel_boot_ramfs_mib = 0;
+        for (const char* c = mib; sized && *c >= '0' && *c <= '9'; c++)
+            kernel_boot_ramfs_mib = kernel_boot_ramfs_mib * 10 + (uint32_t)(*c - '0');
+        if (!kernel_boot_ramfs_mib) kernel_boot_ramfs_mib = RAMDISK_DEFAULT_MIB;
+    }
     multiboot2_get_cmdline_value(mb_info, "root=", kernel_boot_root,
                                  sizeof(kernel_boot_root));
     uint64_t total_ram_bytes = get_total_memory(mb_info);
@@ -134,6 +147,12 @@ void kernel_main(uint64_t mb2_info_addr) {
     addvar(total_ram_bytes, "totalrambytes");
 
     pci_enumerate_all();
+
+    // In a Hyper-V VM, devices passed through with DDA (a GPU, a USB
+    // controller) sit behind VMBus; this adds them to the PCI device list
+    // before the drivers below look for hardware. Nothing happens on
+    // real hardware or other hypervisors.
+    hyperv_bringup();
 
     // Registers every built-in usb_hw_driver_t with usb_manager and
     // brings up whichever host controller is actually present. See

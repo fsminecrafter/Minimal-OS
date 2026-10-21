@@ -16,6 +16,7 @@
 
 #include "vgaterm.h"
 #include "minimafshandler.h"
+#include "x86_64/storage_setup.h"
 #include "systeminfo.h"
 #include "mouse/usbmouse.h"
 
@@ -473,6 +474,24 @@ void terminal_init_keyboard(void) {
 
 
 
+// RamFS boot option: formats the RAM disk as 0: and unpacks the system
+// files into it, like 'format' does for a real disk. Returns mountdrive()'s
+// codes (1 = ready).
+static void ramfs_progress(uint32_t percent, const char* text) {
+    (void)percent;
+    serial_write_str("RamFS: ");
+    serial_write_str(text);
+    serial_write_str("\n");
+}
+
+static int ramfs_prepare(minimafs_disk_device_t* device) {
+    if (!storage_format_volume(device, 0, "ramfs")) return 0;
+    if (!storage_populate_system(0, ramfs_progress)) {
+        vgaterm_print_error("RamFS: system files could not be installed\n");
+    }
+    return 1;
+}
+
 // ===========================================
 // TERMINAL INITIALIZATION
 // ===========================================
@@ -513,13 +532,18 @@ void terminal_program_entry(void) {
         graphics_write_textr("[STARTING] Disk mode disabled by boot option\n");
         serial_write_str("Terminal: disk initialization skipped by boot option\n");
     } else {
-        graphics_write_textr("[STARTING] Mounting disk\n");
+        if (kernel_boot_ramfs) {
+            graphics_write_textr("[STARTING] RamFS: system volume in RAM, disks are not touched\n");
+        } else {
+            graphics_write_textr("[STARTING] Mounting disk\n");
+        }
         command_execute("initdisk");
         minimafs_disk_device_t* device = getminimadrive();
         if (!device) {
-            vgaterm_print_error("No disk device found\n");
+            vgaterm_print_error(kernel_boot_ramfs ? "RamFS: could not create the RAM disk\n"
+                                                  : "No disk device found\n");
         } else {
-            int success = mountdrive(device, 0);
+            int success = kernel_boot_ramfs ? ramfs_prepare(device) : mountdrive(device, 0);
             if (success == 1) {
                 vgaterm_print_success("Disk mounted\n");
                 // Every other MinimaFS volume becomes 1:, 2:, ...

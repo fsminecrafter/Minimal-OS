@@ -1,3 +1,5 @@
+#include "x86_64/ramdisk.h"
+#include "x86_64/boot_options.h"
 #include "x86_64/blockdev.h"
 #include "x86_64/partition.h"
 #include "x86_64/ahci.h"
@@ -290,6 +292,12 @@ static void scan_all_partitions(void) {
 }
 
 uint32_t blockdev_probe_all(void) {
+    if (!g_probed && kernel_boot_ramfs) {
+        // RamFS: the RAM disk is the only disk; real ones stay untouched.
+        g_probed = true;
+        serial_write_str("blockdev: RamFS mode, real disks are not probed\n");
+        ramdisk_create(kernel_boot_ramfs_mib);
+    }
     if (!g_probed) {
         g_probed = true;
         uint32_t sata = probe_ahci();

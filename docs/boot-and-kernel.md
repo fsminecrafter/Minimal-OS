@@ -39,6 +39,14 @@ The terminal owns the disk interaction. In normal mode it probes and mounts the
 disk and starts services; no-disk mode skips that path and still starts the
 terminal and keyboard tasks.
 
+RamFS mode (GRUB entry "Minimal-OS (RamFS)", kernel option `ramfs` or
+`ramfs=<MiB>`) runs the whole system from RAM, which makes it safe for
+testing on a real PC. Real disks (AHCI, NVMe) are never probed, so nothing
+reads or writes them. Instead a zeroed RAM disk, `ram0` (64 MiB by default,
+less if memory is short, at least 16 MiB), is formatted as `0:`, the system
+files are unpacked into it as `format` would, and startup goes on as usual
+(services, desktop). Every change is lost at the next boot.
+
 ## Memory
 
 The physical memory manager (`src/impl/pmm.c`) allocates 4 KiB pages. The heap

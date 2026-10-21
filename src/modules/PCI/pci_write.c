@@ -1,4 +1,8 @@
 #include <stdint.h>
+#include <stdbool.h>
+
+bool pci_vbus_read(uint8_t bus, uint8_t device, uint8_t function, uint16_t offset, uint32_t* value);
+bool pci_vbus_write(uint8_t bus, uint8_t device, uint8_t function, uint16_t offset, uint32_t value);
 
 #define PCI_CONFIG_ADDRESS 0xCF8
 #define PCI_CONFIG_DATA    0xCFC
@@ -46,6 +50,8 @@ static inline uint8_t inb(uint16_t port) {
 
 // Read 32-bit from PCI config space
 uint32_t pci_config_read32(uint8_t bus, uint8_t device, uint8_t function, uint8_t offset) {
+    uint32_t vvalue;
+    if (pci_vbus_read(bus, device, function, offset, &vvalue)) return vvalue;
     uint32_t address = pci_config_address(bus, device, function, offset);
     outl(PCI_CONFIG_ADDRESS, address);
     return inl(PCI_CONFIG_DATA + (offset & 0x3));
@@ -53,6 +59,7 @@ uint32_t pci_config_read32(uint8_t bus, uint8_t device, uint8_t function, uint8_
 
 // Write 32-bit to PCI config space
 void pci_config_write32(uint8_t bus, uint8_t device, uint8_t function, uint8_t offset, uint32_t value) {
+    if (pci_vbus_write(bus, device, function, offset, value)) return;
     uint32_t address = pci_config_address(bus, device, function, offset);
     outl(PCI_CONFIG_ADDRESS, address);
     outl(PCI_CONFIG_DATA + (offset & 0x3), value);

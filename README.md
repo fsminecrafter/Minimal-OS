@@ -196,10 +196,10 @@ Last synced 2026 - oct 20, 15:29
 ##### V 0.4.51
 
 - [X] Golf
-- [ ] GPU support (not just display adapter)
-- [ ] MiniGL (Minimal-OS Graphics Library)
-- [ ] Partitions & Larger disk's
-- [ ] Installer & Disk bootable installs
+- [X] GPU support (not just display adapter)
+- [X] FarcadeGL (Minimal-OS Graphics Library)
+- [X] Partitions & Larger disk's
+- [X] Installer & Disk bootable installs
 
 ##### V 0.4.52
 

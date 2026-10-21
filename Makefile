@@ -57,6 +57,12 @@ dlrconnect_run := $(install2_source)/dlrconnect.run
 fglcube_run := $(install2_base_source)/fglcube.run
 fglcube_sources := $(wildcard Minimal-OS-SDK/programs/fglcube/*.c) \
 	Minimal-OS-SDK/include/farcadegl.h Minimal-OS-SDK/include/fgpu_abi.h
+# Deliver Manager, the window for Deliver (SDK programs/delivermanager),
+# installed as 0:/programs/DeliverManager.run. It is built from the same
+# Deliver code as dlr.run.
+delivermanager_run := $(install2_base_source)/DeliverManager.run
+delivermanager_sources := $(shell find Minimal-OS-SDK/programs/delivermanager -type f 2>/dev/null) \
+	$(dlr_source_files) Minimal-OS-SDK/include/easyui.h Minimal-OS-SDK/include/easyui_text.h
 install3_base_source := src/resources/install3
 install3_source := $(install3_base_source)
 install3_mpkg := build/resources/install3.mpkg
@@ -172,7 +178,7 @@ $(install1_object): $(install1_mpkg)
 		--redefine-sym _binary_build_resources_install1_mpkg_end=_binary_install1_mpkg_end \
 		$< $@
 
-$(install2_mpkg): $(mode_stamp) $(mosdesk_install_dep) $(install2_tree_deps) $(dlr_run) $(dlrconnect_run) $(fglcube_run) tools/mkpkg/mkpkg.py
+$(install2_mpkg): $(mode_stamp) $(mosdesk_install_dep) $(install2_tree_deps) $(dlr_run) $(dlrconnect_run) $(fglcube_run) $(delivermanager_run) tools/mkpkg/mkpkg.py
 	mkdir -p $(dir $@)
 	$(MKPKG) $(install2_source) $@ --store
 
@@ -181,6 +187,9 @@ $(dlr_run): $(dlr_source_files) Minimal-OS-SDK/build.sh Minimal-OS-SDK/crt0.c Mi
 
 $(fglcube_run): $(fglcube_sources) Minimal-OS-SDK/build.sh Minimal-OS-SDK/crt0.c Minimal-OS-SDK/link.ld
 	CC=$(CC) LD=$(LD) Minimal-OS-SDK/build.sh Minimal-OS-SDK/programs/fglcube --output $(CURDIR)/$@
+
+$(delivermanager_run): $(delivermanager_sources) Minimal-OS-SDK/build.sh Minimal-OS-SDK/crt0.c Minimal-OS-SDK/link.ld
+	CC=$(CC) LD=$(LD) Minimal-OS-SDK/build.sh Minimal-OS-SDK/programs/delivermanager --output $(CURDIR)/$@
 
 $(dlrconnect_run): $(dlr_source_files) Minimal-OS-SDK/build.sh Minimal-OS-SDK/crt0.c Minimal-OS-SDK/link.ld
 	CC=$(CC) LD=$(LD) Minimal-OS-SDK/build.sh --worker Minimal-OS-SDK/programs/dlr
@@ -297,7 +306,7 @@ mosdesk-build:
 	CC=$(CC) LD=$(LD) MKPKG_TOOL=$(CURDIR)/tools/mkpkg/mkpkg.py MKPKG_JOBS=$(MKPKG_JOBS) \
 		MOSDESK_SDK_DIR=$(CURDIR)/Minimal-OS-SDK $(MOSDESK_DIR)/mosdesk/build.sh
 
-mosdesk-stage: mosdesk-build $(dlr_run) $(dlrconnect_run) $(fglcube_run)
+mosdesk-stage: mosdesk-build $(dlr_run) $(dlrconnect_run) $(fglcube_run) $(delivermanager_run)
 	rm -rf build/resources/mosdesk-install
 	mkdir -p build/resources/mosdesk-install/install2/mosWM \
 		build/resources/mosdesk-install/install3

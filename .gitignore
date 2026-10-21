@@ -21,3 +21,7 @@ Minimal-OS-SDK/
 
 # Built from Minimal-OS-SDK/programs/fglcube
 src/resources/install2/fglcube.run
+
+# Built by make from the SDK (programs/fglcube, programs/delivermanager)
+src/resources/install2/fglcube.run
+src/resources/install2/DeliverManager.run

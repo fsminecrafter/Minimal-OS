@@ -13,6 +13,14 @@ The archives are embedded in the kernel because formatting happens before the
 new MinimaFS disk contains any files. The `format` command extracts the
 archives into their destination directories.
 
+Programs built from the SDK during `make` and placed in `install2`:
+
+| File | What it is |
+| --- | --- |
+| `dlr.run`, `dlrconnect.run` | Deliver, the LAN package manager (`dlr` in the terminal) |
+| `DeliverManager.run` | Deliver Manager, a MOSdesk app for getting and sharing Deliver packages ([README](../Minimal-OS-SDK/programs/delivermanager/README.md)) |
+| `fglcube.run` | FarcadeGL demo |
+
 ## Adding A Service
 
 Place a `.service` file in `src/resources/install3`. No C registration call is

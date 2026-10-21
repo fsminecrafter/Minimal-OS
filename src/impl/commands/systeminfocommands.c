@@ -12,6 +12,7 @@
 #include "prochandler.h"
 #include "x86_64/mmio.h"
 #include "x86_64/gpucore.h"
+#include "x86_64/nv_gpu.h"
 #include "x86_64/scheduler.h"
 #include "x86_64/minimafs.h"
 #include "time.h"
@@ -357,8 +358,23 @@ static void gpu_size_text(uint64_t bytes) {
 }
 
 void cmd_gpu(int argc, const char** argv) {
-    (void)argc; (void)argv;
     uint32_t count = gpu_adapter_count();
+    if (argc >= 2 && strcmp(argv[1], "nvidia") == 0) {
+        // Hardware rendering bring-up status (read only).
+        bool any = false;
+        for (uint32_t i = 0; i < count; i++) {
+            gpu_adapter_t* a = gpu_adapter_get(i);
+            if (a->vendor != GPU_VENDOR_NVIDIA) continue;
+            nv_bringup_report(a, info_text);
+            any = true;
+        }
+        if (!any) info_text("No NVIDIA GPU found.\n");
+        return;
+    }
+    if (argc >= 2) {
+        info_text("Usage: gpu [nvidia]\n");
+        return;
+    }
     if (count == 0) info_text("No GPU adapter found.\n");
     for (uint32_t i = 0; i < count; i++) {
         gpu_adapter_t* a = gpu_adapter_get(i);

@@ -371,10 +371,13 @@ ci-test:
 	bash tools/debug/ci_test.sh
 
 .PHONY: test-host
-test-host: build/tests/host/gfx_blit_tests build/tests/host/fgpu_raster_tests build/tests/host/fgsl_tests
+test-host: build/tests/host/gfx_blit_tests build/tests/host/fgpu_raster_tests build/tests/host/fgsl_tests \
+		build/tests/host/fgpu_ir_tests build/tests/host/nv_hw_tests
 	./build/tests/host/gfx_blit_tests
 	./build/tests/host/fgpu_raster_tests
 	./build/tests/host/fgsl_tests
+	./build/tests/host/fgpu_ir_tests
+	./build/tests/host/nv_hw_tests
 
 build/tests/host/fgpu_raster_tests: tests/host/fgpu_raster_tests.c src/modules/GPU/fgpu_raster.c src/modules/GPU/fgpu_shader.c
 	mkdir -p $(dir $@)
@@ -384,6 +387,14 @@ build/tests/host/fgpu_raster_tests: tests/host/fgpu_raster_tests.c src/modules/G
 build/tests/host/fgsl_tests: tests/host/fgsl_tests.c src/modules/GPU/fgpu_raster.c src/modules/GPU/fgpu_shader.c Minimal-OS-SDK/include/fglsl.h Minimal-OS-SDK/include/fgpu_abi.h
 	mkdir -p $(dir $@)
 	$(HOSTCC) $(HOST_CFLAGS) -idirafter Minimal-OS-SDK/include $(filter %.c,$^) -lm -o $@
+
+build/tests/host/fgpu_ir_tests: tests/host/fgpu_ir_tests.c src/modules/GPU/fgpu_ir.c src/modules/GPU/fgpu_shader.c Minimal-OS-SDK/include/fglsl.h Minimal-OS-SDK/include/fgpu_abi.h $(header_files)
+	mkdir -p $(dir $@)
+	$(HOSTCC) $(HOST_CFLAGS) -idirafter Minimal-OS-SDK/include $(filter %.c,$^) -lm -o $@
+
+build/tests/host/nv_hw_tests: tests/host/nv_hw_tests.c src/modules/GPU/nv_fw.c $(header_files)
+	mkdir -p $(dir $@)
+	$(HOSTCC) $(HOST_CFLAGS) $(filter %.c,$^) -o $@
 
 build/tests/host/gfx_blit_tests: tests/host/gfx_blit_tests.c src/impl/handlers/gfx_blit.c
 	mkdir -p $(dir $@)

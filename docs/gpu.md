@@ -170,3 +170,88 @@ it.
 This needs testing on real cards (QEMU cannot emulate an NVIDIA GPU);
 steps 1-2 are the first milestone.
 
+### What is in place (Turing, e.g. RTX 2060)
+
+Everything below builds into the kernel and changes nothing until the
+hardware backend's `init()` succeeds; until then all work runs on the CPU
+as before.
+
+| Piece | Where | State |
+| --- | --- | --- |
+| Backend interface: FGPU offers every clear and draw to a hardware backend first and falls back to the CPU per command; GPU work is finished before the CPU touches a surface or buffer | `fgpu_backend.h`, `fgpu.c` | done |
+| NVIDIA backend: chosen at boot for NVIDIA adapters; compiles every shader program to the IR below; declines `init()` with the reason | `fgpu_backend_nv.c` | stub |
+| Shader compiler, first half: FGPU bytecode → scalar SSA IR (one op per hardware instruction), if-conversion of jumps, constant folding, CSE, dead code removal, linear-scan register allocation, SASS-style listing | `fgpu_ir.h`, `fgpu_ir.c` | done, tested |
+| Shader compiler, second half: IR → encoded Turing SASS (128-bit instructions with scheduling bits) | | to do |
+| Firmware: list of files per chip, parsers for NVIDIA's `.bin` containers and the GSP-RM ELF image | `nv_hw.h`, `nv_fw.c` | done, tested |
+| Falcons: read state; IMEM/DMEM upload, start, wait | `nv_falcon.c` | reading used, the rest ready for GSP boot |
+| Pushbuffers: method headers, GPFIFO entries, a ready-made `TURING_A` clear | `nv_fw.c` | done, tested (method offsets unverified on hardware) |
+| GSP boot (FWSEC-FRTS from the VBIOS, `booter_load` on SEC2, GSP-RM) | | to do |
+| RM RPC: channel, GPFIFO and class allocation through GSP-RM | | to do |
+
+`gpu nvidia` prints the bring-up state. It only reads registers, so it is
+safe on any card: which firmware files are present and well-formed, and
+each microcontroller (GSP, SEC2, PMU, FECS, GPCCS, NVDEC) with its memory
+sizes and whether it is running.
+
+#### Firmware files
+
+Copy these from `linux-firmware` (`nvidia/tu106/` for an RTX 2060; follow
+the symbolic links, MinimaFS has none) to `0:/firmware/nvidia/tu106/`:
+
+```text
+gsp/booter_load-535.113.01.bin
+gsp/booter_unload-535.113.01.bin
+gsp/bootloader-535.113.01.bin
+gsp/gsp-535.113.01.bin          (about 30 MB)
+```
+
+TU102/TU104 use `tu102`/`tu104`, the GTX 16 series `tu116`/`tu117`.
+
+#### The shader IR
+
+GPU shader cores run 32 threads in step, each on scalar 32-bit registers,
+so `fgpu_ir.c` turns each vec4 instruction into scalar operations that
+correspond one to one to Turing instructions (`FFMA`, `FMNMX`,
+`MUFU.RSQ`, `FSET.BF`, `FSEL`, `TEX`, `IPA`, ...):
+
+- the edge cases FGPU defines (`x / 0 = 0`, `sqrt`/`rsq` of `x <= 0`,
+  `log2(x <= 0) = -126`, `pow` of `x <= 0`) become explicit selects, so GPU
+  and CPU agree;
+- `atan2`, `smoothstep`, `mod` and `sign` become short instruction
+  sequences (the same polynomial as the CPU backend);
+- jumps are if-converted: each thread keeps the instruction it resumes at,
+  as the CPU interpreter does per lane, and writes inside a skipped range
+  become selects. The result has no branches at all; turning long skipped
+  ranges back into real branches (`BRA` with `BSSY`/`BSYNC`) is a later
+  optimization.
+
+`make test-host` compiles FGSL shaders (lighting, every built-in function,
+nested `if`/`else` with `discard`, loops with `break`/`continue`,
+textures, `gl_FragCoord`) and hand-written bytecode with divergent jumps,
+runs them on random inputs through both the IR (with a reference
+evaluator) and the CPU shader machine, and checks that they agree.
+`FGPU_IR_LIST=1 ./build/tests/host/fgpu_ir_tests` prints a listing:
+
+```text
+// fragment stage: 35 ops, 7 registers
+  IPA R0, v3.x
+  IPA R1, v3.y
+  TEX.2D R0+, R0, R1, tex0
+  FSET.BF.LT R3, R3, 0.5
+  ...
+  KIL if R3 != 0
+```
+
+#### Next steps on a card
+
+1. Run `gpu nvidia` with the firmware copied: every file should show
+   `ok`, and GSP/SEC2 should be reachable.
+2. GSP boot, following nouveau's `r535` code (`nvkm/subdev/gsp/r535.c`,
+   `tu102.c`): run FWSEC-FRTS from the VBIOS, load `booter_load` on SEC2
+   with the GSP-RM image and boot loader in system memory, and wait for
+   GSP-RM's init message.
+3. Allocate a channel through RM RPC, submit `nv_push_clear_xrgb` and
+   check the surface changed: then `clear()` in `fgpu_backend_nv.c` can
+   return true.
+4. Encode the IR as SASS (Mesa's NAK, `src/nouveau/compiler/nak/sm70.rs`,
+   has the Volta/Turing encodings), then draws.

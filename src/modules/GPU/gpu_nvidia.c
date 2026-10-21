@@ -1,4 +1,5 @@
 #include "x86_64/gpucore.h"
+#include "x86_64/nv_gpu.h"
 #include "serial.h"
 #include "string.h"
 
@@ -19,13 +20,14 @@
  * What it does not do (yet): change display modes, page flip, or run work
  * on the GPU's own engines. Since Maxwell 2 the graphics engine only runs
  * NVIDIA-signed firmware, which has to be loaded through the secure boot
- * falcon; that is a large project of its own (nouveau's "ACR"). Rendering
- * therefore uses the FGPU CPU backend, drawing into VRAM.
+ * falcon (Pascal) or GSP (Turing). That work is under way in
+ * fgpu_backend_nv.c, nv_falcon.c and nv_fw.c ('gpu nvidia' shows how far
+ * it got); until then rendering uses the FGPU CPU backend, drawing into
+ * VRAM.
  *
  * Register offsets are from nouveau (drm/nouveau/nvkm).
  */
 
-#define NV_PMC_BOOT_0        0x000000
 #define NV_PBUS_BAR1_BLOCK   0x001704   // Fermi-Volta, bit 31: BAR1 uses a GPU page table
 #define NV_BAR1_BLOCK_TU     0xB80F48   // Turing and later, same meaning
 #define NV_PFB_MEM_SIZE_GP   0x100CE0   // Pascal (GP102+), Volta, Turing: size encoding
@@ -84,11 +86,6 @@ static const nv_chip_t g_chips[] = {
     { 0x194, "Ada (AD104)" },     { 0x196, "Ada (AD106)" },
     { 0x197, "Ada (AD107)" },
 };
-
-static uint32_t nv_rd32(gpu_adapter_t* a, uint32_t reg) {
-    if (!a->mmio || reg + 4 > a->mmio_size) return 0xFFFFFFFFu;
-    return a->mmio[reg / 4];
-}
 
 static bool nv_is_turing_or_newer(uint16_t chipset) {
     return chipset >= 0x160;
@@ -176,9 +173,9 @@ static bool nvidia_probe(gpu_adapter_t* a, pci_device_t* pci) {
     int temp = nv_temperature(a, chipset);
     if (temp >= 0) {
         snprintf(a->notes, sizeof(a->notes),
-                 "%d C; display mode from firmware; 3D runs on the FGPU CPU backend", temp);
+                 "%d C; display mode from firmware; 3D on the CPU for now ('gpu nvidia')", temp);
     } else {
-        strcpy(a->notes, "display mode from firmware; 3D runs on the FGPU CPU backend");
+        strcpy(a->notes, "display mode from firmware; 3D on the CPU for now ('gpu nvidia')");
     }
     serial_write_str("nvidia: PMC_BOOT_0=0x");
     serial_write_hex(boot0);

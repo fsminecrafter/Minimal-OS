@@ -1,4 +1,5 @@
 #include "x86_64/gpucore.h"
+#include "x86_64/fgpu.h"
 #include "x86_64/gpu.h"
 #include "x86_64/mmio.h"
 #include "x86_64/spinlock.h"
@@ -222,6 +223,7 @@ void gpu_core_init(void) {
     }
     if (g_adapter_count == 0) serial_write_str("gpu: no display adapter found\n");
     gpu_core_place_backbuffer();
+    fgpu_backend_select();
 }
 
 /* Kernel back buffer in VRAM */

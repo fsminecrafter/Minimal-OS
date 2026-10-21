@@ -371,13 +371,19 @@ ci-test:
 	bash tools/debug/ci_test.sh
 
 .PHONY: test-host
-test-host: build/tests/host/gfx_blit_tests build/tests/host/fgpu_raster_tests
+test-host: build/tests/host/gfx_blit_tests build/tests/host/fgpu_raster_tests build/tests/host/fgsl_tests
 	./build/tests/host/gfx_blit_tests
 	./build/tests/host/fgpu_raster_tests
+	./build/tests/host/fgsl_tests
 
-build/tests/host/fgpu_raster_tests: tests/host/fgpu_raster_tests.c src/modules/GPU/fgpu_raster.c
+build/tests/host/fgpu_raster_tests: tests/host/fgpu_raster_tests.c src/modules/GPU/fgpu_raster.c src/modules/GPU/fgpu_shader.c
 	mkdir -p $(dir $@)
-	$(HOSTCC) $(HOST_CFLAGS) $^ -lm -o $@
+	$(HOSTCC) $(HOST_CFLAGS) $(filter %.c,$^) -lm -o $@
+
+# FGSL compiler (SDK) + shader checker/machine + rasterizer, end to end.
+build/tests/host/fgsl_tests: tests/host/fgsl_tests.c src/modules/GPU/fgpu_raster.c src/modules/GPU/fgpu_shader.c Minimal-OS-SDK/include/fglsl.h Minimal-OS-SDK/include/fgpu_abi.h
+	mkdir -p $(dir $@)
+	$(HOSTCC) $(HOST_CFLAGS) -idirafter Minimal-OS-SDK/include $(filter %.c,$^) -lm -o $@
 
 build/tests/host/gfx_blit_tests: tests/host/gfx_blit_tests.c src/impl/handlers/gfx_blit.c
 	mkdir -p $(dir $@)

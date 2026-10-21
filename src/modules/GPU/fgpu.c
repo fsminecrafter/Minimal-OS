@@ -1,5 +1,6 @@
 #include "x86_64/fgpu.h"
 #include "x86_64/fgpu_raster.h"
+#include "x86_64/fgpu_shader.h"
 #include "x86_64/gpucore.h"
 #include "x86_64/gpu.h"
 #include "x86_64/allocator.h"
@@ -13,14 +14,15 @@
 #include "x86_64/scheduler.h"
 
 /*
- * FGPU command processor (SYS_GPU). Owns surfaces and buffers per
- * process, runs submitted command buffers on the CPU backend
- * (fgpu_raster.c) and presents finished frames to the screen (copy or
- * page flip) or to a window.
+ * FGPU command processor (SYS_GPU). Owns surfaces, buffers and shader
+ * programs per process, runs submitted command buffers on the CPU
+ * backend (fgpu_raster.c, shaders in fgpu_shader.c) and presents
+ * finished frames to the screen (copy or page flip) or to a window.
  */
 
 #define FGPU_MAX_SURFACES 64
 #define FGPU_MAX_BUFFERS 128
+#define FGPU_MAX_PROGRAMS 64
 
 typedef struct {
     bool used;
@@ -45,8 +47,17 @@ typedef struct {
     gpu_adapter_t* adapter;
 } fgpu_buffer_t;
 
+typedef struct {
+    bool used;
+    uint32_t id;
+    uint64_t owner;
+    uint32_t* blob;             // kernel copy; `program` points into it
+    fgpu_program_t program;
+} fgpu_shader_program_t;
+
 static fgpu_surface_t g_surfaces[FGPU_MAX_SURFACES];
 static fgpu_buffer_t g_buffers[FGPU_MAX_BUFFERS];
+static fgpu_shader_program_t g_programs[FGPU_MAX_PROGRAMS];
 static uint32_t g_next_id = 1;
 static volatile int g_busy;
 static uint64_t g_flipped_owner;        // pid whose surface is on screen, 0 = none
@@ -83,6 +94,15 @@ static fgpu_surface_t* find_surface(uint32_t id, uint64_t owner) {
     for (int i = 0; i < FGPU_MAX_SURFACES; i++) {
         if (g_surfaces[i].used && g_surfaces[i].id == id && g_surfaces[i].owner == owner)
             return &g_surfaces[i];
+    }
+    return NULL;
+}
+
+static fgpu_shader_program_t* find_program(uint32_t id, uint64_t owner) {
+    if (!id) return NULL;
+    for (int i = 0; i < FGPU_MAX_PROGRAMS; i++) {
+        if (g_programs[i].used && g_programs[i].id == id && g_programs[i].owner == owner)
+            return &g_programs[i];
     }
     return NULL;
 }
@@ -159,15 +179,26 @@ void fgpu_process_exit(uint64_t pid) {
             b->used = false;
         }
     }
+    for (int i = 0; i < FGPU_MAX_PROGRAMS; i++) {
+        fgpu_shader_program_t* sp = &g_programs[i];
+        if (sp->used && sp->owner == pid) {
+            free_mem(sp->blob);
+            sp->used = false;
+        }
+    }
     unlock();
 }
 
 /* ------------------------------------------------------------ commands */
 
+// State of one SYS_GPU_SUBMIT. Allocated on the heap (it holds the
+// shader constants), and reset for every command buffer.
 typedef struct {
     fgpu_surface_t* color;
     fgpu_surface_t* depth;
     fgpu_pipeline_t pipe;
+    fgpu_layout_t layout;
+    float constants[FGPU_SHADER_MAX_UNIFORMS][4];
     uint64_t owner;
     uint32_t triangles;
 } exec_state_t;
@@ -244,17 +275,67 @@ static uint64_t execute(exec_state_t* st, const uint32_t* cmd, uint32_t words) {
                 if (n * 4 < sizeof(fgpu_uniforms_t)) return SYS_ERR_INVAL;
                 memcpy(&st->pipe.u, arg, sizeof(fgpu_uniforms_t));
                 break;
+            case FGPU_OP_SET_SHADER: {
+                if (n < 1) return SYS_ERR_INVAL;
+                if (!arg[0]) { st->pipe.shader = NULL; break; }
+                fgpu_shader_program_t* sp = find_program(arg[0], st->owner);
+                if (!sp) return SYS_ERR_NOTFOUND;
+                st->pipe.shader = &sp->program;
+                break;
+            }
+            case FGPU_OP_SET_CONSTANTS: {
+                if (n < 2) return SYS_ERR_INVAL;
+                uint32_t first = arg[0], count = arg[1];
+                if (first > FGPU_SHADER_MAX_UNIFORMS || count > FGPU_SHADER_MAX_UNIFORMS - first ||
+                    n - 2 < count * 4) return SYS_ERR_INVAL;
+                memcpy(st->constants[first], arg + 2, (size_t)count * 16);
+                break;
+            }
+            case FGPU_OP_SET_VERTEX_LAYOUT: {
+                if (n < 2 || arg[1] > FGPU_MAX_ATTRIBS || n - 2 < arg[1]) return SYS_ERR_INVAL;
+                fgpu_layout_t l;
+                memset(&l, 0, sizeof(l));
+                l.stride = arg[0];
+                l.count = arg[1];
+                for (uint32_t i = 0; i < l.count; i++) l.attrib[i] = arg[2 + i];
+                if (!fgpu_layout_valid(&l)) return SYS_ERR_INVAL;
+                st->layout = l;
+                break;
+            }
+            case FGPU_OP_BIND_TEXTURE: {
+                if (n < 3 || arg[0] >= FGPU_MAX_TEXTURE_UNITS) return SYS_ERR_INVAL;
+                fgpu_texture_t* tex = &st->pipe.textures[arg[0]];
+                memset(tex, 0, sizeof(*tex));
+                if (!arg[1]) break;
+                fgpu_surface_t* s = find_surface(arg[1], st->owner);
+                if (!s || s->format != FGPU_FORMAT_XRGB8888) return SYS_ERR_NOTFOUND;
+                tex->pixels = (const uint32_t*)s->mem;
+                tex->width = s->width;
+                tex->height = s->height;
+                tex->pitch = s->pitch;
+                tex->flags = arg[2] & (FGPU_TEXTURE_LINEAR | FGPU_TEXTURE_CLAMP);
+                break;
+            }
             case FGPU_OP_DRAW: {
                 if (n * 4 < sizeof(fgpu_draw_t)) return SYS_ERR_INVAL;
                 fgpu_draw_t d;
                 memcpy(&d, arg, sizeof(d));
-                if (d.vertex_format != FGPU_VERTEX_P3N3C4) return SYS_ERR_INVAL;
+                fgpu_layout_t def;
+                const fgpu_layout_t* layout;
+                if (d.vertex_format == FGPU_VERTEX_P3N3C4) {
+                    fgpu_layout_default(&def);
+                    layout = &def;
+                } else if (d.vertex_format == FGPU_VERTEX_LAYOUT) {
+                    layout = &st->layout;
+                } else {
+                    return SYS_ERR_INVAL;
+                }
                 fgpu_buffer_t* vb = find_buffer(d.vertex_buffer, st->owner);
                 if (!vb) return SYS_ERR_NOTFOUND;
-                uint64_t stride = 10 * sizeof(float);
+                uint64_t stride = (uint64_t)layout->stride * sizeof(float);
                 uint64_t total = vb->size / stride;
                 if (d.first_vertex > total) return SYS_ERR_INVAL;
-                const float* verts = (const float*)vb->mem + (uint64_t)d.first_vertex * 10;
+                const float* verts = (const float*)vb->mem + (uint64_t)d.first_vertex * layout->stride;
                 uint32_t avail = (uint32_t)(total - d.first_vertex);
                 fgpu_target_t t;
                 if (!make_target(st, &t)) return SYS_ERR_INVAL;
@@ -265,12 +346,13 @@ static uint64_t execute(exec_state_t* st, const uint32_t* cmd, uint32_t words) {
                     uint64_t icount = ib->size / 4;
                     if (d.first_index > icount || d.index_count > icount - d.first_index)
                         return SYS_ERR_INVAL;
-                    st->triangles += fgpu_raster_draw(&t, &st->pipe, verts, avail,
-                                                      (const uint32_t*)ib->mem + d.first_index,
-                                                      d.index_count);
+                    st->triangles += fgpu_raster_draw_layout(&t, &st->pipe, layout, verts, avail,
+                                                             (const uint32_t*)ib->mem + d.first_index,
+                                                             d.index_count);
                 } else {
                     uint32_t count = d.vertex_count < avail ? d.vertex_count : avail;
-                    st->triangles += fgpu_raster_draw(&t, &st->pipe, verts, avail, NULL, count);
+                    st->triangles += fgpu_raster_draw_layout(&t, &st->pipe, layout, verts, avail,
+                                                             NULL, count);
                 }
                 break;
             }
@@ -292,7 +374,7 @@ static uint64_t op_info(syscall_gpu_request_t* r) {
     memset(&info, 0, sizeof(info));
     info.size = sizeof(info);
     info.version = SYS_GPU_ABI_VERSION;
-    strcpy(info.backend, "cpu (FGPU software)");
+    strcpy(info.backend, "cpu (FGPU software, shaders)");
     gpu_adapter_t* a = gpu_primary_adapter();
     if (a) {
         strncpy(info.name, a->name, sizeof(info.name) - 1);
@@ -305,6 +387,7 @@ static uint64_t op_info(syscall_gpu_request_t* r) {
     } else {
         strcpy(info.name, "no GPU");
     }
+    info.caps |= FGPU_CAP_SHADERS;
     info.screen_width = graphics_get_width();
     info.screen_height = graphics_get_height();
     *out = info;
@@ -418,9 +501,52 @@ static uint64_t op_present(syscall_gpu_request_t* r, uint64_t owner) {
     return graphics_backbuffer_present(&dst) ? SYS_SUCCESS : SYS_ERR_INVAL;
 }
 
+static uint64_t op_create_program(syscall_gpu_request_t* r, uint64_t owner) {
+    if (!r->data || r->bytes < sizeof(fgpu_shader_header_t) || r->bytes > FGPU_MAX_PROGRAM_BYTES ||
+        (r->bytes & 3) || !syscall_user_range_ok(r->data, (size_t)r->bytes, false))
+        return SYS_ERR_INVAL;
+    int slot = -1;
+    for (int i = 0; i < FGPU_MAX_PROGRAMS; i++) if (!g_programs[i].used) { slot = i; break; }
+    if (slot < 0) return SYS_ERR_NOMEM;
+    // Check the kernel's own copy, so the program cannot change afterwards.
+    uint32_t* blob = (uint32_t*)alloc_unzeroed((size_t)r->bytes);
+    if (!blob) return SYS_ERR_NOMEM;
+    memcpy(blob, r->data, (size_t)r->bytes);
+    fgpu_shader_program_t* sp = &g_programs[slot];
+    const char* why = "";
+    if (!fgpu_program_check(blob, (uint32_t)r->bytes, &sp->program, &why)) {
+        serial_write_str("fgpu: shader program rejected: ");
+        serial_write_str(why);
+        serial_write_str("\n");
+        free_mem(blob);
+        return SYS_ERR_INVAL;
+    }
+    sp->used = true;
+    sp->id = g_next_id++;
+    sp->owner = owner;
+    sp->blob = blob;
+    r->handle = sp->id;
+    return SYS_SUCCESS;
+}
+
+static uint64_t op_write_surface(syscall_gpu_request_t* r, uint64_t owner) {
+    fgpu_surface_t* s = find_surface(r->handle, owner);
+    if (!s) return SYS_ERR_NOTFOUND;
+    uint64_t row = (uint64_t)s->width * 4;
+    if (!r->data || r->pitch < row ||
+        !syscall_user_range_ok(r->data, (size_t)r->pitch * (s->height - 1) + row, false))
+        return SYS_ERR_INVAL;
+    for (uint32_t y = 0; y < s->height; y++) {
+        memcpy((uint8_t*)s->mem + (size_t)y * s->pitch * 4,
+               (const uint8_t*)r->data + (size_t)y * r->pitch, (size_t)row);
+    }
+    return SYS_SUCCESS;
+}
+
 uint64_t fgpu_syscall(syscall_gpu_request_t* r) {
     if (!r || !syscall_user_range_ok(r, sizeof(*r), true) || r->size != sizeof(*r) ||
-        r->version != SYS_GPU_ABI_VERSION) return SYS_ERR_INVAL;
+        r->version < SYS_GPU_ABI_VERSION_MIN || r->version > SYS_GPU_ABI_VERSION)
+        return SYS_ERR_INVAL;
     uint64_t owner = caller();
     if (r->op == SYS_GPU_INFO) return op_info(r);
 
@@ -466,14 +592,22 @@ uint64_t fgpu_syscall(syscall_gpu_request_t* r) {
             if (!r->data || r->bytes < 4 || r->bytes > FGPU_MAX_COMMAND_BYTES || (r->bytes & 3) ||
                 !syscall_user_range_ok(r->data, (size_t)r->bytes, false)) break;
             uint32_t* cmd = (uint32_t*)alloc_unzeroed((size_t)r->bytes);
-            if (!cmd) { result = SYS_ERR_NOMEM; break; }
+            exec_state_t* st = (exec_state_t*)alloc(sizeof(exec_state_t));
+            if (!cmd || !st) {
+                if (cmd) free_mem(cmd);
+                if (st) free_mem(st);
+                result = SYS_ERR_NOMEM;
+                break;
+            }
             memcpy(cmd, r->data, (size_t)r->bytes);
-            exec_state_t st;
-            memset(&st, 0, sizeof(st));
-            st.owner = owner;
-            st.pipe.program = FGPU_PROGRAM_COLOR;
-            result = execute(&st, cmd, (uint32_t)(r->bytes / 4));
-            r->handle = st.triangles;
+            memset(st, 0, sizeof(*st));
+            st->owner = owner;
+            st->pipe.program = FGPU_PROGRAM_COLOR;
+            st->pipe.constants = (const float (*)[4])st->constants;
+            fgpu_layout_default(&st->layout);
+            result = execute(st, cmd, (uint32_t)(r->bytes / 4));
+            r->handle = st->triangles;
+            free_mem(st);
             free_mem(cmd);
             break;
         }
@@ -496,6 +630,20 @@ uint64_t fgpu_syscall(syscall_gpu_request_t* r) {
         case SYS_GPU_RELEASE_DISPLAY:
             if (g_flipped_owner == owner) release_flip_locked();
             result = SYS_SUCCESS;
+            break;
+        case SYS_GPU_CREATE_PROGRAM:
+            result = op_create_program(r, owner);
+            break;
+        case SYS_GPU_DESTROY_PROGRAM: {
+            fgpu_shader_program_t* sp = find_program(r->handle, owner);
+            if (!sp) { result = SYS_ERR_NOTFOUND; break; }
+            free_mem(sp->blob);
+            sp->used = false;
+            result = SYS_SUCCESS;
+            break;
+        }
+        case SYS_GPU_WRITE_SURFACE:
+            result = op_write_surface(r, owner);
             break;
         default:
             break;

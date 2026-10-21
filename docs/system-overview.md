@@ -11,7 +11,7 @@ matches the layer you are changing.
 | [Hardware](hardware-and-drivers.md) | PCI, graphics, USB, audio, storage, and driver managers |
 | [Storage and packages](storage-and-packages.md) | Disks, partitions, MinimaFS, drive numbers, `.mpkg`, format |
 | [Installing](installing.md) | Installing to a disk so it boots on BIOS and UEFI PCs, real hardware notes |
-| [GPU and 3D](gpu.md) | GPU adapters, VRAM, the FGPU command processor and FarcadeGL |
+| [GPU and 3D](gpu.md) | GPU adapters, VRAM, the FGPU command processor, the shader machine, FarcadeGL, and the plan for NVIDIA hardware rendering |
 | [Networking](networking.md) | Ethernet, IPv4, ARP, UDP, DHCP, DNS, TCP, and TLS |
 | [Services](services.md) | `.service` files, startup commands, supervision, and registration |
 | [User programs](user-programs.md) | SDK, `.run`, `.slib`, ELF loading, and user/kernel boundaries |

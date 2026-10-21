@@ -9,6 +9,10 @@ Install packages and service definitions are documented in
 [docs/install-and-services.md](docs/install-and-services.md).
 The full kernel, boot, storage, networking, process, and build architecture is
 summarized in [docs/system-overview.md](docs/system-overview.md).
+3D graphics: [FarcadeGL](docs/farcadegl.md) (the 3D API), its GLSL-style
+[shading language FGSL](docs/fgsl.md), and the GPU side in
+[docs/gpu.md](docs/gpu.md) (including what hardware rendering on NVIDIA
+cards needs).
 
 <img width="250" height="250" alt="Icon" src="https://github.com/user-attachments/assets/f2401784-fcd3-4002-bbe0-02d16b9652d1" />
 
@@ -29,7 +33,7 @@ summarized in [docs/system-overview.md](docs/system-overview.md).
 * ```info``` Shows system, CPU, PCI, and memory information.
 * ```cpu``` Shows CPU information.
 * ```gpu``` Shows GPU adapters (NVIDIA GTX 10 / RTX 20 and QEMU drivers), VRAM, and capabilities.
-* ```fglcube``` [seconds] FarcadeGL 3D demo: a rotating, lit cube.
+* ```fglcube``` [seconds] [--shader] FarcadeGL 3D demo: a rotating, lit cube (`--shader`: drawn with FGSL shaders).
 * ```memsize``` Returns the size of available memory in MB.
 * ```usage``` Shows memory and process usage.
 * ```chgres``` [Width] [Height] Changes the display resolution.

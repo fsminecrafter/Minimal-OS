@@ -15,12 +15,17 @@ truth; these pages describe them as of SDK v1.1 and the kernel's
 | [Strings and memory](strings.md) | `string.h` | `strlen`, `strcmp`, `strstr`, `memcpy`, constant-time compare … |
 | [Formatted output](output.md) | `stdio.h`, `iostream` | `printf` and `std::cout` |
 | [Windows](windows.md) | `window.h` | mosWM windows: create, draw, present, events |
+| [easyui widgets](easyui.md) | `easyui.h` | Buttons, sliders, text inputs, radio buttons, lists and more, in the MOSdesk theme |
+| [Text in your own pixels](font.md) | `font.h` | `draw_text` / `text_width`: smooth Inter text (bitmap fallback) in any pixel buffer |
 | [Graphics](graphics.md) | `graphics.h`, `x86_64/user_graphics.h` | Full-screen framebuffer: acquire, blit, present, primitives |
 | [Input](input.md) | `x86_64/user_syscalls.h`, `user_mouse.h`, `user_usb.h` | Raw keyboard and mouse events for full-screen programs |
 | [Networking](network.md) | `net.h` | DNS, TCP client and server, UDP, the ktls transport |
 | [System information](sysinfo.md) | `user_sysinfo.h` | CPU, RAM, heap, cores, uptime, processes |
 | [Packages](packages.md) | `minimalos.h` | `.mpkg` archives: unzip, zip, inspect |
 | [Device managers](managers.md) | `x86_64/user_managers.h` | GPU, audio, storage and USB manager calls |
+| [FarcadeGL 3D](farcadegl.md) | `farcadegl.h`, `fgpu_abi.h` | GPU-backed 3D: buffers, vertex layouts, shaders, textures, blending, drawing into a window or the screen |
+| [FGSL shading language](fgsl.md) | `fglsl.h` | The GLSL-style language FarcadeGL shaders are written in, and its compiler |
+| [Disks and root commands](storage.md) | `storage.h` | List disks and partitions, run kernel commands as root (installer) |
 
 ## Reading an entry
 

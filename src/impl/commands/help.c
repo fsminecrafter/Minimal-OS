@@ -36,7 +36,7 @@ static void help_system_information(void) {
     help_item("info", "Show system, CPU, PCI, and memory information.");
     help_item("cpu", "Show CPU information.");
     help_item("gpu", "Show GPU adapters, VRAM and capabilities.");
-    help_item("fglcube [seconds]", "FarcadeGL 3D demo: a rotating, lit cube.");
+    help_item("fglcube [seconds] [--shader]", "FarcadeGL 3D demo: a rotating, lit cube (--shader: FGSL shaders).");
     help_item("memsize", "Show available memory in megabytes.");
     help_item("usage", "Show memory and process usage.");
     help_item("chgres <width> <height>", "Change the display resolution.");

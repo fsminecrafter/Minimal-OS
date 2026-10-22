@@ -8,7 +8,7 @@
 #   mosvm.ps1 stop | remove | status
 #
 # Needs Hyper-V and membership in "Hyper-V Administrators" (setup-hyperv.ps1).
-# GPU passthrough: gpu-lend.ps1 / gpu-return.ps1.
+# GPU passthrough: gpu-test.ps1. On Linux use mosvm.sh (see README.md).
 
 param(
     [Parameter(Position = 0)][ValidateSet('create', 'run', 'stop', 'remove', 'status')]

@@ -175,11 +175,89 @@ text looks the same there as on MOSdesk.
 `mosdesk/libraries/ttrend_outline` by `tools/bundle-ttrend.py`; do not edit
 it by hand.
 
+## Styling widgets
+
+Every widget can have its own font, text size, text and background colour,
+border, corner radius and padding:
+
+```c
+int save = easyui.createbutton(20, 20, 160, 44, "Save");
+easyui.setfont(save, EASYUI_FONT_MEDIUM);
+easyui.setfontsize(save, 18);                 /* 18 px text */
+easyui.setbackground(save, 0xFF2E7D32);       /* green; hover and pressed shades follow */
+easyui.setradius(save, 12);
+easyui.setborder(save, 0xFF1B5E20, 2);
+```
+
+Pass `EASYUI_WINDOW` instead of a widget to set the default for every widget
+that has no setting of its own (`setbackground(EASYUI_WINDOW, ...)` colours
+the window itself):
+
+```c
+int mono = easyui.addfont("0:/programs/notes/Resources/Mono.ttf");
+easyui.setfont(EASYUI_WINDOW, mono);          /* the whole app in Mono */
+easyui.setfontsize(EASYUI_WINDOW, 14);
+```
+
+A widget's own setting wins over the window's, which wins over the theme.
+`0` (colours, `setfontsize`) or `-1` (`setborder` width, `setradius`,
+`setpadding`) goes back to the default. [`easyui.copystyle`](#easyui-copystyle)
+gives one widget another's whole style.
+
+| Call | Buttons | Labels | Text inputs, lists, dropdowns, panels | Others |
+| --- | --- | --- | --- | --- |
+| `setfont`, `setfontsize` | label | text | text and rows | label text; canvases' `drawtext` |
+| `settextcolor` | label | text | text | label text |
+| `setbackground` | fill | box behind the text | fill | box behind (checkbox, radio, toggle, image, canvas); track (slider, progress) |
+| `setborder`, `setradius` | outline, corners | outline, corners | outline, corners | outline, corners |
+| `setpadding` | text inset (8) | text inset (0) | text inset (8, rows 10) | space before the box |
+
+## Looks: Modern and 2000s Aero
+
+When the user picks **2000s Aero** under Settings > Appearance > Window
+style, easyui windows follow it: grey glass push buttons that turn light
+blue on hover, Windows 7 style check boxes, radio buttons, sunken text
+fields, a green progress bar, blue list selections and a white message box
+over a grey button strip. Like the accent colour, it changes while the app
+runs. [`easyui.setlook`](#easyui-setlook) fixes one look for an app.
+
+## File and folder pickers
+
+[`easyui.pickfile`](#easyui-pickfile), [`easyui.savefile`](#easyui-savefile)
+and [`easyui.pickfolder`](#easyui-pickfolder) open a dialog over the window,
+in the current look: Home, its Documents, Pictures and Desktop folders and
+System on the left; Home, System and Up buttons and the current folder on
+top; the folder's contents in the middle (folders first); a name field and
+Cancel / Open (Save, Select) at the bottom. They return at once; the
+callback runs when the user is done, with `1` for a choice and `0` for
+Cancel or Escape, and [`easyui.pickedpath`](#easyui-pickedpath) gives the
+path.
+
+```c
+static void opened(int chosen) {
+    if (chosen) load_document(easyui.pickedpath());
+}
+easyui.pickfile("Open a note", 0, "txt;md", opened);
+```
+
+| Keys | |
+| --- | --- |
+| Up, Down | Move the selection |
+| Enter | Open the selected folder, or choose (same as the main button) |
+| Backspace | Up one folder (in the save dialog: edit the name) |
+| Escape | Cancel |
+| Double-click | Open a folder, or choose a file |
+
+While a picker is up the window's widgets ignore input; timers and
+`ONFRAME` keep running. One picker at a time.
+
 ## Limits
 
 | Limit | Value |
 | --- | --- |
 | Widgets | `EASYUI_MAX_WIDGETS` (128) |
+| Fonts from `addfont` | `EASYUI_MAX_FONTS` (8) |
+| Picker paths | `EASYUI_PATH_MAX` - 1 (255) bytes; 256 entries per folder |
 | Widget text | `EASYUI_TEXT_MAX` - 1 (127) bytes |
 | Timers | `EASYUI_MAX_TIMERS` (8) |
 | Windows | One per program |
@@ -1235,3 +1313,197 @@ void easyui.drawpixels(int x, int y, const uint32_t* pixels, int w, int h);
 
 Copies a `w × h` ARGB8888 image with its top-left at `(x, y)`, blending
 pixels that are not opaque.
+
+## `easyui.addfont`
+
+```c
+int easyui.addfont(const char* path);
+```
+
+Loads another OpenType (`.otf`) or TrueType (`.ttf`) font for
+[`easyui.setfont`](#easyui-setfont), next to the Inter fonts.
+
+**Returns** the font's number (`EASYUI_FONT_CUSTOM` and up), or `0` if the
+file could not be read or used, or 8 fonts are already loaded.
+
+## `easyui.setfont`
+
+```c
+void easyui.setfont(int widget, int font);
+```
+
+The font a widget's text is drawn in:
+
+| Font | |
+| --- | --- |
+| `EASYUI_FONT_DEFAULT` | By text size: Inter Regular at size 1, Inter Medium above (the default) |
+| `EASYUI_FONT_REGULAR` | Inter Regular |
+| `EASYUI_FONT_MEDIUM` | Inter Medium, for bolder text |
+| `EASYUI_FONT_BITMAP` | The 8 × 8 bitmap font |
+| a number from `addfont` | That font |
+
+`EASYUI_WINDOW` sets the font of every widget that has none of its own.
+
+## `easyui.setfontsize`
+
+```c
+void easyui.setfontsize(int widget, int pixels);
+```
+
+Text height in pixels, 6 … 128, for any size between the steps of
+[`settextsize`](#easyui-settextsize). Whichever of the two was called last
+applies; `0` goes back to the text size. With the bitmap font the size is
+rounded down to a multiple of 8 (at least 8). Check, radio and toggle boxes and list rows
+grow with it.
+
+## `easyui.settextcolor`
+
+```c
+void easyui.settextcolor(int widget, uint32_t argb);
+```
+
+The colour of a widget's text (a button's label, a label's text, a text
+input's characters ...). `0` goes back to the theme. Disabled widgets keep
+the theme's disabled colour.
+
+## `easyui.setbackground`
+
+```c
+void easyui.setbackground(int widget, uint32_t argb);
+```
+
+A widget's fill (see the table in [Styling widgets](#styling-widgets)).
+Buttons derive their hover and pressed shades from it and pick black or
+white text to suit. On `EASYUI_WINDOW` it is the window's background. `0`
+goes back to the theme.
+
+## `easyui.setborder`
+
+```c
+void easyui.setborder(int widget, uint32_t argb, int width);
+```
+
+Draws an outline `width` pixels thick (at most 16) along the widget's edge,
+following its corner radius. Width `0` means no outline; `-1` goes back to
+the widget's own look. A colour of `0` uses the theme's border colour.
+
+## `easyui.setradius`
+
+```c
+void easyui.setradius(int widget, int radius);
+```
+
+Corner radius in pixels of the widget's box (buttons, text inputs, lists,
+panels, progress bars, dropdowns, and the background or border of the
+others). `-1` goes back to the default.
+
+## `easyui.setpadding`
+
+```c
+void easyui.setpadding(int widget, int pixels);
+```
+
+Space between a widget's edge and its text. `-1` goes back to the default.
+
+## `easyui.copystyle`
+
+```c
+void easyui.copystyle(int to, int from);
+```
+
+Gives widget `to` the font, sizes, colours, border, radius, padding,
+alignment and button style of `from`.
+
+**Example**
+
+```c
+int ok = easyui.createbutton(20, 20, 100, 36, "OK");
+easyui.setfontsize(ok, 16);
+easyui.setradius(ok, 18);
+int cancel = easyui.createbutton(130, 20, 100, 36, "Cancel");
+easyui.copystyle(cancel, ok);
+easyui.setstyle(cancel, EASYUI_SECONDARY);
+```
+
+## `easyui.drawtextfont`
+
+```c
+void easyui.drawtextfont(int x, int y, const char* text, uint32_t argb, int font, int pixels);
+```
+
+Like [`easyui.drawtext`](#easyui-drawtext), in a given font
+(`EASYUI_FONT_...` or a number from `addfont`) and pixel size. For
+canvases.
+
+## `easyui.textwidthfont`
+
+```c
+int easyui.textwidthfont(const char* text, int font, int pixels);
+```
+
+**Returns** the width of `text` in that font and size.
+
+## `easyui.setlook`
+
+```c
+void easyui.setlook(int look);
+```
+
+`EASYUI_LOOK_AUTO` (the default) follows MOSdesk's window style;
+`EASYUI_LOOK_MODERN` or `EASYUI_LOOK_AERO` keeps one look whatever the user
+picks.
+
+## `easyui.look`
+
+```c
+int easyui.look(void);
+```
+
+**Returns** the look in use: `EASYUI_LOOK_MODERN` or `EASYUI_LOOK_AERO`.
+
+## `easyui.pickfile`
+
+```c
+int easyui.pickfile(const char* title, const char* folder, const char* extensions,
+                    easyui_callback done);
+```
+
+Asks the user for a file to open.
+
+| Parameter | Description |
+| --- | --- |
+| `title` | Dialog title, or `NULL` for "Open a file" |
+| `folder` | Folder to start in, or `NULL` for the user's home |
+| `extensions` | Files to offer, separated by `;` (`"txt;md"`), or `NULL` for all |
+| `done` | `void done(int chosen)`: `1` with a file, `0` if cancelled |
+
+**Returns** `1`, or `0` if a picker is already open or there is no window.
+
+## `easyui.savefile`
+
+```c
+int easyui.savefile(const char* title, const char* folder, const char* name,
+                    easyui_callback done);
+```
+
+Asks where to save, with `name` (or `NULL`) already typed in. Clicking a
+file takes its name. The chosen path may be an existing file; ask before
+replacing it if that matters.
+
+## `easyui.pickfolder`
+
+```c
+int easyui.pickfolder(const char* title, const char* folder, easyui_callback done);
+```
+
+Asks for a folder. Select chooses the folder selected in the list, or the
+one shown when none is.
+
+## `easyui.pickedpath`
+
+```c
+const char* easyui.pickedpath(void);
+```
+
+**Returns** the full path from the last picker (`"0:/users/ann/notes.txt"`),
+or `""` after Cancel.

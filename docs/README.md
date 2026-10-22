@@ -26,6 +26,7 @@ truth; these pages describe them as of SDK v1.1 and the kernel's
 | [FarcadeGL 3D](farcadegl.md) | `farcadegl.h`, `fgpu_abi.h` | GPU-backed 3D: buffers, vertex layouts, shaders, textures, blending, drawing into a window or the screen |
 | [FGSL shading language](fgsl.md) | `fglsl.h` | The GLSL-style language FarcadeGL shaders are written in, and its compiler |
 | [Disks and root commands](storage.md) | `storage.h` | List disks and partitions, run kernel commands as root (installer) |
+| [Playing audio](audio.md) | `audio.h` | Play, pause, seek and query `.adi` audio files |
 
 ## Reading an entry
 

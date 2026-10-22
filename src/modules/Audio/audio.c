@@ -6,6 +6,13 @@
 #include "x86_64/commandreg.h"
 #include "x86_64/ac97_driver.h"
 #include "x86_64/audio_manager.h"
+#include "x86_64/hda_driver.h"
+#include "x86_64/audio_ctl.h"
+#include "x86_64/scheduler.h"
+#include "time.h"
+
+extern const audio_hw_driver_t* hda_get_driver(void) __attribute__((weak));
+extern const audio_hw_driver_t* ac97_get_driver(void) __attribute__((weak));
 #include "graphics.h"
 #include "x86_64/exec_trace.h"
 #include "x86_64/global_audio_state.h"
@@ -20,6 +27,10 @@ static int16_t audio_apply_volume(int16_t sample, uint8_t volume) {
     if (volume >= 100) return sample;
     return (int16_t)(((int32_t)sample * volume) / 100);
 }
+
+static bool decode_ima_adpcm_mono(const uint8_t* input, uint32_t input_size,
+                                  int16_t* output, uint32_t* output_size,
+                                  uint32_t max_output, int* pred, int* step);
 
 static uint32_t audio_min_u32(uint32_t a, uint32_t b) {
     return (a < b) ? a : b;
@@ -106,6 +117,15 @@ static const uint8_t* audio_find_bytes(const uint8_t* haystack, uint32_t haystac
 
                                            switch (player->format) {
                                                case AUDIO_FORMAT_IMA_ADPCM:
+                                                   if (player->stream->adi_header.channels == 1) {
+                                                       success = decode_ima_adpcm_mono(
+                                                           compressed, bytes_read,
+                                                           target_buffer, &decoded_samples,
+                                                           player->pcm_capacity,
+                                                           &player->adpcm_pred_l,
+                                                           &player->adpcm_step_l);
+                                                       break;
+                                                   }
                                                    success = decode_ima_adpcm(
                                                        compressed, bytes_read,
                                                        target_buffer,
@@ -180,7 +200,11 @@ static const uint8_t* audio_find_bytes(const uint8_t* haystack, uint32_t haystac
                                             * second sound chip, write its driver.c (implementing
                                             * audio_hw_driver_t) and add one more line here - nothing
                                             * else in this file, or anywhere else, needs to change. */
-                                           audio_manager_register_driver(ac97_get_driver());
+                                           /* Tried in this order; the first one with hardware wins.
+                                            * Weak so a driver module disabled in config.mk just
+                                            * drops out of the list. */
+                                           if (hda_get_driver) audio_manager_register_driver(hda_get_driver());
+                                           if (ac97_get_driver) audio_manager_register_driver(ac97_get_driver());
 
                                            if (!audio_manager_init()) {
                                                serial_write_str("[AUDIO] No working audio driver found\n");
@@ -697,7 +721,22 @@ static const uint8_t* audio_find_bytes(const uint8_t* haystack, uint32_t haystac
                                                                           return (out_pos > 0);
                                                                       }
 
-                                                                      /* ============================================================
+                                                                      /* Mono IMA-ADPCM: one predictor, two samples per byte (low nibble first). */
+static bool decode_ima_adpcm_mono(const uint8_t* input, uint32_t input_size,
+                                  int16_t* output, uint32_t* output_size,
+                                  uint32_t max_output, int* pred, int* step) {
+    if (!input || !output || !output_size || !pred || !step) return false;
+    uint32_t out_pos = 0;
+    for (uint32_t in_pos = 0; in_pos < input_size && out_pos + 2 <= max_output; in_pos++) {
+        uint8_t b = input[in_pos];
+        output[out_pos++] = ima_decode_nibble(b & 0x0F, pred, step);
+        output[out_pos++] = ima_decode_nibble((b >> 4) & 0x0F, pred, step);
+    }
+    *output_size = out_pos;
+    return out_pos > 0;
+}
+
+/* ============================================================
                                                                        * MS-ADPCM stub
                                                                        * ============================================================ */
                                                                       bool decode_ms_adpcm(const uint8_t* input, uint32_t input_size,
@@ -1070,97 +1109,349 @@ static void normalize_file_path(const char* input, char* output, uint32_t output
     snprintf(output, output_size, "0:/%s", input);
 }
 
+/* ============================================================
+ * Playback control (terminal commands and SYS_AUDIO)
+ *
+ * g_ctl_player is the one loaded file. It outlives the end of the
+ * stream (audio_player_update() clears g_audio_state.player then), so
+ * the status can say "ended" and RESUME can replay it.
+ * ============================================================ */
+
+static audio_player_t* g_ctl_player = NULL;
+static char g_ctl_path[SYSCALL_AUDIO_PATH_MAX];
+
+static uint32_t audio_ctl_bytes_per_second(const audio_player_t* p) {
+    const adi_header_t* h = &p->stream->adi_header;
+    uint32_t rate = h->sample_rate ? h->sample_rate : 48000;
+    uint32_t ch = (h->channels == 1) ? 1 : 2;
+    if (p->format == AUDIO_FORMAT_PCM16) return rate * ch * 2;
+    return rate * ch / 2;          /* 4-bit ADPCM */
+}
+
+/* Frees the loaded player. The mixer (PIT on the boot core) and the
+ * decode task may be inside it on another core, so unhook it first and
+ * give them a moment to leave before freeing. */
+static void audio_ctl_unload(void) {
+    audio_player_t* p = g_ctl_player;
+    g_audio_state.playing = false;
+    g_audio_state.player  = NULL;
+    g_ctl_player = NULL;
+    g_ctl_path[0] = '\0';
+    if (!p) return;
+    p->playing = false;
+    sleep(20);
+    audio_player_destroy(p);
+}
+
+static void audio_ctl_reset_decoder(audio_player_t* p) {
+    p->read_slot = 0;
+    p->read_pos = 0;
+    p->write_slot = 0;
+    for (int i = 0; i < AUDIO_RING_SIZE; i++) {
+        p->ring_ready[i] = false;
+        p->ring_size[i]  = 0;
+    }
+    p->adpcm_pred_l = p->adpcm_step_l = 0;
+    p->adpcm_pred_r = p->adpcm_step_r = 0;
+}
+
+uint64_t audio_ctl_open(const char* path) {
+    if (!path || !path[0]) return SYS_ERR_INVAL;
+    audio_ctl_unload();
+    if (!audio_manager_driver_name()) return SYS_ERR_GENERIC;   /* no sound card */
+    if (!minimafs_exists(path)) return SYS_ERR_NOTFOUND;
+
+    audio_player_t* p = audio_player_create(path);
+    if (!p) return SYS_ERR_INVAL;               /* not a playable .adi */
+    g_ctl_player = p;
+    strncpy(g_ctl_path, path, sizeof(g_ctl_path) - 1);
+    g_ctl_path[sizeof(g_ctl_path) - 1] = '\0';
+
+    audio_player_play(p);
+    if (!p->playing) {
+        audio_ctl_unload();
+        return SYS_ERR_INVAL;
+    }
+    return SYS_SUCCESS;
+}
+
+uint64_t audio_ctl_pause(void) {
+    audio_player_t* p = g_ctl_player;
+    if (!p) return SYS_ERR_INVAL;
+    if (p->playing) audio_player_pause(p);
+    return SYS_SUCCESS;
+}
+
+static bool audio_ctl_ring_has_data(const audio_player_t* p) {
+    for (int i = 0; i < AUDIO_RING_SIZE; i++)
+        if (p->ring_ready[i]) return true;
+    return false;
+}
+
+uint64_t audio_ctl_resume(void) {
+    audio_player_t* p = g_ctl_player;
+    if (!p) return SYS_ERR_INVAL;
+    if (p->playing) return SYS_SUCCESS;
+
+    if (g_audio_state.player != p) {
+        /* Ended (or never started): play again from the beginning. */
+        audio_ctl_reset_decoder(p);
+        seekstream(p->stream, 0);
+        audio_player_play(p);
+    } else if (audio_ctl_ring_has_data(p)) {
+        /* Keep the decoded audio that was waiting when we paused. */
+        p->playing = true;
+        g_audio_state.playing = true;
+        audio_manager_start();
+    } else {
+        audio_player_play(p);
+    }
+    return p->playing ? SYS_SUCCESS : SYS_ERR_GENERIC;
+}
+
+uint64_t audio_ctl_stop(void) {
+    audio_ctl_unload();
+    return SYS_SUCCESS;
+}
+
+/* Runs the ADPCM decoder from the start of the stream to `offset`,
+ * discarding the samples, so the predictors match the encoder's there.
+ * Leaves the stream positioned at `offset`. */
+static void audio_ctl_fast_forward(audio_player_t* p, uint32_t offset) {
+    audio_datastream_t* st = p->stream;
+    seekstream(st, 0);
+    uint32_t chunk = st->chunk_size;
+    int16_t* scratch = p->pcm_buffer;            /* ring is empty right now */
+    bool mono = st->adi_header.channels == 1;
+
+    while (st->current_offset < offset) {
+        uint32_t left = offset - st->current_offset;
+        st->chunk_size = left < chunk ? left : chunk;
+        uint32_t got = 0;
+        uint8_t* data = readstream(st, &got);
+        if (!data || got == 0) break;
+        uint32_t n = 0;
+        if (mono)
+            decode_ima_adpcm_mono(data, got, scratch, &n, p->pcm_capacity,
+                                  &p->adpcm_pred_l, &p->adpcm_step_l);
+        else
+            decode_ima_adpcm(data, got, scratch, &n, p->pcm_capacity,
+                             &p->adpcm_pred_l, &p->adpcm_step_l,
+                             &p->adpcm_pred_r, &p->adpcm_step_r);
+    }
+    st->chunk_size = chunk;
+    seekstream(st, offset);
+}
+
+uint64_t audio_ctl_seek_ms(uint32_t position_ms) {
+    audio_player_t* p = g_ctl_player;
+    if (!p || !p->stream) return SYS_ERR_INVAL;
+
+    bool was_playing = p->playing;
+    g_audio_state.playing = false;
+    p->playing = false;
+    sleep(5);
+
+    uint32_t bps = audio_ctl_bytes_per_second(p);
+    uint64_t offset = ((uint64_t)position_ms * bps) / 1000u;
+    uint32_t align = (p->format == AUDIO_FORMAT_PCM16) ? 4u : 2u;
+    offset &= ~(uint64_t)(align - 1);
+    if (offset >= p->stream->total_size) offset = p->stream->total_size;
+
+    audio_ctl_reset_decoder(p);
+    if (p->format == AUDIO_FORMAT_IMA_ADPCM) {
+        /* .adi ADPCM has no seek points: the decoder state at `offset`
+         * depends on everything before it, and starting from zero gives
+         * garbage until the music turns quiet. Decode up to the target
+         * without playing it (about 50 KB per second of audio). */
+        audio_ctl_fast_forward(p, (uint32_t)offset);
+    } else {
+        seekstream(p->stream, (uint32_t)offset);
+    }
+    g_audio_state.player = p;
+
+    if (was_playing) audio_player_play(p);
+    return SYS_SUCCESS;
+}
+
+uint64_t audio_ctl_set_volume(uint32_t volume) {
+    if (volume > 100) volume = 100;
+    if (!g_ctl_player) return SYS_ERR_INVAL;
+    audio_player_set_volume(g_ctl_player, (uint8_t)volume);
+    return SYS_SUCCESS;
+}
+
+static void audio_ctl_copy(char* dst, const char* src, uint32_t size) {
+    uint32_t i = 0;
+    for (; src && src[i] && i + 1 < size; i++) dst[i] = src[i];
+    dst[i] = '\0';
+}
+
+void audio_ctl_status(syscall_audio_status_t* out) {
+    memset(out, 0, sizeof(*out));
+    audio_ctl_copy(out->driver, audio_manager_driver_name(), sizeof(out->driver));
+
+    audio_player_t* p = g_ctl_player;
+    if (!p || !p->stream) return;
+
+    if (p->playing)                         out->state = SYSCALL_AUDIO_PLAYING;
+    else if (g_audio_state.player == p)     out->state = SYSCALL_AUDIO_PAUSED;
+    else                                    out->state = SYSCALL_AUDIO_ENDED;
+
+    const adi_header_t* h = &p->stream->adi_header;
+    uint32_t bps = audio_ctl_bytes_per_second(p);
+    uint64_t total = p->stream->total_size;
+    out->duration_ms = bps ? (uint32_t)((total * 1000u) / bps) : h->length_seconds * 1000u;
+    if (out->state == SYSCALL_AUDIO_ENDED) {
+        out->position_ms = out->duration_ms;
+    } else if (bps) {
+        /* The stream is read a few buffers ahead of what is audible. */
+        uint64_t read = p->stream->current_offset;
+        uint64_t ahead = (uint64_t)AUDIO_RING_SIZE * AUDIO_BUFFER_SIZE *
+                         (h->channels == 1 ? 1u : 2u) *
+                         (p->format == AUDIO_FORMAT_PCM16 ? 2u : 1u) / 2u;
+        read = read > ahead ? read - ahead : 0;
+        out->position_ms = (uint32_t)((read * 1000u) / bps);
+        if (out->position_ms > out->duration_ms) out->position_ms = out->duration_ms;
+    }
+    out->sample_rate = h->sample_rate;
+    out->channels = h->channels;
+    out->volume = p->volume;
+    audio_ctl_copy(out->format, adi_format_name(p->format), sizeof(out->format));
+    audio_ctl_copy(out->path, g_ctl_path, sizeof(out->path));
+}
+
+uint64_t audio_syscall(syscall_audio_request_t* req) {
+    if (!req || req->size < sizeof(*req) || req->version != SYS_AUDIO_ABI_VERSION)
+        return SYS_ERR_INVAL;
+    switch (req->op) {
+        case SYS_AUDIO_OPEN: {
+            char path[SYSCALL_AUDIO_PATH_MAX];
+            req->path[SYSCALL_AUDIO_PATH_MAX - 1] = '\0';
+            normalize_file_path(req->path, path, sizeof(path));
+            return audio_ctl_open(path);
+        }
+        case SYS_AUDIO_PAUSE:  return audio_ctl_pause();
+        case SYS_AUDIO_RESUME: return audio_ctl_resume();
+        case SYS_AUDIO_STOP:   return audio_ctl_stop();
+        case SYS_AUDIO_SEEK:   return audio_ctl_seek_ms(req->value);
+        case SYS_AUDIO_VOLUME: return audio_ctl_set_volume(req->value);
+        case SYS_AUDIO_STATUS:
+            audio_ctl_status(&req->status);
+            return SYS_SUCCESS;
+        default:
+            return SYS_ERR_INVAL;
+    }
+}
+
 void cmd_play(int argc, const char** argv) {
-                                                                                                                if (argc < 2) {
-                                                                                                                    graphics_write_textr("Usage: play <path>\n");
-                                                                                                                    graphics_write_textr("Formats: play file, play ./file, or play 0:/file\n");
-                                                                                                                    return;
-                                                                                                                }
+    if (argc < 2) {
+        graphics_write_textr("Usage: play <path>\n");
+        graphics_write_textr("Formats: play file, play ./file, or play 0:/file\n");
+        return;
+    }
 
-                                                                                                                if (g_audio_state.player) {
-                                                                                                                    audio_player_destroy(g_audio_state.player);
-                                                                                                                    g_audio_state.player = NULL;
-                                                                                                                }
+    char path[256];
+    normalize_file_path(argv[1], path, sizeof(path));
+    graphics_write_textr("Loading: ");
+    graphics_write_textr(path);
+    graphics_write_textr("\n");
 
-                                                                                                                char normalized_path[256];
-                                                                                                                normalize_file_path(argv[1], normalized_path, sizeof(normalized_path));
-                                                                                                                const char* path = normalized_path;
-                                                                                                                graphics_write_textr("Loading: ");
-                                                                                                                graphics_write_textr(path);
-                                                                                                                graphics_write_textr("\n");
+    uint64_t r = audio_ctl_open(path);
+    if (r != SYS_SUCCESS) {
+        if (!audio_manager_driver_name())
+            graphics_write_textr("No sound card found (AC97 or HD Audio)\n");
+        else if (r == SYS_ERR_NOTFOUND)
+            graphics_write_textr("File not found\n");
+        else
+            graphics_write_textr("Failed to load audio file\n");
+        return;
+    }
 
-                                                                                                                g_audio_state.player = audio_player_create(path);
-                                                                                                                if (!g_audio_state.player) {
-                                                                                                                    graphics_write_textr("Failed to load audio file\n");
-                                                                                                                    return;
-                                                                                                                }
+    syscall_audio_status_t st;
+    audio_ctl_status(&st);
+    char buf[64];
+    snprintf(buf, sizeof(buf), "Format: %s\n", st.format);
+    graphics_write_textr(buf);
+    snprintf(buf, sizeof(buf), "Duration: %u seconds\n", st.duration_ms / 1000u);
+    graphics_write_textr(buf);
+    snprintf(buf, sizeof(buf), "Sample rate: %u Hz\n", st.sample_rate);
+    graphics_write_textr(buf);
+    snprintf(buf, sizeof(buf), "Channels: %u\n", st.channels);
+    graphics_write_textr(buf);
+    snprintf(buf, sizeof(buf), "Volume: %u%%\n", st.volume);
+    graphics_write_textr(buf);
+    snprintf(buf, sizeof(buf), "Playing via %s...\n", st.driver);
+    graphics_write_textr(buf);
+}
 
-                                                                                                                adi_header_t* h = &g_audio_state.player->stream->adi_header;
-                                                                                                                char buf[64];
+void cmd_stop(int argc, const char** argv) {
+    (void)argc; (void)argv;
+    if (g_ctl_player) {
+        audio_ctl_stop();
+        graphics_write_textr("Stopped\n");
+    } else {
+        graphics_write_textr("No audio playing\n");
+    }
+}
 
-                                                                                                                graphics_write_textr("Format: ");
-                                                                                                                graphics_write_textr(adi_format_name(h->format));
-                                                                                                                graphics_write_textr("\n");
+void cmd_pause(int argc, const char** argv) {
+    (void)argc; (void)argv;
+    if (!g_ctl_player) {
+        graphics_write_textr("No audio playing\n");
+    } else if (g_ctl_player->playing) {
+        audio_ctl_pause();
+        graphics_write_textr("Paused\n");
+    } else {
+        audio_ctl_resume();
+        graphics_write_textr("Resumed\n");
+    }
+}
 
-                                                                                                                snprintf(buf, sizeof(buf), "Duration: %u seconds\n", h->length_seconds);
-                                                                                                                graphics_write_textr(buf);
-                                                                                                                snprintf(buf, sizeof(buf), "Sample rate: %u Hz\n", h->sample_rate);
-                                                                                                                graphics_write_textr(buf);
-                                                                                                                snprintf(buf, sizeof(buf), "Channels: %u\n", (uint32_t)h->channels);
-                                                                                                                graphics_write_textr(buf);
-                                                                                                                snprintf(buf, sizeof(buf), "Volume: %u%%\n", (uint32_t)h->global_volume);
-                                                                                                                graphics_write_textr(buf);
+void cmd_volume(int argc, const char** argv) {
+    if (argc < 2) {
+        graphics_write_textr("Usage: volume <0-100>\n");
+        return;
+    }
+    if (!g_ctl_player) {
+        graphics_write_textr("No audio playing\n");
+        return;
+    }
+    int vol = parse_int(argv[1]);
+    if (vol < 0)   vol = 0;
+    if (vol > 100) vol = 100;
+    audio_ctl_set_volume((uint32_t)vol);
+    char buf[32];
+    snprintf(buf, sizeof(buf), "Volume: %d%%\n", vol);
+    graphics_write_textr(buf);
+}
 
-                                                                                                                graphics_write_textr("Playing...\n");
-                                                                                                                audio_player_play(g_audio_state.player);
-                                                                                                            }
+void cmd_seek(int argc, const char** argv) {
+    if (argc < 2) {
+        graphics_write_textr("Usage: seek <seconds>\n");
+        return;
+    }
+    if (!g_ctl_player) {
+        graphics_write_textr("No audio playing\n");
+        return;
+    }
+    int sec = parse_int(argv[1]);
+    if (sec < 0) sec = 0;
+    uint64_t t0 = time_get_uptime_ms();
+    audio_ctl_seek_ms((uint32_t)sec * 1000u);
+    serial_write_str("[PLAYER] Seek to ");
+    serial_write_dec((uint64_t)sec);
+    serial_write_str(" s took ");
+    serial_write_dec(time_get_uptime_ms() - t0);
+    serial_write_str(" ms\n");
+}
 
-                                                                                                            void cmd_stop(int argc, const char** argv) {
-                                                                                                                if (g_audio_state.player) {
-                                                                                                                    audio_player_stop(g_audio_state.player);
-                                                                                                                    graphics_write_textr("Stopped\n");
-                                                                                                                } else {
-                                                                                                                    graphics_write_textr("No audio playing\n");
-                                                                                                                }
-                                                                                                            }
-
-                                                                                                            void cmd_pause(int argc, const char** argv) {
-                                                                                                                if (g_audio_state.player) {
-                                                                                                                    if (g_audio_state.player->playing) {
-                                                                                                                        audio_player_pause(g_audio_state.player);
-                                                                                                                        graphics_write_textr("Paused\n");
-                                                                                                                    } else {
-                                                                                                                        audio_player_play(g_audio_state.player);
-                                                                                                                        graphics_write_textr("Resumed\n");
-                                                                                                                    }
-                                                                                                                } else {
-                                                                                                                    graphics_write_textr("No audio playing\n");
-                                                                                                                }
-                                                                                                            }
-
-                                                                                                            void cmd_volume(int argc, const char** argv) {
-                                                                                                                if (argc < 2) {
-                                                                                                                    graphics_write_textr("Usage: volume <0-100>\n");
-                                                                                                                    return;
-                                                                                                                }
-                                                                                                                if (!g_audio_state.player) {
-                                                                                                                    graphics_write_textr("No audio playing\n");
-                                                                                                                    return;
-                                                                                                                }
-                                                                                                                int vol = parse_int(argv[1]);
-                                                                                                                if (vol < 0)   vol = 0;
-                                                                                                                if (vol > 100) vol = 100;
-                                                                                                                audio_player_set_volume(g_audio_state.player, (uint8_t)vol);
-                                                                                                                char buf[32];
-                                                                                                                snprintf(buf, sizeof(buf), "Volume: %d%%\n", vol);
-                                                                                                                graphics_write_textr(buf);
-                                                                                                            }
-
-                                                                                                            void register_audio_commands(void) {
+void register_audio_commands(void) {
                                                                                                                 command_register("play",   cmd_play);
                                                                                                                 command_register("stop",   cmd_stop);
                                                                                                                 command_register("pause",  cmd_pause);
                                                                                                                 command_register("volume", cmd_volume);
+    command_register("seek",   cmd_seek);
                                                                                                             }
 
                                                                                                             REGISTER_COMMAND(register_audio_commands);

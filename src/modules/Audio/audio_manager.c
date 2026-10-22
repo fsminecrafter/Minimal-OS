@@ -2,19 +2,45 @@
 #include "serial.h"
 #include <string.h>
 
-static const audio_hw_driver_t* g_audio_driver = NULL;
+/* Every driver the build supports registers here; audio_manager_init()
+ * then uses the first one whose hardware is present. */
+#define AUDIO_MANAGER_MAX_DRIVERS 4
+
+static const audio_hw_driver_t* g_drivers[AUDIO_MANAGER_MAX_DRIVERS];
+static int g_driver_count = 0;
+static const audio_hw_driver_t* g_audio_driver = NULL;   /* the one in use */
 static audio_mix_cb_t g_mix_cb = NULL;
 static audio_ready_cb_t g_ready_cb = NULL;
 
 void audio_manager_register_driver(const audio_hw_driver_t* drv) {
-    g_audio_driver = drv;
+    if (!drv) return;
+    for (int i = 0; i < g_driver_count; i++)
+        if (g_drivers[i] == drv) return;
+    if (g_driver_count < AUDIO_MANAGER_MAX_DRIVERS)
+        g_drivers[g_driver_count++] = drv;
 }
 
 bool audio_manager_init(void) {
-    if (!g_audio_driver) return false;
-    serial_write_str("audio_manager: initializing driver\n");
-    if (g_audio_driver->init) return g_audio_driver->init();
+    if (g_audio_driver) return true;
+    for (int i = 0; i < g_driver_count; i++) {
+        const audio_hw_driver_t* drv = g_drivers[i];
+        if (!drv->init) continue;
+        serial_write_str("audio_manager: trying ");
+        serial_write_str(drv->name ? drv->name : "(unnamed)");
+        serial_write_str("\n");
+        if (drv->init()) {
+            g_audio_driver = drv;
+            serial_write_str("audio_manager: using ");
+            serial_write_str(drv->name ? drv->name : "(unnamed)");
+            serial_write_str("\n");
+            return true;
+        }
+    }
     return false;
+}
+
+const char* audio_manager_driver_name(void) {
+    return (g_audio_driver && g_audio_driver->name) ? g_audio_driver->name : NULL;
 }
 
 void audio_manager_update(void) {

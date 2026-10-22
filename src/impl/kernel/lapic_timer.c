@@ -190,6 +190,10 @@ void lapic_timer_eoi(void) {
  * safe to call concurrently from multiple cores.
  */
 void lapic_timer_irq_handler(void) {
-    scheduler_tick();
+    /* Acknowledge first: scheduler_tick() may switch to a process that
+     * has never run, which starts in proc_trampoline() and never comes
+     * back through here to send the EOI, leaving this core's timer
+     * silent for good. Interrupts stay off until iret/sti either way. */
     lapic_timer_eoi();
+    scheduler_tick();
 }

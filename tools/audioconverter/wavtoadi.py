@@ -47,67 +47,59 @@ IMA_STEP_TABLE = [
     15289, 16818, 18500, 20350, 22385, 24623, 27086, 29794, 32767
 ]
 
-def encode_ima_adpcm(pcm_samples):
-    """Encode PCM16 samples to IMA ADPCM (4-bit)"""
-    predictor = 0
-    step_index = 0
+def _ima_encode_sample(sample, state):
+    """Encode one sample; state is [predictor, step_index]. Returns the nibble.
+
+    Mirrors ima_decode_nibble() in src/modules/Audio/audio.c exactly, so
+    the encoder's predictor never drifts from the kernel decoder's."""
+    predictor, step_index = state
+    step = IMA_STEP_TABLE[step_index]
+    diff = sample - predictor
+    code = 0
+    if diff < 0:
+        code = 8
+        diff = -diff
+    if diff >= step:
+        code |= 4
+        diff -= step
+    if diff >= step >> 1:
+        code |= 2
+        diff -= step >> 1
+    if diff >= step >> 2:
+        code |= 1
+
+    # Reconstruct exactly as the decoder will (with the unshifted step)
+    delta = step >> 3
+    if code & 1: delta += step >> 2
+    if code & 2: delta += step >> 1
+    if code & 4: delta += step
+    if code & 8: delta = -delta
+    predictor = max(-32768, min(32767, predictor + delta))
+    step_index = max(0, min(88, step_index + IMA_INDEX_TABLE[code & 7]))
+    state[0], state[1] = predictor, step_index
+    return code
+
+
+def encode_ima_adpcm(pcm_samples, channels=2):
+    """Encode PCM16 samples to IMA ADPCM (4-bit) in the .adi layout.
+
+    Stereo: each channel has its own predictor. Every 2 frames become 2
+    bytes: [L0 | L1<<4] [R0 | R1<<4].
+    Mono:   one predictor, 2 samples per byte: [S0 | S1<<4].
+    """
     output = bytearray()
-    
-    for i in range(0, len(pcm_samples), 2):
-        byte_val = 0
-        
-        for nibble in range(2):
-            if i + nibble >= len(pcm_samples):
-                break
-                
-            sample = pcm_samples[i + nibble]
-            
-            # Calculate difference
-            diff = sample - predictor
-            sign = 0
-            if diff < 0:
-                sign = 8
-                diff = -diff
-            
-            # Quantize
-            step = IMA_STEP_TABLE[step_index]
-            code = 0
-            
-            if diff >= step:
-                code = 4
-                diff -= step
-            step >>= 1
-            if diff >= step:
-                code |= 2
-                diff -= step
-            step >>= 1
-            if diff >= step:
-                code |= 1
-            
-            code |= sign
-            
-            # Update predictor
-            diff = step >> 3
-            if code & 1: diff += step >> 2
-            if code & 2: diff += step >> 1
-            if code & 4: diff += step
-            if code & 8: diff = -diff
-            
-            predictor += diff
-            predictor = max(-32768, min(32767, predictor))
-            
-            # Update step index
-            step_index += IMA_INDEX_TABLE[code & 7]
-            step_index = max(0, min(88, step_index))
-            
-            # Pack nibble
-            if nibble == 0:
-                byte_val = code & 0x0F
-            else:
-                byte_val |= (code & 0x0F) << 4
-        
-        output.append(byte_val)
-    
+    if channels == 2:
+        left, right = [0, 0], [0, 0]
+        frames = len(pcm_samples) // 2
+        for f in range(0, frames - 1, 2):
+            l0, r0, l1, r1 = pcm_samples[2 * f:2 * f + 4]
+            output.append(_ima_encode_sample(l0, left) | (_ima_encode_sample(l1, left) << 4))
+            output.append(_ima_encode_sample(r0, right) | (_ima_encode_sample(r1, right) << 4))
+    else:
+        state = [0, 0]
+        for i in range(0, len(pcm_samples) - 1, 2):
+            output.append(_ima_encode_sample(pcm_samples[i], state) |
+                          (_ima_encode_sample(pcm_samples[i + 1], state) << 4))
     return bytes(output)
 
 # ===========================================
@@ -267,7 +259,7 @@ def wav_to_adi(input_wav, output_file, format_type, volume=80, object_file=False
     print(f"Encoding to {format_type}...")
     
     if format_type == 'IADPCM':
-        compressed = encode_ima_adpcm(samples)
+        compressed = encode_ima_adpcm(samples, channels)
         format_name = 'IADPCM'
     elif format_type == 'MSADPCM':
         compressed = encode_ms_adpcm(samples)

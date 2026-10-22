@@ -110,4 +110,7 @@ void scheduler_rebalance(void);
 // SCHED_BOOST_INTERVAL_TICKS in scheduler.c.
 void scheduler_priority_boost(void);
 
+// True for an AP's idle context (see schedule()); it is not a real process.
+bool scheduler_is_idle_process(const process_t* proc);
+
 #endif // SCHEDULER_H

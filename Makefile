@@ -10,6 +10,11 @@ KERNEL_CFLAGS := -ffreestanding -mno-red-zone
 QEMU_NETDEV ?= user,id=net0
 QEMU_TWO_MCAST ?= 230.0.0.1:12345
 QEMU_AUDIO_DRIVER ?= none
+# Sound card for 'make run': ac97 or hda (Intel HD Audio + hda-duplex codec).
+QEMU_SOUND ?= ac97
+qemu_sound_ac97 := -device AC97,audiodev=audio0
+qemu_sound_hda := -device intel-hda -device hda-duplex,audiodev=audio0
+QEMU_SOUND_DEVICE ?= $(qemu_sound_$(QEMU_SOUND))
 HOSTCC ?= gcc
 HOST_CFLAGS ?= -std=c11 -Wall -Wextra -Werror -I src/intf
 MOSDESK_REPO ?= https://github.com/fsminecrafter/MOSdesk.git
@@ -149,7 +154,7 @@ $(ap_trampoline_object): $(ap_trampoline_bin)
 		--redefine-sym _binary_build_impl_boot_ap_trampoline_bin_end=_binary_ap_trampoline_bin_end \
 		$< $@
 
-build/resources/%.o: src/resources/%.wav
+build/resources/%.o: src/resources/%.wav tools/audioconverter/wavtoadi.py
 	mkdir -p $(dir $@)
 	python3 tools/audioconverter/wavtoadi.py --format IADPCM --object-file $< $@
 
@@ -277,7 +282,7 @@ $(INSTALL_DISK):
 
 .PHONY: run
 run: build-x86_64 $(INSTALL_DISK)
-	qemu-system-x86_64 -smp 2 -cdrom dist/x86_64/kernel.iso -m 1024M $(QEMU_VGA) $(QEMU_INSTALL_DISK) -boot d -d guest_errors,int,cpu_reset,unimp -D qemu.log -serial stdio -device piix3-usb-uhci,id=uhci -device usb-kbd,bus=uhci.0,port=1 -device usb-mouse,bus=uhci.0,port=2 -audiodev $(QEMU_AUDIO_DRIVER),id=speaker -machine pcspk-audiodev=speaker  -audiodev $(QEMU_AUDIO_DRIVER),id=audio0 -device AC97,audiodev=audio0 -device ahci,id=ahci -drive id=disk0,file=sata256.img,if=none,format=raw -device ide-hd,drive=disk0,bus=ahci.0 -netdev $(QEMU_NETDEV) -device rtl8139,netdev=net0,mac=52:54:00:12:34:56
+	qemu-system-x86_64 -smp 2 -cdrom dist/x86_64/kernel.iso -m 1024M $(QEMU_VGA) $(QEMU_INSTALL_DISK) -boot d -d guest_errors,int,cpu_reset,unimp -D qemu.log -serial stdio -device piix3-usb-uhci,id=uhci -device usb-kbd,bus=uhci.0,port=1 -device usb-mouse,bus=uhci.0,port=2 -audiodev $(QEMU_AUDIO_DRIVER),id=speaker -machine pcspk-audiodev=speaker  -audiodev $(QEMU_AUDIO_DRIVER),id=audio0 $(QEMU_SOUND_DEVICE) -device ahci,id=ahci -drive id=disk0,file=sata256.img,if=none,format=raw -device ide-hd,drive=disk0,bus=ahci.0 -netdev $(QEMU_NETDEV) -device rtl8139,netdev=net0,mac=52:54:00:12:34:56
 
 .PHONY: mosdesk-build mosdesk-stage run-mosdesk
 # MOSDESK_USE_LOCAL=1 builds the checkouts as they are (no submodule
@@ -321,6 +326,13 @@ run-mosdesk:
 	$(MAKE) MOSDESK=1 run
 
 # Boots the disk the installer wrote ($(INSTALL_DISK)) without the CD.
+# Boots the ISO in QEMU/KVM showing the guest a Hyper-V interface
+# (enlightenments, SynIC, VMBus), the Linux stand-in for a Hyper-V test VM.
+# Logs COM1 to build/hyperv/serial.log; see tools/hyperv/README.md.
+.PHONY: run-hyperv
+run-hyperv: build-x86_64
+	tools/hyperv/mosvm.sh run --gui $(HYPERV_ARGS)
+
 .PHONY: run-installed run-installed-uefi
 run-installed:
 	qemu-system-x86_64 -smp 2 -m 1024M $(QEMU_VGA) -boot c -serial stdio \

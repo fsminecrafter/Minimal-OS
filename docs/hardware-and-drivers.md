@@ -70,10 +70,18 @@ presence, key translation, and keyboard metadata.
 
 ## Audio
 
-Audio drivers are registered through the audio manager. The AC'97 path searches
-for a compatible controller, configures the device, and provides a mix/update
-callback. The kernel audio process updates playback independently of the
-terminal.
+Audio drivers register with the audio manager, which uses the first one whose
+hardware is present: Intel HD Audio (`hda_driver.c`, any PCI class 04:03
+controller and its codecs), then AC'97 (`ac97_driver.c`). Both are polled
+from the PIT tick: they refill the DMA buffers the card has played with
+samples pulled from the mixer. The HD Audio driver walks each codec from its
+speaker, line-out and headphone pins to a DAC, and resamples when the codec
+cannot play a file's rate.
+
+The `kernelaudio` process decodes `.adi` files ahead of the card. Playback is
+controlled by the terminal's `play`, `pause`, `stop`, `volume` and `seek`
+commands, and by programs through `SYS_AUDIO` ([Playing audio](audio.md)).
+`make run QEMU_SOUND=hda` boots QEMU with an HD Audio card instead of AC'97.
 
 If no compatible audio controller is present, initialization reports that state
 and the rest of the system continues.

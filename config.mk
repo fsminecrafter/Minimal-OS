@@ -5,6 +5,7 @@
 MODULE_Audio_ac97_driver_c := 1
 MODULE_Audio_audio_c := 1
 MODULE_Audio_audio_manager_c := 1
+MODULE_Audio_hda_driver_c := 1
 MODULE_Audio_pcaudio_c := 1
 MODULE_GPU_gpu_c := 1
 MODULE_GPU_gpu_manager_c := 1

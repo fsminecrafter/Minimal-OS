@@ -239,7 +239,12 @@ void ac97_update(void) {
         last_civ = civ;
     }
 
-    if (stall > 25) {
+    /* Only a halted engine needs a kick. CIV can legitimately sit still
+     * for longer than one 21 ms buffer (QEMU advances it in bursts), and
+     * kicking a running engine refilled all 32 buffers - mostly with
+     * silence - which was heard as long gaps. A halt at LVI after an
+     * underrun normally resumes on its own once LVI moves (below). */
+    if (stall > 250 && (port_inb((uint16_t)(g_nabm_base + AC97_NABM_POSR)) & 0x01)) {
         ac97_kick();
         stall = 0;
         return;
@@ -301,8 +306,9 @@ void ac97_kick(void) {
     port_outb(g_nabm_base + AC97_NABM_POCR, 0x00);
     port_outb(g_nabm_base + AC97_NABM_POSR, 0x1C);
 
+    /* Restart like ac97_start(): a few buffers ahead, not all 32. */
     g_last_valid = 0;
-    for (int i = 0; i < AC97_BD_COUNT; i++) {
+    for (int i = 0; i < AUDIO_RING_SIZE; i++) {
         audio_manager_pull_samples(g_audio_buffers[i], AC97_FRAMES_PER_BUFFER);
         g_last_valid = (uint8_t)i;
     }

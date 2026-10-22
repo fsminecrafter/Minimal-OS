@@ -436,6 +436,37 @@ void currentstate() {
  * happens for the comparatively rare zombie-reap pass and for the
  * periodic rebalance.
  */
+/*
+ * Idle context of each AP. The AP's boot code (the hlt loop at the end of
+ * ap_entry_c) is parked here the first time the core schedules, and the
+ * core switches back to it whenever nothing on its run queue can run, so
+ * sleep() really waits there instead of spinning. It is never queued,
+ * never on proc_list_head and never migrated. The boot core has no idle
+ * context: its boot code (the terminal) runs as a normal process.
+ */
+static process_t g_ap_idle[MAX_CPUS];
+
+static inline process_t* ap_idle_for(uint32_t cpu_id) {
+    if (cpu_id >= MAX_CPUS || smp_is_master_core_id(cpu_id)) return NULL;
+    process_t* idle = &g_ap_idle[cpu_id];
+    if (!idle->name[0]) {
+        strcpy(idle->name, "idle");
+        idle->sched_cpu = cpu_id;
+        idle->sched_level = SCHED_LEVEL_BACKGROUND;
+        // First call happens in the AP's boot context, which runs on the
+        // kernel page tables; context_switch() loads this when switching
+        // back to idle, so it must never stay 0.
+        uint64_t cr3;
+        asm volatile("mov %%cr3, %0" : "=r"(cr3));
+        idle->pml4 = cr3;
+    }
+    return idle;
+}
+
+bool scheduler_is_idle_process(const process_t* proc) {
+    return proc && proc >= &g_ap_idle[0] && proc < &g_ap_idle[MAX_CPUS];
+}
+
 void schedule() {
     uint32_t cpu_id = smp_current_cpu_id();
     percpu_runqueue_t* rq = &g_runqueues[cpu_id];
@@ -509,6 +540,7 @@ void schedule() {
 
     // ---- Per-CPU dispatch ----
     process_t* old = current_process;
+    process_t* idle = ap_idle_for(cpu_id);
 
     uint64_t rq_flags = spinlock_acquire(&rq->lock);
 
@@ -545,12 +577,23 @@ void schedule() {
         }
 
         idle_cycles++;
+        if (idle && old && old != idle) {
+            // `old` is sleeping or exiting and nothing else is ready:
+            // wait in this core's idle loop until a timer tick brings
+            // work, rather than returning into a sleeping process.
+            if (old->state == PROCESS_ZOMBIE || old->state == PROCESS_TERMINATED) {
+                g_deferred_reap[cpu_id] = old;
+            }
+            idle->state = PROCESS_RUNNING;
+            current_process = idle;
+            context_switch(old, idle);
+        }
         return;
     }
 
     // Requeue the outgoing process (it was never itself in the queue
     // while running) behind whatever's now at the front of its level.
-    if (old && old->state == PROCESS_RUNNING) {
+    if (old && old->state == PROCESS_RUNNING && old != idle) {
         old->state = PROCESS_READY;
         rq_push(rq, old, old->sched_level);
     }
@@ -574,9 +617,22 @@ void schedule() {
         serial_write_str("\n");
     }
 
+    if (!old && !smp_is_master_core_id(cpu_id)) {
+        // First process on an AP. The code running here is the AP's
+        // boot idle loop (ap_entry_c), which no process owns. Park it as
+        // this core's idle context and really start `next`; otherwise `next` would
+        // be marked running while the idle loop kept the CPU, so its
+        // entry point never ran (this is how 'kernelaudio' got lost on
+        // cpu1 and audio playback never refilled).
+        idle->state = PROCESS_RUNNING;
+        context_switch(idle, next);
+        return;
+    }
+
     if (!old) {
-        // First process this core has ever run - nothing to save,
-        // nothing to switch away from.
+        // First process the boot core has run: the code running here
+        // (the terminal) carries on as that process. main() creates a
+        // throwaway "busy" process first for exactly this.
         if (SCHED_DEBUG >= 1) {
             serial_write_str("Starting first process on cpu");
             serial_write_dec(cpu_id);
@@ -700,7 +756,8 @@ void scheduler_tick() {
     uint32_t cpu_id = smp_current_cpu_id();
     if (cpu_id < MAX_CPUS) {
         cpu_local_t* cpu = &g_cpus[cpu_id];
-        bool busy = current_process && current_process->state == PROCESS_RUNNING;
+        bool busy = current_process && current_process->state == PROCESS_RUNNING &&
+                    !scheduler_is_idle_process(current_process);
         __atomic_add_fetch(&cpu->usage_total_ticks, 1, __ATOMIC_RELAXED);
         if (busy) {
             __atomic_add_fetch(&cpu->usage_busy_ticks, 1, __ATOMIC_RELAXED);
@@ -718,6 +775,11 @@ void scheduler_tick() {
     }
 
     if (was_idle || !current_process) return;
+    if (scheduler_is_idle_process(current_process)) {
+        // Idle on an AP: pick up anything woken or migrated here.
+        if (rq_total(&g_runqueues[cpu_id]) > 0) schedule();
+        return;
+    }
 
     current_process->sched_ticks_used++;
     current_process->cpu_time_ms++;

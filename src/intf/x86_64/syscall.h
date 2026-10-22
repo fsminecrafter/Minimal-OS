@@ -767,4 +767,51 @@ typedef struct {
     char boot_device[16];       // STATUS: device mounted as 0:
 } syscall_storage_request_t;
 
+// ===========================================
+// AUDIO PLAYBACK (SYS_AUDIO)
+// ===========================================
+//
+// rdi = syscall_audio_request_t*. Plays .adi files through whichever
+// sound card the kernel found (Intel HD Audio or AC97). One file plays
+// at a time for the whole system; OPEN replaces whatever was playing,
+// including a file started with the terminal's 'play' command.
+#define SYS_AUDIO 42
+#define SYS_AUDIO_ABI_VERSION 1u
+
+#define SYS_AUDIO_OPEN   1u   // path: load and start playing
+#define SYS_AUDIO_PAUSE  2u
+#define SYS_AUDIO_RESUME 3u   // also restarts a file that has ended
+#define SYS_AUDIO_STOP   4u   // stop and unload
+#define SYS_AUDIO_SEEK   5u   // value: position in milliseconds
+#define SYS_AUDIO_VOLUME 6u   // value: 0-100
+#define SYS_AUDIO_STATUS 7u   // fills status (works with nothing loaded)
+
+#define SYSCALL_AUDIO_IDLE    0u   // nothing loaded
+#define SYSCALL_AUDIO_PLAYING 1u
+#define SYSCALL_AUDIO_PAUSED  2u
+#define SYSCALL_AUDIO_ENDED   3u   // reached the end; RESUME plays it again
+
+#define SYSCALL_AUDIO_PATH_MAX 256u
+
+typedef struct {
+    uint32_t state;          // SYSCALL_AUDIO_*
+    uint32_t position_ms;
+    uint32_t duration_ms;
+    uint32_t sample_rate;
+    uint32_t channels;
+    uint32_t volume;         // 0-100
+    char format[16];         // "IMA-ADPCM", "PCM16"
+    char driver[24];         // sound card driver in use, "" if none
+    char path[SYSCALL_AUDIO_PATH_MAX];
+} syscall_audio_status_t;
+
+typedef struct {
+    uint32_t size;           // sizeof(syscall_audio_request_t)
+    uint32_t version;        // SYS_AUDIO_ABI_VERSION
+    uint32_t op;
+    uint32_t value;
+    char path[SYSCALL_AUDIO_PATH_MAX];
+    syscall_audio_status_t status;
+} syscall_audio_request_t;
+
 #endif // SYSCALL_H

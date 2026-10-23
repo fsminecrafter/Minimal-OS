@@ -273,6 +273,7 @@ src/resources/%.o: src/resources/%.wav
 INSTALL_DISK ?= install-target.img
 INSTALL_DISK_SIZE ?= 8G
 QEMU_VGA ?= -vga none -device VGA,vgamem_mb=64
+# Must come after '-device ahci,id=ahci' on the command line (it uses bus ahci.1).
 QEMU_INSTALL_DISK = -drive id=disk1,file=$(INSTALL_DISK),if=none,format=raw -device ide-hd,drive=disk1,bus=ahci.1
 OVMF_CODE ?= /usr/share/OVMF/OVMF_CODE_4M.fd
 OVMF_VARS ?= /usr/share/OVMF/OVMF_VARS_4M.fd
@@ -282,9 +283,9 @@ $(INSTALL_DISK):
 
 .PHONY: run
 run: build-x86_64 $(INSTALL_DISK)
-	qemu-system-x86_64 -smp 2 -cdrom dist/x86_64/kernel.iso -m 1024M $(QEMU_VGA) $(QEMU_INSTALL_DISK) -boot d -d guest_errors,int,cpu_reset,unimp -D qemu.log -serial stdio -device piix3-usb-uhci,id=uhci -device usb-kbd,bus=uhci.0,port=1 -device usb-mouse,bus=uhci.0,port=2 -audiodev $(QEMU_AUDIO_DRIVER),id=speaker -machine pcspk-audiodev=speaker  -audiodev $(QEMU_AUDIO_DRIVER),id=audio0 $(QEMU_SOUND_DEVICE) -device ahci,id=ahci -drive id=disk0,file=sata256.img,if=none,format=raw -device ide-hd,drive=disk0,bus=ahci.0 -netdev $(QEMU_NETDEV) -device rtl8139,netdev=net0,mac=52:54:00:12:34:56
+	qemu-system-x86_64 -smp 2 -cdrom dist/x86_64/kernel.iso -m 1024M $(QEMU_VGA) -boot d -d guest_errors,int,cpu_reset,unimp -D qemu.log -serial stdio -device piix3-usb-uhci,id=uhci -device usb-kbd,bus=uhci.0,port=1 -device usb-mouse,bus=uhci.0,port=2 -audiodev $(QEMU_AUDIO_DRIVER),id=speaker -machine pcspk-audiodev=speaker  -audiodev $(QEMU_AUDIO_DRIVER),id=audio0 $(QEMU_SOUND_DEVICE) -device ahci,id=ahci -drive id=disk0,file=sata256.img,if=none,format=raw -device ide-hd,drive=disk0,bus=ahci.0 $(QEMU_INSTALL_DISK) -netdev $(QEMU_NETDEV) -device rtl8139,netdev=net0,mac=52:54:00:12:34:56
 
-.PHONY: mosdesk-build mosdesk-stage run-mosdesk
+.PHONY: mosdesk-build mosdesk-stage mosdesk-dlr run-mosdesk
 # MOSDESK_USE_LOCAL=1 builds the checkouts as they are (no submodule
 # fetching), e.g. when MOSdesk and the SDK have unpushed changes.
 MOSDESK_USE_LOCAL ?= 0
@@ -311,7 +312,7 @@ mosdesk-build:
 	CC=$(CC) LD=$(LD) MKPKG_TOOL=$(CURDIR)/tools/mkpkg/mkpkg.py MKPKG_JOBS=$(MKPKG_JOBS) \
 		MOSDESK_SDK_DIR=$(CURDIR)/Minimal-OS-SDK $(MOSDESK_DIR)/mosdesk/build.sh
 
-mosdesk-stage: mosdesk-build $(dlr_run) $(dlrconnect_run) $(fglcube_run) $(delivermanager_run)
+mosdesk-stage: mosdesk-dlr $(dlr_run) $(dlrconnect_run) $(fglcube_run) $(delivermanager_run)
 	rm -rf build/resources/mosdesk-install
 	mkdir -p build/resources/mosdesk-install/install2/mosWM \
 		build/resources/mosdesk-install/install3
@@ -324,6 +325,32 @@ mosdesk-stage: mosdesk-build $(dlr_run) $(dlrconnect_run) $(fglcube_run) $(deliv
 
 run-mosdesk:
 	$(MAKE) MOSDESK=1 run
+
+# The whole desktop (mosdesk + mosWM + mosWM.service) as one Deliver
+# package, laid out like dlr's store (0:/var/dlrd/packages):
+#   $(MOSDESK_DLR_DIR)/$(MOSDESK_DLR_NAME)/        files + .pkg manifest
+#   $(MOSDESK_DLR_DIR)/$(MOSDESK_DLR_NAME).mpkg    the archive clients download
+# Copy both into 0:/var/dlrd/packages and `dlr serve` offers it; clients
+# get it with `dlr install MOSdesk` (it installs below 0:/).
+MOSDESK_DLR_NAME ?= MOSdesk
+MOSDESK_DLR_DIR ?= dist/x86_64/dlr/packages
+mosdesk_dlr_pkg := $(MOSDESK_DLR_DIR)/$(MOSDESK_DLR_NAME)
+mosdesk_dlr_version = $(shell sed -n 's/^version=//p' $(MOSDESK_DIR)/mosdesk/mosdesk.pkg | head -n 1)
+
+mosdesk-dlr: mosdesk-build
+	rm -rf $(mosdesk_dlr_pkg) $(mosdesk_dlr_pkg).mpkg
+	mkdir -p $(mosdesk_dlr_pkg)/programs $(mosdesk_dlr_pkg)/services
+	cp -a $(MOSDESK_DIR)/mosdesk/dist/mosdesk/programs/. $(mosdesk_dlr_pkg)/programs/
+	cp -a $(MOSDESK_DIR)/mosWM/dist/mosWM/programs/. $(mosdesk_dlr_pkg)/programs/
+	cp -a $(MOSDESK_DIR)/mosWM/dist/mosWM/services/. $(mosdesk_dlr_pkg)/services/
+	printf '%s\n' '[Info]' 'name=$(MOSDESK_DLR_NAME)' 'version=$(mosdesk_dlr_version)' \
+		'description=MOSdesk desktop: mosWM window manager, Settings and built-in apps' \
+		'arch=x86_64' 'operatingsystem=MINIMALOS' '' \
+		'# No copy= list: programs/ and services/ install below 0:/' \
+		'[Install.minimalos]' 'target=0:/' > $(mosdesk_dlr_pkg)/$(MOSDESK_DLR_NAME).pkg
+	# --store like mosWM.mpkg: the wallpapers are already compressed.
+	$(MKPKG) $(mosdesk_dlr_pkg) $(mosdesk_dlr_pkg).mpkg --store
+	@echo "mosdesk-dlr: Deliver package ready: $(mosdesk_dlr_pkg)/ + $(MOSDESK_DLR_NAME).mpkg"
 
 # Boots the disk the installer wrote ($(INSTALL_DISK)) without the CD.
 # Boots the ISO in QEMU/KVM showing the guest a Hyper-V interface

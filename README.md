@@ -272,6 +272,18 @@ desktop files and mosWM startup service are installed when `format` is run in
 Minimal-OS; formatting erases the selected disk, so back up an existing disk
 before formatting it.
 
+Every MOSdesk build (or `make mosdesk-dlr` on its own) also writes the whole
+desktop as a Deliver package, ready for `dlr serve`:
+
+```text
+dist/x86_64/dlr/packages/MOSdesk/       package files + MOSdesk.pkg manifest
+dist/x86_64/dlr/packages/MOSdesk.mpkg   the archive clients download
+```
+
+Copy both into `0:/var/dlrd/packages/` on the serving machine and run
+`dlr serve`; other machines install it with `dlr install MOSdesk` (it installs
+below `0:/`, including `0:/services/mosWM.service`).
+
 ### MOSdesk (Minimal-OS Desktop Enviroment)
 Now you can find Minimal-OS's's's's's's completly own desktop enviroment (mosWM not included... Im joking)
 

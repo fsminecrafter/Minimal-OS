@@ -488,25 +488,13 @@ static void ramfs_progress(uint32_t percent, const char* text) {
     serial_write_str("\n");
 }
 
-// A "mosfirmware" boot module (an .mpkg, see tools/hyperv/mosvm.sh) is
-// unpacked into 0:/firmware, so firmware files reach a RAM-only system.
-static void ramfs_install_firmware(void) {
-    memlayout_module_t m;
-    if (!memlayout_find_module(kernel_multiboot_info, "mosfirmware", &m)) return;
-    if (m.end <= m.start || m.end - m.start > 0xFFFFFFFFull) return;
-    serial_write_str("RamFS: unpacking the mosfirmware module into 0:/firmware\n");
-    if (!storage_install_package((const uint8_t*)(uintptr_t)m.start,
-                                 (uint32_t)(m.end - m.start), "0:/firmware")) {
-        vgaterm_print_error("RamFS: firmware files could not be installed\n");
-    }
-}
-
+// storage_populate_system also unpacks a "mosfirmware" boot module (GPU
+// firmware, see tools/gpu/setup-gpu.sh) into 0:/firmware.
 static int ramfs_prepare(minimafs_disk_device_t* device) {
     if (!storage_format_volume(device, 0, "ramfs")) return 0;
     if (!storage_populate_system(0, ramfs_progress)) {
         vgaterm_print_error("RamFS: system files could not be installed\n");
     }
-    ramfs_install_firmware();
     return 1;
 }
 

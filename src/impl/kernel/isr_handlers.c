@@ -3,6 +3,13 @@
 #include "panic.h"
 #include "x86_64/proc.h"
 #include "x86_64/scheduler.h"
+#include "x86_64/isr_crash.h"
+
+static user_crash_info_t g_last_crash;
+
+const user_crash_info_t* isr_last_user_crash(void) {
+    return &g_last_crash;
+}
 
 static const char* exception_name(uint64_t vector) {
     switch (vector) {
@@ -74,6 +81,25 @@ void isr_generic_handler(uint64_t vector, uint64_t error_code,
     if ((saved_cs & 3) == 3 && current_process &&
         current_process->privilege == PROC_PRIVILEGE_USER &&
         vector != 2 && vector != 18) {
+        // Kept for the terminal's crash message: machines without a
+        // serial port only see the screen.
+        uint64_t cr2 = 0;
+        if (vector == 14) asm volatile("mov %%cr2, %0" : "=r"(cr2));
+        g_last_crash.pid = current_process->pid;
+        g_last_crash.vector = (uint8_t)vector;
+        g_last_crash.error_code = error_code;
+        g_last_crash.rip = saved_rip;
+        g_last_crash.fault_address = cr2;
+        g_last_crash.image_base = current_process->user_image_address;
+        g_last_crash.image_size = current_process->user_image_size;
+        for (uint32_t i = 0; i < sizeof(g_last_crash.name) - 1; i++) {
+            g_last_crash.name[i] = current_process->name[i];
+            if (!current_process->name[i]) break;
+        }
+        g_last_crash.name[sizeof(g_last_crash.name) - 1] = 0;
+        serial_write_str("  Image base: 0x");
+        serial_write_hex(current_process->user_image_address);
+        serial_write_str("\n");
         serial_write_str("  Terminating faulting user process: ");
         serial_write_str(current_process->name);
         serial_write_str("\n");

@@ -75,7 +75,14 @@ static void test_bin(void) {
     CHECK(!nv_fw_parse_bin(&file, &h, &why), "ucode past the end rejected");
     put32(f + 20, 64);
     put32(f + 8, 4096);
-    CHECK(!nv_fw_parse_bin(&file, &h, &why), "bin_size past the file rejected");
+    CHECK(nv_fw_parse_bin(&file, &h, &why),
+          "bin_size past the file accepted (NVIDIA's real files do this)");
+    put32(f + 16, 120);
+    put32(f + 20, 16);
+    CHECK(!nv_fw_parse_bin(&file, &h, &why) && strstr(why, "ucode"),
+          "ucode past the real file end rejected");
+    put32(f + 16, 64);
+    put32(f + 20, 64);
     put32(f + 8, sizeof f);
     put32(f, 0x1234);
     CHECK(!nv_fw_parse_bin(&file, &h, &why) && strstr(why, "magic"), "bad magic rejected");

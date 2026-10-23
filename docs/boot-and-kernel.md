@@ -46,8 +46,10 @@ reads or writes them. Instead a zeroed RAM disk, `ram0` (64 MiB by default,
 less if memory is short, at least 16 MiB), is formatted as `0:`, the system
 files are unpacked into it as `format` would, and startup goes on as usual
 (services, desktop). Every change is lost at the next boot. A boot module
-named `mosfirmware` (an `.mpkg`) is unpacked into `0:/firmware`; the test
-VM uses it to bring NVIDIA firmware files along.
+named `mosfirmware` (an `.mpkg`) is unpacked into `0:/firmware` (by `format`
+and `install` too); `make gpu-setup` puts one on the ISO with NVIDIA's
+firmware files (see [gpu.md](gpu.md#firmware-files)), and the test VM uses
+it the same way.
 
 The kernel option `serial-echo` copies everything the terminal prints to
 COM1, so a headless VM's serial log contains command output as well as the

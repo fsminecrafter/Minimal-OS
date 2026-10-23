@@ -22,6 +22,7 @@
 
 #include "x86_64/storage_setup.h"
 #include "x86_64/blockdev.h"
+#include "x86_64/memlayout.h"
 
 extern const uint8_t _binary_install1_mpkg_start[];
 extern const uint8_t _binary_install1_mpkg_end[];
@@ -242,6 +243,23 @@ bool storage_format_volume(blockdev_t* device, uint8_t drive_number,
     return true;
 }
 
+// GPU firmware: an ISO made after tools/gpu/setup-gpu.sh carries a
+// "mosfirmware" boot module (an .mpkg), unpacked into N:/firmware. Missing
+// or broken firmware is not fatal; the system just runs without it.
+static void storage_install_firmware(uint8_t drive_number, storage_progress_fn progress) {
+    memlayout_module_t m;
+    if (!kernel_multiboot_info ||
+        !memlayout_find_module(kernel_multiboot_info, "mosfirmware", &m)) return;
+    if (m.end <= m.start || m.end - m.start > 0xFFFFFFFFull) return;
+    char dir[16];
+    snprintf(dir, sizeof(dir), "%u:/firmware", (unsigned)drive_number);
+    setup_say(progress, 90, "Installing GPU firmware");
+    if (!format_install_package((const uint8_t*)(uintptr_t)m.start,
+                                (uint32_t)(m.end - m.start), dir)) {
+        serial_write_str("setup: GPU firmware could not be installed\n");
+    }
+}
+
 bool storage_populate_system(uint8_t drive_number, storage_progress_fn progress) {
     minimafs_drive_t* drive = get_drive(drive_number);
     if (!drive || !drive->mounted) return false;
@@ -292,6 +310,7 @@ bool storage_populate_system(uint8_t drive_number, storage_progress_fn progress)
         serial_write_str("FORMAT: failed to install resource package\n");
         return false;
     }
+    storage_install_firmware(drive_number, progress);
     minimafs_refresh_storage_desc(drive);
     return true;
 }

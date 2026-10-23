@@ -13,6 +13,8 @@ summarized in [docs/system-overview.md](docs/system-overview.md).
 [shading language FGSL](docs/fgsl.md), and the GPU side in
 [docs/gpu.md](docs/gpu.md) (including what hardware rendering on NVIDIA
 cards needs).
+NVIDIA firmware for an RTX 20 / GTX 16 card: `make gpu-setup` (RTX 2060)
+or `make gpu-setup GPU="GTX 1660 Ti"`, then `make mosdesk`.
 
 <img width="250" height="250" alt="Icon" src="https://github.com/user-attachments/assets/f2401784-fcd3-4002-bbe0-02d16b9652d1" />
 

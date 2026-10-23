@@ -445,8 +445,15 @@ void cmd_cgres(int argc, const char** argv) {
         info_text("cgres: resolution must be between 320x200 and 8192x8192\n");
         return;
     }
-    if (!gpu.pci_dev || !gpu_set_resolution(&gpu, width, height)) {
-        info_text("cgres: no initialized GPU\n");
+    if (!gpu.pci_dev) {
+        // Only QEMU's virtual GPU (Bochs VBE) can switch modes; on real
+        // cards the screen keeps the mode the firmware and GRUB set.
+        info_text("cgres: this display cannot change modes; the resolution is set at boot\n"
+                  "       by the firmware and GRUB (cgres works on QEMU's virtual GPU)\n");
+        return;
+    }
+    if (!gpu_set_resolution(&gpu, width, height)) {
+        info_text("cgres: the display does not support that mode\n");
         return;
     }
     graphics_set_resolution(width / 8, height / 8);

@@ -1,6 +1,7 @@
 #include "graphics.h"
 #include "prochandler.h"
 #include "x86_64/gpu.h"
+#include "x86_64/gpucore.h"
 #include "x86_64/allocator.h"
 #include "x86_64/spinlock.h"
 #include "panic.h"
@@ -488,6 +489,13 @@ void graphics_terminal_newline(void) {
     }
 }
 
+// True when the CPU can read the screen as fast as RAM (a virtual GPU whose
+// VRAM is host memory).
+static bool screen_reads_are_fast(void) {
+    gpu_adapter_t* a = gpu_primary_adapter();
+    return a && (a->caps & GPU_CAP_VRAM_FAST_READ);
+}
+
 void graphics_terminal_scroll(void) {
     if (!g_gpu) return;
 
@@ -506,6 +514,24 @@ void graphics_terminal_scroll(void) {
 
     // Clear the last row in the buffer
     if (rows > 0) term_buf_clear_row(rows - 1);
+
+    // Moving the pixels up means reading the screen back. That is cheap
+    // when VRAM is ordinary memory (QEMU), but on a real graphics card every
+    // read crosses the bus uncached: seconds per scroll at 1080p, which made
+    // fglcube crawl once it printed its frame rate. There the rows are drawn
+    // again from the character buffer, which only writes.
+    if (!screen_reads_are_fast()) {
+        for (uint32_t row = 0; row < rows && row < TERM_MAX_ROWS; row++) {
+            for (uint32_t col = 0; col < cols && col < TERM_MAX_COLS; col++) {
+                term_cell_t* cell = &g_term_buf[row][col];
+                graphics_terminal_putchar(cell->ch, col, row,
+                                          (color_t){cell->r, cell->g, cell->b, 0xFF},
+                                          g_terminal.bg_color);
+            }
+        }
+        g_terminal.cursor_y = rows - 1;
+        return;
+    }
 
     // The framebuffer already contains the rendered rows. Move pixels by one
     // character row instead of rasterizing every glyph on every scroll.

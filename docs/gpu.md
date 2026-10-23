@@ -195,8 +195,31 @@ sizes and whether it is running.
 
 #### Firmware files
 
-Copy these from `linux-firmware` (`nvidia/tu106/` for an RTX 2060; follow
-the symbolic links, MinimaFS has none) to `0:/firmware/nvidia/tu106/`:
+`tools/gpu/setup-gpu.sh` (or `make gpu-setup`) sets them up:
+
+```sh
+make gpu-setup                      # RTX 2060 (tu106), the default
+make gpu-setup GPU="GTX 1660 Ti"    # another card, a chip (GPU=tu104)
+                                    # or a PCI id (GPU=10de:1f08)
+make gpu-setup GPU=--detect         # the NVIDIA card in the build PC
+make mosdesk                        # or make / make run-mosdesk
+make gpu-remove                     # build without firmware again
+```
+
+It copies the files from the build PC's `/lib/firmware` (unpacking
+`.zst`/`.xz`), or downloads them from linux-firmware on git.kernel.org,
+checks them, and puts them in `firmware/nvidia/<chip>/` (ignored by git;
+NVIDIA's licence goes along as `firmware/nvidia/LICENCE.nvidia`). Every
+build then packs `firmware/` into the ISO as `boot/mosfirmware.mpkg`.
+GRUB loads it as the `mosfirmware` module when it is there, and the kernel
+unpacks it into `0:/firmware` whenever it sets up a system volume: RamFS
+boot (which then gets a 192 MiB RAM disk), `format` and `install`. A disk
+formatted before the firmware was added does not get it; format it again
+or boot RamFS.
+
+The files, by hand: copy these from `linux-firmware` (`nvidia/tu106/` for
+an RTX 2060; follow the symbolic links, MinimaFS has none) to
+`0:/firmware/nvidia/tu106/`:
 
 ```text
 gsp/booter_load-535.113.01.bin

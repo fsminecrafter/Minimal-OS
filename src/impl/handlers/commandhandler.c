@@ -1,3 +1,4 @@
+#include "x86_64/isr_crash.h"
 #include <stdbool.h>
 #include <stdint.h>
 #include "print.h"
@@ -487,6 +488,32 @@ static const char* user_crash_reason(uint8_t vector) {
     }
 }
 
+// Where it crashed, as "<program> +0x<offset>": the offset is into the
+// program's image, which the SDK links at 0, so
+// addr2line -f -e Minimal-OS-SDK/build/<program>/<program>.elf 0x<offset>
+// names the function.
+static void print_crash_details(uint64_t pid) {
+    const user_crash_info_t* c = isr_last_user_crash();
+    if (!c || c->pid != pid) return;
+    graphics_write_textr("  in ");
+    graphics_write_textr(c->name);
+    if (c->rip >= c->image_base && c->rip - c->image_base < c->image_size) {
+        graphics_write_textr(" at offset ");
+        graphics_write_textr_hex(c->rip - c->image_base);
+    } else {
+        graphics_write_textr(" at address ");
+        graphics_write_textr_hex64(c->rip);
+        graphics_write_textr(" (outside the program)");
+    }
+    graphics_write_textr(", error ");
+    graphics_write_textr_hex(c->error_code);
+    if (c->vector == 14) {
+        graphics_write_textr(", address ");
+        graphics_write_textr_hex64(c->fault_address);
+    }
+    graphics_write_textr("\n");
+}
+
 void command_user_process_exited(uint64_t pid, uint8_t exit_code,
                                  bool crashed, uint8_t crash_vector) {
     if (pid == 0 || g_last_user_pid != pid) return;
@@ -498,6 +525,7 @@ void command_user_process_exited(uint64_t pid, uint8_t exit_code,
         graphics_write_textr(": ");
         graphics_write_textr(user_crash_reason(crash_vector));
         graphics_write_textr(".\n");
+        print_crash_details(pid);
         return;
     }
 

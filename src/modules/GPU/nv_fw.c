@@ -88,11 +88,13 @@ bool nv_fw_parse_bin(const nv_fw_file_t* f, nv_fw_bin_hdr_t* out, const char** w
         le32(b), le32(b + 4), le32(b + 8), le32(b + 12), le32(b + 16), le32(b + 20),
     };
     if (h.bin_magic != NV_FW_BIN_MAGIC) { *why = "not an NVIDIA firmware file (bad magic)"; return false; }
-    if (h.bin_size > f->size) { *why = "file is shorter than its header says"; return false; }
-    if (h.header_offset < sizeof(b) || !range_ok(h.header_offset, 4, h.bin_size)) {
+    // bin_size is not the file length: NVIDIA's published files say more
+    // (booter_load-535.113.01: 0xE300, file 0xE288, which ends exactly
+    // where the ucode ends). nouveau ignores it too; check the real size.
+    if (h.header_offset < sizeof(b) || !range_ok(h.header_offset, 4, f->size)) {
         *why = "descriptor outside the file"; return false;
     }
-    if (h.data_size == 0 || !range_ok(h.data_offset, h.data_size, h.bin_size)) {
+    if (h.data_size == 0 || !range_ok(h.data_offset, h.data_size, f->size)) {
         *why = "ucode outside the file"; return false;
     }
     if (out) *out = h;

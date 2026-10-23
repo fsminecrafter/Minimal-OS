@@ -246,12 +246,41 @@ installer-payload:
 	fi
 	$(MKPKG) $(installer_dir) $(installer_mpkg) --store
 
+# GPU firmware (tools/gpu/setup-gpu.sh, 'make gpu-setup'): when firmware/
+# holds files, they go on the ISO as boot/mosfirmware.mpkg. GRUB loads it as
+# the "mosfirmware" module only if it is there, and the kernel unpacks it into
+# 0:/firmware whenever it sets up a system volume (RamFS, format, install).
+GPU_FIRMWARE_DIR ?= firmware
+firmware_mpkg := targets/x86_64/iso/boot/mosfirmware.mpkg
+
+.PHONY: firmware-payload
+firmware-payload:
+	@if [ -n "$$(find $(GPU_FIRMWARE_DIR) -type f 2>/dev/null | head -n 1)" ]; then \
+		$(MKPKG) $(GPU_FIRMWARE_DIR) $(firmware_mpkg) --store && \
+		echo "firmware: $(GPU_FIRMWARE_DIR)/ packed into the ISO as boot/mosfirmware.mpkg"; \
+	else \
+		rm -f $(firmware_mpkg); \
+	fi
+
+# make gpu-setup                     RTX 2060
+# make gpu-setup GPU="GTX 1660 Ti"   another card (or a chip: GPU=tu116)
+# make gpu-setup GPU=--detect        the NVIDIA card in this PC
+# make gpu-remove                    build without firmware again
+GPU ?= RTX 2060
+.PHONY: gpu-setup gpu-remove
+gpu-setup:
+	tools/gpu/setup-gpu.sh --out $(GPU_FIRMWARE_DIR) $(GPU)
+
+gpu-remove:
+	tools/gpu/setup-gpu.sh --out $(GPU_FIRMWARE_DIR) --remove
+
 .PHONY: build-x86_64
 build-x86_64: minimaSSL-slib $(source_object_files) $(audio_object_files)
 	mkdir -p dist/x86_64
 	$(LD) -o dist/x86_64/kernel.bin -T targets/x86_64/linker.ld $(source_object_files) $(audio_object_files)
 	cp dist/x86_64/kernel.bin targets/x86_64/iso/boot/kernel.bin
 	$(MAKE) --no-print-directory installer-payload
+	$(MAKE) --no-print-directory firmware-payload
 	# grub-mkrescue makes a BIOS + UEFI hybrid image when both GRUB
 	# platforms are installed (grub-pc-bin, grub-efi-amd64-bin, mtools).
 	grub-mkrescue -o dist/x86_64/kernel.iso targets/x86_64/iso
@@ -325,6 +354,11 @@ mosdesk-stage: mosdesk-dlr $(dlr_run) $(dlrconnect_run) $(fglcube_run) $(deliver
 
 run-mosdesk:
 	$(MAKE) MOSDESK=1 run
+
+# Builds the ISO with the desktop (for a real PC) without starting QEMU.
+.PHONY: mosdesk
+mosdesk:
+	$(MAKE) MOSDESK=1 build-x86_64
 
 # The whole desktop (mosdesk + mosWM + mosWM.service) as one Deliver
 # package, laid out like dlr's store (0:/var/dlrd/packages):

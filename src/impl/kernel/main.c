@@ -38,6 +38,7 @@
 
 #include "x86_64/network_manager.h"
 #include "x86_64/rtl8139.h"
+#include "x86_64/rtl8168.h"
 #include "net/ethernet.h"
 #include "net/arp.h"
 #include "net/ip.h"
@@ -51,6 +52,7 @@ bool kernel_boot_ramfs;
 uint32_t kernel_boot_ramfs_mib;
 multiboot2_info_t* kernel_multiboot_info;
 bool kernel_boot_debug;
+bool kernel_boot_serial_echo;
 
 
 void busy(void) {
@@ -102,6 +104,7 @@ void kernel_main(uint64_t mb2_info_addr) {
     pat_init();
     kernel_boot_no_disk = multiboot2_has_cmdline_token(mb_info, "no-disk");
     kernel_boot_debug = multiboot2_has_cmdline_token(mb_info, "--debug");
+    kernel_boot_serial_echo = multiboot2_has_cmdline_token(mb_info, "serial-echo");
     {
         char mib[12];
         bool sized = multiboot2_get_cmdline_value(mb_info, "ramfs=", mib, sizeof(mib));
@@ -197,6 +200,7 @@ void kernel_main(uint64_t mb2_info_addr) {
     serial_write_str(proc_list[0]);
 
     network_manager_register_driver(rtl8139_get_driver());
+    network_manager_register_driver(rtl8168_get_driver());
     if (network_manager_init()) {
         eth_init();
         arp_init();

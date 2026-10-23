@@ -1,16 +1,30 @@
 #include "x86_64/network_manager.h"
 #include "serial.h"
 
+// Drivers in registration order; the first whose hardware is present and
+// starts becomes the active one.
+#define NETWORK_MAX_DRIVERS 8
+static const network_hw_driver_t* g_drivers[NETWORK_MAX_DRIVERS];
+static uint32_t g_driver_count = 0;
 static const network_hw_driver_t* g_driver = NULL;
 
 void network_manager_register_driver(const network_hw_driver_t* drv) {
-    g_driver = drv;
+    if (drv && g_driver_count < NETWORK_MAX_DRIVERS) g_drivers[g_driver_count++] = drv;
 }
 
 bool network_manager_init(void) {
-    if (!g_driver) return false;
     serial_write_str("network_manager: initializing driver\n");
-    if (g_driver->init) return g_driver->init();
+    for (uint32_t i = 0; i < g_driver_count; i++) {
+        const network_hw_driver_t* drv = g_drivers[i];
+        if (drv->init && drv->init()) {
+            g_driver = drv;
+            serial_write_str("network_manager: using ");
+            serial_write_str(drv->name);
+            serial_write_str("\n");
+            return true;
+        }
+    }
+    serial_write_str("network_manager: no supported network card\n");
     return false;
 }
 

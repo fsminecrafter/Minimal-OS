@@ -26,6 +26,10 @@ PCI enumeration discovers devices by bus, device, and function. Driver code
 reads vendor/device IDs and maps BARs through the kernel MMIO allocator rather
 than using arbitrary virtual addresses.
 
+Enabling a device for a driver (`pci_enable_io_busmaster`) also brings it
+to full power (D0) if the firmware or a previous OS left it in a sleep
+state; until then its registers read as all ones.
+
 The MMIO subsystem reserves a high virtual range, creates page-table entries,
 and maps device registers or framebuffer memory. Device mappings must remain
 page aligned and should use the mapping helpers rather than direct identity
@@ -67,6 +71,13 @@ behave the same as with USB.
 
 User programs use `SYS_USB` wrappers for initialization, polling, keyboard
 presence, key translation, and keyboard metadata.
+
+## Network
+
+Network drivers register with the network manager, which uses the first one
+whose card is present: RTL8139 (`rtl8139.c`, QEMU's default) and
+RTL8111/8168 (`rtl8168.c`, PCI Express gigabit, `10ec:8168`/`10ec:8161`).
+Both are polled from the PIT tick. See [Networking](networking.md).
 
 ## Audio
 

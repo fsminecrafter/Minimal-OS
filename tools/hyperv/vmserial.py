@@ -7,9 +7,11 @@ terminal commands into it.
 The port is a Hyper-V named pipe on Windows (mosvm.ps1), or a QEMU serial
 socket on Linux (mosvm.sh): "unix:PATH" or "tcp:HOST:PORT".
 
-Commands are sent once the guest has been quiet for a moment (the
-terminal is waiting), one at a time, each after the previous one's output
-has settled.
+Commands are sent once the terminal has said it is ready (--ready, by
+default the line "=== TERMINAL READY ===") and the guest has been quiet
+for a moment, one at a time, each after the previous one's output has
+settled. Waiting for the marker matters: a driver that is slow to start
+also makes the guest quiet, and commands typed during boot pile up.
 """
 import argparse
 import ctypes
@@ -152,6 +154,8 @@ def main():
     ap.add_argument("--seconds", type=float, default=60)
     ap.add_argument("--commands", nargs="*", default=[])
     ap.add_argument("--quiet-before-command", type=float, default=4.0)
+    ap.add_argument("--ready", default="=== TERMINAL READY ===",
+                    help="text the guest prints when it takes commands ('' = do not wait)")
     args = ap.parse_args()
 
     deadline = time.time() + args.seconds
@@ -159,6 +163,9 @@ def main():
     pending = list(args.commands)
     last_rx = time.time()
     seen_output = False
+    marker = args.ready.encode()
+    ready = not marker
+    tail = b""                                      # for a marker split across reads
     with open(args.log, "wb") as out:
         while time.time() < deadline:
             n = port.available()
@@ -172,8 +179,11 @@ def main():
                 sys.stdout.flush()
                 last_rx = time.time()
                 seen_output = True
+                if not ready:
+                    tail = (tail + data)[-(len(marker) + 65536):]
+                    ready = marker in tail
                 continue
-            if pending and seen_output and time.time() - last_rx > args.quiet_before_command:
+            if pending and ready and seen_output and time.time() - last_rx > args.quiet_before_command:
                 cmd = pending.pop(0)
                 out.write(f"\n[vmserial] >>> {cmd}\n".encode())
                 for ch in cmd + "\r":

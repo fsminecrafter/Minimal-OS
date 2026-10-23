@@ -1,6 +1,7 @@
 #include "serial.h"
 #include <stdint.h>
 #include <stdbool.h>
+#include "x86_64/smp.h"
 
 bool enabled = true;
 bool initialized = false;
@@ -45,11 +46,38 @@ int serial_is_transmit_empty() {
     return inb(SERIAL_COM1 + 5) & 0x20;
 }
 
+/*
+ * One line at a time: a core keeps COM1 from its first character to its
+ * '\n', so lines printed by several cores at once do not mix character by
+ * character (a line is usually several calls: text, a number, "\n").
+ * Interrupts and other processes on the same core just continue the line.
+ * A core that stops mid-line (halted, or never ends the line) loses COM1
+ * to the next one after about 50 ms.
+ */
+#define SERIAL_NO_OWNER 0xFFFFFFFFu
+static volatile uint32_t g_line_owner = SERIAL_NO_OWNER;
+
+static void serial_take_line(uint32_t cpu) {
+    if (g_line_owner == cpu) return;
+    for (uint32_t spins = 0; spins < 2000000u; spins++) {
+        uint32_t expected = SERIAL_NO_OWNER;
+        if (__atomic_compare_exchange_n(&g_line_owner, &expected, cpu, false,
+                                        __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+            return;
+        }
+        asm volatile("pause");
+    }
+    __atomic_store_n(&g_line_owner, cpu, __ATOMIC_RELEASE);   // stalled owner
+}
+
 void serial_write(char a) {
     if (!initialized) return;
     if (!enabled) return;
+    uint32_t cpu = smp_current_cpu_id();
+    serial_take_line(cpu);
     while (serial_is_transmit_empty() == 0);
     outb(SERIAL_COM1, a);
+    if (a == '\n') __atomic_store_n(&g_line_owner, SERIAL_NO_OWNER, __ATOMIC_RELEASE);
 }
 
 void serial_write_str(const char* str) {

@@ -197,26 +197,32 @@ static bool ahci_port_reset(hba_port_t* port) {
     // Clear errors
     port->serr = 0xFFFFFFFF;
 
-    // Issue COMRESET (DET=1), then clear (DET=0)
+    // Issue COMRESET: DET=1 for at least 1 ms (AHCI 1.3 10.4.2), then DET=0.
+    // The waits are in milliseconds, not loop counts: every register
+    // access is slow in a VM, and on real boards most ports are empty.
     uint32_t sctl = port->sctl;
     port->sctl = (sctl & ~0x0F) | 0x01;
-    for (int i = 0; i < 100000; i++) {
-        port_wait();
-    }
+    ahci_sleep_ms(2);
     port->sctl = (sctl & ~0x0F);
 
-    // Wait for device to become present and active
-    int timeout = 1000000;
-    while (timeout-- > 0) {
+    // An attached device brings the link up within a few ms; a port with
+    // nothing on it stays at DET=0, so it is given up on after 50 ms.
+    uint64_t start = time_get_uptime_ms();
+    uint32_t polls = 0;
+    for (;;) {
         uint32_t ssts = port->ssts;
         uint8_t det = ssts & 0x0F;
         uint8_t ipm = (ssts >> 8) & 0x0F;
         if (det == HBA_PORT_DET_PRESENT && ipm == HBA_PORT_IPM_ACTIVE) {
+            port->serr = 0xFFFFFFFF;    // the reset itself sets error bits
             return true;
         }
+        uint64_t waited = time_get_uptime_ms() - start;
+        if (det == 0 && waited >= 50) return false;
+        if (waited >= 1000) return false;
+        if (++polls > 2000000u) return false;   // clock not running
+        asm volatile("pause" ::: "memory");
     }
-
-    return false;
 }
 
 static bool ahci_port_wait_ready(hba_port_t* port) {

@@ -30,7 +30,7 @@ memory test reserves only free PMM pages and halts after reporting PASS or FAIL.
 - memory and startup routines;
 - PCI enumeration;
 - USB and graphics driver-manager registration;
-- RTL8139 network registration, Ethernet/IP/UDP/TCP setup, and network syscall state;
+- network driver registration (RTL8139, RTL8168), Ethernet/IP/UDP/TCP setup, and network syscall state;
 - time and random seeding;
 - audio and AHCI storage-driver registration;
 - AP startup, interrupts, kernel background processes, and the terminal.
@@ -45,7 +45,13 @@ testing on a real PC. Real disks (AHCI, NVMe) are never probed, so nothing
 reads or writes them. Instead a zeroed RAM disk, `ram0` (64 MiB by default,
 less if memory is short, at least 16 MiB), is formatted as `0:`, the system
 files are unpacked into it as `format` would, and startup goes on as usual
-(services, desktop). Every change is lost at the next boot.
+(services, desktop). Every change is lost at the next boot. A boot module
+named `mosfirmware` (an `.mpkg`) is unpacked into `0:/firmware`; the test
+VM uses it to bring NVIDIA firmware files along.
+
+The kernel option `serial-echo` copies everything the terminal prints to
+COM1, so a headless VM's serial log contains command output as well as the
+kernel's own messages (`tools/hyperv/mosvm.sh` boots with it).
 
 ## Memory
 

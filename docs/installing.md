@@ -52,4 +52,4 @@ What has been made to work for real PCs:
 - write-combining framebuffer mapping.
 
 Not yet: USB hubs and USB storage, EHCI, network cards other than the
-RTL8139, audio other than AC'97/PC speaker, GPU acceleration.
+RTL8139 and RTL8111/8168, audio other than AC'97/PC speaker, GPU acceleration.

@@ -17,6 +17,8 @@
 #include "vgaterm.h"
 #include "minimafshandler.h"
 #include "x86_64/storage_setup.h"
+#include "x86_64/memlayout.h"
+#include "x86_64/pkgformat.h"
 #include "systeminfo.h"
 #include "mouse/usbmouse.h"
 
@@ -61,8 +63,10 @@ static void terminal_poll_serial_input(void) {
     static bool previous_was_cr = false;
 
     /* A hostile or accidentally connected serial peer must not starve the
-     * terminal process forever. */
-    for (uint16_t i = 0; i < INPUT_BUFFER_SIZE && serial_received(); i++) {
+     * terminal process forever.  Stop at a submitted line: anything typed
+     * after Enter stays in the UART until the command has been taken, or it
+     * would be appended to the line just submitted. */
+    for (uint16_t i = 0; i < INPUT_BUFFER_SIZE && !command_ready && serial_received(); i++) {
         char c = serial_read();
 
         if (c == '\r') {
@@ -484,11 +488,25 @@ static void ramfs_progress(uint32_t percent, const char* text) {
     serial_write_str("\n");
 }
 
+// A "mosfirmware" boot module (an .mpkg, see tools/hyperv/mosvm.sh) is
+// unpacked into 0:/firmware, so firmware files reach a RAM-only system.
+static void ramfs_install_firmware(void) {
+    memlayout_module_t m;
+    if (!memlayout_find_module(kernel_multiboot_info, "mosfirmware", &m)) return;
+    if (m.end <= m.start || m.end - m.start > 0xFFFFFFFFull) return;
+    serial_write_str("RamFS: unpacking the mosfirmware module into 0:/firmware\n");
+    if (!storage_install_package((const uint8_t*)(uintptr_t)m.start,
+                                 (uint32_t)(m.end - m.start), "0:/firmware")) {
+        vgaterm_print_error("RamFS: firmware files could not be installed\n");
+    }
+}
+
 static int ramfs_prepare(minimafs_disk_device_t* device) {
     if (!storage_format_volume(device, 0, "ramfs")) return 0;
     if (!storage_populate_system(0, ramfs_progress)) {
         vgaterm_print_error("RamFS: system files could not be installed\n");
     }
+    ramfs_install_firmware();
     return 1;
 }
 

@@ -5,7 +5,7 @@
 The kernel network path is:
 
 ```text
-RTL8139 -> Ethernet -> IPv4/ARP -> UDP/TCP -> syscall handles
+RTL8139 / RTL8168 -> Ethernet -> IPv4/ARP -> UDP/TCP -> syscall handles
 ```
 
 `network_manager` selects the NIC driver. Ethernet frames are passed to IPv4,
@@ -17,8 +17,13 @@ Only wire headers use network byte order.
 
 ## Initialization
 
-`kernel_main()` registers the RTL8139 driver and initializes Ethernet, IP, UDP,
-TCP, and `net_syscall`. The NIC must be initialized before protocol traffic can
+`kernel_main()` registers the network drivers, RTL8139 (QEMU's default card)
+and RTL8111/8168 (the gigabit NIC on most desktop boards, `rtl8168.c`); the
+network manager uses the first one whose card is present. Then it
+initializes Ethernet, IP, UDP, TCP, and `net_syscall`. Both drivers are
+polled. The RTL8168 driver has not been run on real hardware yet (QEMU has
+no RTL8168), so `RTL8168:` lines in the serial log are the first thing to
+check if networking does not come up on such a board. The NIC must be initialized before protocol traffic can
 be sent. `network_manager_poll()` pumps received frames and is called from
 blocking protocol operations and user polling wrappers.
 

@@ -220,8 +220,43 @@ int pci_bar_containing(const pci_device_t* dev, uint64_t phys, uint64_t len) {
     return -1;
 }
 
+// Offset of capability `id` in the device's capability list, or 0.
+uint8_t pci_find_capability(pci_device_t* dev, uint8_t id) {
+    if (!dev) return 0;
+    uint16_t status = pci_config_read_word(dev->bus, dev->device, dev->function, 0x06);
+    if (!(status & (1u << 4))) return 0;                  // no capability list
+    uint8_t off = (uint8_t)(pci_config_read_word(dev->bus, dev->device, dev->function, 0x34) & 0xFC);
+    for (int guard = 0; off >= 0x40 && guard < 48; guard++) {
+        uint16_t head = pci_config_read_word(dev->bus, dev->device, dev->function, off);
+        if ((head & 0xFF) == id) return off;
+        off = (uint8_t)((head >> 8) & 0xFC);
+    }
+    return 0;
+}
+
+// Wakes a device the firmware or a previous OS left in a low-power state
+// (D1-D3hot). Its registers read as all ones until it is back in D0.
+void pci_set_power_d0(pci_device_t* dev) {
+    uint8_t pm = pci_find_capability(dev, 0x01);         // power management
+    if (!pm) return;
+    uint16_t pmcsr = pci_config_read_word(dev->bus, dev->device, dev->function, pm + 4);
+    if ((pmcsr & 3u) == 0) return;
+    serial_write_str("pci: waking ");
+    serial_write_hex(dev->vendor_id);
+    serial_write_str(":");
+    serial_write_hex(dev->device_id);
+    serial_write_str(" from D");
+    serial_write_dec(pmcsr & 3u);
+    serial_write_str("\n");
+    pci_config_write_word(dev->bus, dev->device, dev->function, pm + 4,
+                          (uint16_t)(pmcsr & ~3u));
+    // D3hot -> D0 takes up to 10 ms (PCI PM 1.2); port 0x80 writes are ~1 us.
+    for (int i = 0; i < 12000; i++) port_outb(0x80, 0);
+}
+
 void pci_enable_io_busmaster(pci_device_t* dev) {
     if (!dev) return;
+    pci_set_power_d0(dev);
     uint16_t cmd = pci_config_read_word(dev->bus, dev->device, dev->function, 0x04);
     cmd |= (1U << 0); // I/O space
     cmd |= (1U << 1); // Memory space

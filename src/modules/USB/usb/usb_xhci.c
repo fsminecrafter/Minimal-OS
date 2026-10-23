@@ -470,6 +470,14 @@ static bool init_controller(pci_device_t* pci, xhci_t* hc) {
     hc->max_ports = hcs1 >> 24;
     hc->ctx_size = (hcc & (1u << 2)) ? 64 : 32;
 
+    if (r32(hc->op, 0x04) == 0xFFFFFFFFu) {
+        serial_write_str("xhci: registers read all ones (powered off?), skipping\n");
+        return false;
+    }
+    // After power-up (or D3 -> D0) nothing may be written before the
+    // controller clears CNR (xHCI 1.2, 4.2).
+    for (uint32_t i = 0; i < 1000 && (r32(hc->op, 0x04) & (1u << 11)); i++) udelay(1000);
+
     bios_handoff(hc);
 
     // Stop and reset.
@@ -479,7 +487,11 @@ static bool init_controller(pci_device_t* pci, xhci_t* hc) {
     for (uint32_t i = 0; i < 1000 && (r32(hc->op, 0x00) & (1u << 1)); i++) udelay(1000);
     for (uint32_t i = 0; i < 1000 && (r32(hc->op, 0x04) & (1u << 11)); i++) udelay(1000);
     if (r32(hc->op, 0x04) & (1u << 11)) {
-        serial_write_str("xhci: controller not ready after reset\n");
+        serial_write_str("xhci: controller not ready after reset (USBSTS=0x");
+        serial_write_hex(r32(hc->op, 0x04));
+        serial_write_str(", USBCMD=0x");
+        serial_write_hex(r32(hc->op, 0x00));
+        serial_write_str(")\n");
         return false;
     }
 

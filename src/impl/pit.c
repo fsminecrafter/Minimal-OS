@@ -59,11 +59,16 @@ void pit_irq_handler() {
 
     network_manager_poll(); //Net-no-scape
 
+    // Acknowledge IRQ0 before scheduling: scheduler_tick() may switch to a
+    // process that has never run, which starts in proc_trampoline() and
+    // never comes back here. Without the EOI the PIC holds IRQ0 for good:
+    // the clock stops (uptime, sleep(), timeouts) and so does USB, audio
+    // and network polling. Interrupts stay off until iret either way.
+    // (lapic_timer_irq_handler() has the same fix.)
+    pic_eoi_master();
+
     // Run scheduler
     scheduler_tick();
-    
-    // Send End Of Interrupt (EOI) to PIC master for IRQ0
-    pic_eoi_master();
 }
 
 uint64_t pit_get_ticks() {

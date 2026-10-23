@@ -201,6 +201,11 @@ static bool format_install_packages(uint8_t drive_number) {
                                   services);
 }
 
+bool storage_install_package(const uint8_t* archive, uint32_t archive_size,
+                             const char* target_dir) {
+    return format_install_package(archive, archive_size, target_dir);
+}
+
 static void setup_say(storage_progress_fn progress, uint32_t percent, const char* text) {
     serial_write_str("setup: ");
     serial_write_str(text);

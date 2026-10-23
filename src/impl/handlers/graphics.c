@@ -5,6 +5,7 @@
 #include "x86_64/spinlock.h"
 #include "panic.h"
 #include "serial.h"
+#include "x86_64/boot_options.h"
 #include "string.h"
 
 //8x8 font at dhepper/font8x8 - github
@@ -560,6 +561,7 @@ bool (*graphics_text_capture)(char c) = NULL;
 
 void graphics_write_textr_char(char c) {
     if (graphics_text_capture && graphics_text_capture(c)) return;
+    if (kernel_boot_serial_echo && c != '\r') serial_write(c);
     if (graphics_has_screen_owner()) return;
     invalidate_cursor();
 

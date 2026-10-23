@@ -52,7 +52,10 @@ void initializeGraphicsDevice();
 int pci_get_device_count(void);
 pci_device_t* pci_find_device(uint16_t vendor_id, uint16_t device_id);
 pci_device_t* pci_find_class(uint8_t class_code, uint8_t subclass);
+// Also wakes the device to D0 (see pci_set_power_d0).
 void pci_enable_io_busmaster(pci_device_t* dev);
+uint8_t pci_find_capability(pci_device_t* dev, uint8_t id);
+void pci_set_power_d0(pci_device_t* dev);
 
 /* Virtual buses: devices that are not reached through the 0xCF8/0xCFC
  * ports (for example PCI devices passed through to a Hyper-V VM, whose

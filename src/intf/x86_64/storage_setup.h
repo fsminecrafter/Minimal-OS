@@ -13,3 +13,7 @@ bool storage_format_volume(blockdev_t* device, uint8_t drive_number,
 // Creates etc/, services/, programs/ and System.conf on a mounted drive
 // and unpacks the built-in system packages into it.
 bool storage_populate_system(uint8_t drive_number, storage_progress_fn progress);
+
+// Unpacks an .mpkg archive in memory into target_dir (created if needed).
+bool storage_install_package(const uint8_t* archive, uint32_t archive_size,
+                             const char* target_dir);

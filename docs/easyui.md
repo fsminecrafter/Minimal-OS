@@ -88,6 +88,7 @@ include if they clash with your own names.
 | `ONFRAME` | Window only: once per frame, about 60 times a second | uptime in ms |
 | `ONCLOSE` | Window only: the close button was clicked | `0` |
 | `ONRESIZE` | Window only: the window changed size | the new width |
+| `ONWHEEL` | Canvas only: the mouse wheel turned over it | `1` up, `-1` down |
 
 `ONCHANGE` values by widget:
 
@@ -1507,3 +1508,14 @@ const char* easyui.pickedpath(void);
 
 **Returns** the full path from the last picker (`"0:/users/ann/notes.txt"`),
 or `""` after Cancel.
+
+## `easyui.mouse`
+
+```c
+void easyui.mouse(int* x, int* y, int* buttons);
+```
+
+The pointer in window coordinates (`-1, -1` when it is outside the
+window) and its buttons (bit 0 = left). Any argument may be `NULL`. Useful
+in a canvas's `ONPRESS` or `ONFRAME` to see where a click landed or to
+follow a drag.

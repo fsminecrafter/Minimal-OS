@@ -462,12 +462,17 @@ ci-test:
 
 .PHONY: test-host
 test-host: build/tests/host/gfx_blit_tests build/tests/host/fgpu_raster_tests build/tests/host/fgsl_tests \
-		build/tests/host/fgpu_ir_tests build/tests/host/nv_hw_tests
+		build/tests/host/fgpu_ir_tests build/tests/host/nv_hw_tests build/tests/host/hid_mouse_tests
 	./build/tests/host/gfx_blit_tests
 	./build/tests/host/fgpu_raster_tests
 	./build/tests/host/fgsl_tests
 	./build/tests/host/fgpu_ir_tests
 	./build/tests/host/nv_hw_tests
+	./build/tests/host/hid_mouse_tests
+
+build/tests/host/hid_mouse_tests: tests/host/hid_mouse_tests.c src/modules/USB/hid_mouse.c src/intf/mouse/hid_mouse.h
+	mkdir -p $(dir $@)
+	$(HOSTCC) $(HOST_CFLAGS) $(filter %.c,$^) -o $@
 
 build/tests/host/fgpu_raster_tests: tests/host/fgpu_raster_tests.c src/modules/GPU/fgpu_raster.c src/modules/GPU/fgpu_shader.c
 	mkdir -p $(dir $@)

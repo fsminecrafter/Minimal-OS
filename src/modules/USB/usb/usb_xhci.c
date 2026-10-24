@@ -5,6 +5,7 @@
 #include "x86_64/pmm.h"
 #include "keyboard/usbkeyboard.h"
 #include "mouse/usbmouse.h"
+#include "mouse/hid_mouse.h"
 #include "serial.h"
 #include "string.h"
 
@@ -68,6 +69,7 @@ typedef struct {
     uint8_t* in_ctx;
     uint8_t* report;        // one page; report at offset 0
     uint16_t report_size;
+    hid_mouse_layout_t mouse;   // valid: report protocol (wheel), else boot
 } xhci_dev_t;
 
 struct xhci {
@@ -246,8 +248,17 @@ static void handle_transfer(xhci_t* hc, trb_t* ev) {
         xhci_dev_t* d = &g_devs[i];
         if (!d->used || d->hc != hc || d->slot != slot || d->dci != ep) continue;
         if (code == CC_SUCCESS || code == CC_SHORT_PACKET) {
-            if (d->keyboard) usb_keyboard_process_report((const usb_hid_keyboard_report_t*)d->report);
-            else usb_mouse_process_report((const usb_hid_mouse_report_t*)d->report);
+            if (d->keyboard) {
+                usb_keyboard_process_report((const usb_hid_keyboard_report_t*)d->report);
+            } else if (d->mouse.valid) {
+                uint32_t got = d->report_size - (ev->status & 0xFFFFFFu);  // minus residue
+                uint8_t buttons;
+                int32_t dx, dy, wheel;
+                if (hid_mouse_decode(&d->mouse, d->report, got, &buttons, &dx, &dy, &wheel))
+                    usb_mouse_process_motion(buttons, dx, dy, wheel);
+            } else {
+                usb_mouse_process_report((const usb_hid_mouse_report_t*)d->report);
+            }
         }
         queue_report(d);
         return;
@@ -331,7 +342,7 @@ static bool setup_device(xhci_t* hc, uint32_t port, uint8_t speed) {
     // First HID boot keyboard or mouse interface and its interrupt IN endpoint.
     int iface = -1, protocol = 0;
     uint8_t ep_addr = 0, interval = 10;
-    uint16_t ep_mps = 8;
+    uint16_t ep_mps = 8, hid_report_length = 0;
     for (uint32_t off = 0; off + 2 <= total && buf[off] >= 2; off += buf[off]) {
         uint8_t len = buf[off], type = buf[off + 1];
         if (type == 4 && len >= 9) {                // interface
@@ -343,6 +354,10 @@ static bool setup_device(xhci_t* hc, uint32_t port, uint8_t speed) {
             } else if (!ep_addr) {
                 iface = -1;
             }
+        } else if (type == 0x21 && len >= 9 && iface >= 0 && !ep_addr) {
+            // HID descriptor: the first class descriptor is the report one.
+            if (buf[off + 6] == 0x22)
+                hid_report_length = (uint16_t)(buf[off + 7] | (buf[off + 8] << 8));
         } else if (type == 5 && len >= 7 && iface >= 0 && !ep_addr) {
             if ((buf[off + 2] & 0x80) && (buf[off + 3] & 3) == 3) {
                 ep_addr = buf[off + 2];
@@ -360,7 +375,19 @@ static bool setup_device(xhci_t* hc, uint32_t port, uint8_t speed) {
     d->report_size = ep_mps > 64 ? 64 : ep_mps;
 
     if (!control(d, 0x00, 9, config_value, 0, 0, NULL)) return false;    // SET_CONFIGURATION
-    control(d, 0x21, 0x0B, 0, (uint16_t)iface, 0, NULL);                  // SET_PROTOCOL boot
+    // Mice: boot protocol has no wheel on most real mice, so read the
+    // report descriptor and use report protocol when it makes sense.
+    memset(&d->mouse, 0, sizeof(d->mouse));
+    if (!d->keyboard && hid_report_length) {
+        uint16_t want = hid_report_length > 2048 ? 2048 : hid_report_length;
+        uint8_t* rd = buf + 1024;
+        if (control(d, 0x81, 6, 0x2200, (uint16_t)iface, want, rd) &&
+            hid_mouse_parse(rd, want, &d->mouse))
+            serial_write_str(d->mouse.wheel.size ? "xhci: mouse report protocol, wheel\n"
+                                                 : "xhci: mouse report protocol, no wheel\n");
+    }
+    // SET_PROTOCOL: 1 = report, 0 = boot.
+    control(d, 0x21, 0x0B, d->mouse.valid ? 1 : 0, (uint16_t)iface, 0, NULL);
     if (d->keyboard) control(d, 0x21, 0x0A, 0, (uint16_t)iface, 0, NULL); // SET_IDLE
 
     // Configure the interrupt endpoint.

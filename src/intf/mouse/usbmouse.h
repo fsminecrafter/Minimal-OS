@@ -41,6 +41,8 @@ void usb_mouse_init(void);
 
 // Feeds one HID boot mouse report into the driver. Called by the UHCI
 // driver's interrupt-poll path (see uhci.h).
+// Movement already decoded from a report-protocol mouse.
+void usb_mouse_process_motion(uint8_t buttons, int32_t dx, int32_t dy, int32_t wheel);
 void usb_mouse_process_report(const usb_hid_mouse_report_t* report);
 
 // Read-only snapshot: current buttons + last raw report.

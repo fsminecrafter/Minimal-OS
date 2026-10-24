@@ -306,8 +306,10 @@ static uint16_t hda_ring_entries(uint8_t size_reg, uint8_t* sel) {
 }
 
 static bool hda_setup_rings(void) {
-    g_corb = (volatile uint32_t*)kmalloc_aligned(1024, 128);
-    g_rirb = (volatile uint32_t*)kmalloc_aligned(2048, 128);
+    /* Allocated once; a later controller (after one was given up) reuses
+     * them. */
+    if (!g_corb) g_corb = (volatile uint32_t*)kmalloc_aligned(1024, 128);
+    if (!g_rirb) g_rirb = (volatile uint32_t*)kmalloc_aligned(2048, 128);
     if (!g_corb || !g_rirb) return false;
     memset((void*)g_corb, 0, 1024);
     memset((void*)g_rirb, 0, 2048);
@@ -756,21 +758,54 @@ static volatile uint8_t* hda_map_bar0(pci_device_t* dev) {
     return (volatile uint8_t*)(va + (phys - base));
 }
 
-static bool hda_init(void) {
-    serial_write_str("HDA: Searching for HD Audio controller...\n");
-    if (pci_get_device_count() == 0) pci_enumerate_all();
+/* Stops a controller that was given up, so it no longer reads or writes
+ * the command rings the next one will use. */
+static void hda_abandon(void) {
+    if (!g_mmio) return;
+    w8(HDA_CORBCTL, 0);
+    w8(HDA_RIRBCTL, 0);
+    w32(HDA_GCTL, r32(HDA_GCTL) & ~HDA_GCTL_CRST);
+    g_mmio = NULL;
+}
 
-    pci_device_t* dev = pci_find_class(PCI_CLASS_MULTIMEDIA, PCI_SUBCLASS_HDA);
-    if (!dev) {
-        serial_write_str("HDA: No controller found\n");
-        return false;
-    }
-    if (dev->bar_type[0] != PCI_BAR_MEM) {
-        serial_write_str("HDA: BAR0 is not memory mapped\n");
-        return false;
-    }
+/* HD Audio controllers have a memory BAR0. Intel ones with the audio DSP
+ * enabled report the "audio device" subclass (0x01) instead of HDA (0x03);
+ * AC97 controllers share that subclass but have I/O BARs. */
+static bool hda_candidate(const pci_device_t* d) {
+    return d->class_code == PCI_CLASS_MULTIMEDIA &&
+           (d->subclass == PCI_SUBCLASS_HDA || d->subclass == 0x01) &&
+           d->bar_type[0] == PCI_BAR_MEM;
+}
 
+/* Graphics cards' HDMI/DisplayPort audio: tried last, as it has no
+ * speaker or headphone jacks. */
+static bool hda_is_gpu_audio(const pci_device_t* d) {
+    return d->vendor_id == 0x10DE || (d->vendor_id == 0x1002 &&
+           d->device_id != 0x437B && d->device_id != 0x4383);  /* ATI SB450/SB600+ */
+}
+
+/* Lets the controller see what the CPU wrote to its buffers (cache snoop),
+ * as Linux does: PCIe "no snoop" off, and AMD's own snoop enable. */
+static void hda_enable_snoop(pci_device_t* dev) {
+    uint8_t pcie = pci_find_capability(dev, 0x10);
+    if (pcie) {
+        uint32_t v = pci_config_read(dev->bus, dev->device, dev->function, (uint8_t)(pcie + 8));
+        if (v & (1u << 11)) pci_cfg_write32(dev, (uint8_t)(pcie + 8), v & ~(1u << 11));
+    }
+    if (dev->vendor_id == 0x1022 || dev->vendor_id == 0x1002) {
+        /* ATI_SB450_HDAUDIO_MISC_CNTR2 (0x42): bits 2:0 = 2, snoop on. */
+        uint32_t v = pci_config_read(dev->bus, dev->device, dev->function, 0x40);
+        v = (v & ~(0x07u << 16)) | (0x02u << 16);
+        pci_cfg_write32(dev, 0x40, v);
+    }
+}
+
+static bool hda_try_controller(pci_device_t* dev) {
+    g_immediate = false;
+    g_dac_count = 0;
+    g_mmio = NULL;
     pci_enable_io_busmaster(dev);
+    hda_enable_snoop(dev);
     if (dev->vendor_id == 0x8086) {
         /* Intel: TCSEL (config 0x44 bits 2:0) to TC0, as Linux does,
          * or some chipsets play crackly or stall. */
@@ -864,6 +899,28 @@ static bool hda_init(void) {
     serial_write_dec((uint64_t)g_dac_count);
     serial_write_str(" DAC(s)\n");
     return true;
+}
+
+
+static bool hda_init(void) {
+    serial_write_str("HDA: Searching for HD Audio controller...\n");
+    if (pci_get_device_count() == 0) pci_enumerate_all();
+
+    /* Every controller is tried until one has a usable analog output:
+     * the first one found is often a graphics card's HDMI audio. */
+    bool any = false;
+    for (int pass = 0; pass < 2; pass++) {
+        for (int i = 0; i < pci_get_device_count(); i++) {
+            pci_device_t* dev = &pci_devices[i];
+            if (!hda_candidate(dev) || hda_is_gpu_audio(dev) != (pass == 1)) continue;
+            any = true;
+            if (hda_try_controller(dev)) return true;
+            hda_abandon();
+        }
+    }
+    serial_write_str(any ? "HDA: no controller with a usable output\n"
+                         : "HDA: No controller found\n");
+    return false;
 }
 
 static const audio_hw_driver_t hda_driver = {

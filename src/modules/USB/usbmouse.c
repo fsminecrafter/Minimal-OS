@@ -15,6 +15,26 @@ void usb_mouse_init(void) {
     serial_write_str("USB Mouse: Ready (waiting for device)\n");
 }
 
+void usb_mouse_process_motion(uint8_t raw_buttons, int32_t dx, int32_t dy, int32_t wheel) {
+    g_mouse_seen = true;
+    g_mouse_state.left   = (raw_buttons & USB_MOUSE_BTN_LEFT)   != 0;
+    g_mouse_state.right  = (raw_buttons & USB_MOUSE_BTN_RIGHT)  != 0;
+    g_mouse_state.middle = (raw_buttons & USB_MOUSE_BTN_MIDDLE) != 0;
+    uint8_t buttons = raw_buttons &
+        (USB_MOUSE_BTN_LEFT | USB_MOUSE_BTN_RIGHT | USB_MOUSE_BTN_MIDDLE);
+    if (dx || dy)
+        input_event_push(SYSCALL_INPUT_MOUSE_MOVE, 0, 0, buttons, dx, dy, 0);
+    if (buttons != g_last_event_buttons) {
+        input_event_push(SYSCALL_INPUT_MOUSE_BUTTON, 0, 0, buttons, 0, 0, 0);
+        g_last_event_buttons = buttons;
+    }
+    if (wheel)
+        input_event_push(SYSCALL_INPUT_MOUSE_WHEEL, 0, 0, buttons, 0, 0, wheel);
+    g_mouse_state.accum_dx    += dx;
+    g_mouse_state.accum_dy    += dy;
+    g_mouse_state.accum_wheel += wheel;
+}
+
 void usb_mouse_process_report(const usb_hid_mouse_report_t* report) {
     if (!report) return;
 

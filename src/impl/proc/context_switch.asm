@@ -2,7 +2,7 @@
 section .text
 global context_switch
 
-; RDI = old process_t*, RSI = new process_t*
+; RDI = old process_t*, RSI = new process_t*, RDX = &old->on_cpu (or 0)
 
 ; CORRECT OFFSETS:
 ; pml4 at 0xD8, kernel_stack at 0xE0, regs at 0x90
@@ -42,6 +42,13 @@ context_switch:
     mov r14, [rsi + 0x0000000000000090 + 4*8]
     mov r15, [rsi + 0x0000000000000090 + 5*8]
     mov rsp, [rsi + 0x0000000000000090 + 6*8]
+
+    ; Off the old stack and its registers are saved: another core may run
+    ; the old process from here on (see scheduler_rebalance()).
+    test rdx, rdx
+    jz .no_on_cpu
+    mov dword [rdx], 0
+.no_on_cpu:
     
     push qword [rsi + 0x0000000000000090 + 8*8]
     popfq

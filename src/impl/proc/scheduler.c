@@ -28,7 +28,15 @@ bool scheduler_on = false;
 extern process_t* proc_list_head;
 
 // Forward declaration of context switch assembly routine
-extern void context_switch(process_t* current, process_t* next);
+extern void context_switch(process_t* current, process_t* next,
+                           volatile uint32_t* current_on_cpu);
+
+// Marks `next` as live on this CPU; `current` is released by the assembly
+// once its context is saved and its stack no longer in use.
+static void switch_to(process_t* current, process_t* next) {
+    next->on_cpu = 1;
+    context_switch(current, next, current ? &current->on_cpu : NULL);
+}
 
 // Statistics
 static uint64_t total_context_switches = 0;
@@ -254,6 +262,12 @@ void scheduler_rebalance(void) {
     for (uint32_t level = 0; level < SCHED_NUM_LEVELS; level++) {
         for (process_t* candidate = src->head[level]; candidate;
              candidate = candidate->rq_next) {
+            // Just requeued by a core that has not finished switching
+            // away from it yet: its saved registers are stale and its
+            // stack is still in use there. Moving it now let two cores
+            // run on one kernel stack (a #GP on iretq a few seconds after
+            // starting an app).
+            if (candidate->on_cpu) continue;
             if (candidate->cpu_time_ms < migrant_cpu_time) {
                 migrant = candidate;
                 migrant_level = level;
@@ -467,7 +481,7 @@ bool scheduler_is_idle_process(const process_t* proc) {
     return proc && proc >= &g_ap_idle[0] && proc < &g_ap_idle[MAX_CPUS];
 }
 
-void schedule() {
+static void schedule_irqs_off(void) {
     uint32_t cpu_id = smp_current_cpu_id();
     percpu_runqueue_t* rq = &g_runqueues[cpu_id];
 
@@ -540,6 +554,9 @@ void schedule() {
 
     // ---- Per-CPU dispatch ----
     process_t* old = current_process;
+    // Live on this CPU until context_switch() saves it (some processes,
+    // like the boot one, started running without passing through it).
+    if (old) old->on_cpu = 1;
     process_t* idle = ap_idle_for(cpu_id);
 
     uint64_t rq_flags = spinlock_acquire(&rq->lock);
@@ -586,7 +603,7 @@ void schedule() {
             }
             idle->state = PROCESS_RUNNING;
             current_process = idle;
-            context_switch(old, idle);
+            switch_to(old, idle);
         }
         return;
     }
@@ -625,7 +642,7 @@ void schedule() {
         // entry point never ran (this is how 'kernelaudio' got lost on
         // cpu1 and audio playback never refilled).
         idle->state = PROCESS_RUNNING;
-        context_switch(idle, next);
+        switch_to(idle, next);
         return;
     }
 
@@ -657,7 +674,21 @@ void schedule() {
         serial_write_str("\n");
     }
 
-    context_switch(old, next);
+    switch_to(old, next);
+}
+
+// Interrupts stay off for all of schedule(): kernel processes call it
+// with them on (from sleep()/yield), and a timer tick landing between
+// "current_process = next" and the actual switch ran a nested schedule()
+// that saved this CPU's context into the wrong process. That process
+// later resumed on another one's stack (#GP on iretq, seconds after an
+// app started on a second core). Each context keeps its own flags: the
+// switch saves and restores RFLAGS, and new processes start with IF=1.
+void schedule() {
+    uint64_t flags;
+    asm volatile("pushfq; pop %0; cli" : "=r"(flags) :: "memory");
+    schedule_irqs_off();
+    if (flags & 0x200) asm volatile("sti" ::: "memory");
 }
 
 /*

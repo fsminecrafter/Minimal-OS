@@ -130,6 +130,10 @@ typedef struct process {
     size_t user_stack_size;
     uint64_t parent_pid;
     bool is_window_manager;
+    // Set while this process's registers and kernel stack are live on a
+    // CPU. context_switch() clears it only once it has saved them and left
+    // the stack, so another core must not take the process before then.
+    volatile uint32_t on_cpu;
 } process_t;
 
 // Global process list head (defined in proc.c)

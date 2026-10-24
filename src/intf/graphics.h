@@ -56,6 +56,7 @@ void graphics_init(void);
 uint32_t graphics_get_width(void);
 uint32_t graphics_get_height(void);
 bool graphics_get_display_info(gfx_display_info_t* info);
+const gpu_device_t* graphics_panic_screen(void);
 bool graphics_backbuffer_blit(const gfx_surface_t* src,
                               const gfx_rect_t* src_rect,
                               int32_t dst_x, int32_t dst_y, bool alpha);

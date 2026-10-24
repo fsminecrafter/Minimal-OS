@@ -844,6 +844,15 @@ uint32_t graphics_get_height(void) {
     return g_gpu ? g_gpu->height : 0;
 }
 
+// For panic(): the screen device, read without the graphics lock. If a
+// program flipped the display to another VRAM page, point it back at the
+// main framebuffer so what panic() draws is what is shown.
+const gpu_device_t* graphics_panic_screen(void) {
+    gpu_adapter_t* a = gpu_primary_adapter();
+    if (a && a->flip && a->scanout_in_vram) a->flip(a, a->scanout_offset);
+    return g_gpu;
+}
+
 bool graphics_get_display_info(gfx_display_info_t* info) {
     if (!info) return false;
     uint64_t flags = spinlock_acquire(&g_graphics_lock);

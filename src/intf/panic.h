@@ -13,3 +13,6 @@ typedef struct RegisterState {
 #define PANIC_WITH_REGS(msg, regs) panic(msg, __FILE__, __LINE__, regs)
 
 noreturn void panic(const char* message, const char* file, int line, const RegisterState* regs);
+
+// True once a core has entered panic() (the others are being stopped).
+int panic_in_progress(void);

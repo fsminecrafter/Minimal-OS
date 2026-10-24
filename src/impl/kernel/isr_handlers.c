@@ -51,6 +51,10 @@ static const char* exception_name(uint64_t vector) {
  */
 void isr_generic_handler(uint64_t vector, uint64_t error_code,
                          uint64_t saved_rip, uint64_t saved_cs) {
+    // panic() stops the other cores with an NMI: just halt here.
+    if (vector == 2 && panic_in_progress()) {
+        for (;;) asm volatile("cli; hlt");
+    }
     if (vector == 14) {
         uint64_t cr2;
         asm volatile("mov %%cr2, %0" : "=r"(cr2));
@@ -106,5 +110,27 @@ void isr_generic_handler(uint64_t vector, uint64_t error_code,
         process_exit_with_status(0xFF, true, (uint8_t)vector);
     }
 
-    PANIC("Unhandled CPU exception");
+    // Kernel-mode exception: put the details in the panic message, since
+    // the screen is often the only thing the user can see.
+    static char message[160];
+    static const char hex[] = "0123456789ABCDEF";
+    int n = 0;
+    const char* parts[] = { "CPU exception ", exception_name(vector) };
+    for (int p = 0; p < 2; p++)
+        for (const char* c = parts[p]; *c && n < 100; c++) message[n++] = *c;
+    const char* labels[] = { " vec=0x", " err=0x", " rip=0x" };
+    uint64_t values[] = { vector, error_code, saved_rip };
+    for (int p = 0; p < 3; p++) {
+        for (const char* c = labels[p]; *c; c++) message[n++] = *c;
+        int digits = p == 2 ? 16 : 4;
+        for (int i = digits - 1; i >= 0; i--) message[n++] = hex[(values[p] >> (4 * i)) & 0xF];
+    }
+    if (vector == 14) {
+        uint64_t cr2;
+        asm volatile("mov %%cr2, %0" : "=r"(cr2));
+        for (const char* c = " cr2=0x"; *c; c++) message[n++] = *c;
+        for (int i = 15; i >= 0; i--) message[n++] = hex[(cr2 >> (4 * i)) & 0xF];
+    }
+    message[n] = 0;
+    PANIC(message);
 }

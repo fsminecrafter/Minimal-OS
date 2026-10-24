@@ -95,3 +95,14 @@ void lapic_send_init_ipi(uint32_t target_apic_id) {
 void lapic_send_startup_ipi(uint32_t target_apic_id, uint8_t vector) {
     lapic_send_ipi(target_apic_id, LAPIC_ICR_DELIVERY_STARTUP, vector);
 }
+
+// Sends an NMI to every core but this one (used by panic() to stop the
+// others). Bounded wait: a panicking core must never hang here.
+void lapic_send_nmi_all_but_self(void) {
+    if (!g_lapic_mmio) return;
+    for (int i = 0; i < 100000 && (lapic_read(LAPIC_REG_ICR_LOW) & LAPIC_ICR_DELIVERY_STATUS); i++)
+        asm volatile("pause");
+    lapic_write(LAPIC_REG_ICR_HIGH, 0);
+    lapic_write(LAPIC_REG_ICR_LOW, (3u << 18) /* all excluding self */ |
+                                   (4u << 8)  /* NMI */ | LAPIC_ICR_LEVEL_ASSERT);
+}

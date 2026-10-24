@@ -88,6 +88,13 @@ static void lapic_send_ipi(uint32_t target_apic_id, uint32_t delivery_mode, uint
     lapic_wait_icr_idle();
 }
 
+void lapic_send_fixed_ipi(uint32_t target_apic_id, uint8_t vector) {
+    if (!g_lapic_mmio) return;
+    lapic_wait_icr_idle();
+    lapic_write(LAPIC_REG_ICR_HIGH, target_apic_id << 24);
+    lapic_write(LAPIC_REG_ICR_LOW, vector | LAPIC_ICR_LEVEL_ASSERT);   // fixed delivery
+}
+
 void lapic_send_init_ipi(uint32_t target_apic_id) {
     lapic_send_ipi(target_apic_id, LAPIC_ICR_DELIVERY_INIT, 0);
 }

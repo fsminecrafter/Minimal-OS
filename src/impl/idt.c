@@ -10,6 +10,7 @@
 #include "x86_64/exec_trace.h"
 #include "x86_64/lapic.h"
 #include "x86_64/lapic_timer.h"
+#include "x86_64/smp_par.h"
 #include "x86_64/smp.h"
 
 #define IDT_IRQ0_TIMER 0x20
@@ -32,6 +33,7 @@ extern void idt_handler_pit_wrapped();
 extern void idt_handler_doublefault_wrapped();
 extern void isr_spurious();
 extern void lapic_timer_irq_handler_wrapped();
+extern void smp_par_ipi_handler_wrapped();
 extern void idt_handler_stray_vector_wrapped();
 
 #define PIC_IRQ_STUB(n) \
@@ -193,6 +195,9 @@ void idt_init() {
 	// Per-core scheduler tick, driven by each core's own LAPIC timer.
 	// See lapic_timer_init() / ap_entry_c() in smp.c.
 	idt_set_entry(LAPIC_TIMER_VECTOR, (uint64_t)lapic_timer_irq_handler_wrapped, GDT_SELECTOR_CS_KERNEL, IDT_ENTRY_TYPE_INTERRUPT, 0);
+
+	// "Help with this job" IPI (x86_64/smp_par.h).
+	idt_set_entry(SMP_PAR_VECTOR, (uint64_t)smp_par_ipi_handler_wrapped, GDT_SELECTOR_CS_KERNEL, IDT_ENTRY_TYPE_INTERRUPT, 0);
 
 	// Software syscall gate for .run programs (see x86_64/syscall.h).
 	// DPL3 so it stays callable once real ring3 processes exist; every

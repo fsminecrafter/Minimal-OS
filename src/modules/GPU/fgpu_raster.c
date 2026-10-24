@@ -6,9 +6,44 @@
 #define FIXED_VARS 10           // built-in programs: world[3], normal[3], color[4]
 #define VAR_MAX (FGPU_SHADER_MAX_VARYINGS * 4)
 
-// Shader invocations run FGPU_LANES at a time. One draw runs at a time
-// (the kernel serializes SYS_GPU), so these can be shared.
-static fgpu_shader_batch_t g_vs_batch, g_fs_batch;
+// Triangles per round: shaded and clipped first, then rasterized.
+#define CHUNK_TRIS 256
+#define GEOMETRY_PART 16        // triangles per geometry part
+#define MIN_BAND_ROWS 8
+
+// Shader invocations run FGPU_LANES at a time, with one pair of batches
+// per worker. One draw runs at a time (the kernel serializes SYS_GPU).
+static fgpu_shader_batch_t g_vs_batch[FGPU_RASTER_MAX_WORKERS], g_fs_batch[FGPU_RASTER_MAX_WORKERS];
+static uint32_t g_batch_epoch[FGPU_RASTER_MAX_WORKERS];
+static uint32_t g_epoch = 1;            // bumped per draw: batches are reset on first use
+static fgpu_parallel_t g_par;
+
+void fgpu_raster_set_parallel(const fgpu_parallel_t* par) {
+    if (par) g_par = *par;
+    else { g_par.workers = NULL; g_par.run = NULL; }
+}
+
+static uint32_t worker_count(void) {
+    if (!g_par.run || !g_par.workers) return 1;
+    uint32_t n = g_par.workers();
+    if (n < 1) n = 1;
+    return n < FGPU_RASTER_MAX_WORKERS ? n : FGPU_RASTER_MAX_WORKERS;
+}
+
+static void run_parts(fgpu_part_fn fn, void* ctx, uint32_t parts) {
+    if (parts > 1 && g_par.run && worker_count() > 1) g_par.run(fn, ctx, parts);
+    else for (uint32_t i = 0; i < parts; i++) fn(ctx, i, 0);
+}
+
+// The worker's shader batch, with its registers cleared for this draw.
+static fgpu_shader_batch_t* batch_for(const fgpu_pipeline_t* p, uint32_t worker, bool fragment) {
+    if (g_batch_epoch[worker] != g_epoch) {
+        g_batch_epoch[worker] = g_epoch;
+        fgpu_shader_batch_reset(&g_vs_batch[worker], p->shader->h.temp_count);
+        fgpu_shader_batch_reset(&g_fs_batch[worker], p->shader->h.temp_count);
+    }
+    return fragment ? &g_fs_batch[worker] : &g_vs_batch[worker];
+}
 
 /* ---------------------------------------------------------------- math */
 
@@ -192,9 +227,9 @@ static inline bool edge_owns(float dx, float dy) {
 // Runs the fragment stage for interpolated (already divided) varyings.
 // Returns false when the fragment is discarded.
 // Runs the vertex shader for up to FGPU_LANES vertices at once.
-static void shade_vertices(const fgpu_pipeline_t* p, const fgpu_layout_t* layout,
+static void shade_vertices(const fgpu_pipeline_t* p, const fgpu_layout_t* layout, uint32_t worker,
                            const float* const* in, uint32_t n, vtx_t* out) {
-    fgpu_shader_batch_t* b = &g_vs_batch;
+    fgpu_shader_batch_t* b = batch_for(p, worker, false);
     for (uint32_t l = 0; l < n; l++) {
         float attr[FGPU_MAX_ATTRIBS][4];
         fetch_vertex(layout, in[l], attr);
@@ -210,18 +245,19 @@ static void shade_vertices(const fgpu_pipeline_t* p, const fgpu_layout_t* layout
     }
 }
 
-static bool shade(const fgpu_pipeline_t* p, const float* var, const float special[2][4],
-                  float out[4]) {
+static bool shade(const fgpu_pipeline_t* p, uint32_t worker, const float* var,
+                  const float special[2][4], float out[4]) {
     if (p->shader) {
-        float in[FGPU_SHADER_MAX_VARYINGS][4];
+        // One lane of the worker's batch.
+        fgpu_shader_batch_t* b = batch_for(p, worker, true);
         uint32_t n = p->shader->h.varying_count;
         for (uint32_t v = 0; v < n; v++)
-            for (int i = 0; i < 4; i++) in[v][i] = var[v * 4 + i];
-        float o[1][4];
-        fgpu_shader_io_t io = { p->shader, (const float (*)[4])in, o, p->constants, special,
-                                p->textures };
-        if (!fgpu_shader_run_fragment(&io)) return false;
-        for (int i = 0; i < 4; i++) out[i] = o[0][i];
+            for (int i = 0; i < 4; i++) b->input[v][i][0] = var[v * 4 + i];
+        for (int k = 0; k < 2; k++)
+            for (int i = 0; i < 4; i++) b->special[k][i][0] = special[k][i];
+        if (!(fgpu_shader_run_batch(p->shader, true, b, 1, p->constants, p->textures) & 1))
+            return false;
+        for (int i = 0; i < 4; i++) out[i] = b->output[0][i][0];
         return true;
     }
     if (p->program == FGPU_PROGRAM_PHONG) {
@@ -239,10 +275,10 @@ typedef struct {
     float z[FGPU_LANES];
 } frag_batch_t;
 
-static void flush_fragments(const fgpu_target_t* t, const fgpu_pipeline_t* p, frag_batch_t* fb,
+static void flush_fragments(const fgpu_target_t* t, const fgpu_pipeline_t* p,
+                            fgpu_shader_batch_t* b, frag_batch_t* fb,
                             bool late_depth, bool depth_write, bool blending) {
     if (!fb->n) return;
-    fgpu_shader_batch_t* b = &g_fs_batch;
     uint32_t kept = fgpu_shader_run_batch(p->shader, true, b, (1u << fb->n) - 1, p->constants,
                                           p->textures);
     for (uint32_t l = 0; l < fb->n; l++) {
@@ -257,7 +293,9 @@ static void flush_fragments(const fgpu_target_t* t, const fgpu_pipeline_t* p, fr
     fb->n = 0;
 }
 
+// Draws the rows band_y0 <= y < band_y1 of a triangle.
 static void raster_triangle(const fgpu_target_t* t, const fgpu_pipeline_t* p, uint32_t nvar,
+                            uint32_t worker, int32_t band_y0, int32_t band_y1,
                             const svtx_t* a, const svtx_t* b, const svtx_t* c) {
     float area = edge(a->x, a->y, b->x, b->y, c->x, c->y);
     if (area == 0.0f) return;
@@ -281,6 +319,8 @@ static void raster_triangle(const fgpu_target_t* t, const fgpu_pipeline_t* p, ui
     int32_t clip_y1 = p->vp_y + p->vp_h;
     if (clip_x1 > (int32_t)t->width) clip_x1 = (int32_t)t->width;
     if (clip_y1 > (int32_t)t->height) clip_y1 = (int32_t)t->height;
+    if (clip_y0 < band_y0) clip_y0 = band_y0;
+    if (clip_y1 > band_y1) clip_y1 = band_y1;
 
     float fx0 = f_floor(minx), fx1 = f_ceil(maxx), fy0 = f_floor(miny), fy1 = f_ceil(maxy);
     if (fx1 < (float)clip_x0 || fy1 < (float)clip_y0 ||
@@ -306,23 +346,25 @@ static void raster_triangle(const fgpu_target_t* t, const fgpu_pipeline_t* p, ui
     special[1][0] = special[1][1] = special[1][2] = special[1][3] = front ? 1.0f : 0.0f;
     frag_batch_t fb;
     fb.n = 0;
-    fgpu_shader_batch_t* sb = &g_fs_batch;
+    fgpu_shader_batch_t* sb = p->shader ? batch_for(p, worker, true) : NULL;
     if (p->shader) {
         for (int c = 0; c < 4; c++)
             for (int l = 0; l < FGPU_LANES; l++) sb->special[1][c][l] = special[1][0];
     }
 
-    // Edge function steps per pixel in x and y.
-    float e0dx = -(c->y - b->y), e0dy = (c->x - b->x);
-    float e1dx = -(a->y - c->y), e1dy = (a->x - c->x);
-    float e2dx = -(b->y - a->y), e2dy = (b->x - a->x);
-    float px0 = (float)x0 + 0.5f, py0 = (float)y0 + 0.5f;
-    float row0 = edge(b->x, b->y, c->x, c->y, px0, py0);
-    float row1 = edge(c->x, c->y, a->x, a->y, px0, py0);
-    float row2 = edge(a->x, a->y, b->x, b->y, px0, py0);
+    // Edge function steps per pixel in x.
+    float e0dx = -(c->y - b->y);
+    float e1dx = -(a->y - c->y);
+    float e2dx = -(b->y - a->y);
+    float px0 = (float)x0 + 0.5f;
 
     for (int32_t y = y0; y < y1; y++) {
-        float w0 = row0, w1 = row1, w2 = row2;
+        // Evaluated per row, not summed up from the top, so a pixel comes
+        // out the same however the rows are split between workers.
+        float py = (float)y + 0.5f;
+        float w0 = edge(b->x, b->y, c->x, c->y, px0, py);
+        float w1 = edge(c->x, c->y, a->x, a->y, px0, py);
+        float w2 = edge(a->x, a->y, b->x, b->y, px0, py);
         uint32_t* crow = t->color ? t->color + (size_t)y * t->color_pitch : NULL;
         float* drow = t->depth ? t->depth + (size_t)y * t->depth_pitch : NULL;
         for (int32_t x = x0; x < x1; x++, w0 += e0dx, w1 += e1dx, w2 += e2dx) {
@@ -348,7 +390,7 @@ static void raster_triangle(const fgpu_target_t* t, const fgpu_pipeline_t* p, ui
                 fb.x[lane] = x;
                 fb.y[lane] = y;
                 fb.z[lane] = z;
-                if (fb.n == FGPU_LANES) flush_fragments(t, p, &fb, late_depth, depth_write, blending);
+                if (fb.n == FGPU_LANES) flush_fragments(t, p, sb, &fb, late_depth, depth_write, blending);
                 continue;
             }
             float v[VAR_MAX];
@@ -360,26 +402,29 @@ static void raster_triangle(const fgpu_target_t* t, const fgpu_pipeline_t* p, ui
             special[0][2] = z;
             special[0][3] = iw;
             float out[4];
-            if (!shade(p, v, (const float (*)[4])special, out)) continue;
+            if (!shade(p, worker, v, (const float (*)[4])special, out)) continue;
             if (depth_write && late_depth) drow[x] = z;
             if (!crow) continue;
             crow[x] = blending ? blend(out, crow[x]) : pack_color(out);
         }
-        row0 += e0dy; row1 += e1dy; row2 += e2dy;
     }
-    flush_fragments(t, p, &fb, late_depth, depth_write, blending);
+    flush_fragments(t, p, sb, &fb, late_depth, depth_write, blending);
 }
 
+// Plots the pixels of a line in rows band_y0 <= y < band_y1.
 static void plot_line(const fgpu_target_t* t, const fgpu_pipeline_t* p, uint32_t nvar,
+                      uint32_t worker, int32_t band_y0, int32_t band_y1,
                       const svtx_t* a, const svtx_t* b) {
     if (!t->color) return;
+    int32_t ya = (int32_t)a->y, yb = (int32_t)b->y;
+    if ((ya < band_y0 && yb < band_y0) || (ya >= band_y1 && yb >= band_y1)) return;
     // One color per line: the fragment stage at the first end point.
     float v[VAR_MAX];
     float iw = a->inv_w != 0.0f ? 1.0f / a->inv_w : 0.0f;
     for (uint32_t k = 0; k < nvar; k++) v[k] = a->var[k] * iw;
     float special[2][4] = { { a->x, a->y, a->z, a->inv_w }, { 1, 1, 1, 1 } };
     float color[4];
-    if (!shade(p, v, (const float (*)[4])special, color)) return;
+    if (!shade(p, worker, v, (const float (*)[4])special, color)) return;
     bool blending = (p->state & FGPU_STATE_BLEND) != 0;
     uint32_t packed = pack_color(color);
     int32_t x0 = (int32_t)a->x, y0 = (int32_t)a->y, x1 = (int32_t)b->x, y1 = (int32_t)b->y;
@@ -387,7 +432,8 @@ static void plot_line(const fgpu_target_t* t, const fgpu_pipeline_t* p, uint32_t
     int32_t dy = y1 > y0 ? y0 - y1 : y1 - y0, sy = y0 < y1 ? 1 : -1;
     int32_t err = dx + dy;
     for (int guard = 0; guard < 16384; guard++) {
-        if (x0 >= p->vp_x && y0 >= p->vp_y && x0 < p->vp_x + p->vp_w && y0 < p->vp_y + p->vp_h &&
+        if (y0 >= band_y0 && y0 < band_y1 &&
+            x0 >= p->vp_x && y0 >= p->vp_y && x0 < p->vp_x + p->vp_w && y0 < p->vp_y + p->vp_h &&
             x0 >= 0 && y0 >= 0 && x0 < (int32_t)t->width && y0 < (int32_t)t->height) {
             uint32_t* px = &t->color[(size_t)y0 * t->color_pitch + x0];
             *px = blending ? blend(color, *px) : packed;
@@ -451,18 +497,117 @@ static void to_screen(const fgpu_pipeline_t* p, const vtx_t* v, uint32_t nvar, s
 
 /* ---------------------------------------------------------------- entry */
 
-void fgpu_raster_clear(const fgpu_target_t* t, uint32_t flags, uint32_t color, float depth) {
-    if ((flags & FGPU_CLEAR_COLOR) && t->color) {
-        for (uint32_t y = 0; y < t->height; y++) {
+typedef struct {
+    const fgpu_target_t* t;
+    uint32_t flags, color;
+    float depth;
+    uint32_t band_h;
+} clear_job_t;
+
+static void clear_part(void* ctx, uint32_t part, uint32_t worker) {
+    (void)worker;
+    const clear_job_t* j = ctx;
+    const fgpu_target_t* t = j->t;
+    uint32_t y0 = part * j->band_h, y1 = y0 + j->band_h;
+    if (y1 > t->height) y1 = t->height;
+    uint32_t opaque = j->color | 0xFF000000u;
+    for (uint32_t y = y0; y < y1; y++) {
+        if ((j->flags & FGPU_CLEAR_COLOR) && t->color) {
             uint32_t* row = t->color + (size_t)y * t->color_pitch;
-            uint32_t opaque = color | 0xFF000000u;
             for (uint32_t x = 0; x < t->width; x++) row[x] = opaque;
         }
-    }
-    if ((flags & FGPU_CLEAR_DEPTH) && t->depth) {
-        for (uint32_t y = 0; y < t->height; y++) {
+        if ((j->flags & FGPU_CLEAR_DEPTH) && t->depth) {
             float* row = t->depth + (size_t)y * t->depth_pitch;
-            for (uint32_t x = 0; x < t->width; x++) row[x] = depth;
+            for (uint32_t x = 0; x < t->width; x++) row[x] = j->depth;
+        }
+    }
+}
+
+// Rows per band for `rows` rows: about four bands per worker, so a worker
+// that finishes early takes over more of the screen.
+static uint32_t band_rows(uint32_t rows) {
+    uint32_t workers = worker_count();
+    if (workers <= 1 || rows == 0) return rows ? rows : 1;
+    uint32_t h = (rows + workers * 4 - 1) / (workers * 4);
+    return h < MIN_BAND_ROWS ? MIN_BAND_ROWS : h;
+}
+
+void fgpu_raster_clear(const fgpu_target_t* t, uint32_t flags, uint32_t color, float depth) {
+    if (!t || !t->height) return;
+    clear_job_t j = { t, flags, color, depth, band_rows(t->height) };
+    run_parts(clear_part, &j, (t->height + j.band_h - 1) / j.band_h);
+}
+
+// One triangle after the vertex stage and clipping: a polygon of 3 or 4
+// screen vertices (n = 0: dropped).
+typedef struct {
+    uint32_t n;
+    svtx_t v[4];
+} prim_t;
+
+static prim_t g_prims[CHUNK_TRIS];
+
+typedef struct {
+    const fgpu_target_t* t;
+    const fgpu_pipeline_t* p;
+    const fgpu_layout_t* layout;
+    const float* vertices;
+    uint32_t vertex_count;
+    const uint32_t* indices;
+    uint32_t nvar;
+    uint32_t first, tris;           // this chunk: triangles first .. first + tris - 1
+    int32_t y0, y1;                 // rows that can be drawn
+    uint32_t band_h;
+} draw_job_t;
+
+static void geometry_part(void* ctx, uint32_t part, uint32_t worker) {
+    const draw_job_t* j = ctx;
+    const fgpu_pipeline_t* p = j->p;
+    uint32_t end = (part + 1) * GEOMETRY_PART;
+    if (end > j->tris) end = j->tris;
+    for (uint32_t i = part * GEOMETRY_PART; i < end; i++) {
+        prim_t* prim = &g_prims[i];
+        prim->n = 0;
+        uint32_t tri_first = (j->first + i) * 3;
+        vtx_t tri[3];
+        const float* src[3];
+        bool bad = false;
+        for (uint32_t k = 0; k < 3; k++) {
+            uint32_t index = j->indices ? j->indices[tri_first + k] : tri_first + k;
+            if (index >= j->vertex_count) { bad = true; break; }
+            src[k] = j->vertices + (size_t)index * j->layout->stride;
+        }
+        if (bad) continue;
+        if (p->shader) shade_vertices(p, j->layout, worker, src, 3, tri);
+        else for (int k = 0; k < 3; k++) vertex_stage(p, j->layout, src[k], &tri[k]);
+
+        vtx_t poly[4];
+        int n = clip_near(tri, 3, j->nvar, poly);
+        if (n < 3) continue;
+        for (int k = 0; k < n; k++) to_screen(p, &poly[k], j->nvar, &prim->v[k]);
+        prim->n = (uint32_t)n;
+    }
+}
+
+static void raster_part(void* ctx, uint32_t part, uint32_t worker) {
+    const draw_job_t* j = ctx;
+    int32_t y0 = j->y0 + (int32_t)(part * j->band_h);
+    int32_t y1 = y0 + (int32_t)j->band_h;
+    if (y1 > j->y1) y1 = j->y1;
+    bool wire = (j->p->state & FGPU_STATE_WIREFRAME) != 0;
+    // Every band walks the triangles in order, so overlapping triangles
+    // land in the same order as on one core.
+    for (uint32_t i = 0; i < j->tris; i++) {
+        const prim_t* prim = &g_prims[i];
+        int n = (int)prim->n;
+        if (n < 3) continue;
+        const svtx_t* s = prim->v;
+        if (wire) {
+            for (int k = 0; k < n; k++)
+                plot_line(j->t, j->p, j->nvar, worker, y0, y1, &s[k], &s[(k + 1) % n]);
+        } else {
+            for (int k = 1; k + 1 < n; k++)
+                raster_triangle(j->t, j->p, j->nvar, worker, y0, y1, &s[0], &s[k], &s[k + 1]);
         }
     }
 }
@@ -474,37 +619,30 @@ uint32_t fgpu_raster_draw_layout(const fgpu_target_t* t, const fgpu_pipeline_t* 
     if (!t || !p || !vertices || p->vp_w <= 0 || p->vp_h <= 0 || !fgpu_layout_valid(layout))
         return 0;
     if (p->shader && !p->constants) return 0;
-    uint32_t nvar = p->shader ? p->shader->h.varying_count * 4 : FIXED_VARS;
-    if (p->shader) {
-        fgpu_shader_batch_reset(&g_vs_batch, p->shader->h.temp_count);
-        fgpu_shader_batch_reset(&g_fs_batch, p->shader->h.temp_count);
+    if (++g_epoch == 0) {           // wrapped: make every batch stale again
+        for (uint32_t w = 0; w < FGPU_RASTER_MAX_WORKERS; w++) g_batch_epoch[w] = 0;
+        g_epoch = 1;
     }
-    uint32_t drawn = 0;
-    for (uint32_t i = 0; i + 2 < count; i += 3) {
-        vtx_t tri[3];
-        const float* src[3];
-        bool bad = false;
-        for (int k = 0; k < 3; k++) {
-            uint32_t index = indices ? indices[i + (uint32_t)k] : i + (uint32_t)k;
-            if (index >= vertex_count) { bad = true; break; }
-            src[k] = vertices + (size_t)index * layout->stride;
-        }
-        if (bad) continue;
-        if (p->shader) shade_vertices(p, layout, src, 3, tri);
-        else for (int k = 0; k < 3; k++) vertex_stage(p, layout, src[k], &tri[k]);
 
-        vtx_t poly[4];
-        int n = clip_near(tri, 3, nvar, poly);
-        if (n < 3) continue;
-        svtx_t s[4];
-        for (int k = 0; k < n; k++) to_screen(p, &poly[k], nvar, &s[k]);
+    draw_job_t j = {
+        .t = t, .p = p, .layout = layout, .vertices = vertices, .vertex_count = vertex_count,
+        .indices = indices, .nvar = p->shader ? p->shader->h.varying_count * 4 : FIXED_VARS,
+    };
+    // Rows the viewport covers on the target. Lines clip the same way.
+    j.y0 = p->vp_y < 0 ? 0 : p->vp_y;
+    j.y1 = p->vp_y + p->vp_h;
+    if (j.y1 > (int32_t)t->height) j.y1 = (int32_t)t->height;
+    uint32_t rows = j.y1 > j.y0 ? (uint32_t)(j.y1 - j.y0) : 0;
+    j.band_h = band_rows(rows);
+    uint32_t bands = rows ? (rows + j.band_h - 1) / j.band_h : 0;
 
-        if (p->state & FGPU_STATE_WIREFRAME) {
-            for (int k = 0; k < n; k++) plot_line(t, p, nvar, &s[k], &s[(k + 1) % n]);
-        } else {
-            for (int k = 1; k + 1 < n; k++) raster_triangle(t, p, nvar, &s[0], &s[k], &s[k + 1]);
-        }
-        drawn++;
+    uint32_t total = count / 3, drawn = 0;
+    for (uint32_t first = 0; first < total; first += CHUNK_TRIS) {
+        j.first = first;
+        j.tris = total - first < CHUNK_TRIS ? total - first : CHUNK_TRIS;
+        run_parts(geometry_part, &j, (j.tris + GEOMETRY_PART - 1) / GEOMETRY_PART);
+        for (uint32_t i = 0; i < j.tris; i++) drawn += g_prims[i].n >= 3;
+        if (bands) run_parts(raster_part, &j, bands);
     }
     return drawn;
 }

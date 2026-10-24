@@ -38,5 +38,7 @@ void lapic_send_init_ipi(uint32_t target_apic_id);
 void lapic_send_startup_ipi(uint32_t target_apic_id, uint8_t vector);
 void lapic_wait_icr_idle(void);
 void lapic_send_nmi_all_but_self(void);
+// Sends interrupt `vector` to one core. Does not wait for delivery.
+void lapic_send_fixed_ipi(uint32_t target_apic_id, uint8_t vector);
 
 #endif // LAPIC_H

@@ -337,12 +337,104 @@ static void test_pipeline(void) {
     CHECK(px == 0xFF800080u || px == 0xFF7F0080u || px == 0xFF80007Fu, "50% blend of red over blue");
 }
 
+
+/* Splitting a draw over cores must not change a single pixel. The fake
+ * runner below runs the parts backwards on five "workers". */
+static uint32_t fake_workers(void) { return 5; }
+static void fake_run(fgpu_part_fn fn, void* ctx, uint32_t parts) {
+    for (uint32_t i = parts; i-- > 0;) fn(ctx, i, (i * 7u) % 5u);
+}
+
+// Overlapping, half-transparent waves: 2 x 40 x 12 quads (1920 triangles,
+// more than one chunk), so draw order and chunking both matter.
+static int wave_mesh(float* v) {
+    int n = 0;
+    for (int layer = 0; layer < 2; layer++)
+        for (int gy = 0; gy < 12; gy++)
+            for (int gx = 0; gx < 40; gx++) {
+                float x0 = -1.2f + gx * 0.06f, x1 = x0 + 0.06f;
+                float y0 = -1.0f + gy * 0.17f + layer * 0.08f, y1 = y0 + 0.17f;
+                float z0 = 0.3f * sinf(x0 * 3 + layer), z1 = 0.3f * sinf(x1 * 3 + layer);
+                const float q[6][3] = { {x0,y0,z0}, {x1,y0,z1}, {x1,y1,z1}, {x0,y0,z0}, {x1,y1,z1}, {x0,y1,z0} };
+                for (int k = 0; k < 6; k++, n++) {
+                    float* o = v + n * 10;
+                    o[0] = q[k][0]; o[1] = q[k][1]; o[2] = q[k][2];
+                    o[3] = 0; o[4] = 0; o[5] = 1;
+                    o[6] = layer ? 1.0f : 0.2f; o[7] = 0.1f * (gx % 10); o[8] = 0.08f * gy; o[9] = 0.6f;
+                }
+            }
+    return n;
+}
+
+static void test_parallel(void) {
+    enum { W = 200, H = 150 };
+    static uint32_t c1[W * H], c2[W * H];
+    static float d1[W * H], d2[W * H];
+    static float verts[2 * 40 * 12 * 6 * 10];
+    int n = wave_mesh(verts);
+    fgpu_parallel_t par = { fake_workers, fake_run };
+
+    float proj[16], view[16], rot[16], tmp[16], mvp[16];
+    mat_perspective(proj, 1.0f, (float)W / H, 0.1f, 50.0f);
+    memset(view, 0, sizeof view);
+    view[0] = view[5] = view[10] = view[15] = 1; view[14] = -2.5f;
+    mat_rot_y(rot, 0.4f);
+    mat_mul(view, rot, tmp);
+    mat_mul(proj, tmp, mvp);
+
+    CHECK(build("uniform mat4 fgl_ModelViewProjection;\n"
+                "attribute vec3 position; attribute vec4 color; varying vec4 v_color; varying vec3 v_pos;\n"
+                "void main() { v_color = color; v_pos = position; gl_Position = fgl_ModelViewProjection * vec4(position, 1.0); }",
+                "varying vec4 v_color; varying vec3 v_pos;\n"
+                "void main() { if (fract(v_pos.x * 7.0) < 0.1) discard;\n"
+                "  float s = 0.5 + 0.5 * sin(v_pos.y * 20.0);\n"
+                "  gl_FragColor = vec4(v_color.rgb * s, v_color.a); }"), "parallel test shader builds");
+    memset(uniforms, 0, sizeof uniforms);
+    set_uniform("fgl_ModelViewProjection", mvp, 16);
+
+    // Shader + blending + depth, built-in Phong, wireframe, and a viewport.
+    for (int mode = 0; mode < 4; mode++) {
+        fgpu_pipeline_t p;
+        memset(&p, 0, sizeof p);
+        p.vp_w = W; p.vp_h = H;
+        p.state = FGPU_STATE_DEPTH_TEST | FGPU_STATE_DEPTH_WRITE | FGPU_STATE_BLEND;
+        memcpy(p.u.mvp, mvp, sizeof mvp);
+        p.u.model[0] = p.u.model[5] = p.u.model[10] = p.u.model[15] = 1;
+        memcpy(p.u.normal, p.u.model, sizeof p.u.model);
+        p.u.light_dir[2] = -1; p.u.light_color[0] = p.u.light_color[1] = p.u.light_color[2] = 1;
+        p.u.camera_pos[2] = 2.5f; p.u.material[0] = 0.5f; p.u.material[1] = 16;
+        if (mode == 0) { p.shader = &prog; p.constants = (const float (*)[4])uniforms; }
+        else p.program = FGPU_PROGRAM_PHONG;
+        if (mode == 2) p.state |= FGPU_STATE_WIREFRAME;
+        if (mode == 3) { p.vp_x = 17; p.vp_y = -9; p.vp_w = 150; p.vp_h = 140; }
+
+        uint32_t drawn[2];
+        for (int run = 0; run < 2; run++) {
+            fgpu_raster_set_parallel(run ? &par : NULL);
+            fgpu_target_t t = run ? (fgpu_target_t){ c2, W, d2, W, W, H } : (fgpu_target_t){ c1, W, d1, W, W, H };
+            fgpu_raster_clear(&t, FGPU_CLEAR_COLOR | FGPU_CLEAR_DEPTH, 0x203040, 1.0f);
+            drawn[run] = fgpu_raster_draw(&t, &p, verts, (uint32_t)n, NULL, (uint32_t)n);
+        }
+        fgpu_raster_set_parallel(NULL);
+        int diff = 0, covered = 0;
+        for (int i = 0; i < W * H; i++) {
+            diff += c1[i] != c2[i] || d1[i] != d2[i];
+            covered += c1[i] != 0xFF203040u;
+        }
+        CHECK(drawn[0] == drawn[1] && drawn[0] > 1000, "parallel draw counts match");
+        CHECK(covered > 3000, "parallel scene is visible");
+        CHECK(diff == 0, "parallel rendering matches one core pixel for pixel");
+        if (diff) printf("  mode %d: %d pixels differ\n", mode, diff);
+    }
+}
+
 int main(void) {
     test_math();
     test_swizzle_and_control();
     test_errors();
     test_validator();
     test_pipeline();
+    test_parallel();
     if (failures) {
         printf("fgsl tests: %d failure(s)\n", failures);
         return 1;

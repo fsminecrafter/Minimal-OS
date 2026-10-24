@@ -13,6 +13,7 @@
 #include "serial.h"
 #include "string.h"
 #include "x86_64/scheduler.h"
+#include "x86_64/smp_par.h"
 
 /*
  * FGPU command processor (SYS_GPU). Owns surfaces, buffers and shader
@@ -73,7 +74,12 @@ static const fgpu_backend_t* g_hw;
 static const char* g_hw_why = "not chosen yet";
 static bool g_hw_pending;               // GPU work queued since the last finish()
 
+// The CPU backend draws on every core (smp_par.h).
+_Static_assert(SMP_PAR_MAX_WORKERS <= FGPU_RASTER_MAX_WORKERS, "worker numbers must fit the rasterizer");
+static const fgpu_parallel_t k_parallel = { smp_par_workers, smp_par_run };
+
 void fgpu_backend_select(void) {
+    fgpu_raster_set_parallel(&k_parallel);
     g_hw = NULL;
     gpu_adapter_t* a = gpu_primary_adapter();
     if (!a) { g_hw_why = "no GPU adapter"; return; }

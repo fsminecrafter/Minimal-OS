@@ -41,6 +41,26 @@ typedef struct {
     fgpu_texture_t textures[FGPU_MAX_TEXTURE_UNITS];
 } fgpu_pipeline_t;
 
+/* Several cores. The rasterizer splits a draw into parts (groups of
+ * triangles for the vertex stage, bands of rows for rasterization; each
+ * pixel is drawn by one part, in the order the triangles were given, so
+ * the picture is the same as on one core) and hands them to run(). */
+#define FGPU_RASTER_MAX_WORKERS 16u
+
+typedef void (*fgpu_part_fn)(void* ctx, uint32_t part, uint32_t worker);
+
+typedef struct {
+    // Workers available now (>= 1).
+    uint32_t (*workers)(void);
+    // Calls fn(ctx, part, worker) once for every part < parts and returns
+    // when all have finished. Calls running at the same time get
+    // different worker numbers, each < FGPU_RASTER_MAX_WORKERS.
+    void (*run)(fgpu_part_fn fn, void* ctx, uint32_t parts);
+} fgpu_parallel_t;
+
+// NULL: one core (the default).
+void fgpu_raster_set_parallel(const fgpu_parallel_t* par);
+
 // The FGPU_VERTEX_P3N3C4 layout.
 void fgpu_layout_default(fgpu_layout_t* layout);
 

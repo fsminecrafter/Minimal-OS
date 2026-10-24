@@ -7,6 +7,7 @@
 #include "x86_64/window_manager.h"
 #include "graphics.h"
 #include "x86_64/scheduler.h"
+#include "x86_64/wm_watchdog.h"
 #include "x86_64/commandhandler.h"
 #include "x86_64/gdt.h"
 #include "time.h"
@@ -514,6 +515,7 @@ static void schedule_irqs_off(void) {
             }
 
             process_t* to_free = curr;
+            wm_watchdog_forget(to_free);
 
             if (prev) {
                 prev->next = curr->next;

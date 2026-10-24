@@ -7,6 +7,7 @@
 #include "audio.h"
 #include "time.h"
 #include "panic.h"
+#include "x86_64/wm_watchdog.h"
 #include "usb/usb_stack.h"
 #include "x86_64/network_manager.h"
 #include "x86_64/smp.h"
@@ -48,6 +49,7 @@ void pit_irq_handler() {
     
     // Update system time
     time_tick(pit_frequency);
+    wm_watchdog_tick();
 
     // Usb poll
     usb_poll();

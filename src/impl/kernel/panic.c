@@ -186,6 +186,45 @@ static void panic_report_cpus(uint32_t self) {
 	}
 }
 
+static process_t* volatile g_panic_focus;
+
+void panic_set_focus_process(process_t* proc) {
+	g_panic_focus = proc;
+}
+
+// The process a watchdog blamed. If it is not on a core, it is parked in
+// the scheduler: its saved registers show where (regs[1] = rbp,
+// regs[7] = resume address), so walk its kernel stack from there.
+static void panic_report_focus(void) {
+	process_t* p = g_panic_focus;
+	if (!p) return;
+	uint32_t online = smp_online_cpu_count();
+	if (online > MAX_CPUS) online = MAX_CPUS;
+	for (uint32_t c = 0; c < online; c++)
+		if (smp_current_process_for_cpu(c) == p) return;   // already listed
+	panic_cpu_state_t st;
+	for (uint32_t i = 0; i < sizeof(st); i++) ((volatile char*)&st)[i] = 0;
+	panic_walk(&st, p->regs[1]);
+	char buf[96];
+	int n = 0;
+	buf[0] = 0;
+	panic_append(buf, &n, "pid ");
+	panic_append_dec(buf, &n, p->pid);
+	panic_append(buf, &n, " not on a cpu, parked at ");
+	panic_append_hex(buf, &n, p->regs[7]);
+	panic_fb_text(buf);
+	if (st.trace_count) {
+		n = 0;
+		buf[0] = 0;
+		panic_append(buf, &n, "      calls:");
+		for (uint32_t i = 0; i < st.trace_count; i++) {
+			panic_append(buf, &n, " ");
+			panic_append_hex(buf, &n, st.trace[i]);
+		}
+		panic_fb_text(buf);
+	}
+}
+
 int panic_in_progress(void) {
 	return g_panic_active != 0;
 }
@@ -288,6 +327,7 @@ noreturn void panic(const char* message, const char* file, int line, const Regis
 	panic_record_cpu(regs ? regs->rip : (uint64_t)__builtin_return_address(0), 0,
 	                 *(uint64_t*)__builtin_frame_address(0));
 	panic_report_cpus(self);
+	panic_report_focus();
 	panic_fb_text("");
 	panic_fb_text("Take a photo of this screen, then restart.");
 

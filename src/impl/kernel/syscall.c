@@ -1,4 +1,5 @@
 #include "x86_64/syscall.h"
+#include "x86_64/wm_watchdog.h"
 #include "graphics.h"
 #include "serial.h"
 #include "prochandler.h"
@@ -1013,8 +1014,16 @@ static bool syscall_user_may_call(uint64_t syscall_num, const syscall_regs_t* re
     }
 }
 
+static void syscall_dispatch_inner(syscall_regs_t* regs);
+
 void syscall_dispatch(syscall_regs_t* regs) {
     if (!regs) return;
+    wm_watchdog_syscall_enter(regs->rax);
+    syscall_dispatch_inner(regs);
+    wm_watchdog_syscall_exit();
+}
+
+static void syscall_dispatch_inner(syscall_regs_t* regs) {
 
     if (isCurrentProcessUser() && current_process->cleanup_requested &&
         !current_process->cleanup_invoked && current_process->cleanup_entry &&

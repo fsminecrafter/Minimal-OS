@@ -18,3 +18,6 @@ noreturn void panic(const char* message, const char* file, int line, const Regis
 int panic_in_progress(void);
 // Called on each core that panic() stops with an NMI.
 void panic_record_cpu(uint64_t rip, uint64_t cs, uint64_t rbp);
+// A watchdog's suspect: panic() also prints where it is parked.
+struct process;
+void panic_set_focus_process(struct process* proc);

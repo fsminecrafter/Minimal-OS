@@ -321,21 +321,29 @@ MOSDESK_USE_LOCAL ?= 0
 
 mosdesk-build:
 	mkdir -p $(dir $(MOSDESK_DIR))
-	@if [ "$(MOSDESK_USE_LOCAL)" = 1 ]; then exit 0; fi; \
+	# Submodules are only fetched when they are not checked out yet. One
+	# that is already there is built as it is: updating it would move it
+	# back to the commit pinned here and leave newer local commits (and
+	# their features) out of the build, which is how MOSdesk once lost its
+	# Aero theme. To pull upstream changes, update the submodule yourself.
+	@if [ "$(MOSDESK_USE_LOCAL)" = 1 ] || [ -e Minimal-OS-SDK/.git ]; then exit 0; fi; \
 	if ! git submodule update --init --recursive Minimal-OS-SDK; then \
 		git -C Minimal-OS-SDK fetch origin && \
 		git -C Minimal-OS-SDK checkout --detach FETCH_HEAD; \
 	fi
-	@if [ "$(MOSDESK_USE_LOCAL)" = 1 ]; then exit 0; fi; \
+	@if [ "$(MOSDESK_USE_LOCAL)" = 1 ] || [ -e "$(MOSDESK_DIR)/.git" ]; then exit 0; fi; \
 	if ! git submodule update --init "$(MOSDESK_DIR)"; then \
 		echo "mosdesk-build: pinned MOSdesk commit is not on the remote; using its latest default branch" >&2; \
-		git submodule update --init --remote --force "$(MOSDESK_DIR)"; \
+		git submodule update --init --remote "$(MOSDESK_DIR)"; \
 	fi
 	@if [ "$(MOSDESK_USE_LOCAL)" = 1 ]; then exit 0; fi; \
-	if ! git -C "$(MOSDESK_DIR)" submodule update --init; then \
-		echo "mosdesk-build: a pinned nested commit is not on the remote; using the latest default branches" >&2; \
-		git -C "$(MOSDESK_DIR)" submodule update --init --remote --force; \
-	fi
+	for sub in $$(git -C "$(MOSDESK_DIR)" config -f .gitmodules --get-regexp 'submodule\..*\.path' | awk '{print $$2}'); do \
+		[ -e "$(MOSDESK_DIR)/$$sub/.git" ] && continue; \
+		if ! git -C "$(MOSDESK_DIR)" submodule update --init "$$sub"; then \
+			echo "mosdesk-build: pinned $$sub is not on the remote; using its latest default branch" >&2; \
+			git -C "$(MOSDESK_DIR)" submodule update --init --remote "$$sub"; \
+		fi; \
+	done
 	# MOSdesk is built with this checkout's SDK: its apps talk to this
 	# kernel, so they must use the same syscall headers.
 	CC=$(CC) LD=$(LD) MKPKG_TOOL=$(CURDIR)/tools/mkpkg/mkpkg.py MKPKG_JOBS=$(MKPKG_JOBS) \

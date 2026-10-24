@@ -4,6 +4,8 @@
 #include "graphics.h"
 #include "x86_64/lapic.h"
 #include "serial.h"
+#include "x86_64/smp.h"
+#include "x86_64/proc.h"
 
 extern char font8x8_basic[128][8];
 
@@ -59,6 +61,131 @@ static void panic_fb_text(const char* text) {
 	} while (*text);
 }
 
+static void panic_hex(char* out, uint64_t v);
+
+// What each core was doing when panic() stopped it, filled in by the
+// NMI handler (panic_record_cpu) and by the panicking core itself.
+#define PANIC_TRACE_DEPTH 6
+typedef struct {
+	volatile uint32_t recorded;
+	uint64_t rip, cs;
+	uint64_t trace[PANIC_TRACE_DEPTH];
+	volatile uint32_t trace_count;
+} panic_cpu_state_t;
+static panic_cpu_state_t g_panic_cpu[MAX_CPUS];
+
+static int panic_frame_ok(uint64_t rbp) {
+	return rbp >= 0x1000 && rbp < 0x0000800000000000ULL && (rbp & 7) == 0;
+}
+
+// Walks the frame-pointer chain (the kernel is built without
+// -fomit-frame-pointer). Each step is stored before the next is read, so
+// a bad pointer that faults still leaves the frames found so far.
+static void panic_walk(panic_cpu_state_t* st, uint64_t rbp) {
+	for (int i = 0; i < PANIC_TRACE_DEPTH && panic_frame_ok(rbp); i++) {
+		uint64_t* frame = (uint64_t*)rbp;
+		uint64_t ret = frame[1];
+		if (ret < 0x100000 || ret >= 0x100000000ULL) break;   // not kernel code
+		st->trace[i] = ret;
+		st->trace_count = (uint32_t)(i + 1);
+		if (frame[0] <= rbp) break;
+		rbp = frame[0];
+	}
+}
+
+void panic_record_cpu(uint64_t rip, uint64_t cs, uint64_t rbp) {
+	uint32_t cpu = smp_current_cpu_id();
+	if (cpu >= MAX_CPUS) return;
+	panic_cpu_state_t* st = &g_panic_cpu[cpu];
+	st->rip = rip;
+	st->cs = cs;
+	st->trace_count = 0;
+	__atomic_store_n(&st->recorded, 1, __ATOMIC_RELEASE);
+	if ((cs & 3) == 0) panic_walk(st, rbp);
+}
+
+static void panic_append(char* buf, int* n, const char* text) {
+	while (*text && *n < 94) buf[(*n)++] = *text++;
+	buf[*n] = 0;
+}
+
+// Hex without leading zeros (kernel addresses are short).
+static void panic_append_hex(char* buf, int* n, uint64_t v) {
+	char h[19];
+	panic_hex(h, v);
+	const char* digits = h + 2;
+	while (*digits == '0' && digits[1]) digits++;
+	panic_append(buf, n, "0x");
+	panic_append(buf, n, digits);
+}
+
+static void panic_append_dec(char* buf, int* n, uint64_t v) {
+	char d[21];
+	int k = 0;
+	do { d[k++] = (char)('0' + v % 10); v /= 10; } while (v);
+	char out[21];
+	int o = 0;
+	while (k) out[o++] = d[--k];
+	out[o] = 0;
+	panic_append(buf, n, out);
+}
+
+// One line per core: where it was and what it was running, then a short
+// call trace. Look the addresses up with
+//   addr2line -f -e dist/x86_64/kernel.bin <address>
+static void panic_report_cpus(uint32_t self) {
+	uint32_t online = smp_online_cpu_count();
+	if (online > MAX_CPUS) online = MAX_CPUS;
+	// Give the other cores a moment to take the NMI.
+	for (uint32_t spin = 0; spin < 20000000u; spin++) {
+		uint32_t done = 0;
+		for (uint32_t c = 0; c < online; c++) done += g_panic_cpu[c].recorded;
+		if (done >= online) break;
+		asm volatile("pause");
+	}
+	char buf[96];
+	panic_fb_text("");
+	for (uint32_t c = 0; c < online; c++) {
+		panic_cpu_state_t* st = &g_panic_cpu[c];
+		int n = 0;
+		buf[0] = 0;
+		panic_append(buf, &n, "cpu");
+		panic_append_dec(buf, &n, c);
+		panic_append(buf, &n, c == self ? "* " : "  ");
+		if (!st->recorded) {
+			panic_append(buf, &n, "did not answer (stuck with interrupts off?)");
+			panic_fb_text(buf);
+			continue;
+		}
+		panic_append(buf, &n, (st->cs & 3) ? "user   rip=" : "kernel rip=");
+		panic_append_hex(buf, &n, st->rip);
+		process_t* proc = smp_current_process_for_cpu(c);
+		if (proc) {
+			panic_append(buf, &n, " pid ");
+			panic_append_dec(buf, &n, proc->pid);
+			panic_append(buf, &n, " ");
+			char name[24];
+			int k = 0;
+			const char* nm = proc->name;
+			for (const char* q = nm; *q; q++) if (*q == '/') nm = q + 1;
+			while (nm[k] && k < 23) { name[k] = nm[k]; k++; }
+			name[k] = 0;
+			panic_append(buf, &n, name);
+		}
+		panic_fb_text(buf);
+		if (st->trace_count) {
+			n = 0;
+			buf[0] = 0;
+			panic_append(buf, &n, "      calls:");
+			for (uint32_t i = 0; i < st->trace_count; i++) {
+				panic_append(buf, &n, " ");
+				panic_append_hex(buf, &n, st->trace[i]);
+			}
+			panic_fb_text(buf);
+		}
+	}
+}
+
 int panic_in_progress(void) {
 	return g_panic_active != 0;
 }
@@ -99,8 +226,6 @@ static void panic_fb_report(const char* message, const char* file, int line, con
 			panic_fb_text(buf);
 		}
 	}
-	panic_fb_text("");
-	panic_fb_text("Take a photo of this screen, then restart.");
 }
 
 
@@ -159,6 +284,12 @@ noreturn void panic(const char* message, const char* file, int line, const Regis
 	}
 	lapic_send_nmi_all_but_self();
 	panic_fb_report(message, file, line, regs);
+	uint32_t self = smp_current_cpu_id();
+	panic_record_cpu(regs ? regs->rip : (uint64_t)__builtin_return_address(0), 0,
+	                 *(uint64_t*)__builtin_frame_address(0));
+	panic_report_cpus(self);
+	panic_fb_text("");
+	panic_fb_text("Take a photo of this screen, then restart.");
 
 	// Blue background, white text
 	print_clear_color(PRINT_COLOR_WHITE, PRINT_COLOR_BLUE);

@@ -53,6 +53,9 @@ void isr_generic_handler(uint64_t vector, uint64_t error_code,
                          uint64_t saved_rip, uint64_t saved_cs) {
     // panic() stops the other cores with an NMI: just halt here.
     if (vector == 2 && panic_in_progress()) {
+        // isr_common_stub's frame pointer slot holds the interrupted rbp.
+        uint64_t* stub_frame = (uint64_t*)__builtin_frame_address(0);
+        panic_record_cpu(saved_rip, saved_cs, *(uint64_t*)stub_frame[0]);
         for (;;) asm volatile("cli; hlt");
     }
     if (vector == 14) {

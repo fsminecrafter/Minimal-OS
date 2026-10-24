@@ -5,6 +5,9 @@
 #include "x86_64/scheduler.h"
 #include "serial.h"
 #include "time.h"
+#include "panic.h"
+#include "x86_64/pit.h"
+#include "x86_64/smp.h"
 #include <stddef.h>
 
 /*
@@ -189,11 +192,36 @@ void lapic_timer_eoi(void) {
  * real cross-core scheduler_lock() spinlock (scheduler.c), so this is
  * safe to call concurrently from multiple cores.
  */
+/*
+ * Hang watchdog, run by every core except cpu0 on its own timer.
+ * Everything time-related (and the keyboard, mouse and window manager's
+ * clock) depends on the PIT interrupt on cpu0. If that stops for 5 s,
+ * cpu0 is stuck with interrupts off (a deadlock or an endless loop):
+ * panic so the screen shows where every core is, instead of a silent
+ * freeze. Any core can notice, so a hang that also takes cpu1 is caught.
+ */
+#define WATCHDOG_STALL_TICKS 5000u
+static void hang_watchdog_tick(void) {
+    static uint64_t last_pit_ticks[MAX_CPUS];
+    static uint32_t stalled_ticks[MAX_CPUS];
+    uint32_t cpu = smp_current_cpu_id();
+    if (cpu == 0 || cpu >= MAX_CPUS) return;
+    uint64_t now = pit_get_ticks();
+    if (now != last_pit_ticks[cpu] || now == 0) {
+        last_pit_ticks[cpu] = now;
+        stalled_ticks[cpu] = 0;
+        return;
+    }
+    if (++stalled_ticks[cpu] == WATCHDOG_STALL_TICKS)
+        PANIC("Watchdog: cpu0 stopped taking timer interrupts for 5 s (system hang)");
+}
+
 void lapic_timer_irq_handler(void) {
     /* Acknowledge first: scheduler_tick() may switch to a process that
      * has never run, which starts in proc_trampoline() and never comes
      * back through here to send the EOI, leaving this core's timer
      * silent for good. Interrupts stay off until iret/sti either way. */
     lapic_timer_eoi();
+    hang_watchdog_tick();
     scheduler_tick();
 }

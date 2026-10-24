@@ -16,3 +16,5 @@ noreturn void panic(const char* message, const char* file, int line, const Regis
 
 // True once a core has entered panic() (the others are being stopped).
 int panic_in_progress(void);
+// Called on each core that panic() stops with an NMI.
+void panic_record_cpu(uint64_t rip, uint64_t cs, uint64_t rbp);

@@ -19,3 +19,15 @@ void audio_manager_pull_samples(int16_t* out, uint32_t frames);
 bool audio_manager_has_data(void);
 void audio_manager_start(void);
 void audio_manager_set_sample_rate(uint32_t rate_hz);
+
+/* Master volume (0-100) and mute, applied to everything played. */
+void audio_manager_set_master_volume(uint32_t volume);
+uint32_t audio_manager_master_volume(void);
+void audio_manager_set_muted(bool muted);
+bool audio_manager_muted(void);
+
+/* Outputs of the sound card in use (at least 1 when there is one). */
+int audio_manager_output_count(void);
+void audio_manager_output_name(int index, char* out, uint32_t size);
+int audio_manager_output_current(void);
+bool audio_manager_output_select(int index);

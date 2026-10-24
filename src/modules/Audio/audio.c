@@ -1321,6 +1321,50 @@ void audio_ctl_status(syscall_audio_status_t* out) {
     audio_ctl_copy(out->path, g_ctl_path, sizeof(out->path));
 }
 
+uint64_t audio_mixer_syscall(syscall_audio_mixer_t* m) {
+    if (!m) return SYS_ERR_INVAL;
+    uint64_t result = SYS_SUCCESS;
+    switch (m->op) {
+        case SYS_AUDIO_MIXER_GET: break;
+        case SYS_AUDIO_MIXER_VOLUME:
+            audio_manager_set_master_volume(m->value);
+            break;
+        case SYS_AUDIO_MIXER_MUTE:
+            audio_manager_set_muted(m->value != 0);
+            break;
+        case SYS_AUDIO_MIXER_OUTPUT:
+            if (!audio_manager_output_select((int)m->value)) result = SYS_ERR_INVAL;
+            break;
+        default:
+            return SYS_ERR_INVAL;
+    }
+    m->volume = audio_manager_master_volume();
+    m->muted = audio_manager_muted() ? 1u : 0u;
+    int count = audio_manager_output_count();
+    if (count > (int)SYSCALL_AUDIO_MAX_OUTPUTS) count = (int)SYSCALL_AUDIO_MAX_OUTPUTS;
+    m->output_count = count > 0 ? (uint32_t)count : 0u;
+    m->output = audio_manager_output_current();
+    audio_ctl_copy(m->driver, audio_manager_driver_name(), sizeof(m->driver));
+    for (uint32_t i = 0; i < SYSCALL_AUDIO_MAX_OUTPUTS; i++) {
+        m->outputs[i][0] = '\0';
+        if ((int)i < count) audio_manager_output_name((int)i, m->outputs[i], SYSCALL_AUDIO_OUTPUT_NAME);
+    }
+    /* Same names (two identical cards): number them, "... 2". */
+    for (int i = 1; i < count; i++) {
+        uint32_t same = 1;
+        for (int j = 0; j < i; j++)
+            if (!strcmp(m->outputs[i], m->outputs[j])) same++;
+        if (same < 2) continue;
+        size_t len = strlen(m->outputs[i]);
+        if (len + 3 < SYSCALL_AUDIO_OUTPUT_NAME) {
+            m->outputs[i][len] = ' ';
+            m->outputs[i][len + 1] = (char)('0' + (same > 9 ? 9 : same));
+            m->outputs[i][len + 2] = '\0';
+        }
+    }
+    return result;
+}
+
 uint64_t audio_syscall(syscall_audio_request_t* req) {
     if (!req || req->size < sizeof(*req) || req->version != SYS_AUDIO_ABI_VERSION)
         return SYS_ERR_INVAL;

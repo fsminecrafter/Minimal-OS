@@ -814,4 +814,32 @@ typedef struct {
     syscall_audio_status_t status;
 } syscall_audio_request_t;
 
+// ===========================================
+// SOUND MIXER (SYS_AUDIO_MIXER)
+// ===========================================
+//
+// rdi = syscall_audio_mixer_t*. Master volume and mute for everything
+// played, and the output (jack) the sound card plays to. Every op fills
+// in the current state afterwards.
+#define SYS_AUDIO_MIXER 43
+
+#define SYS_AUDIO_MIXER_GET    1u
+#define SYS_AUDIO_MIXER_VOLUME 2u   // value: 0-100
+#define SYS_AUDIO_MIXER_MUTE   3u   // value: 1 = muted
+#define SYS_AUDIO_MIXER_OUTPUT 4u   // value: output index
+
+#define SYSCALL_AUDIO_MAX_OUTPUTS 8u
+#define SYSCALL_AUDIO_OUTPUT_NAME 40u
+
+typedef struct {
+    uint32_t op;
+    uint32_t value;
+    uint32_t volume;            // 0-100
+    uint32_t muted;
+    uint32_t output_count;      // 0: no sound card
+    int32_t output;             // the output in use, -1 if none
+    char driver[24];
+    char outputs[SYSCALL_AUDIO_MAX_OUTPUTS][SYSCALL_AUDIO_OUTPUT_NAME];
+} syscall_audio_mixer_t;
+
 #endif // SYSCALL_H

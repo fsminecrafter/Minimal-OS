@@ -159,6 +159,26 @@ static hda_node_t g_dacs[HDA_MAX_DACS];
 static int        g_dac_count = 0;
 static uint32_t   g_rate_mask = 0;           /* PARAM_PCM rate bits every DAC supports */
 
+/* Outputs (jacks) on every controller, found at boot. One is in use. */
+#define HDA_MAX_OUTPUTS 8
+typedef struct {
+    pci_device_t* dev;
+    uint8_t cad, pin;
+    uint8_t device;             /* default config: 0 line out, 1 speaker, 2 headphone */
+    uint8_t location;
+    uint32_t codec_vendor;
+} hda_output_t;
+static hda_output_t g_outs[HDA_MAX_OUTPUTS];
+static int g_out_count;
+static int g_out_current = -1;
+static bool g_surveying;                     /* record outputs while setting up */
+static int g_only = -1;                      /* set up only this output */
+static pci_device_t* g_dev;                  /* controller being set up */
+static uint32_t g_codec_vendor;
+/* Held by the stream update (PIT) and by anything that reprograms the
+ * controller, so switching outputs never races the update. */
+static volatile uint32_t g_hw_lock;
+
 static volatile bool g_ready   = false;
 static volatile bool g_running = false;
 static uint32_t g_write = 0;                 /* next buffer to fill */
@@ -505,6 +525,7 @@ static void hda_setup_codec(uint8_t cad) {
     c->cad = cad;
 
     uint32_t vendor = hda_param(cad, 0, PARAM_VENDOR_ID);
+    g_codec_vendor = vendor;
     serial_write_str("HDA: codec ");
     serial_write_dec(cad);
     serial_write_str(" vendor ");
@@ -553,7 +574,20 @@ static void hda_setup_codec(uint8_t cad) {
                     } else if (o != 0) {
                         continue;    /* second pass: any output pin, once */
                     }
-                    if (hda_setup_pin(c, nid)) configured++;
+                    if (g_only >= 0 && (g_outs[g_only].cad != cad ||
+                                        g_outs[g_only].pin != nid))
+                        continue;
+                    if (!hda_setup_pin(c, nid)) continue;
+                    configured++;
+                    if (g_surveying && g_out_count < HDA_MAX_OUTPUTS) {
+                        hda_output_t* o = &g_outs[g_out_count++];
+                        o->dev = g_dev;
+                        o->cad = cad;
+                        o->pin = nid;
+                        o->device = (uint8_t)device;
+                        o->location = (uint8_t)((config >> 24) & 0x3F);
+                        o->codec_vendor = g_codec_vendor;
+                    }
                 }
             }
         }
@@ -677,7 +711,19 @@ static void hda_stream_program(void) {
         hda_cmd4(g_dacs[i].cad, g_dacs[i].nid, VERB4_SET_FORMAT, g_hw_fmt);
 }
 
+static void hda_start_locked(void);
+static void hda_lock(void) {
+    while (__atomic_exchange_n(&g_hw_lock, 1u, __ATOMIC_ACQUIRE)) __asm__ volatile("pause");
+}
+static void hda_unlock(void) { __atomic_store_n(&g_hw_lock, 0u, __ATOMIC_RELEASE); }
+
 static void hda_start(void) {
+    hda_lock();
+    hda_start_locked();
+    hda_unlock();
+}
+
+static void hda_start_locked(void) {
     if (!g_ready) return;
     g_running = false;
 
@@ -708,6 +754,9 @@ static void hda_start(void) {
 
 static void hda_update(void) {
     if (!g_running) return;
+    /* Busy (an output switch): this tick is skipped. */
+    if (__atomic_exchange_n(&g_hw_lock, 1u, __ATOMIC_ACQUIRE)) return;
+    if (!g_running) { hda_unlock(); return; }
 
     uint32_t lpib = r32(g_sd + HDA_SD_LPIB) % (HDA_BUF_COUNT * HDA_BUF_BYTES);
     uint32_t hw = lpib / HDA_BUF_BYTES;
@@ -722,6 +771,7 @@ static void hda_update(void) {
         hda_render(g_bufs[g_write], HDA_BUF_FRAMES);
         g_write = (g_write + 1) % HDA_BUF_COUNT;
     }
+    hda_unlock();
 }
 
 static void hda_set_sample_rate(uint32_t rate_hz) {
@@ -743,7 +793,21 @@ static void hda_shutdown(void) {
  * Init
  * ============================================================ */
 
+/* BAR0 mappings, kept: a controller is set up again on every output
+ * switch. */
+static struct { pci_device_t* dev; volatile uint8_t* mmio; } g_maps[6];
+
+static volatile uint8_t* hda_map_bar0_new(pci_device_t* dev);
 static volatile uint8_t* hda_map_bar0(pci_device_t* dev) {
+    for (uint32_t i = 0; i < sizeof(g_maps) / sizeof(g_maps[0]); i++)
+        if (g_maps[i].dev == dev) return g_maps[i].mmio;
+    volatile uint8_t* mmio = hda_map_bar0_new(dev);
+    for (uint32_t i = 0; mmio && i < sizeof(g_maps) / sizeof(g_maps[0]); i++)
+        if (!g_maps[i].dev) { g_maps[i].dev = dev; g_maps[i].mmio = mmio; break; }
+    return mmio;
+}
+
+static volatile uint8_t* hda_map_bar0_new(pci_device_t* dev) {
     uint64_t phys = dev->bar_address[0] ? dev->bar_address[0]
                                         : (uint64_t)(dev->bar[0] & ~0xFu);
     uint64_t size = dev->bar_length[0] ? dev->bar_length[0] : 0x4000;
@@ -762,6 +826,9 @@ static volatile uint8_t* hda_map_bar0(pci_device_t* dev) {
  * the command rings the next one will use. */
 static void hda_abandon(void) {
     if (!g_mmio) return;
+    if (g_sd) hda_stream_stop();
+    g_ready = false;
+    g_running = false;
     w8(HDA_CORBCTL, 0);
     w8(HDA_RIRBCTL, 0);
     w32(HDA_GCTL, r32(HDA_GCTL) & ~HDA_GCTL_CRST);
@@ -804,6 +871,8 @@ static bool hda_try_controller(pci_device_t* dev) {
     g_immediate = false;
     g_dac_count = 0;
     g_mmio = NULL;
+    g_sd = 0;
+    g_dev = dev;
     pci_enable_io_busmaster(dev);
     hda_enable_snoop(dev);
     if (dev->vendor_id == 0x8086) {
@@ -876,8 +945,9 @@ static bool hda_try_controller(pci_device_t* dev) {
         return false;
     }
 
-    g_bdl = (hda_bdl_entry_t*)kmalloc_aligned(HDA_BUF_COUNT * sizeof(hda_bdl_entry_t), 128);
-    uint8_t* pcm = (uint8_t*)kmalloc_aligned(HDA_BUF_COUNT * HDA_BUF_BYTES, 4096);
+    static uint8_t* pcm;
+    if (!g_bdl) g_bdl = (hda_bdl_entry_t*)kmalloc_aligned(HDA_BUF_COUNT * sizeof(hda_bdl_entry_t), 128);
+    if (!pcm) pcm = (uint8_t*)kmalloc_aligned(HDA_BUF_COUNT * HDA_BUF_BYTES, 4096);
     if (!g_bdl || !pcm) {
         serial_write_str("HDA: buffer alloc failed\n");
         return false;
@@ -902,25 +972,91 @@ static bool hda_try_controller(pci_device_t* dev) {
 }
 
 
+/* Sets up the controller of output `index` with only that output on. */
+static bool hda_activate(int index) {
+    g_only = index;
+    bool ok = hda_try_controller(g_outs[index].dev);
+    g_only = -1;
+    if (!ok) {
+        hda_abandon();
+        g_out_current = -1;
+        return false;
+    }
+    g_out_current = index;
+    return true;
+}
+
 static bool hda_init(void) {
     serial_write_str("HDA: Searching for HD Audio controller...\n");
     if (pci_get_device_count() == 0) pci_enumerate_all();
 
-    /* Every controller is tried until one has a usable analog output:
-     * the first one found is often a graphics card's HDMI audio. */
+    /* Survey every controller's analog outputs (graphics cards' HDMI
+     * audio last), then turn on the first one. */
     bool any = false;
+    g_out_count = 0;
+    g_surveying = true;
     for (int pass = 0; pass < 2; pass++) {
         for (int i = 0; i < pci_get_device_count(); i++) {
             pci_device_t* dev = &pci_devices[i];
             if (!hda_candidate(dev) || hda_is_gpu_audio(dev) != (pass == 1)) continue;
             any = true;
-            if (hda_try_controller(dev)) return true;
+            hda_try_controller(dev);
             hda_abandon();
         }
     }
+    g_surveying = false;
+    serial_write_str("HDA: ");
+    serial_write_dec((uint64_t)g_out_count);
+    serial_write_str(" output(s)\n");
+    for (int i = 0; i < g_out_count; i++)
+        if (hda_activate(i)) return true;
     serial_write_str(any ? "HDA: no controller with a usable output\n"
                          : "HDA: No controller found\n");
     return false;
+}
+
+static int hda_output_count(void) { return g_out_count; }
+static int hda_output_current(void) { return g_out_current; }
+
+static void hda_output_name(int index, char* out, uint32_t size) {
+    if (!out || !size) return;
+    out[0] = '\0';
+    if (index < 0 || index >= g_out_count) return;
+    const hda_output_t* o = &g_outs[index];
+    const char* kind = o->device == 1 ? "Speakers" : o->device == 2 ? "Headphones"
+                     : o->device == 0 ? "Line out" : "Output";
+    /* Location: bits 5:4 = inside/outside, 3:0 = where on it. */
+    static const char* const places[] = { NULL, "rear", "front", "left", "right",
+                                          "top", "bottom" };
+    const char* place = (o->location & 0xF) < 7 ? places[o->location & 0xF] : NULL;
+    if (((o->location >> 4) & 3) == 1) place = "built-in";
+    uint16_t v = (uint16_t)(o->codec_vendor >> 16);
+    const char* maker = v == 0x10EC ? "Realtek" : v == 0x8086 ? "Intel"
+                      : v == 0x14F1 ? "Conexant" : v == 0x111D ? "IDT"
+                      : v == 0x11D4 ? "Analog Devices" : v == 0x1106 ? "VIA"
+                      : v == 0x1002 ? "AMD" : v == 0x10DE ? "NVIDIA"
+                      : v == 0x1AF4 ? "QEMU" : v == 0x434D ? "C-Media"
+                      : v == 0x1102 ? "Creative" : "HD Audio";
+    const char* parts[6] = { kind, place ? ", " : NULL, place, " (", maker, ")" };
+    uint32_t at = 0;
+    for (int p = 0; p < 6; p++)
+        for (const char* c = parts[p]; c && *c && at + 1 < size; c++) out[at++] = *c;
+    out[at] = '\0';
+}
+
+/* Switches to another output, keeping playback going. */
+static bool hda_output_select(int index) {
+    if (index < 0 || index >= g_out_count) return false;
+    if (index == g_out_current) return true;
+    hda_lock();
+    bool was_running = g_running;
+    int previous = g_out_current;
+    hda_abandon();
+    bool ok = hda_activate(index);
+    if (!ok && previous >= 0) hda_activate(previous);
+    if (was_running && g_ready) hda_start_locked();
+    hda_unlock();
+    return ok;
 }
 
 static const audio_hw_driver_t hda_driver = {
@@ -930,6 +1066,10 @@ static const audio_hw_driver_t hda_driver = {
     .update          = hda_update,
     .set_sample_rate = hda_set_sample_rate,
     .shutdown        = hda_shutdown,
+    .output_count    = hda_output_count,
+    .output_name     = hda_output_name,
+    .output_current  = hda_output_current,
+    .output_select   = hda_output_select,
 };
 
 const audio_hw_driver_t* hda_get_driver(void) {

@@ -26,4 +26,9 @@ typedef struct {
     void (*update)(void);
     void (*set_sample_rate)(uint32_t rate_hz);
     void (*shutdown)(void);
+    /* Outputs (jacks) the sound can go to; NULL = just one. */
+    int  (*output_count)(void);
+    void (*output_name)(int index, char* out, uint32_t size);
+    int  (*output_current)(void);
+    bool (*output_select)(int index);
 } audio_hw_driver_t;

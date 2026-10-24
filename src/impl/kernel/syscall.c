@@ -1004,6 +1004,9 @@ static bool syscall_user_may_call(uint64_t syscall_num, const syscall_regs_t* re
         case SYS_AUDIO:
             return user_range_ok((const void*)regs->rdi,
                                  sizeof(syscall_audio_request_t), true);
+        case SYS_AUDIO_MIXER:
+            return user_range_ok((const void*)regs->rdi,
+                                 sizeof(syscall_audio_mixer_t), true);
 
         default:
             // Everything else (SYS_WRITE, file I/O, graphics drawing,
@@ -1052,6 +1055,13 @@ static void syscall_dispatch_inner(syscall_regs_t* regs) {
             extern uint64_t audio_syscall(syscall_audio_request_t* r) __attribute__((weak));
             regs->rax = audio_syscall
                 ? audio_syscall((syscall_audio_request_t*)regs->rdi)
+                : SYS_ERR_INVAL;
+            return;
+        }
+        case SYS_AUDIO_MIXER: {
+            extern uint64_t audio_mixer_syscall(syscall_audio_mixer_t* m) __attribute__((weak));
+            regs->rax = audio_mixer_syscall
+                ? audio_mixer_syscall((syscall_audio_mixer_t*)regs->rdi)
                 : SYS_ERR_INVAL;
             return;
         }

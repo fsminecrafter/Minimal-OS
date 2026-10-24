@@ -54,30 +54,24 @@ static inline uint8_t bin_to_bcd(uint8_t bin) {
     return ((bin / 10) << 4) | (bin % 10);
 }
 
+// rtc_get_datetime() already returns binary values with a full year, and
+// the rtc_write_* helpers encode to BCD themselves, so no conversion here.
 static void write_rtc_if_needed(void) {
-    datetime_t rtc_raw;
-    rtc_get_datetime(&rtc_raw);
+    datetime_t rtc_now;
+    rtc_get_datetime(&rtc_now);
 
-    // rtc_raw fields are BCD — decode before comparing to our binary values
-    if (bcd_to_bin(rtc_raw.second) != current_datetime.second)
-        rtc_write_seconds(bin_to_bcd(current_datetime.second));
-
-    if (bcd_to_bin(rtc_raw.minute) != current_datetime.minute)
-        rtc_write_minutes(bin_to_bcd(current_datetime.minute));
-
-    if (bcd_to_bin(rtc_raw.hour) != current_datetime.hour)
-        rtc_write_hours(bin_to_bcd(current_datetime.hour));
-
-    if (bcd_to_bin(rtc_raw.day) != current_datetime.day)
-        rtc_write_day(bin_to_bcd(current_datetime.day));
-
-    if (bcd_to_bin(rtc_raw.month) != current_datetime.month)
-        rtc_write_month(bin_to_bcd(current_datetime.month));
-
-    // Year: write back the 2-digit BCD form of the current year
-    uint8_t year_2digit = (uint8_t)(current_datetime.year % 100);
-    if (bcd_to_year(rtc_raw.year) != current_datetime.year)
-        rtc_write_year(bin_to_bcd(year_2digit));
+    if (rtc_now.second != current_datetime.second)
+        rtc_write_seconds(current_datetime.second);
+    if (rtc_now.minute != current_datetime.minute)
+        rtc_write_minutes(current_datetime.minute);
+    if (rtc_now.hour != current_datetime.hour)
+        rtc_write_hours(current_datetime.hour);
+    if (rtc_now.day != current_datetime.day)
+        rtc_write_day(current_datetime.day);
+    if (rtc_now.month != current_datetime.month)
+        rtc_write_month(current_datetime.month);
+    if (rtc_now.year != current_datetime.year)
+        rtc_write_year(current_datetime.year);
 }
 // ===========================================
 // INITIALIZATION & UPDATES
@@ -90,12 +84,13 @@ void time_init(void) {
     while (cmos_read(RTC_STATUS_A) & 0x80);
 
     // Read RTC once
-    current_datetime.year   = bcd_to_year(rtc_year());
-    current_datetime.month  = bcd_to_bin(rtc_month());
-    current_datetime.day    = bcd_to_bin(rtc_day());
-    current_datetime.hour   = bcd_to_bin(rtc_hours());
-    current_datetime.minute = bcd_to_bin(rtc_minutes());
-    current_datetime.second = bcd_to_bin(rtc_seconds());
+    // The rtc_* readers already decode BCD and return a full year.
+    current_datetime.year   = rtc_year();
+    current_datetime.month  = rtc_month();
+    current_datetime.day    = rtc_day();
+    current_datetime.hour   = rtc_hours();
+    current_datetime.minute = rtc_minutes();
+    current_datetime.second = rtc_seconds();
 
     system_uptime_ms = 0;
     last_pit_ticks = pit_get_ticks();
@@ -146,9 +141,10 @@ void time_tick(uint32_t pit_frequency) {
         }
     }
 
-    if (system_uptime_ms % RTC_SYNC_INTERVAL_MS < 1000) {
-        write_rtc_if_needed();
-    }
+    // No write-back here: the RTC keeps its own time and this clock was
+    // read from it. Doing it from the timer interrupt cost a full RTC
+    // read (plus writes and busy-waits) on every tick for a second at a
+    // time, starving everything else. The time_set_* calls still write.
 
 }
 

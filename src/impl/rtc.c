@@ -54,15 +54,10 @@ uint16_t rtc_year() {
     uint8_t year = rtc_read_reg(RTC_YEAR);
     uint8_t century = rtc_read_reg(RTC_CENTURY);
     
-    // If century register is 0 or invalid, assume 21st century
-    if (century == 0 || century == 0xFF) {
+    // rtc_read_reg() has already decoded BCD. Many machines have no
+    // century register: assume the 21st century when it looks unset.
+    if (century < 19 || century > 99) {
         century = 20;
-    } else {
-        uint8_t status_b = rtc_read_reg(RTC_STATUS_B);
-        if (!(status_b & 0x04)) {
-            // BCD mode
-            century = bcd_to_binary(century);
-        }
     }
     
     return (uint16_t)(century * 100 + year);

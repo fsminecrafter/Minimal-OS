@@ -269,6 +269,14 @@ void scheduler_rebalance(void) {
             // run on one kernel stack (a #GP on iretq a few seconds after
             // starting an app).
             if (candidate->on_cpu) continue;
+            // Only user programs move. Kernel processes stay on the core
+            // they were created on: "busy" is the boot core's idle task
+            // (cpu0 has no idle context), and with it moved away a
+            // sleeping process on cpu0 found nothing to switch to, so
+            // schedule() returned into it still marked WAITING. mosWM
+            // then got parked with no wake-up: the desktop froze when an
+            // app was opened (the app's load triggered the rebalance).
+            if (candidate->privilege != PROC_PRIVILEGE_USER) continue;
             if (candidate->cpu_time_ms < migrant_cpu_time) {
                 migrant = candidate;
                 migrant_level = level;

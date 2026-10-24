@@ -21,11 +21,7 @@
 #define LAPIC_ICR_LEVEL_ASSERT     (1 << 14)
 #define LAPIC_ICR_DEST_PHYSICAL    (0 << 11)
 
-// Vector the spurious-interrupt handler would run at. NOTE: idt.c's
-// idt[256] table only has 3 real entries installed (double fault,
-// IRQ0, IRQ1) - a spurious interrupt landing on this vector today
-// hits a zeroed/absent IDT gate. Harmless unless one actually fires;
-// flagged here rather than silently papered over.
+// Vector the LAPIC spurious-interrupt handler (isr_spurious) runs at.
 #define LAPIC_SPURIOUS_VECTOR 0xFF
 
 // Maps the LAPIC MMIO region and enables it, via both the

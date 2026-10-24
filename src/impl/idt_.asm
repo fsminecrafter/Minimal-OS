@@ -4,6 +4,12 @@ extern idt_handler_keyboard
 extern idt_handler_pit
 extern idt_handler_doublefault
 extern lapic_timer_irq_handler
+extern idt_handler_stray_vector
+%assign irq 2
+%rep 14
+extern idt_handler_pic_irq %+ irq
+%assign irq irq+1
+%endrep
 
 global idt_load
 
@@ -64,3 +70,12 @@ WRAPPED_HANDLER idt_handler_keyboard
 WRAPPED_HANDLER idt_handler_pit
 WRAPPED_HANDLER idt_handler_doublefault
 WRAPPED_HANDLER lapic_timer_irq_handler
+WRAPPED_HANDLER idt_handler_stray_vector
+
+; IRQ2-15 on the legacy PIC (vectors 0x22-0x2F). They are masked, but the
+; PIC still raises spurious IRQ7/IRQ15 and the CPU needs a gate for them.
+%assign irq 2
+%rep 14
+WRAPPED_HANDLER idt_handler_pic_irq %+ irq
+%assign irq irq+1
+%endrep

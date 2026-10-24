@@ -3,6 +3,7 @@
 #include "x86_64/gdt.h"
 #include "x86_64/idt.h"
 #include "x86_64/pic.h"
+#include "x86_64/port.h"
 #include "x86_64/scheduler.h"
 #include "panic.h"
 #include "print.h"
@@ -31,6 +32,28 @@ extern void idt_handler_pit_wrapped();
 extern void idt_handler_doublefault_wrapped();
 extern void isr_spurious();
 extern void lapic_timer_irq_handler_wrapped();
+extern void idt_handler_stray_vector_wrapped();
+
+#define PIC_IRQ_STUB(n) \
+	extern void idt_handler_pic_irq##n##_wrapped(); \
+	void idt_handler_pic_irq##n(void) { pic_stray_irq(n); }
+
+static void pic_stray_irq(uint8_t irq);
+PIC_IRQ_STUB(2)  PIC_IRQ_STUB(3)  PIC_IRQ_STUB(4)  PIC_IRQ_STUB(5)
+PIC_IRQ_STUB(6)  PIC_IRQ_STUB(7)  PIC_IRQ_STUB(8)  PIC_IRQ_STUB(9)
+PIC_IRQ_STUB(10) PIC_IRQ_STUB(11) PIC_IRQ_STUB(12) PIC_IRQ_STUB(13)
+PIC_IRQ_STUB(14) PIC_IRQ_STUB(15)
+
+static void (*const pic_irq_stub_table[16])() = {
+	NULL, NULL,
+	idt_handler_pic_irq2_wrapped,  idt_handler_pic_irq3_wrapped,
+	idt_handler_pic_irq4_wrapped,  idt_handler_pic_irq5_wrapped,
+	idt_handler_pic_irq6_wrapped,  idt_handler_pic_irq7_wrapped,
+	idt_handler_pic_irq8_wrapped,  idt_handler_pic_irq9_wrapped,
+	idt_handler_pic_irq10_wrapped, idt_handler_pic_irq11_wrapped,
+	idt_handler_pic_irq12_wrapped, idt_handler_pic_irq13_wrapped,
+	idt_handler_pic_irq14_wrapped, idt_handler_pic_irq15_wrapped,
+};
 
 extern void isr0();  extern void isr1();  extern void isr2();  extern void isr3();
 extern void isr4();  extern void isr5();  extern void isr6();  extern void isr7();
@@ -87,6 +110,37 @@ void idt_handler_keyboard() {
 }
 
 
+// In-service register of one PIC (OCW3 "read ISR", then back to IRR).
+static uint8_t pic_read_isr(uint16_t command_port) {
+	port_outb(command_port, 0x0B);
+	uint8_t isr = port_inb(command_port);
+	port_outb(command_port, 0x0A);
+	return isr;
+}
+
+// IRQ2-15 are masked, so the usual visitor here is a spurious IRQ7 or
+// IRQ15: the PIC raises it when a line drops before the CPU acknowledges
+// it (common on real hardware). Without a gate the CPU took a #GP on the
+// empty IDT entry, which killed the running program or panicked the
+// kernel. A spurious IRQ7 gets no EOI; a spurious IRQ15 only needs the
+// master's, for the cascade line.
+static void pic_stray_irq(uint8_t irq) {
+	if (irq == 7 && !(pic_read_isr(PORT_PIC1_COMMAND) & 0x80)) return;
+	if (irq == 15 && !(pic_read_isr(PORT_PIC2_COMMAND) & 0x80)) {
+		pic_eoi_master();
+		return;
+	}
+	if (irq >= 8) pic_eoi_slave();
+	pic_eoi_master();
+}
+
+// Any other vector with no driver behind it. Only the LAPIC can deliver
+// these (the PIC sits at 0x20-0x2F), so acknowledge it there; this is a
+// no-op until the LAPIC is mapped.
+void idt_handler_stray_vector(void) {
+	lapic_send_eoi();
+}
+
 void idt_set_entry(uint8_t vector,uint64_t isr_addr,uint16_t selector,uint8_t type_attr,uint8_t ist_index)
 {
     idt[vector] = (struct IdtEntry){
@@ -114,6 +168,17 @@ void idt_init() {
 		if (v == 8 || !isr_stub_table[v]) continue;
 		idt_set_entry(v, (uint64_t)isr_stub_table[v], GDT_SELECTOR_CS_KERNEL,
 		              IDT_ENTRY_TYPE_INTERRUPT, 0);
+	}
+
+	// Every interrupt vector gets a gate, so a stray interrupt can never
+	// fault on an empty entry. Drivers install their own over these.
+	for (int v = 32; v < 256; v++) {
+		idt_set_entry(v, (uint64_t)idt_handler_stray_vector_wrapped, GDT_SELECTOR_CS_KERNEL,
+		              IDT_ENTRY_TYPE_INTERRUPT, 0);
+	}
+	for (int irq = 2; irq < 16; irq++) {
+		idt_set_entry(PIC_OFFSET_MASTER + irq, (uint64_t)pic_irq_stub_table[irq],
+		              GDT_SELECTOR_CS_KERNEL, IDT_ENTRY_TYPE_INTERRUPT, 0);
 	}
 
 	idt_set_entry(8, (uint64_t)idt_handler_doublefault_wrapped, GDT_SELECTOR_CS_KERNEL, IDT_ENTRY_TYPE_INTERRUPT, 1);

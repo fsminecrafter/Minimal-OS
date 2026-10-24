@@ -529,9 +529,12 @@ void command_user_process_exited(uint64_t pid, uint8_t exit_code,
         return;
     }
 
-    graphics_write_textr("Program exited with code ");
-    graphics_write_textr_hex(exit_code);
-    graphics_write_textr(".\n");
+    // A normal exit says nothing; only a failure code is worth a line.
+    if (exit_code != 0) {
+        graphics_write_textr("Program exited with code ");
+        graphics_write_textr_udec(exit_code);
+        graphics_write_textr(".\n");
+    }
 }
 
 void command_kill_last_user_program(void) {

@@ -412,11 +412,10 @@ void cmd_run(int argc, const char** argv) {
         return;
     }
 
-    graphics_write_textr("Started: ");
-    graphics_write_textr(run_path);
-    graphics_write_textr(" (PID ");
-    graphics_write_textr_udec(proc->pid);
-    graphics_write_textr(")\n");
+    // Started quietly: the program's own output is what matters.
+    serial_write_str("run: started ");
+    serial_write_str(run_path);
+    serial_write_str("\n");
 }
 
 void register_run(void) {

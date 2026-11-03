@@ -493,6 +493,12 @@ typedef enum {
     SYS_NET_TLS_SEND,           // handle/buf/len -> bytes (<= 4096 per call), SYS_ERR_AGAIN while handshaking
     SYS_NET_TLS_RECV,           // handle/buf/len -> bytes, 0 = nothing yet, SYS_ERR_NOTFOUND = closed/dead
     SYS_NET_TLS_CLOSE,          // handle
+
+    // Blocking TLS 1.3 client sessions for ordinary HTTPS servers.
+    SYS_NET_TLS13_CONNECT = 0x40, // ip/port/host/timeout_ms -> out_handle
+    SYS_NET_TLS13_SEND,           // handle/buf/len -> bytes
+    SYS_NET_TLS13_RECV,           // handle/buf/len/timeout_ms -> bytes or SYS_ERR_NOTFOUND
+    SYS_NET_TLS13_CLOSE,          // handle
 } syscall_net_op_t;
 
 // Handle ownership. Every connection and listener handle belongs to the

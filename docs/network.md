@@ -425,6 +425,22 @@ long n = mos_udp_recv_timeout(u, reply, sizeof reply, &from, &fport, 2000);
 **Notes** Under QEMU's `-netdev user` the guest is behind NAT and LAN
 broadcasts never reach it; use a tap or bridge network to test discovery.
 
+## TLS 1.3 client sessions
+
+`mos_tls13_connect(ip, port, host, timeout_ms)` opens a TCP connection and
+completes the kernel's TLS 1.3 client handshake using `host` for SNI. It returns
+a positive owned handle or a negative `SYS_ERR_*` value. The TLS 1.3 client is
+a separate API from the KTLS transport below, which does not speak HTTPS.
+
+Use `mos_tls13_send(handle, buf, len)` to send encrypted data (up to 4096 bytes
+per call), `mos_tls13_recv(handle, buf, len, timeout_ms)` to receive data, and
+`mos_tls13_close(handle)` to close the session. Handles are owned by the
+creating process and reclaimed if that process exits.
+
+The current TLS 1.3 client does not authenticate server certificates. It
+encrypts traffic but cannot establish the server's identity, so applications
+must not use it for credentials or other sensitive data.
+
 ## `mos_tls_connect`
 
 ```c

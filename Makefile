@@ -20,6 +20,8 @@ HOST_CFLAGS ?= -std=c11 -Wall -Wextra -Werror -I src/intf
 MOSDESK_REPO ?= https://github.com/fsminecrafter/MOSdesk.git
 # The MOSdesk submodule; override to build some other checkout.
 MOSDESK_DIR ?= MOSdesk
+mxplorer_run := build/resources/mxplorer/Mxplorer.run
+mxplorer_sources := $(shell find $(MOSDESK_DIR)/Mxplorer -type f 2>/dev/null)
 # Package builder: compresses on every core and skips unchanged packages.
 MKPKG_JOBS ?= $(shell nproc 2>/dev/null || echo 1)
 MKPKG := python3 tools/mkpkg/mkpkg.py -j$(MKPKG_JOBS)
@@ -349,14 +351,21 @@ mosdesk-build:
 	CC=$(CC) LD=$(LD) MKPKG_TOOL=$(CURDIR)/tools/mkpkg/mkpkg.py MKPKG_JOBS=$(MKPKG_JOBS) \
 		MOSDESK_SDK_DIR=$(CURDIR)/Minimal-OS-SDK $(MOSDESK_DIR)/mosdesk/build.sh
 
-mosdesk-stage: mosdesk-dlr $(dlr_run) $(dlrconnect_run) $(fglcube_run) $(delivermanager_run)
+$(mxplorer_run): mosdesk-build $(mxplorer_sources) Minimal-OS-SDK/build.sh
+	mkdir -p $(dir $@)
+	CC=$(CC) LD=$(LD) Minimal-OS-SDK/build.sh --output $(CURDIR)/$@ $(MOSDESK_DIR)/Mxplorer
+
+mosdesk-stage: mosdesk-dlr $(mxplorer_run) $(dlr_run) $(dlrconnect_run) $(fglcube_run) $(delivermanager_run)
 	rm -rf build/resources/mosdesk-install
 	mkdir -p build/resources/mosdesk-install/install2/mosWM \
+		build/resources/mosdesk-install/install2/Mxplorer \
 		build/resources/mosdesk-install/install3
 	cp -a $(install2_base_source)/. build/resources/mosdesk-install/install2/
 	cp -a $(install3_base_source)/. build/resources/mosdesk-install/install3/
 	# The MOSdesk package is rooted at 0:/; install2 is unpacked into 0:/programs.
 	cp -a $(MOSDESK_DIR)/mosdesk/dist/mosdesk/programs/. build/resources/mosdesk-install/install2/
+	cp $(mxplorer_run) build/resources/mosdesk-install/install2/Mxplorer.run
+	cp -a $(MOSDESK_DIR)/Mxplorer/Resources build/resources/mosdesk-install/install2/Mxplorer/
 	cp -a $(MOSDESK_DIR)/mosWM/dist/mosWM/programs/mosWM/. build/resources/mosdesk-install/install2/mosWM/
 	cp $(MOSDESK_DIR)/mosWM/dist/mosWM/services/mosWM.service build/resources/mosdesk-install/install3/mosWM.service
 
@@ -379,10 +388,12 @@ MOSDESK_DLR_DIR ?= dist/x86_64/dlr/packages
 mosdesk_dlr_pkg := $(MOSDESK_DLR_DIR)/$(MOSDESK_DLR_NAME)
 mosdesk_dlr_version = $(shell sed -n 's/^version=//p' $(MOSDESK_DIR)/mosdesk/mosdesk.pkg | head -n 1)
 
-mosdesk-dlr: mosdesk-build
+mosdesk-dlr: mosdesk-build $(mxplorer_run)
 	rm -rf $(mosdesk_dlr_pkg) $(mosdesk_dlr_pkg).mpkg
-	mkdir -p $(mosdesk_dlr_pkg)/programs $(mosdesk_dlr_pkg)/services
+	mkdir -p $(mosdesk_dlr_pkg)/programs/Mxplorer $(mosdesk_dlr_pkg)/services
 	cp -a $(MOSDESK_DIR)/mosdesk/dist/mosdesk/programs/. $(mosdesk_dlr_pkg)/programs/
+	cp $(mxplorer_run) $(mosdesk_dlr_pkg)/programs/Mxplorer.run
+	cp -a $(MOSDESK_DIR)/Mxplorer/Resources $(mosdesk_dlr_pkg)/programs/Mxplorer/
 	cp -a $(MOSDESK_DIR)/mosWM/dist/mosWM/programs/. $(mosdesk_dlr_pkg)/programs/
 	cp -a $(MOSDESK_DIR)/mosWM/dist/mosWM/services/. $(mosdesk_dlr_pkg)/services/
 	printf '%s\n' '[Info]' 'name=$(MOSDESK_DLR_NAME)' 'version=$(mosdesk_dlr_version)' \

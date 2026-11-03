@@ -94,6 +94,22 @@ static const uint8_t* dhcp_find_option(const dhcp_packet_t* pkt, uint16_t opt_ar
     return NULL;
 }
 
+static void dhcp_apply_network_options(const dhcp_packet_t* pkt, uint16_t opt_len) {
+    uint8_t option_len;
+    const uint8_t* option = dhcp_find_option(pkt, opt_len, 1, &option_len);
+    if (option && option_len == 4) {
+        g_offered_netmask = net_ntohl(*(const uint32_t*)option);
+    }
+    option = dhcp_find_option(pkt, opt_len, 3, &option_len);
+    if (option && option_len >= 4) {
+        g_offered_gateway = net_ntohl(*(const uint32_t*)option);
+    }
+    option = dhcp_find_option(pkt, opt_len, 6, &option_len);
+    if (option && option_len >= 4) {
+        g_offered_dns = net_ntohl(*(const uint32_t*)option);
+    }
+}
+
 static void dhcp_handle_reply(uint32_t src_ip, uint16_t src_port,
                               const uint8_t* data, uint16_t len) {
     (void)src_ip; (void)src_port;
@@ -112,14 +128,10 @@ static void dhcp_handle_reply(uint32_t src_ip, uint16_t src_port,
         uint8_t l;
         const uint8_t* server_id = dhcp_find_option(pkt, opt_len, 54, &l);
         g_server_ip = (server_id && l == 4) ? net_ntohl(*(const uint32_t*)server_id) : net_ntohl(pkt->siaddr);
-        const uint8_t* mask = dhcp_find_option(pkt, opt_len, 1, &l);
-        if (mask && l == 4) g_offered_netmask = net_ntohl(*(const uint32_t*)mask);
-        const uint8_t* router = dhcp_find_option(pkt, opt_len, 3, &l);
-        if (router && l >= 4) g_offered_gateway = net_ntohl(*(const uint32_t*)router);
-        const uint8_t* dns = dhcp_find_option(pkt, opt_len, 6, &l);
-        if (dns && l >= 4) g_offered_dns = net_ntohl(*(const uint32_t*)dns);
+        dhcp_apply_network_options(pkt, opt_len);
         g_offer_received = true;
     } else if (*type == DHCPACK) {
+        dhcp_apply_network_options(pkt, opt_len);
         g_ack_received = true;
     } else if (*type == DHCPNAK) {
         g_nak_received = true;
@@ -128,6 +140,11 @@ static void dhcp_handle_reply(uint32_t src_ip, uint16_t src_port,
 
 static bool dhcp_acquire_internal(uint32_t timeout_ms, bool quiet) {
     g_offer_received = g_ack_received = g_nak_received = false;
+    g_offered_ip = 0;
+    g_server_ip = 0;
+    g_offered_netmask = 0xFFFFFF00u;
+    g_offered_gateway = 0;
+    g_offered_dns = 0;
     g_xid = (uint32_t)time_get_uptime_ms() ^ 0xA5A5A5A5u;
 
     udp_register_handler(DHCP_CLIENT_PORT, dhcp_handle_reply);

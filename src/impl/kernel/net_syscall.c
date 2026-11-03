@@ -14,6 +14,7 @@
 #include "net/dhcp.h"
 #include "net/ethernet.h"
 #include "net/tls.h"
+#include "net/tls13.h"
 #include "string.h"
 #include "serial.h"
 #include "time.h"
@@ -214,6 +215,17 @@ typedef struct {
 
 static net_tls_slot_t g_tls_slots[NET_MAX_TLS_HANDLES];
 
+#define NET_MAX_TLS13_HANDLES TCP_MAX_CONNS
+#define NET_TLS13_SEND_SLICE  4096
+
+typedef struct {
+    bool in_use;
+    tls13_client_t* client;
+    uint64_t owner_pid;
+} net_tls13_slot_t;
+
+static net_tls13_slot_t g_tls13_slots[NET_MAX_TLS13_HANDLES];
+
 static int tls_slot_find_free(void) {
     for (int i = 0; i < NET_MAX_TLS_HANDLES; i++)
         if (!g_tls_slots[i].in_use) return i;
@@ -256,6 +268,8 @@ static void net_sweep_dead_owners(void) {
         if (g_listen_slots[i].in_use && g_listen_slots[i].owner_pid) any_owned = true;
     for (int i = 0; i < NET_MAX_TLS_HANDLES; i++)
         if (g_tls_slots[i].in_use && g_tls_slots[i].owner_pid) any_owned = true;
+    for (int i = 0; i < NET_MAX_TLS13_HANDLES; i++)
+        if (g_tls13_slots[i].in_use && g_tls13_slots[i].owner_pid) any_owned = true;
     if (!any_owned) return;
 
     size_t count = 0;
@@ -287,6 +301,17 @@ static void net_sweep_dead_owners(void) {
         slot->k = NULL;
         slot->owner_pid = 0;
         slot->tcp_handle = 0;
+    }
+
+    for (int i = 0; i < NET_MAX_TLS13_HANDLES; i++) {
+        net_tls13_slot_t* slot = &g_tls13_slots[i];
+        if (!slot->in_use || !slot->owner_pid) continue;
+        if (pid_is_live(slot->owner_pid, procs, count)) continue;
+
+        tls13_close(slot->client);
+        slot->in_use = false;
+        slot->client = NULL;
+        slot->owner_pid = 0;
     }
 
     for (int i = 0; i < NET_MAX_LISTENERS; i++) {
@@ -579,6 +604,82 @@ static uint64_t net_tls_dispatch(syscall_net_request_t* request) {
     }
 }
 
+static uint64_t net_tls13_dispatch(syscall_net_request_t* request) {
+    switch (request->op) {
+    case SYS_NET_TLS13_CONNECT: {
+        if (!request->out_handle || !request->host || !request->ip || !request->port)
+            return SYS_ERR_INVAL;
+        if (!ip_is_configured()) return SYS_ERR_GENERIC;
+        net_sweep_dead_owners();
+
+        int idx = -1;
+        for (int i = 0; i < NET_MAX_TLS13_HANDLES; i++) {
+            if (!g_tls13_slots[i].in_use) {
+                idx = i;
+                break;
+            }
+        }
+        if (idx < 0) return SYS_ERR_GENERIC;
+
+        tls13_client_t* client = tls13_connect(request->ip, request->port,
+                                               request->host,
+                                               request->timeout_ms ? request->timeout_ms : 15000);
+        if (!client) return SYS_ERR_GENERIC;
+
+        net_tls13_slot_t* slot = &g_tls13_slots[idx];
+        slot->in_use = true;
+        slot->client = client;
+        slot->owner_pid = getCurrentPID();
+        *request->out_handle = (uint64_t)(idx + 1);
+        return SYS_SUCCESS;
+    }
+
+    case SYS_NET_TLS13_SEND: {
+        if (!request->handle || request->handle > NET_MAX_TLS13_HANDLES)
+            return SYS_ERR_BADFD;
+        net_tls13_slot_t* slot = &g_tls13_slots[request->handle - 1];
+        if (!slot->in_use || !slot->client) return SYS_ERR_BADFD;
+        if (slot->owner_pid != getCurrentPID()) return SYS_ERR_PERM;
+        if (!request->buf || request->len == 0) return SYS_ERR_INVAL;
+
+        uint32_t length = request->len > NET_TLS13_SEND_SLICE
+                              ? NET_TLS13_SEND_SLICE : request->len;
+        int32_t sent = tls13_send(slot->client, request->buf, length);
+        return sent < 0 ? SYS_ERR_GENERIC : (uint64_t)sent;
+    }
+
+    case SYS_NET_TLS13_RECV: {
+        if (!request->handle || request->handle > NET_MAX_TLS13_HANDLES)
+            return SYS_ERR_BADFD;
+        net_tls13_slot_t* slot = &g_tls13_slots[request->handle - 1];
+        if (!slot->in_use || !slot->client) return SYS_ERR_BADFD;
+        if (slot->owner_pid != getCurrentPID()) return SYS_ERR_PERM;
+        if (!request->buf || request->len == 0) return SYS_ERR_INVAL;
+
+        int32_t received = tls13_recv(slot->client, request->buf, request->len,
+                                      request->timeout_ms ? request->timeout_ms : 5000);
+        return received < 0 ? SYS_ERR_NOTFOUND : (uint64_t)received;
+    }
+
+    case SYS_NET_TLS13_CLOSE: {
+        if (!request->handle || request->handle > NET_MAX_TLS13_HANDLES)
+            return SYS_ERR_BADFD;
+        net_tls13_slot_t* slot = &g_tls13_slots[request->handle - 1];
+        if (!slot->in_use || !slot->client) return SYS_ERR_BADFD;
+        if (slot->owner_pid != getCurrentPID()) return SYS_ERR_PERM;
+
+        tls13_close(slot->client);
+        slot->in_use = false;
+        slot->client = NULL;
+        slot->owner_pid = 0;
+        return SYS_SUCCESS;
+    }
+
+    default:
+        return SYS_ERR_INVAL;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Entry point (called from syscall_dispatch)
 // ---------------------------------------------------------------------------
@@ -588,6 +689,7 @@ void net_syscall_init(void) {
     memset(g_listen_slots, 0, sizeof(g_listen_slots));
     memset(g_udp_bindings, 0, sizeof(g_udp_bindings));
     memset(g_tls_slots, 0, sizeof(g_tls_slots));
+    memset(g_tls13_slots, 0, sizeof(g_tls13_slots));
     g_net_busy = 0;
     g_last_sweep_ms = 0;
 }
@@ -845,6 +947,13 @@ uint64_t sys_net_impl(syscall_net_request_t* request) {
         case SYS_NET_TLS_RECV:
         case SYS_NET_TLS_CLOSE:
             result = net_tls_dispatch(request);
+            break;
+
+        case SYS_NET_TLS13_CONNECT:
+        case SYS_NET_TLS13_SEND:
+        case SYS_NET_TLS13_RECV:
+        case SYS_NET_TLS13_CLOSE:
+            result = net_tls13_dispatch(request);
             break;
 
         default:

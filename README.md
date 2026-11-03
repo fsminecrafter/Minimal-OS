@@ -267,7 +267,11 @@ sudo apt install -y \
 ```
 fallocate -l 256M sata256.img
 ```
-5. Compile and run using make
+5. Get submodules
+```
+git submodule update --init --remote
+```
+6. Compile and run using make
 ```make run -j$(nproc)```
 If audio doesnt work use either
 ```make run-sdl``` or ```make run-alsa```

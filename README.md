@@ -3,6 +3,8 @@ Is a OS made in C and Assembly made for x86_64 processors, It currently runs wit
 
 find roadmap in roadmap.txt or below (might be old or un-synced!)
 
+##### Hyperlinks
+
 User application developers can find the syscall and SDK integration guide in
 [docs/user-sdk-syscalls.md](docs/user-sdk-syscalls.md).
 Install packages and service definitions are documented in
@@ -13,9 +15,13 @@ summarized in [docs/system-overview.md](docs/system-overview.md).
 [shading language FGSL](docs/fgsl.md), and the GPU side in
 [docs/gpu.md](docs/gpu.md) (including what hardware rendering on NVIDIA
 cards needs).
+
+##### Nvidia firmware setup
+
 NVIDIA firmware for an RTX 20 / GTX 16 card: `make gpu-setup` (RTX 2060)
 or `make gpu-setup GPU="GTX 1660 Ti"`, then `make mosdesk`.
 
+##### Beatifull logo (i know) 
 <img width="250" height="250" alt="Icon" src="https://github.com/user-attachments/assets/f2401784-fcd3-4002-bbe0-02d16b9652d1" />
 
 <details>
@@ -190,14 +196,14 @@ Last synced 2026 - oct 20, 15:29
 - [X] Syscalls and User layer
 - [X] .run executable file
 
-</details>
-
 #### V 0.4.50
 
 - [X] Simple Desktop 
 - [X] Window Manager 
 - [X] MinimaFS file browser (within minimal-os) 
 - [X] Text editor
+
+</details>
 
 ##### V 0.4.51
 
@@ -211,6 +217,10 @@ Last synced 2026 - oct 20, 15:29
 
 - [X] GPU engine and GLSL style shaders (Pascal)
 - [X] Fix various apps.
+
+##### V  0.4.53
+
+- [ ] Webbrowser (Mxplorer)
 
 ## Usage
 
@@ -257,7 +267,11 @@ sudo apt install -y \
 ```
 fallocate -l 256M sata256.img
 ```
-5. Compile and run using make
+5. Get submodules
+```
+git submodule update --init --remote
+```
+6. Compile and run using make
 ```make run -j$(nproc)```
 If audio doesnt work use either
 ```make run-sdl``` or ```make run-alsa```

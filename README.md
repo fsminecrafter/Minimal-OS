@@ -196,14 +196,14 @@ Last synced 2026 - oct 20, 15:29
 - [X] Syscalls and User layer
 - [X] .run executable file
 
-</details>
-
 #### V 0.4.50
 
 - [X] Simple Desktop 
 - [X] Window Manager 
 - [X] MinimaFS file browser (within minimal-os) 
 - [X] Text editor
+
+</details>
 
 ##### V 0.4.51
 

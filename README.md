@@ -218,6 +218,10 @@ Last synced 2026 - oct 20, 15:29
 - [X] GPU engine and GLSL style shaders (Pascal)
 - [X] Fix various apps.
 
+##### V  0.4.53
+
+- [ ] Webbrowser (Mxplorer)
+
 ## Usage
 
 To run Minimal-OS (direct iso) download from github releases ( [Minimal-OS Downloads](https://github.com/fsminecrafter/Minimal-OS/releases) )

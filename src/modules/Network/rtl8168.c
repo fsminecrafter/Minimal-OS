@@ -1,3 +1,4 @@
+#include "x86_64/syscall.h"
 #include <stdint.h>
 #include <stdbool.h>
 #include "x86_64/rtl8168.h"
@@ -289,7 +290,17 @@ static void rtl8168_poll(void) {
     }
 }
 
+/* PHYstatus: bit 0 full duplex, 1 link, 2 10M, 3 100M, 4 1000M. */
+static int rtl8168_link_state(uint32_t* speed, bool* full) {
+    if (!g_present) return SYSCALL_NET_LINK_UNKNOWN;
+    uint8_t status = rd8(REG_PHY_STATUS);
+    *full = (status & 0x01) != 0;
+    *speed = (status & 0x10) ? 1000u : (status & 0x08) ? 100u : (status & 0x04) ? 10u : 0u;
+    return (status & PHY_LINK_UP) ? SYSCALL_NET_LINK_UP : SYSCALL_NET_LINK_DOWN;
+}
+
 static const network_hw_driver_t rtl8168_driver = {
+    .link_state = rtl8168_link_state,
     .name    = "RTL8168",
     .init    = rtl8168_init,
     .send    = rtl8168_send,

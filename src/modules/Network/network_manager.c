@@ -1,5 +1,6 @@
 #include "x86_64/network_manager.h"
 #include "serial.h"
+#include "string.h"
 
 // Drivers in registration order; the first whose hardware is present and
 // starts becomes the active one.
@@ -45,5 +46,23 @@ void network_manager_get_mac(uint8_t mac[6]) {
         g_driver->get_mac(mac);
     } else {
         for (int i = 0; i < 6; i++) mac[i] = 0;
+    }
+}
+
+void network_manager_adapters(syscall_net_adapters_t* out) {
+    memset(out, 0, sizeof(*out));
+    if (!g_driver) return;
+    // Only the adapter that started is driven; it carries the address.
+    syscall_net_adapter_t* a = &out->adapters[out->count++];
+    const char* name = g_driver->name ? g_driver->name : "Network adapter";
+    for (uint32_t i = 0; name[i] && i + 1 < sizeof(a->name); i++) a->name[i] = name[i];
+    a->kind = g_driver->wireless ? SYSCALL_NET_ADAPTER_WIFI : SYSCALL_NET_ADAPTER_ETHERNET;
+    a->active = 1;
+    if (g_driver->get_mac) g_driver->get_mac(a->mac);
+    a->link = SYSCALL_NET_LINK_UNKNOWN;
+    if (g_driver->link_state) {
+        bool full = false;
+        a->link = (uint8_t)g_driver->link_state(&a->speed_mbps, &full);
+        a->full_duplex = full ? 1 : 0;
     }
 }

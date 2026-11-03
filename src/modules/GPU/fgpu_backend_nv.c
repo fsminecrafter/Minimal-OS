@@ -12,7 +12,8 @@
  *
  * Status:
  *   1. firmware files: checked (nv_fw.c)                         done
- *   2. GSP boot (FWSEC-FRTS, booter_load on SEC2, GSP-RM)        to do
+ *   2a. FWSEC found in the VBIOS (nv_vbios.c), reported         done, untested on a card
+ *   2b. GSP boot (FWSEC-FRTS, booter_load on SEC2, GSP-RM)       to do
  *   3. RM channel + TURING_A, first clear (nv_push_clear_xrgb)   to do
  *   4. draws: pushbuffers + SASS from the shader IR (fgpu_ir.c)  IR done, encoder to do
  *
@@ -149,6 +150,78 @@ static bool check_file(const char* chip, const nv_fw_entry_t* e, char* result, s
     return ok;
 }
 
+// Reads the VBIOS through the PROM window, a 32-bit register at a time.
+static bool prom_read(void* ctx, uint64_t offset, void* buf, uint32_t len) {
+    gpu_adapter_t* a = (gpu_adapter_t*)ctx;
+    if (offset + len > NV_VBIOS_PROM_SIZE) return false;
+    uint8_t* out = (uint8_t*)buf;
+    uint32_t at = (uint32_t)offset;
+    while (len) {
+        uint32_t word = nv_rd32(a, NV_VBIOS_PROM + (at & ~3u));
+        uint32_t skip = at & 3u, n = 4u - skip;
+        if (n > len) n = len;
+        for (uint32_t i = 0; i < n; i++) out[i] = (uint8_t)(word >> (8u * (skip + i)));
+        out += n;
+        at += n;
+        len -= n;
+    }
+    return true;
+}
+
+// Step 2, first part: find FWSEC in the VBIOS. Only reads, apart from
+// turning ROM shadowing off while it reads (as nouveau does).
+static void report_vbios(gpu_adapter_t* a, void (*print)(const char* text)) {
+    char line[160];
+    print("\nStep 2a VBIOS: FWSEC (sets up the protected memory GSP boots in)\n");
+    uint32_t shadow = nv_rd32(a, NV_PCI_ROM_SHADOW);
+    if (nv_pri_error(shadow)) {
+        print("  The ROM shadow register does not answer.\n");
+        return;
+    }
+    nv_wr32(a, NV_PCI_ROM_SHADOW, shadow & ~1u);
+    nv_fw_file_t rom = { prom_read, a, NV_VBIOS_PROM_SIZE };
+    nv_vbios_info_t v;
+    const char* why = "";
+    bool ok = nv_vbios_parse(&rom, &v, &why);
+    nv_wr32(a, NV_PCI_ROM_SHADOW, shadow);
+
+    for (uint32_t i = 0; i < v.image_count; i++) {
+        snprintf(line, sizeof(line), "  image %u at 0x%05x, %3u KiB, type 0x%02x %s\n", (unsigned)i,
+                 (unsigned)v.images[i].base, (unsigned)(v.images[i].size >> 10),
+                 (unsigned)v.images[i].type, nv_vbios_image_name(v.images[i].type));
+        print(line);
+    }
+    if (v.bit_offset) {
+        snprintf(line, sizeof(line), "  BIT table at 0x%05x", (unsigned)v.bit_offset);
+        print(line);
+        if (v.pmu_table) {
+            snprintf(line, sizeof(line), ", falcon ucode table at 0x%05x (%u entries)",
+                     (unsigned)v.pmu_table, (unsigned)v.pmu_entries);
+            print(line);
+        }
+        print("\n");
+    }
+    if (v.fwsec_desc) {
+        snprintf(line, sizeof(line),
+                 "  FWSEC at 0x%05x: descriptor v%u, %u signature(s), IMEM %u + DMEM %u bytes\n",
+                 (unsigned)v.fwsec_desc, (unsigned)v.desc_version, (unsigned)v.signature_count,
+                 (unsigned)v.imem_load, (unsigned)v.dmem_load);
+        print(line);
+    }
+    if (v.mapper_offset) {
+        snprintf(line, sizeof(line),
+                 "  DMEM mapper: command buffer at DMEM 0x%x, init command 0x%x, mask 0x%08x\n",
+                 (unsigned)v.mapper_cmd_in, (unsigned)v.mapper_init_cmd,
+                 (unsigned)v.mapper_cmd_mask0);
+        print(line);
+    }
+    snprintf(line, sizeof(line), "  %s%s\n", ok ? "ok: FWSEC can be patched with the FRTS command"
+                                                : "not usable: ", ok ? "" : why);
+    print(line);
+    serial_write_str(ok ? "nvidia: FWSEC found in the VBIOS\n" : "nvidia: VBIOS: ");
+    if (!ok) { serial_write_str(why); serial_write_str("\n"); }
+}
+
 // `text` padded with spaces to `width` (the kernel's snprintf has no %-Ns).
 static const char* padded(const char* text, uint32_t width, char* buf, size_t size) {
     size_t n = 0;
@@ -210,7 +283,8 @@ void nv_bringup_report(gpu_adapter_t* a, void (*print)(const char* text)) {
         print(line);
     }
 
-    print("\nStep 2  boot GSP-RM                       not implemented yet\n");
+    if (is_turing(chip)) report_vbios(a, print);
+    print("\nStep 2b FWSEC-FRTS, booter_load on SEC2, GSP-RM   to do (needs 2a ok)\n");
     print("Step 3  channel + TURING_A, first clear   waits for step 2\n");
     print("Step 4  draws: pushbuffers + shader code  shader IR ready, SASS encoder to do\n");
     const char* why = "";

@@ -1,3 +1,4 @@
+#include "x86_64/syscall.h"
 #include <stdint.h>
 #include <stdbool.h>
 #include "x86_64/rtl8139.h"
@@ -59,6 +60,7 @@ static inline void wr8(uint16_t reg, uint8_t v)   { port_outb(g_io_base + reg, v
 static inline void wr16(uint16_t reg, uint16_t v) { port_outw(g_io_base + reg, v); }
 static inline void wr32(uint16_t reg, uint32_t v) { port_outl(g_io_base + reg, v); }
 static inline uint8_t  rd8(uint16_t reg)  { return port_inb(g_io_base + reg); }
+static inline uint16_t rd16(uint16_t reg) { return port_inw(g_io_base + reg); }
 static inline uint32_t rd32(uint16_t reg) { return port_inl(g_io_base + reg); }
 
 
@@ -236,7 +238,18 @@ static void rtl8139_poll(void) {
     }
 }
 
+/* Media Status Register: bit 2 LINKB (0 = link), bit 3 SPEED_10.
+ * Basic Mode Control Register (0x62): bit 8 full duplex. */
+static int rtl8139_link_state(uint32_t* speed, bool* full) {
+    if (!g_io_base) return SYSCALL_NET_LINK_UNKNOWN;
+    uint8_t msr = rd8(0x58);
+    *speed = (msr & 0x08) ? 10u : 100u;
+    *full = (rd16(0x62) & 0x0100) != 0;
+    return (msr & 0x04) ? SYSCALL_NET_LINK_DOWN : SYSCALL_NET_LINK_UP;
+}
+
 static const network_hw_driver_t rtl8139_driver = {
+    .link_state = rtl8139_link_state,
     .name    = "RTL8139",
     .init    = rtl8139_init,
     .send    = rtl8139_send,

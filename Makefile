@@ -498,7 +498,7 @@ build/tests/host/fgpu_ir_tests: tests/host/fgpu_ir_tests.c src/modules/GPU/fgpu_
 	mkdir -p $(dir $@)
 	$(HOSTCC) $(HOST_CFLAGS) -idirafter Minimal-OS-SDK/include $(filter %.c,$^) -lm -o $@
 
-build/tests/host/nv_hw_tests: tests/host/nv_hw_tests.c src/modules/GPU/nv_fw.c $(header_files)
+build/tests/host/nv_hw_tests: tests/host/nv_hw_tests.c src/modules/GPU/nv_fw.c src/modules/GPU/nv_vbios.c $(header_files)
 	mkdir -p $(dir $@)
 	$(HOSTCC) $(HOST_CFLAGS) $(filter %.c,$^) -o $@
 

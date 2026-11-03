@@ -714,6 +714,13 @@ uint64_t sys_net_impl(syscall_net_request_t* request) {
             return SYS_SUCCESS;
         }
 
+        case SYS_NET_ADAPTERS: {
+            if (!request->buf || request->len < sizeof(syscall_net_adapters_t))
+                return SYS_ERR_INVAL;
+            network_manager_adapters((syscall_net_adapters_t*)request->buf);
+            return SYS_SUCCESS;
+        }
+
         case SYS_NET_TCP_STATE: {
             net_tcp_slot_t* slot = tcp_slot_get(request->handle);
             if (!slot) return SYS_ERR_BADFD;

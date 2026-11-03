@@ -147,11 +147,92 @@ static void test_manifest(void) {
           "falcon memory sizes from HWCFG");
 }
 
+// One PCI ROM image at `base`: signature, PCIR (and an NPDE when `npde`).
+static void put_image(uint8_t* rom, uint32_t base, uint32_t blocks, uint8_t type, int last, int npde) {
+    put16(rom + base, 0xAA55);
+    put16(rom + base + 0x18, 0x40);
+    uint8_t* pcir = rom + base + 0x40;
+    memcpy(pcir, "PCIR", 4);
+    put16(pcir + 0x0A, 0x18);
+    put16(pcir + 0x10, npde ? 1 : (uint16_t)blocks);   // the NPDE overrides this
+    pcir[0x14] = type;
+    pcir[0x15] = last && !npde ? 0x80 : 0;
+    if (npde) {
+        uint8_t* e = rom + base + 0x60;                  // (0x40 + 0x18 + 15) & ~15
+        memcpy(e, "NPDE", 4);
+        put16(e + 0x08, (uint16_t)blocks);
+        e[0x0A] = last ? 0x80 : 0;
+    }
+}
+
+static void test_vbios(void) {
+    static uint8_t rom[0x4000];
+    memset(rom, 0, sizeof(rom));
+    // image 0 (x86, 1 KiB) with the BIT table, an EFI image, then the
+    // extended image at 0x3400 holding the PMU table and FWSEC.
+    put_image(rom, 0x0000, 2, 0x00, 0, 1);
+    put_image(rom, 0x0400, 24, 0x03, 0, 0);
+    put_image(rom, 0x3400, 6, 0xE0, 1, 0);
+    uint8_t* bit = rom + 0x100;
+    bit[0] = 0xFF; bit[1] = 0xB8; memcpy(bit + 2, "BIT", 4);
+    bit[8] = 12; bit[9] = 6; bit[10] = 2;
+    bit[12] = 'i';                                       // another token first
+    bit[18] = 'p'; bit[19] = 2; put16(bit + 20, 4); put16(bit + 22, 0x200);
+    // 'p' data: a pointer past image 0 -> 0x3400 + (0x0480 - 0x400).
+    put32(rom + 0x200, 0x0480);
+    uint8_t* pmu = rom + 0x3480;
+    pmu[0] = 1; pmu[1] = 4; pmu[2] = 6; pmu[3] = 2;
+    pmu[4] = 0x45; put32(pmu + 6, 0x0500);               // another ucode
+    pmu[10] = 0x85; put32(pmu + 12, 0x0500);             // FWSEC at 0x3500
+    uint8_t* d = rom + 0x3500;
+    put32(d, (uint32_t)(44 + 384) << 16 | 3u << 8 | 1u);
+    put32(d + 4, 0x300);                                 // stored size
+    put32(d + 12, 0x10);                                 // interface offset in DMEM
+    put32(d + 20, 0x200);                                // IMEM load size
+    put32(d + 32, 0x100);                                // DMEM load size
+    d[39] = 1;                                           // one signature
+    uint8_t* dmem = d + 44 + 384 + 0x200;
+    uint8_t* appif = dmem + 0x10;
+    appif[0] = 1; appif[1] = 4; appif[2] = 8; appif[3] = 2;
+    put32(appif + 4, 0x1); put32(appif + 8, 0x40);
+    put32(appif + 12, NV_FALCON_APPIF_DMEMMAPPER); put32(appif + 16, 0x80);
+    put32(dmem + 0x80, NV_FWSEC_DMAP_SIGNATURE);
+    put32(dmem + 0x80 + 8, 0xC0);
+    put32(dmem + 0x80 + 52, 1u << NV_FWSEC_CMD_FRTS);
+
+    mem_t m = { rom, sizeof(rom) };
+    nv_fw_file_t f = { mem_read, &m, sizeof(rom) };
+    nv_vbios_info_t info;
+    const char* why = "";
+    bool ok = nv_vbios_parse(&f, &info, &why);
+    if (!ok) printf("  vbios: %s\n", why);
+    CHECK(ok, "vbios parses");
+    CHECK(info.image_count == 3 && info.images[0].size == 1024 && info.images[1].type == 3,
+          "image chain, NPDE size");
+    CHECK(info.image0_size == 1024 && info.extended_base == 0x3400, "extended image");
+    CHECK(info.bit_offset == 0x100, "BIT found");
+    CHECK(info.pmu_table == 0x3480 && info.pmu_entries == 2, "PMU table through the extended image");
+    CHECK(info.fwsec_desc == 0x3500 && info.desc_version == 3 && info.signature_count == 1,
+          "FWSEC descriptor");
+    CHECK(info.image_offset == 0x3500 + 44 + 384, "ucode image after the signatures");
+    CHECK(info.mapper_offset == (uint32_t)(dmem + 0x80 - rom) && info.mapper_cmd_in == 0xC0,
+          "DMEM mapper");
+
+    // Broken mapper signature and a missing FWSEC entry are reported.
+    put32(dmem + 0x80, 0);
+    CHECK(!nv_vbios_parse(&f, &info, &why) && info.fwsec_desc == 0x3500, "bad DMAP rejected");
+    pmu[10] = 0x86;
+    CHECK(!nv_vbios_parse(&f, &info, &why) && !info.fwsec_desc, "no FWSEC entry");
+    memset(rom, 0, 2);
+    CHECK(!nv_vbios_parse(&f, &info, &why) && !info.image_count, "no ROM signature");
+}
+
 int main(void) {
     test_push();
     test_bin();
     test_elf();
     test_manifest();
+    test_vbios();
     if (failures) {
         printf("nv hw tests: %d failure(s)\n", failures);
         return 1;

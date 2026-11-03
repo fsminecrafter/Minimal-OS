@@ -499,7 +499,34 @@ typedef enum {
     SYS_NET_TLS13_SEND,           // handle/buf/len -> bytes
     SYS_NET_TLS13_RECV,           // handle/buf/len/timeout_ms -> bytes or SYS_ERR_NOTFOUND
     SYS_NET_TLS13_CLOSE,          // handle
+
+    SYS_NET_ADAPTERS = 0x50,      // buf/len = syscall_net_adapters_t; no side effects
 } syscall_net_op_t;
+
+// SYS_NET_ADAPTERS: the network adapters the kernel drives.
+#define SYSCALL_NET_MAX_ADAPTERS 4
+#define SYSCALL_NET_ADAPTER_ETHERNET 0
+#define SYSCALL_NET_ADAPTER_WIFI     1
+#define SYSCALL_NET_LINK_UNKNOWN 0
+#define SYSCALL_NET_LINK_DOWN    1
+#define SYSCALL_NET_LINK_UP      2
+
+typedef struct {
+    char     name[24];      // driver / chip, e.g. "RTL8168"
+    uint8_t  kind;          // SYSCALL_NET_ADAPTER_*
+    uint8_t  active;        // carries the IPv4 configuration below
+    uint8_t  link;          // SYSCALL_NET_LINK_*
+    uint8_t  full_duplex;
+    uint8_t  mac[6];
+    uint16_t reserved;
+    uint32_t speed_mbps;    // 0 when unknown
+} syscall_net_adapter_t;
+
+typedef struct {
+    uint32_t count;
+    uint32_t reserved;
+    syscall_net_adapter_t adapters[SYSCALL_NET_MAX_ADAPTERS];
+} syscall_net_adapters_t;
 
 // Handle ownership. Every connection and listener handle belongs to the
 // process that created (or accepted) it. When that process is gone

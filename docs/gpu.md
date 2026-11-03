@@ -185,7 +185,8 @@ as before.
 | Firmware: list of files per chip, parsers for NVIDIA's `.bin` containers and the GSP-RM ELF image | `nv_hw.h`, `nv_fw.c` | done, tested |
 | Falcons: read state; IMEM/DMEM upload, start, wait | `nv_falcon.c` | reading used, the rest ready for GSP boot |
 | Pushbuffers: method headers, GPFIFO entries, a ready-made `TURING_A` clear | `nv_fw.c` | done, tested (method offsets unverified on hardware) |
-| GSP boot (FWSEC-FRTS from the VBIOS, `booter_load` on SEC2, GSP-RM) | | to do |
+| VBIOS: ROM image chain, BIT table, falcon ucode table, FWSEC's descriptor and DMEM mapper (where the FRTS command goes), read through the BAR0 PROM window | `nv_vbios.c` | done, tested on a synthetic ROM, not yet on a card |
+| GSP boot (FWSEC-FRTS, `booter_load` on SEC2, GSP-RM) | | to do |
 | RM RPC: channel, GPFIFO and class allocation through GSP-RM | | to do |
 
 `gpu nvidia` prints the bring-up state. It only reads registers, so it is
@@ -268,7 +269,8 @@ evaluator) and the CPU shader machine, and checks that they agree.
 #### Next steps on a card
 
 1. Run `gpu nvidia` with the firmware copied: every file should show
-   `ok`, and GSP/SEC2 should be reachable.
+   `ok`, GSP/SEC2 should be reachable, and step 2a should list the ROM
+   images and end with `ok: FWSEC can be patched with the FRTS command`.
 2. GSP boot, following nouveau's `r535` code (`nvkm/subdev/gsp/r535.c`,
    `tu102.c`): run FWSEC-FRTS from the VBIOS, load `booter_load` on SEC2
    with the GSP-RM image and boot loader in system memory, and wait for

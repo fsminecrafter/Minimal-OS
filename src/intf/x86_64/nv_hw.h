@@ -192,3 +192,61 @@ const char* nv_chip_name(uint16_t chipset);
 // The firmware files `chipset` needs for hardware rendering; NULL (and
 // *count = 0) when none is listed for it yet.
 const nv_fw_entry_t* nv_fw_manifest(uint16_t chipset, uint32_t* count);
+
+/* --------------------------------------------------------------- VBIOS */
+
+/* GSP boot starts with FWSEC, a signed falcon program stored in the
+ * card's VBIOS. Run with the FRTS command it carves out the protected
+ * region GSP-RM boots in. These parse the ROM as nouveau does
+ * (nvkm/subdev/bios: image.c, bit.c, pmu.c; gsp/fwsec.c). Read only. */
+
+#define NV_VBIOS_MAX_IMAGES 8u
+#define NV_VBIOS_PROM       0x300000u   // BAR0 window onto the ROM (1 MiB)
+#define NV_VBIOS_PROM_SIZE  0x100000u
+#define NV_PCI_ROM_SHADOW   0x088050u   // PCI config 0x50 mirror; bit 0 = ROM shadow on
+
+#define NV_VBIOS_IMAGE_X86      0x00u
+#define NV_VBIOS_IMAGE_EFI      0x03u
+#define NV_VBIOS_IMAGE_EXTENDED 0xE0u   // holds the falcon ucodes
+#define NV_VBIOS_UCODE_FWSEC_PROD 0x85u // PMU table entry type
+#define NV_FALCON_APPIF_DMEMMAPPER 0x4u
+#define NV_FWSEC_DMAP_SIGNATURE 0x50414D44u   // "DMAP"
+#define NV_FWSEC_CMD_FRTS       0x15u
+
+typedef struct {
+    uint32_t base, size;
+    uint8_t type;
+} nv_vbios_image_t;
+
+typedef struct {
+    uint32_t image_count;
+    nv_vbios_image_t images[NV_VBIOS_MAX_IMAGES];
+    uint32_t image0_size;       // pointers at or past this ...
+    uint32_t extended_base;     // ... are relative to the 0xE0 image (0 = none)
+    uint32_t bit_offset;
+    uint32_t pmu_table;         // ROM offset, 0 = none
+    uint8_t pmu_version, pmu_entries;
+
+    uint32_t fwsec_desc;        // ROM offset of FWSEC's descriptor, 0 = not found
+    uint32_t desc_version;      // 2 or 3
+    uint32_t desc_size;         // descriptor + signatures
+    uint32_t stored_size;       // ucode image bytes (IMEM then DMEM)
+    uint32_t interface_offset;  // DMEM offset of the application interface table
+    uint32_t imem_phys, imem_load, imem_virt;
+    uint32_t dmem_phys, dmem_load;
+    uint16_t engine_mask;
+    uint8_t ucode_id, signature_count;
+    uint32_t image_offset;      // ROM offset of the ucode image
+
+    uint32_t mapper_offset;     // ROM offset of the DMEM mapper, 0 = none
+    uint32_t mapper_cmd_in;     // its command buffer (DMEM offset)
+    uint32_t mapper_init_cmd;
+    uint32_t mapper_cmd_mask0;
+} nv_vbios_info_t;
+
+// Fills `out` as far as the ROM allows; false (with *why) when FWSEC and
+// its DMEM mapper cannot be found. The fields found before the failure
+// stay filled in, for the report.
+bool nv_vbios_parse(const nv_fw_file_t* rom, nv_vbios_info_t* out, const char** why);
+
+const char* nv_vbios_image_name(uint8_t type);

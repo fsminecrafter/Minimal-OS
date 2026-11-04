@@ -504,13 +504,19 @@ build/tests/host/nv_hw_tests: tests/host/nv_hw_tests.c src/modules/GPU/nv_fw.c s
 	mkdir -p $(dir $@)
 	$(HOSTCC) $(HOST_CFLAGS) $(filter %.c,$^) -o $@
 
-build/tests/host/media_tests: tests/host/media_tests.c Minimal-OS-SDK/include/mosmedia.h
+build/tests/host/media_tests: tests/host/media_tests.c Minimal-OS-SDK/include/mosmedia.h Minimal-OS-SDK/include/mosmedia_motion.h
 	mkdir -p $(dir $@)
 	$(HOSTCC) $(HOST_CFLAGS) -idirafter Minimal-OS-SDK/include tests/host/media_tests.c -o $@
 
-build/tools/mosmedia: tools/media/mosmedia.c Minimal-OS-SDK/include/mosmedia.h
+build/tools/mosmedia: tools/media/mosmedia.c Minimal-OS-SDK/include/mosmedia.h Minimal-OS-SDK/include/mosmedia_motion.h
 	mkdir -p $(dir $@)
-	$(HOSTCC) -std=c11 -O2 -Wall -Wextra -idirafter Minimal-OS-SDK/include tools/media/mosmedia.c -o $@
+	$(HOSTCC) -std=c11 -O2 -Wall -Wextra -pthread -idirafter Minimal-OS-SDK/include tools/media/mosmedia.c -o $@
+
+# The same converter for Windows (needs MinGW-w64; ffmpeg and ffprobe in PATH there).
+MINGW_CC ?= x86_64-w64-mingw32-gcc
+build/tools/mosmedia.exe: tools/media/mosmedia.c Minimal-OS-SDK/include/mosmedia.h Minimal-OS-SDK/include/mosmedia_motion.h
+	mkdir -p $(dir $@)
+	$(MINGW_CC) -std=c11 -O2 -Wall -Wextra -static -idirafter Minimal-OS-SDK/include tools/media/mosmedia.c -o $@
 
 build/tests/host/gfx_blit_tests: tests/host/gfx_blit_tests.c src/impl/handlers/gfx_blit.c
 	mkdir -p $(dir $@)

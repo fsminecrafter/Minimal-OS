@@ -85,6 +85,31 @@ class MediaDecoderTests(unittest.TestCase):
         self.assertEqual(video.frame(0)[0], 0x280A141E)
         self.assertEqual(video.frame(1)[0], 0x50323C46)
 
+    def test_motion_codec_video_decodes_close_to_the_source(self):
+        examples = ROOT / "docs" / "examples"
+        source = mosplayer.VideoFile((examples / "sample.vid").read_bytes())
+        video = mosplayer.VideoFile((examples / "sample-motion.vid").read_bytes())
+        self.assertEqual((video.codec_name, video.width, video.height, video.frame_count),
+                         ("motion", 160, 90, 24))
+        self.assertFalse(video.alpha)
+        for number in (0, 1, 2, 13, 23, 5):     # in order, then seeking back
+            got, want = video.frame(number), source.frame(number)
+            error = sum(abs(((g >> s) & 255) - ((w >> s) & 255))
+                        for g, w in zip(got, want) for s in (0, 8, 16)) / (len(got) * 3)
+            # (Saturated colour bars with hard edges are 4:2:0's worst case.)
+            self.assertLess(error, 10, f"frame {number}")
+            self.assertTrue(all(p >> 24 == 255 for p in got))
+
+    def test_damaged_motion_frame_is_rejected_or_survived(self):
+        data = bytearray((ROOT / "docs" / "examples" / "sample-motion.vid").read_bytes())
+        video = mosplayer.VideoFile(bytes(data))
+        offset, size, _ = video.index[0]
+        data[offset + 4:offset + size] = bytes(size - 4)     # all zero: decodes to garbage, no crash
+        try:
+            mosplayer.VideoFile(bytes(data)).frame(0)
+        except ValueError:
+            pass
+
     def test_truncated_image_is_rejected(self):
         with self.assertRaises(ValueError):
             mosplayer.ImageFile(b"MIMG")

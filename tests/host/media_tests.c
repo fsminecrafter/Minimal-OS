@@ -167,6 +167,162 @@ static void test_video(uint32_t w, uint32_t h, bool fast, bool alpha) {
     free(px); free(all); free(out); free(m.data);
 }
 
+// Lossy videos: every decoded pixel is within `loss` of the source (alpha
+// exact), also when seeking, and noisy footage gets smaller.
+static size_t encode_noisy(membuf_t* m, uint32_t w, uint32_t h, uint32_t frames, bool alpha,
+                           uint32_t loss, bool fast, uint32_t* all) {
+    mvid_writer_t v;
+    CHECK(mvid_writer_begin(&v, w, h, 30, 1, alpha, 10, fast, mem_write, m, malloc, free), "begin");
+    v.loss = loss;
+    rng = 7;
+    for (uint32_t t = 0; t < frames; t++) {
+        uint32_t* px = all + (size_t)t * w * h;
+        video_frame(px, w, h, w, t, alpha);
+        for (size_t i = 0; i < (size_t)w * h; i++) {   // camera-like noise, and edge values
+            uint32_t c = px[i], out = c & 0xFF000000u;
+            for (int sh = 0; sh < 24; sh += 8) {
+                int ch = (int)((c >> sh) & 255u) + (int)(rnd() % 9u) - 4;
+                if (i % 97 == 0) ch = sh ? 0 : 255;
+                out |= (uint32_t)(ch < 0 ? 0 : ch > 255 ? 255 : ch) << sh;
+            }
+            px[i] = out;
+        }
+        CHECK(mvid_writer_frame(&v, px, w), "frame");
+    }
+    CHECK(mvid_writer_finish(&v, NULL, 0), "finish");
+    return m->size;
+}
+
+static void test_video_lossy(uint32_t w, uint32_t h, bool alpha, uint32_t loss, bool fast) {
+    uint32_t frames = 25;
+    uint32_t* all = malloc((size_t)w * h * 4 * frames);
+    membuf_t exact = {0}, m = {0};
+    size_t lossless = encode_noisy(&exact, w, h, frames, alpha, 0, fast, all);
+    size_t lossy = encode_noisy(&m, w, h, frames, alpha, loss, fast, all);
+    mvid_reader_t r;
+    CHECK(mvid_open(&r, mem_read, &m, m.size, malloc), "open");
+    uint32_t* out = malloc((size_t)w * h * 4);
+    uint32_t order[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+                        13, 4, 22};
+    for (size_t i = 0; i < sizeof(order) / sizeof(order[0]); i++) {
+        uint32_t n = order[i];
+        CHECK(mvid_decode(&r, n, out), "decode lossy frame");
+        const uint32_t* src = all + (size_t)n * w * h;
+        size_t bad = 0;
+        for (size_t p = 0; p < (size_t)w * h; p++)
+            bad += !mm_close(out[p], src[p] | (alpha ? 0 : 0xFF000000u), loss);
+        if (bad) { printf("  lossy frame %u: %zu pixels too far\n", n, bad); failures++; break; }
+    }
+    CHECK(lossy < lossless, "lossy is smaller");
+    printf("  lossy video %ux%u loss %u%s%s: %zu bytes (lossless %zu)\n", w, h, loss, alpha ? " alpha" : "",
+           fast ? " fast" : "", lossy, lossless);
+    mvid_close(&r, free);
+    free(all); free(out); free(m.data); free(exact.data);
+}
+
+// The motion codec: decoders show exactly the encoder's reference frames
+// (also when seeking), quality is sane, damage fails cleanly.
+static void test_video_motion(uint32_t w, uint32_t h, uint32_t qp) {
+    uint32_t frames = 31;
+    membuf_t m = {0};
+    mvid_writer_t v;
+    CHECK(mvid_writer_begin(&v, w, h, 30, 1, true, 10, false, mem_write, &m, malloc, free), "begin");
+    v.codec = MVID_CODEC_MOTION;
+    v.qp = qp;
+    uint32_t* src = malloc((size_t)w * h * 4 * frames);
+    uint32_t* rec = malloc((size_t)w * h * 4 * frames);
+    rng = 3;
+    for (uint32_t t = 0; t < frames; t++) {
+        uint32_t* px = src + (size_t)t * w * h;
+        video_frame(px, w, h, w, t, false);
+        for (size_t i = 0; i < (size_t)w * h; i++) {   // a little noise, like a camera
+            uint32_t c = px[i], out = 0xFF000000u;
+            for (int sh = 0; sh < 24; sh += 8) {
+                int ch = (int)((c >> sh) & 255u) + (int)(rnd() % 5u) - 2;
+                out |= (uint32_t)(ch < 0 ? 0 : ch > 255 ? 255 : ch) << sh;
+            }
+            px[i] = out;
+        }
+        CHECK(mvid_writer_frame(&v, px, w), "motion frame");
+        mmc_to_argb(&v.mc, rec + (size_t)t * w * h, w, h, w);
+    }
+    static const char adi[] = "AudioFormat=PCM16\nSampleRate=8000\nChannels=1\n#DATA\n\x01\x02";
+    CHECK(mvid_writer_finish(&v, adi, sizeof(adi) - 1), "finish");
+    mvid_reader_t r;
+    CHECK(mvid_open(&r, mem_read, &m, m.size, malloc), "open motion");
+    CHECK(r.info.codec == MVID_CODEC_MOTION && !r.info.alpha && r.info.frame_count == frames && r.info.has_audio,
+          "motion info");
+    uint32_t* out = malloc((size_t)w * h * 4);
+    uint32_t order[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 25, 26, 3, 30, 29, 9, 10, 0, 20, 19, 21};
+    double err = 0;
+    for (size_t i = 0; i < sizeof(order) / sizeof(order[0]); i++) {
+        uint32_t n = order[i];
+        CHECK(mvid_decode(&r, n, out), "decode motion frame");
+        if (memcmp(out, rec + (size_t)n * w * h, (size_t)w * h * 4)) {
+            printf("  motion frame %u differs from the encoder's (%ux%u)\n", n, w, h);
+            failures++;
+            break;
+        }
+        // (Random colour noise in the corner is beyond 4:2:0 colour; leave it out.)
+        for (size_t p = 0; p < (size_t)w * h; p++)
+            for (int sh = 0; sh < 24 && (p % w >= 16 || p / w >= 16); sh += 8) {
+                double d = (double)((out[p] >> sh) & 255u) - (double)((src[(size_t)n * w * h + p] >> sh) & 255u);
+                err += d * d;
+            }
+    }
+    double counted = (double)w * h - (double)(w < 16 ? w : 16) * (h < 16 ? h : 16);
+    double mse = counted > 0 ? err / (counted * 3 * (sizeof(order) / sizeof(order[0]))) : 0;
+    if (qp <= 30) CHECK(mse < 65.0, "motion quality (better than 30 dB PSNR)");
+    // Damaged frames: no crash, and decoding recovers at the next keyframe.
+    for (int trial = 0; trial < 60; trial++) {
+        uint8_t keep[32];
+        size_t at = MVID_HEADER_SIZE + rnd() % (r.info.index_offset - MVID_HEADER_SIZE - 32);
+        memcpy(keep, m.data + at, 32);
+        for (int k = 0; k < 3; k++) m.data[at + rnd() % 32] ^= (uint8_t)(1u << (rnd() % 8));
+        r.decoded = -1;
+        mvid_decode(&r, rnd() % frames, out);
+        memcpy(m.data + at, keep, 32);
+    }
+    r.decoded = -1;
+    CHECK(mvid_decode(&r, 22, out) && !memcmp(out, rec + (size_t)22 * w * h, (size_t)w * h * 4),
+          "motion decodes again after damage");
+    printf("  motion video %ux%u q %u: %zu bytes, mean squared error %.1f\n", w, h, qp, m.size, mse);
+    mvid_close(&r, free);
+    free(src); free(rec); free(out); free(m.data);
+}
+
+// Macroblocks in another valid order (anti-diagonals, the order threads
+// may finish them in) must give the same bytes as in order.
+static void diagonal_order(void* ctx, mmc_t* m, const mmc_job_t* job) {
+    (void)ctx;
+    for (uint32_t d = 0; d < m->mbw + 2 * m->mbh; d++)
+        for (uint32_t my = 0; my < m->mbh; my++) {
+            if (d < 2 * my) break;
+            uint32_t mx = d - 2 * my;
+            if (mx < m->mbw) mmc_encode_mb(m, job, mx, my);
+        }
+}
+
+static void test_motion_order(void) {
+    uint32_t w = 150, h = 100, frames = 12;
+    membuf_t a = {0}, b = {0};
+    uint32_t* px = malloc((size_t)w * h * 4);
+    for (int pass = 0; pass < 2; pass++) {
+        mvid_writer_t v;
+        CHECK(mvid_writer_begin(&v, w, h, 30, 1, false, 6, false, mem_write, pass ? &b : &a, malloc, free), "begin");
+        v.codec = MVID_CODEC_MOTION;
+        if (pass) v.parallel = diagonal_order;
+        rng = 11;
+        for (uint32_t t = 0; t < frames; t++) {
+            video_frame(px, w, h, w, t, false);
+            CHECK(mvid_writer_frame(&v, px, w), "frame");
+        }
+        CHECK(mvid_writer_finish(&v, NULL, 0), "finish");
+    }
+    CHECK(a.size == b.size && !memcmp(a.data, b.data, a.size), "motion output does not depend on macroblock order");
+    free(px); free(a.data); free(b.data);
+}
+
 int main(void) {
     test_swar();
     uint32_t sizes[][2] = {{1, 1}, {64, 64}, {65, 3}, {3, 130}, {130, 70}, {200, 129}};
@@ -177,6 +333,16 @@ int main(void) {
     test_video(160, 90, true, false);
     test_video(67, 129, false, false);
     test_video(67, 129, false, true);
+    test_video_lossy(160, 90, false, 4, false);
+    test_video_lossy(160, 90, false, 8, true);
+    test_video_lossy(67, 129, true, 6, false);
+    test_video_lossy(65, 70, false, 255, false);
+    test_video_motion(160, 90, 26);
+    test_video_motion(67, 129, 20);
+    test_video_motion(1, 1, 30);
+    test_video_motion(33, 17, 0);
+    test_video_motion(48, 32, 51);
+    test_motion_order();
     if (failures) {
         printf("media tests: %d failure(s)\n", failures);
         return 1;

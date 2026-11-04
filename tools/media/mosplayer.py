@@ -161,11 +161,409 @@ class ImageFile:
         return self.pixels
 
 
+# --- The "motion" .vid codec (Minimal-OS-SDK/include/mosmedia_motion.h) ---
+# A bit-exact port of the C decoder. It is slow in Python (fine for
+# checking files, not for smooth playback of large videos).
+
+_MMC_ZIGZAG = (0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15)
+_MMC_V = ((10, 16, 13), (11, 18, 14), (13, 20, 16), (14, 23, 18), (16, 25, 20), (18, 29, 23))
+_MMC_CLASS = tuple(0 if not (i >> 2) & 1 and not i & 1 else 1 if (i >> 2) & 1 and i & 1 else 2
+                   for i in range(16))
+_MMC_CHROMA_QP = (
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
+    26, 27, 28, 29, 29, 30, 31, 32, 32, 33, 34, 34, 35, 35, 36, 36, 37, 37, 37, 38, 38, 38, 39, 39, 39, 39)
+_MMC_ALPHA = (
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 4, 5, 6, 7, 8, 9, 10, 12, 13,
+    15, 17, 20, 22, 25, 28, 32, 36, 40, 45, 50, 56, 63, 71, 80, 90, 101, 113, 127, 144, 162, 182, 203, 226, 255, 255)
+_MMC_BETA = (
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4,
+    6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13, 14, 14, 15, 15, 16, 16, 17, 17, 18, 18)
+_MMC_TC0 = (
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 4, 4, 4, 5, 6, 6, 7, 8, 9, 10, 13)
+_MMC_UBINS = 14
+_MMC_MV_MAX = 16383
+
+
+def _clip(v: int) -> int:
+    return 0 if v < 0 else 255 if v > 255 else v
+
+
+class _RangeDecoder:
+    __slots__ = ("data", "pos", "range", "code", "over")
+
+    def __init__(self, data: bytes):
+        self.data, self.pos, self.range, self.code, self.over = data, 0, 0xFFFFFFFF, 0, 0
+        for _ in range(5):
+            self.code = ((self.code << 8) | self._byte()) & 0xFFFFFFFF
+
+    def _byte(self) -> int:
+        if self.pos < len(self.data):
+            self.pos += 1
+            return self.data[self.pos - 1]
+        self.over += 1
+        return 0
+
+    def bit(self, probs: list, i: int) -> int:
+        p = probs[i]
+        bound = (self.range >> 11) * p
+        if self.code < bound:
+            self.range = bound
+            probs[i] = p + ((2048 - p) >> 5)
+            b = 0
+        else:
+            self.code -= bound
+            self.range -= bound
+            probs[i] = p - (p >> 5)
+            b = 1
+        while self.range < 0x1000000:
+            self.range <<= 8
+            self.code = ((self.code << 8) | self._byte()) & 0xFFFFFFFF
+        return b
+
+    def direct(self) -> int:
+        self.range >>= 1
+        b = 0
+        if self.code >= self.range:
+            self.code -= self.range
+            b = 1
+        while self.range < 0x1000000:
+            self.range <<= 8
+            self.code = ((self.code << 8) | self._byte()) & 0xFFFFFFFF
+        return b
+
+    def eg(self) -> int:
+        n = 0
+        while self.direct():
+            n += 1
+            if n > 24:
+                self.over += 1000
+                return 0
+        v = 1
+        for _ in range(n):
+            v = v << 1 | self.direct()
+        return v - 1
+
+    def uint(self, bins: list) -> int:
+        i = 0
+        while i < _MMC_UBINS and self.bit(bins, i):
+            i += 1
+        return i if i < _MMC_UBINS else _MMC_UBINS + self.eg()
+
+
+class _MotionDecoder:
+    def __init__(self, width: int, height: int):
+        self.w, self.h = (width + 15) & ~15, (height + 15) & ~15
+        self.mbw, self.mbh = self.w // 16, self.h // 16
+        self.cw, self.ch = self.w // 2, self.h // 2
+        size_y, size_c = self.w * self.h, self.cw * self.ch
+        self.cur = [bytearray(size_y), bytearray(size_c), bytearray(size_c)]
+        self.ref = [bytearray(size_y), bytearray(size_c), bytearray(size_c)]
+        mbs = self.mbw * self.mbh
+        self.nz_y = bytearray(size_y // 16)
+        self.mode = bytearray(size_y // 16)
+        self.nz_c = [bytearray(size_c // 16), bytearray(size_c // 16)]
+        self.mb_intra = bytearray(mbs)
+        self.mb_skip = bytearray(mbs)
+        self.mv = [0] * (mbs * 2)
+        self.qp = 26
+
+    # Prediction and reconstruction -----------------------------------
+    @staticmethod
+    def _intra_pred(plane, stride, x, y, n, mode):
+        ha, hl = y > 0, x > 0
+        above = [plane[(y - 1) * stride + x + i] if ha else 128 for i in range(n)]
+        left = [plane[(y + i) * stride + x - 1] if hl else 128 for i in range(n)]
+        corner = plane[(y - 1) * stride + x - 1] if ha and hl else 128
+        shift = 2 if n == 4 else 3
+        dc = 128
+        if ha and hl:
+            dc = (sum(above) + sum(left) + n) >> (shift + 1)
+        elif ha or hl:
+            dc = (sum(above if ha else left) + n // 2) >> shift
+        if mode == 0:
+            return [dc] * (n * n)
+        if mode == 1:
+            return above * n
+        if mode == 2:
+            return [left[j] for j in range(n) for _ in range(n)]
+        return [_clip(left[j] + above[i] - corner) for j in range(n) for i in range(n)]
+
+    @staticmethod
+    def _mc(plane, pw, ph, x, y, n, mvx, mvy, frac):
+        one = 1 << frac
+        ix0, iy0 = x + (mvx >> frac), y + (mvy >> frac)
+        fx, fy = mvx & (one - 1), mvy & (one - 1)
+        w00, w01 = (one - fx) * (one - fy), fx * (one - fy)
+        w10, w11 = (one - fx) * fy, fx * fy
+        sh = 2 * frac
+        rnd = 1 << (sh - 1)
+        maxx, maxy = pw - 1, ph - 1
+        out = [0] * (n * n)
+        xs0 = [min(max(ix0 + i, 0), maxx) for i in range(n)]
+        xs1 = [min(max(ix0 + i + 1, 0), maxx) for i in range(n)]
+        for j in range(n):
+            r0 = min(max(iy0 + j, 0), maxy) * pw
+            r1 = min(max(iy0 + j + 1, 0), maxy) * pw
+            base = j * n
+            if not fx and not fy:
+                for i in range(n):
+                    out[base + i] = plane[r0 + xs0[i]]
+            else:
+                for i in range(n):
+                    a, b = xs0[i], xs1[i]
+                    out[base + i] = (w00 * plane[r0 + a] + w01 * plane[r0 + b] +
+                                     w10 * plane[r1 + a] + w11 * plane[r1 + b] + rnd) >> sh
+        return out
+
+    @staticmethod
+    def _put(plane, stride, x, y, n, block):
+        for j in range(n):
+            at = (y + j) * stride + x
+            plane[at:at + n] = bytes(block[j * n:(j + 1) * n])
+
+    @staticmethod
+    def _add_residual(z, qp, plane, at, stride):
+        scale = 1 << (qp // 6)
+        row_v = _MMC_V[qp % 6]
+        c = [0] * 16
+        for i in range(16):
+            if z[i]:
+                v = z[i] * row_v[_MMC_CLASS[i]] * scale
+                c[i] = -(1 << 20) if v < -(1 << 20) else (1 << 20) if v > (1 << 20) else v
+        t = [0] * 16
+        for i in range(4):
+            d0, d1, d2, d3 = c[i * 4], c[i * 4 + 1], c[i * 4 + 2], c[i * 4 + 3]
+            e0, e1, e2, e3 = d0 + d2, d0 - d2, (d1 >> 1) - d3, d1 + (d3 >> 1)
+            t[i * 4:i * 4 + 4] = (e0 + e3, e1 + e2, e1 - e2, e0 - e3)
+        for i in range(4):
+            d0, d1, d2, d3 = t[i], t[4 + i], t[8 + i], t[12 + i]
+            e0, e1, e2, e3 = d0 + d2, d0 - d2, (d1 >> 1) - d3, d1 + (d3 >> 1)
+            for y, r in enumerate((e0 + e3, e1 + e2, e1 - e2, e0 - e3)):
+                q = at + y * stride + i
+                plane[q] = _clip(plane[q] + ((r + 32) >> 6))
+
+    def _mvp(self, mx, my):
+        w, mv, intra = self.mbw, self.mv, self.mb_intra
+        a = b = c = (0, 0)
+        if mx > 0:
+            i = my * w + mx - 1
+            if not intra[i]:
+                a = (mv[i * 2], mv[i * 2 + 1])
+        if my == 0:
+            return a
+        bi = (my - 1) * w + mx
+        if not intra[bi]:
+            b = (mv[bi * 2], mv[bi * 2 + 1])
+        ci = bi + 1 if mx + 1 < w else bi - 1 if mx > 0 else bi
+        if ci != bi and not intra[ci]:
+            c = (mv[ci * 2], mv[ci * 2 + 1])
+        res = []
+        for k in range(2):
+            lo, hi = min(a[k], b[k]), max(a[k], b[k])
+            res.append(lo if c[k] < lo else hi if c[k] > hi else c[k])
+        return res[0], res[1]
+
+    # Entropy decoding ----------------------------------------------------
+    def _coeffs(self, d, c, typ, ctx):
+        z = [0] * 16
+        if not d.bit(c["cbf"][typ], ctx):
+            return None
+        sig, last_p = c["sig"][typ], c["last"][typ]
+        pos = []
+        last = 15
+        for i in range(15):
+            if d.bit(sig, i):
+                pos.append(i)
+                if d.bit(last_p, i):
+                    last = i
+                    break
+        if last == 15:
+            pos.append(15)
+        gt1 = eq1 = 0
+        g, lev = c["gt1"][typ], c["lev"][typ]
+        for k in range(len(pos) - 1, -1, -1):
+            inc = 0 if gt1 else min(eq1 + 1, 4)
+            a = 1
+            if d.bit(g, inc):
+                a = min(2 + d.uint(lev), 65535)
+                gt1 += 1
+            else:
+                eq1 += 1
+            z[_MMC_ZIGZAG[pos[k]]] = -a if d.direct() else a
+        return z
+
+    def _mvd(self, d, c, k):
+        if not d.bit(c["mv_zero"], k):
+            return 0
+        s = d.direct()
+        a = min(1 + d.uint(c["mv_bins"][k]), _MMC_MV_MAX * 2)
+        return -a if s else a
+
+    def _mpm(self, bx, by):
+        bw = self.w // 4
+        a = self.mode[by * bw + bx - 1] if bx > 0 else 0
+        b = self.mode[(by - 1) * bw + bx] if by > 0 else 0
+        return min(a, b)
+
+    def _chroma(self, d, c, mx, my):
+        qpc = _MMC_CHROMA_QP[self.qp]
+        cw, cbw = self.cw, self.w // 8
+        for pl in range(2):
+            plane, nz = self.cur[1 + pl], self.nz_c[pl]
+            for k in range(4):
+                bx, by = mx * 2 + (k & 1), my * 2 + (k >> 1)
+                ctx = (bx > 0 and nz[by * cbw + bx - 1]) + (by > 0 and nz[(by - 1) * cbw + bx])
+                z = self._coeffs(d, c, 1, ctx)
+                nz[by * cbw + bx] = z is not None
+                if z is not None:
+                    self._add_residual(z, qpc, plane, by * 4 * cw + bx * 4, cw)
+
+    def decode(self, data: bytes, key: bool, qp: int) -> None:
+        if not 0 <= qp <= 51:
+            raise ValueError("invalid motion frame QP")
+        self.qp = qp
+        d = _RangeDecoder(data)
+        c = {"skip": [1024] * 3, "intra": [1024] * 3, "mpm": [1024], "rem": [1024] * 2,
+             "cmode": [1024] * 3, "mv_zero": [1024] * 2,
+             "mv_bins": [[1024] * _MMC_UBINS for _ in range(2)],
+             "cbf": [[1024] * 3 for _ in range(2)], "sig": [[1024] * 15 for _ in range(2)],
+             "last": [[1024] * 15 for _ in range(2)], "gt1": [[1024] * 5 for _ in range(2)],
+             "lev": [[1024] * _MMC_UBINS for _ in range(2)]}
+        w, cw, bw, cbw = self.w, self.cw, self.w // 4, self.w // 8
+        Y, U, V = self.cur
+        for my in range(self.mbh):
+            for mx in range(self.mbw):
+                mb = my * self.mbw + mx
+                nskip = (mx > 0 and self.mb_skip[mb - 1]) + (my > 0 and self.mb_skip[mb - self.mbw])
+                nintra = (mx > 0 and self.mb_intra[mb - 1]) + (my > 0 and self.mb_intra[mb - self.mbw])
+                skip = not key and d.bit(c["skip"], nskip)
+                intra = key or (not skip and d.bit(c["intra"], nintra))
+                self.mb_skip[mb], self.mb_intra[mb] = skip, intra
+                if intra:
+                    self.mv[mb * 2] = self.mv[mb * 2 + 1] = 0
+                    modes = []
+                    for k in range(16):
+                        bx, by = mx * 4 + (k & 3), my * 4 + (k >> 2)
+                        mpm = mode = self._mpm(bx, by)
+                        if d.bit(c["mpm"], 0):
+                            rem = 1 + d.bit(c["rem"], 1) if d.bit(c["rem"], 0) else 0
+                            mode = rem if rem < mpm else rem + 1
+                        self.mode[by * bw + bx] = mode
+                        modes.append(mode)
+                    b0 = d.bit(c["cmode"], 0)
+                    cmode = b0 * 2 + d.bit(c["cmode"], 1 + b0)
+                    for k in range(16):
+                        bx, by = mx * 4 + (k & 3), my * 4 + (k >> 2)
+                        self._put(Y, w, bx * 4, by * 4, 4, self._intra_pred(Y, w, bx * 4, by * 4, 4, modes[k]))
+                        ctx = (bx > 0 and self.nz_y[by * bw + bx - 1]) + (by > 0 and self.nz_y[(by - 1) * bw + bx])
+                        z = self._coeffs(d, c, 0, ctx)
+                        self.nz_y[by * bw + bx] = z is not None
+                        if z is not None:
+                            self._add_residual(z, qp, Y, by * 4 * w + bx * 4, w)
+                    for plane in (U, V):
+                        self._put(plane, cw, mx * 8, my * 8, 8, self._intra_pred(plane, cw, mx * 8, my * 8, 8, cmode))
+                    self._chroma(d, c, mx, my)
+                else:
+                    px, py = self._mvp(mx, my)
+                    if not skip:
+                        px = min(max(px + self._mvd(d, c, 0), -_MMC_MV_MAX), _MMC_MV_MAX)
+                        py = min(max(py + self._mvd(d, c, 1), -_MMC_MV_MAX), _MMC_MV_MAX)
+                    self.mv[mb * 2], self.mv[mb * 2 + 1] = px, py
+                    ry, ru, rv = self.ref
+                    self._put(Y, w, mx * 16, my * 16, 16, self._mc(ry, w, self.h, mx * 16, my * 16, 16, px, py, 2))
+                    self._put(U, cw, mx * 8, my * 8, 8, self._mc(ru, cw, self.ch, mx * 8, my * 8, 8, px, py, 3))
+                    self._put(V, cw, mx * 8, my * 8, 8, self._mc(rv, cw, self.ch, mx * 8, my * 8, 8, px, py, 3))
+                    for k in range(16):
+                        i = (my * 4 + (k >> 2)) * bw + mx * 4 + (k & 3)
+                        self.mode[i] = 0
+                        self.nz_y[i] = 0
+                    if skip:
+                        for k in range(4):
+                            i = (my * 2 + (k >> 1)) * cbw + mx * 2 + (k & 1)
+                            self.nz_c[0][i] = self.nz_c[1][i] = 0
+                    else:
+                        for k in range(16):
+                            bx, by = mx * 4 + (k & 3), my * 4 + (k >> 2)
+                            ctx = (bx > 0 and self.nz_y[by * bw + bx - 1]) + (by > 0 and self.nz_y[(by - 1) * bw + bx])
+                            z = self._coeffs(d, c, 0, ctx)
+                            self.nz_y[by * bw + bx] = z is not None
+                            if z is not None:
+                                self._add_residual(z, qp, Y, by * 4 * w + bx * 4, w)
+                        self._chroma(d, c, mx, my)
+                if d.over > 16:
+                    raise ValueError("damaged motion frame")
+        self._deblock(Y, w, self.h, self.nz_y, 2, qp)
+        qpc = _MMC_CHROMA_QP[qp]
+        self._deblock(U, cw, self.ch, self.nz_c[0], 1, qpc)
+        self._deblock(V, cw, self.ch, self.nz_c[1], 1, qpc)
+        self.cur, self.ref = self.ref, self.cur
+
+    def _deblock(self, plane, pw, ph, nz, mbsh, qp):
+        alpha, beta = _MMC_ALPHA[qp], _MMC_BETA[qp]
+        if not alpha:
+            return
+        bw, bh = pw // 4, ph // 4
+        intra, mv, mbw = self.mb_intra, self.mv, self.mbw
+        for direction in range(2):
+            for by in range(direction, bh):
+                for bx in range(1 - direction, bw):
+                    ax, ay = (bx, by - 1) if direction else (bx - 1, by)
+                    mba = (ay >> mbsh) * mbw + (ax >> mbsh)
+                    mbb = (by >> mbsh) * mbw + (bx >> mbsh)
+                    if intra[mba] or intra[mbb]:
+                        s = 2
+                    elif nz[ay * bw + ax] or nz[by * bw + bx]:
+                        s = 1
+                    elif mba != mbb and (abs(mv[mba * 2] - mv[mbb * 2]) >= 4 or
+                                         abs(mv[mba * 2 + 1] - mv[mbb * 2 + 1]) >= 4):
+                        s = 1
+                    else:
+                        continue
+                    tc = _MMC_TC0[qp] + (s == 2)
+                    base = by * 4 * pw + bx * 4
+                    step = pw if direction else 1
+                    for k in range(4):
+                        p = base + k if direction else base + k * pw
+                        p1, p0, q0, q1 = plane[p - 2 * step], plane[p - step], plane[p], plane[p + step]
+                        if abs(p0 - q0) < alpha and abs(p1 - p0) < beta and abs(q1 - q0) < beta:
+                            dl = ((q0 - p0) * 4 + (p1 - q1) + 4) >> 3
+                            dl = -tc if dl < -tc else tc if dl > tc else dl
+                            plane[p - step] = _clip(p0 + dl)
+                            plane[p] = _clip(q0 - dl)
+
+    def to_argb(self, width: int, height: int) -> array:
+        Y, U, V = self.ref
+        cw, ch = self.cw, self.ch
+        out = array("I", [0]) * (width * height)
+        for y in range(height):
+            cy = y >> 1
+            cy2 = min(max(cy + 1 if y & 1 else cy - 1, 0), ch - 1)
+            u0, u1, v0, v1 = cy * cw, cy2 * cw, cy * cw, cy2 * cw
+            row = y * self.w
+            o = y * width
+            for x in range(width):
+                cx = x >> 1
+                cx2 = min(max(cx + 1 if x & 1 else cx - 1, 0), cw - 1)
+                u = (9 * U[u0 + cx] + 3 * U[u0 + cx2] + 3 * U[u1 + cx] + U[u1 + cx2] + 8) >> 4
+                v = (9 * V[v0 + cx] + 3 * V[v0 + cx2] + 3 * V[v1 + cx] + V[v1 + cx2] + 8) >> 4
+                lum, cb, cr = Y[row + x], u - 128, v - 128
+                r = _clip(lum + ((359 * cr + 128) >> 8))
+                g = _clip(lum - ((88 * cb + 183 * cr + 128) >> 8))
+                b = _clip(lum + ((454 * cb + 128) >> 8))
+                out[o + x] = 0xFF000000 | r << 16 | g << 8 | b
+        return out
+
+
 class VideoFile:
     def __init__(self, data: bytes):
-        if (len(data) < 64 or data[:4] != b"MVID" or data[4] != 1 or
+        if (len(data) < 64 or data[:4] != b"MVID" or data[4] not in (1, 2) or
                 data[5] not in (3, 4) or data[6] != 6):
             raise ValueError("not a supported .vid file")
+        self.codec = _u32(data, 60) if data[4] == 2 else 0
+        if self.codec not in (0, 1) or (self.codec == 1 and data[5] != 3):
+            raise ValueError(f"unsupported .vid codec {self.codec}")
+        self.codec_name = "motion" if self.codec else "tiles"
         self.data = data
         (self.width, self.height, fps_num, fps_den, self.frame_count,
          self.duration_ms) = struct.unpack_from("<IIIIII", data, 8)
@@ -194,10 +592,21 @@ class VideoFile:
         self.audio = data[self.audio_offset:self.audio_offset + self.audio_size] if self.audio_size else None
         self._pixels = array("I", [0]) * (self.width * self.height)
         self._decoded = -1
+        self._motion = _MotionDecoder(self.width, self.height) if self.codec else None
 
     def _decode_one(self, number: int) -> None:
         offset, size, _ = self.index[number]
         frame = self.data[offset:offset + size]
+        if self._motion:
+            if len(frame) < 5:
+                raise ValueError(f"truncated .vid frame {number}")
+            key = bool(frame[0] & 1)
+            if not key and self._decoded != number - 1:
+                raise ValueError(f".vid frame {number} requires its previous frame")
+            self._motion.decode(frame[4:], key, frame[1])
+            self._pixels = self._motion.to_argb(self.width, self.height)
+            self._decoded = number
+            return
         across = (self.width + 63) // 64
         tiles = across * ((self.height + 63) // 64)
         bitmap_size = (tiles + 7) // 8
@@ -682,7 +1091,7 @@ class MediaPlayer:
             self.status.set(f"{self.path}  |  IMG {media.width} x {media.height}  |  "
                             f"{'RGBA' if media.alpha else 'RGB'}")
         elif isinstance(media, VideoFile):
-            self.status.set(f"{self.path}  |  VID {media.width} x {media.height}  |  "
+            self.status.set(f"{self.path}  |  VID {media.codec_name} {media.width} x {media.height}  |  "
                             f"{self.last_frame + 1}/{media.frame_count}  |  {media.fps:.3g} fps  |  "
                             f"{'RGBA' if media.alpha else 'RGB'}  |  "
                             f"{'audio' if media.audio else 'silent'}")

@@ -77,6 +77,9 @@ static void dhcp_send(uint8_t msg_type, uint32_t requested_ip, uint32_t server_i
 
     uint16_t opt_len = (uint16_t)(p - pkt.options);
     uint16_t total_len = (uint16_t)(offsetof(dhcp_packet_t, options) + opt_len);
+    // Pad to the 300-byte BOOTP minimum (RFC 1542); some routers drop
+    // shorter requests. The options area is already zeroed (= pad bytes).
+    if (total_len < 300) total_len = 300;
 
     udp_send(0xFFFFFFFFu, DHCP_CLIENT_PORT, DHCP_SERVER_PORT, &pkt, total_len);
 }

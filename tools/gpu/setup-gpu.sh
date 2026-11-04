@@ -191,30 +191,33 @@ else
     chip=$(resolve_chip "${target:-RTX 2060}")
 fi
 
-# The four files nv_fw.c's manifest asks for, and their kind.
-files=(booter_load:bin booter_unload:bin bootloader:bin gsp:elf)
+# The files nv_fw.c's manifest asks for (path in the chip folder), and
+# their kind. acr/bl.bin is the boot loader Turing's VBIOS FWSEC runs through.
+files=(acr/bl.bin:bin
+       "gsp/booter_load-$fw_version.bin:bin" "gsp/booter_unload-$fw_version.bin:bin"
+       "gsp/bootloader-$fw_version.bin:bin" "gsp/gsp-$fw_version.bin:elf")
 
 stage=$(mktemp -d "${TMPDIR:-/tmp}/mos-gpufw.XXXXXX")
 trap 'rm -rf "$stage"' EXIT
-mkdir -p "$stage/gsp"
+mkdir -p "$stage/gsp" "$stage/acr"
 
 say "card chip: $chip, GSP firmware $fw_version"
 from=""
 for entry in "${files[@]}"; do
-    name=${entry%%:*} kind=${entry##*:}
-    file="$name-$fw_version.bin"
-    dst="$stage/gsp/$file"
+    file=${entry%%:*} kind=${entry##*:}
+    dst="$stage/$file"
     if [ "$force_download" = 0 ] &&
-        copy_local "$source_dir/nvidia/$chip/gsp/$file" "$dst"; then
+        { copy_local "$source_dir/nvidia/$chip/$file" "$dst" ||
+          copy_local "$source_dir/nvidia/$(upstream_gsp_dir "$chip")/$file" "$dst"; }; then
         from="$source_dir"
     else
         # GTX 16 cards have their own booter_* files; their boot loader and
         # GSP-RM image are links to tu102's, so fall back to tu102.
         say "downloading $file ..."
-        url="$upstream/nvidia/$(upstream_gsp_dir "$chip")/gsp/$file"
-        if ! download "$url" "$dst" 2>/dev/null; then
-            url="$upstream/nvidia/tu102/gsp/$file"
-            download "$url" "$dst" || die "could not download $file from linux-firmware"
+        if ! download "$upstream/nvidia/$chip/$file" "$dst" 2>/dev/null &&
+           ! download "$upstream/nvidia/$(upstream_gsp_dir "$chip")/$file" "$dst" 2>/dev/null; then
+            download "$upstream/nvidia/tu102/$file" "$dst" ||
+                die "could not download $file from linux-firmware"
         fi
         from="git.kernel.org linux-firmware"
     fi
@@ -231,13 +234,13 @@ fi
 mkdir -p "$out/nvidia"
 rm -rf "$out/nvidia/$chip"
 mkdir -p "$out/nvidia/$chip"
-cp -a "$stage/gsp" "$out/nvidia/$chip/"
+cp -a "$stage/gsp" "$stage/acr" "$out/nvidia/$chip/"
 [ -f "$licence" ] && cp "$licence" "$out/nvidia/LICENCE.nvidia"
 
 say "copied from $from into ${out#$repo/}/nvidia/$chip ($(du -sh "$out/nvidia/$chip" | cut -f1)):"
 for entry in "${files[@]}"; do
-    f="$out/nvidia/$chip/gsp/${entry%%:*}-$fw_version.bin"
-    printf '  0:/firmware/nvidia/%s/gsp/%-32s %s bytes\n' "$chip" "$(basename "$f")" "$(stat -c %s "$f")"
+    f="$out/nvidia/$chip/${entry%%:*}"
+    printf '  0:/firmware/nvidia/%s/%-36s %s bytes\n' "$chip" "${entry%%:*}" "$(stat -c %s "$f")"
 done
 cat <<EOF
 

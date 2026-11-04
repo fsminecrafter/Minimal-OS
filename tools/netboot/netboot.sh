@@ -28,7 +28,7 @@ SUBNET="$(ip -4 route show dev "$IFACE" scope link | awk '{split($1,a,"/"); prin
 die() { echo "netboot: $*" >&2; exit 1; }
 
 # Modules built into the GRUB images. Everything else is loaded over TFTP.
-GRUB_MODULES="tftp normal configfile echo test multiboot2 all_video gfxterm font"
+GRUB_MODULES="tftp normal configfile echo test true multiboot2 all_video gfxterm font"
 
 prepare() {
 	[ -f "$ISO" ] || die "ISO not found: $ISO (run make first)"
@@ -41,6 +41,14 @@ prepare() {
 	xorriso -osirrox on -indev "$ISO" -extract /boot "$TFTP/boot" >/dev/null 2>&1 \
 		|| die "could not unpack $ISO"
 	chmod -R u+w,a+rX "$TFTP"
+	# GRUB's 'test -f' cannot see files over TFTP (no directory listing), so
+	# grub.cfg's "load the firmware if it is there" checks are always false
+	# on netboot. Decide them here instead, against the unpacked files.
+	if [ -f "$TFTP/boot/mosfirmware.mpkg" ]; then
+		sed -i 's|\[ -f /boot/mosfirmware.mpkg \]|true|' "$TFTP/boot/grub/grub.cfg"
+	else
+		sed -i 's|\[ -f /boot/mosfirmware.mpkg \]|false|' "$TFTP/boot/grub/grub.cfg"
+	fi
 	# The ISO's BIOS GRUB modules are replaced by the host's matching set below.
 	rm -rf "$TFTP/boot/grub/i386-pc" "$TFTP/boot/grub/x86_64-efi"
 

@@ -372,6 +372,12 @@ mosdesk-stage: mosdesk-dlr $(mxplorer_run) $(dlr_run) $(dlrconnect_run) $(fglcub
 run-mosdesk:
 	$(MAKE) MOSDESK=1 run
 
+# Serves the built ISO over the LAN so another PC can PXE boot it.
+# Needs root for the DHCP/TFTP ports; see docs/netboot.md.
+.PHONY: netboot
+netboot:
+	sudo tools/netboot/netboot.sh serve
+
 # Builds the ISO with the desktop (for a real PC) without starting QEMU.
 .PHONY: mosdesk
 mosdesk:

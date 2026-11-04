@@ -9,6 +9,7 @@
 #include "string.h"
 #include "net/ethernet.h"
 #include "net/net.h"
+#include "time.h"
 
 /*
  * Realtek RTL8111/8168/8411 PCI Express gigabit Ethernet (10ec:8168, and
@@ -117,6 +118,13 @@ static uint32_t g_rx_frames, g_rx_errors, g_tx_frames;
 static uint16_t g_status_seen;           // every IntrStatus bit seen since start
 static uint32_t g_rx_bcast, g_rx_ucast;  // good frames by destination
 static uint32_t g_rx_resyncs;            // times our ring position was repaired
+static uint32_t g_rx_restarts;           // times the stalled receiver was reset
+static uint64_t g_last_rx_ms;            // when the last frame arrived
+static uint64_t g_unanswered_since_ms;   // first send with no frame after it
+static volatile int g_in_send;           // send() running (any core, or interrupted)
+static volatile int g_restarting;        // receiver restart in progress
+
+#define RX_STALL_MS      3000            // sending, but nothing back for this long
 
 static inline uint8_t rd8(uint32_t r) { return g_regs[r]; }
 static inline uint16_t rd16(uint32_t r) { return *(volatile uint16_t*)(g_regs + r); }
@@ -337,12 +345,50 @@ static bool alloc_rings(void) {
         g_tx_buf[i] = page;
         g_tx_buf[i + 1] = page + BUF_SIZE;
     }
+    return true;
+}
+
+// Every Rx slot to the card, every Tx slot to us, both rings from slot 0.
+static void arm_rings(void) {
     for (uint32_t i = 0; i < RX_COUNT; i++) rx_give(i);
     for (uint32_t i = 0; i < TX_COUNT; i++) {
-        g_tx[i].opts1 = (i == TX_COUNT - 1) ? DESC_END : 0;
+        g_tx[i].opts2 = 0;
         g_tx[i].addr = (uint64_t)(uintptr_t)g_tx_buf[i];
+        g_tx[i].opts1 = (i == TX_COUNT - 1) ? DESC_END : 0;
     }
-    return true;
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    g_rx_next = 0;
+    g_tx_next = 0;
+}
+
+/* Everything after a MAC reset: ring addresses, Rx/Tx enable and
+ * configuration, filters. The PHY is not touched, so the link stays. */
+static void hw_start(void) {
+    wr16(REG_INTR_STATUS, 0xFFFF);
+    arm_rings();
+
+    wr8(REG_CFG9346, CFG9346_UNLOCK);
+    wr16(REG_CPLUS_CMD, rd16(REG_CPLUS_CMD) & ~((1u << 5) | (1u << 6)));  // no checksum offload, no VLAN strip
+    wr8(REG_MAX_TX_SIZE, 0x3F);                            // 8064 bytes, in 128-byte units
+    wr16(REG_RX_MAX_SIZE, BUF_SIZE);
+    wr32(REG_TX_DESC_HI, (uint32_t)((uint64_t)(uintptr_t)g_tx >> 32));
+    wr32(REG_TX_DESC_LO, (uint32_t)(uintptr_t)g_tx);
+    wr32(REG_RX_DESC_HI, (uint32_t)((uint64_t)(uintptr_t)g_rx >> 32));
+    wr32(REG_RX_DESC_LO, (uint32_t)(uintptr_t)g_rx);
+    wr8(REG_CFG9346, CFG9346_LOCK);
+    (void)rd16(REG_CPLUS_CMD);                             // flush posted writes
+
+    wr8(REG_CHIP_CMD, CMD_RX_ENABLE | CMD_TX_ENABLE);
+    wr32(REG_RX_CONFIG, rx_config());
+    wr32(REG_TX_CONFIG, TX_CONFIG | (g_family >= FAM_EVL ? TX_AUTO_FIFO : 0));
+    wr32(REG_MAR0, 0xFFFFFFFF);                            // all multicast groups
+    wr32(REG_MAR0 + 4, 0xFFFFFFFF);
+    wr16(REG_INTR_MASK, 0);                                // polled
+    wr16(REG_INTR_STATUS, 0xFFFF);
+    // Open the receive path (closed by take_from_firmware, or left closed
+    // by the firmware's own driver on shutdown).
+    if (g_family == FAM_G) setup_fifo_and_filter();
+    if (g_family >= FAM_EVL) wr32(REG_MISC, rd32(REG_MISC) & ~MISC_RXDV_GATE);
 }
 
 static void report_link(void) {
@@ -372,39 +418,15 @@ static bool rtl8168_init(void) {
         serial_write_str("RTL8168: reset timeout\n");
         return false;
     }
-    wr16(REG_INTR_STATUS, 0xFFFF);
 
     for (int i = 0; i < 6; i++) g_mac[i] = rd8(REG_MAC0 + i);
     if (!alloc_rings()) {
         serial_write_str("RTL8168: out of memory for the rings\n");
         return false;
     }
+    hw_start();
 
-    wr8(REG_CFG9346, CFG9346_UNLOCK);
-    wr16(REG_CPLUS_CMD, rd16(REG_CPLUS_CMD) & ~((1u << 5) | (1u << 6)));  // no checksum offload, no VLAN strip
-    wr8(REG_MAX_TX_SIZE, 0x3F);                            // 8064 bytes, in 128-byte units
-    wr16(REG_RX_MAX_SIZE, BUF_SIZE);
-    wr32(REG_TX_DESC_HI, (uint32_t)((uint64_t)(uintptr_t)g_tx >> 32));
-    wr32(REG_TX_DESC_LO, (uint32_t)(uintptr_t)g_tx);
-    wr32(REG_RX_DESC_HI, (uint32_t)((uint64_t)(uintptr_t)g_rx >> 32));
-    wr32(REG_RX_DESC_LO, (uint32_t)(uintptr_t)g_rx);
-    wr8(REG_CFG9346, CFG9346_LOCK);
-    (void)rd16(REG_CPLUS_CMD);                             // flush posted writes
-
-    wr8(REG_CHIP_CMD, CMD_RX_ENABLE | CMD_TX_ENABLE);
-    wr32(REG_RX_CONFIG, rx_config());
-    wr32(REG_TX_CONFIG, TX_CONFIG | (g_family >= FAM_EVL ? TX_AUTO_FIFO : 0));
-    wr32(REG_MAR0, 0xFFFFFFFF);                            // all multicast groups
-    wr32(REG_MAR0 + 4, 0xFFFFFFFF);
-    wr16(REG_INTR_MASK, 0);                                // polled
-    wr16(REG_INTR_STATUS, 0xFFFF);
-    // Open the receive path (closed by take_from_firmware, or left closed
-    // by the firmware's own driver on shutdown).
-    if (g_family == FAM_G) setup_fifo_and_filter();
-    if (g_family >= FAM_EVL) wr32(REG_MISC, rd32(REG_MISC) & ~MISC_RXDV_GATE);
-
-    g_rx_next = 0;
-    g_tx_next = 0;
+    g_last_rx_ms = time_get_uptime_ms();
     g_present = true;
 
     serial_write_str("RTL8168: initialized, XID 0x");
@@ -426,6 +448,13 @@ static void rtl8168_get_mac(uint8_t out[6]) {
 static void rtl8168_send(const void* frame, uint16_t len) {
     if (!g_present || !frame) return;
     if (len > ETH_FRAME_MAX) len = ETH_FRAME_MAX;
+    // A receiver restart resets the Tx ring too. Never wait for it here:
+    // send() also runs from the timer interrupt's poll.
+    __atomic_add_fetch(&g_in_send, 1, __ATOMIC_ACQ_REL);
+    if (__atomic_load_n(&g_restarting, __ATOMIC_ACQUIRE)) {
+        __atomic_sub_fetch(&g_in_send, 1, __ATOMIC_RELEASE);
+        return;
+    }
 
     uint32_t i = g_tx_next;
     // Wait for the card to finish with this descriptor's previous frame.
@@ -434,6 +463,7 @@ static void rtl8168_send(const void* frame, uint16_t len) {
     }
     if (g_tx[i].opts1 & DESC_OWN) {
         serial_write_str("RTL8168: transmit ring stuck, frame dropped\n");
+        __atomic_sub_fetch(&g_in_send, 1, __ATOMIC_RELEASE);
         return;
     }
     g_tx_next = (i + 1) % TX_COUNT;
@@ -451,6 +481,36 @@ static void rtl8168_send(const void* frame, uint16_t len) {
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
     wr8(REG_TX_POLL, TX_POLL_NORMAL);
     g_tx_frames++;
+    if (!g_unanswered_since_ms) g_unanswered_since_ms = time_get_uptime_ms();
+    __atomic_sub_fetch(&g_in_send, 1, __ATOMIC_RELEASE);
+}
+
+/*
+ * Seen on an RTL8168H: the card filled the 64-slot Rx ring once, every
+ * slot went back to it, and it never wrote another frame (no "Rx ring
+ * full" either), so all later DHCP offers were lost. When we keep
+ * sending but nothing comes back, reset the MAC and re-arm both rings,
+ * as Linux's r8169 reset task does. Called from poll() only.
+ */
+static void rx_watchdog(uint64_t now) {
+    if (!g_unanswered_since_ms || now - g_unanswered_since_ms < RX_STALL_MS) return;
+    if (now - g_last_rx_ms < RX_STALL_MS) return;
+    if (!(rd8(REG_PHY_STATUS) & PHY_LINK_UP)) return;       // no cable: nothing to fix
+    __atomic_store_n(&g_restarting, 1, __ATOMIC_SEQ_CST);
+    if (__atomic_load_n(&g_in_send, __ATOMIC_SEQ_CST)) {    // sending: try next tick
+        __atomic_store_n(&g_restarting, 0, __ATOMIC_RELEASE);
+        return;
+    }
+
+    wr8(REG_CHIP_CMD, CMD_RESET);
+    bool ok = wait_reset_done();
+    if (ok) hw_start();
+    g_rx_restarts++;
+    g_unanswered_since_ms = 0;
+    g_last_rx_ms = now;
+    __atomic_store_n(&g_restarting, 0, __ATOMIC_RELEASE);
+    serial_write_str(ok ? "RTL8168: receiver stalled, restarted\n"
+                        : "RTL8168: receiver stalled, reset timeout\n");
 }
 
 static void rtl8168_poll(void) {
@@ -492,6 +552,8 @@ static void rtl8168_poll(void) {
         if (whole && !(opts1 & RX_DESC_ERROR) && len > 4 + 14 && len - 4 <= ETH_FRAME_MAX) {
             g_rx_frames++;
             if (g_rx_buf[i][0] & 1) g_rx_bcast++; else g_rx_ucast++;
+            g_last_rx_ms = time_get_uptime_ms();
+            g_unanswered_since_ms = 0;
             eth_handle_frame(g_rx_buf[i], (uint16_t)(len - 4));
         } else {
             g_rx_errors++;
@@ -499,6 +561,8 @@ static void rtl8168_poll(void) {
         rx_give(i);
         g_rx_next = (i + 1) % RX_COUNT;
     }
+
+    rx_watchdog(time_get_uptime_ms());
 
     if (!g_link_reported && (rd8(REG_PHY_STATUS) & PHY_LINK_UP)) {
         serial_write_str("RTL8168: link up\n");
@@ -530,14 +594,16 @@ static void rtl8168_describe(char* buf, uint32_t size) {
              "RTL%s XID %03X, link %s %u Mbit, PHY BMCR %04X%s\n"
              "      rx %u (bcast %u, ucast %u, bad %u) tx %u | seen %04X cmd %02X "
              "rxcfg %08X misc %08X mcu %02X\n"
-             "      ring: next %u, card-owned %u of %u, repaired %u",
+             "      ring: next %u, card-owned %u of %u, repaired %u, "
+             "receiver restarts %u, last frame %us ago",
              fam[g_family], g_xid, (st & PHY_LINK_UP) ? "up" : "DOWN", speed,
              g_bmcr_at_start, g_was_oob ? ", was in firmware mode" : "",
              g_rx_frames, g_rx_bcast, g_rx_ucast, g_rx_errors, g_tx_frames,
              g_status_seen, g_present ? rd8(REG_CHIP_CMD) : 0,
              g_present ? rd32(REG_RX_CONFIG) : 0, g_present ? rd32(REG_MISC) : 0,
              g_present ? rd8(REG_MCU) : 0,
-             g_rx_next, owned, (uint32_t)RX_COUNT, g_rx_resyncs);
+             g_rx_next, owned, (uint32_t)RX_COUNT, g_rx_resyncs, g_rx_restarts,
+             g_present ? (uint32_t)((time_get_uptime_ms() - g_last_rx_ms) / 1000) : 0u);
 }
 
 static const network_hw_driver_t rtl8168_driver = {

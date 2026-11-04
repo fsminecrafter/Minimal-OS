@@ -66,5 +66,13 @@ bool nv_gsp_fwsec_frts(gpu_adapter_t* a, void (*print)(const char* text));
 // WPR2 bounds as set by FWSEC-FRTS; false while there is none.
 bool nv_gsp_wpr2(gpu_adapter_t* a, uint64_t* lo, uint64_t* hi);
 
+// Step 2b, second part, and step 3a (nv_gsp_rm.c): after FWSEC-FRTS,
+// runs booter_load on SEC2, which starts GSP-RM on the GSP core, waits
+// for GSP_INIT_DONE and makes a first RPC. Writes to the card; prints
+// what it does and saves it to 0:/gsp_boot.log.
+bool nv_gsp_rm_boot(gpu_adapter_t* a, void (*print)(const char* text));
+bool nv_gsp_rm_running(gpu_adapter_t* a);
+bool nv_gsp_rm_rpc_ok(gpu_adapter_t* a);
+
 // Prints the bring-up status of an NVIDIA adapter, line by line.
 void nv_bringup_report(gpu_adapter_t* a, void (*print)(const char* text));

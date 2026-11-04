@@ -186,7 +186,9 @@ as before.
 | Falcons: read state; IMEM/DMEM upload, start, wait | `nv_falcon.c` | reading used, the rest ready for GSP boot |
 | Pushbuffers: method headers, GPFIFO entries, a ready-made `TURING_A` clear | `nv_fw.c` | done, tested (method offsets unverified on hardware) |
 | VBIOS: ROM image chain, BIT table, falcon ucode table, FWSEC's descriptor and DMEM mapper (where the FRTS command goes), read through the BAR0 PROM window | `nv_vbios.c` | done, tested on a synthetic ROM, not yet on a card |
-| GSP boot (FWSEC-FRTS, `booter_load` on SEC2, GSP-RM) | | to do |
+| GSP boot: FWSEC-FRTS | `nv_gsp.c` | works on an RTX 2060 |
+| GSP boot: `booter_load` on SEC2, GSP-RM (WPR meta, radix3 image, LibOS args, message queues, CPU sequencer) | `nv_rm.h`, `nv_rm_fmt.c`, `nv_gsp_rm.c` | written; formats tested against the real firmware headers, not yet run on a card |
+| RM RPC: first round trip (`GET_GSP_STATIC_INFO`) | `nv_gsp_rm.c` | written, not yet run on a card |
 | RM RPC: channel, GPFIFO and class allocation through GSP-RM | | to do |
 
 `gpu nvidia` prints the bring-up state. It only reads registers, so it is
@@ -271,11 +273,14 @@ evaluator) and the CPU shader machine, and checks that they agree.
 1. Run `gpu nvidia` with the firmware copied: every file should show
    `ok`, GSP/SEC2 should be reachable, and step 2a should list the ROM
    images and end with `ok: FWSEC can be patched with the FRTS command`.
-2. GSP boot, following nouveau's `r535` code (`nvkm/subdev/gsp/r535.c`,
-   `tu102.c`): run FWSEC-FRTS from the VBIOS, load `booter_load` on SEC2
-   with the GSP-RM image and boot loader in system memory, and wait for
-   GSP-RM's init message.
-3. Allocate a channel through RM RPC, submit `nv_push_clear_xrgb` and
+2. `gpu nvidia boot`: FWSEC-FRTS (works), then `booter_load` on SEC2
+   and GSP-RM, following nouveau's `r535` code (`nvkm/subdev/gsp/r535.c`,
+   `tu102.c`), then a first RPC (step 3a). Everything it prints is also
+   saved to `0:/gsp_boot.log`, in case the screen goes dark. What to look
+   for: `booter_load halted, mailbox 0x0 0x0` (non-zero mailbox 0 is
+   booter's error code), `GSP RISC-V running`, then `GSP-RM is running`
+   and the GPU's name from the first RPC.
+3. Allocate RM objects and a channel through RM RPC, submit `nv_push_clear_xrgb` and
    check the surface changed: then `clear()` in `fgpu_backend_nv.c` can
    return true.
 4. Encode the IR as SASS (Mesa's NAK, `src/nouveau/compiler/nak/sm70.rs`,

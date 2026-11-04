@@ -13,9 +13,10 @@
  * Status:
  *   1. firmware files: checked (nv_fw.c)                         done
  *   2a. FWSEC found in the VBIOS (nv_vbios.c), reported         done, untested on a card
- *   2b. GSP boot: FWSEC-FRTS (nv_gsp.c, 'gpu nvidia boot')      written, untested on a card
- *       booter_load on SEC2, GSP-RM                              to do
- *   3. RM channel + TURING_A, first clear (nv_push_clear_xrgb)   to do
+ *   2b. GSP boot: FWSEC-FRTS (nv_gsp.c, 'gpu nvidia boot')      works on an RTX 2060
+ *       booter_load on SEC2, GSP-RM (nv_gsp_rm.c)                written, untested on a card
+ *   3a. first RPC to GSP-RM (nv_gsp_rm.c)                        written, untested on a card
+ *   3b. RM channel + TURING_A, first clear (nv_push_clear_xrgb)  to do
  *   4. draws: pushbuffers + SASS from the shader IR (fgpu_ir.c)  IR done, encoder to do
  *
  * Until step 2 works, init() declines and everything runs on the CPU
@@ -87,7 +88,8 @@ static bool is_turing(uint16_t chipset) { return chipset >= 0x160 && chipset < 0
 static bool nv_init(gpu_adapter_t* a, const char** why) {
     if (!a || a->vendor != GPU_VENDOR_NVIDIA || !a->mmio) { *why = "not an NVIDIA adapter"; return false; }
     if (!is_turing(nv_chipset(a))) { *why = "hardware rendering is planned for Turing first"; return false; }
-    *why = "NVIDIA GSP boot is not implemented yet (see 'gpu nvidia')";
+    *why = nv_gsp_rm_running(a) ? "GSP-RM runs; channel setup (step 3b) is not written yet"
+                                : "GSP-RM is not running (see 'gpu nvidia')";
     return false;
 }
 
@@ -292,15 +294,20 @@ void nv_bringup_report(gpu_adapter_t* a, void (*print)(const char* text)) {
 
     if (is_turing(chip)) report_vbios(a, print);
     uint64_t wlo, whi;
-    if (is_turing(chip) && nv_gsp_wpr2(a, &wlo, &whi)) {
+    if (is_turing(chip) && nv_gsp_rm_running(a)) {
+        print("\nStep 2b GSP-RM running (FWSEC-FRTS, booter_load, GSP_INIT_DONE)\n");
+    } else if (is_turing(chip) && nv_gsp_wpr2(a, &wlo, &whi)) {
         snprintf(line, sizeof(line),
-                 "\nStep 2b FWSEC-FRTS done (WPR2 0x%llx - 0x%llx); booter_load, GSP-RM to do\n",
+                 "\nStep 2b FWSEC-FRTS done (WPR2 0x%llx - 0x%llx); run 'gpu nvidia boot' for GSP-RM\n",
                  (unsigned long long)wlo, (unsigned long long)whi);
         print(line);
     } else {
-        print("\nStep 2b FWSEC-FRTS: run 'gpu nvidia boot'; booter_load, GSP-RM to do\n");
+        print("\nStep 2b GSP boot: run 'gpu nvidia boot' (log in 0:/gsp_boot.log)\n");
     }
-    print("Step 3  channel + TURING_A, first clear   waits for step 2\n");
+    if (nv_gsp_rm_rpc_ok(a))
+        print("Step 3a RPC to GSP-RM works; 3b channel + TURING_A, first clear   to do\n");
+    else
+        print("Step 3  RPC, channel + TURING_A, first clear   waits for step 2b\n");
     print("Step 4  draws: pushbuffers + shader code  shader IR ready, SASS encoder to do\n");
     const char* why = "";
     const fgpu_backend_t* hw = fgpu_hw_backend(&why);

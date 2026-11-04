@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "x86_64/nv_hw.h"
+#include "x86_64/nv_rm.h"
 
 static int failures;
 #define CHECK(cond, msg) do { if (!(cond)) { printf("FAIL: %s (line %d)\n", msg, __LINE__); failures++; } } while (0)
@@ -132,13 +133,13 @@ static void test_elf(void) {
 static void test_manifest(void) {
     uint32_t n = 0;
     const nv_fw_entry_t* m = nv_fw_manifest(0x166, &n);
-    CHECK(m && n == 4, "TU106 (RTX 2060) has a firmware list");
+    CHECK(m && n == 5, "TU106 (RTX 2060) has a firmware list");
     CHECK(strcmp(nv_chip_name(0x166), "tu106") == 0, "TU106 name");
-    CHECK(m && strcmp(m[3].file, "gsp/gsp-535.113.01.bin") == 0 && m[3].kind == NV_FW_KIND_ELF,
+    CHECK(m && strcmp(m[4].file, "gsp/gsp-535.113.01.bin") == 0 && m[4].kind == NV_FW_KIND_ELF,
           "GSP-RM image path");
-    CHECK(m && strcmp(m[3].sections[1], ".fwsignature_tu10x") == 0, "TU10x signature section");
+    CHECK(m && strcmp(m[4].sections[1], ".fwsignature_tu10x") == 0, "TU10x signature section");
     m = nv_fw_manifest(0x168, &n);
-    CHECK(m && strcmp(m[3].sections[1], ".fwsignature_tu11x") == 0, "TU116 signature section");
+    CHECK(m && strcmp(m[4].sections[1], ".fwsignature_tu11x") == 0, "TU116 signature section");
     CHECK(!nv_fw_manifest(0x134, &n) && n == 0, "Pascal has no list yet");
     CHECK(nv_pri_error(0xBADF1100u) && nv_pri_error(0xFFFFFFFFu) && !nv_pri_error(0x16600A1u),
           "PRI error values");
@@ -227,7 +228,106 @@ static void test_vbios(void) {
     CHECK(!nv_vbios_parse(&f, &info, &why) && !info.image_count, "no ROM signature");
 }
 
+// Header values of linux-firmware nvidia/tu102/gsp/booter_load-535.113.01.bin.
+static void test_booter(void) {
+    static uint8_t f[0x88 + 0xE200];
+    memset(f, 0, sizeof f);
+    uint32_t bin[6] = { 0x10DE, 1, 0xE300, 0x18, 0x88, 0xE200 };
+    for (int i = 0; i < 6; i++) put32(f + 4 * i, bin[i]);
+    uint32_t hs[9] = { 0x3C, 0x10, 0x4C, 0x50, 0x54, 0xC, 0x60, 0x64, 0x24 };
+    for (int i = 0; i < 9; i++) put32(f + 0x18 + 4 * i, hs[i]);
+    put32(f + 0x4C, 0x8200);                    // patch location
+    put32(f + 0x50, 0);                         // signature index offset
+    put32(f + 0x54, 0); put32(f + 0x58, 1); put32(f + 0x5C, 0xD);   // fuse, engine, ucode id
+    put32(f + 0x60, 1);                         // one signature
+    uint32_t lh[7] = { 0, 0x100, 0x8000, 0x6200, 1, 0x100, 0x7F00 };
+    for (int i = 0; i < 7; i++) put32(f + 0x64 + 4 * i, lh[i]);
+    mem_t m = { f, sizeof f };
+    nv_fw_file_t file = { mem_read, &m, sizeof f };
+    nv_booter_t b;
+    const char* why = "";
+    CHECK(nv_fw_parse_booter(&file, &b, &why), "booter_load parses");
+    CHECK(b.data_offset == 0x88 && b.data_size == 0xE200, "booter ucode");
+    CHECK(b.sig_offset == 0x3C && b.sig_size == 16 && b.sig_count == 1, "booter signature");
+    CHECK(b.patch_loc == 0x8200, "booter signature slot");
+    CHECK(b.os_code_size == 0x100 && b.app_offset == 0x100 && b.app_size == 0x7F00, "booter code");
+    CHECK(b.os_data_offset == 0x8000 && b.os_data_size == 0x6200, "booter data");
+    CHECK(b.meta[2] == 0xD, "booter ucode id");
+    put32(f + 0x4C, 0xE1F8);
+    CHECK(!nv_fw_parse_booter(&file, &b, &why), "signature slot past the ucode rejected");
+}
+
+// nvidia/tu102/gsp/bootloader-535.113.01.bin: descriptor v4, offsets 0.
+static void test_rm_bootloader(void) {
+    static uint8_t f[0x64 + 0x1000];
+    memset(f, 0, sizeof f);
+    uint32_t bin[6] = { 0x10DE, 1, 0x1100, 0x18, 0x64, 0x1000 };
+    for (int i = 0; i < 6; i++) put32(f + 4 * i, bin[i]);
+    uint32_t d[5] = { 4, 0, 0x488, 0x488, 0x10 };
+    for (int i = 0; i < 5; i++) put32(f + 0x18 + 4 * i, d[i]);
+    mem_t m = { f, sizeof f };
+    nv_fw_file_t file = { mem_read, &m, sizeof f };
+    nv_rm_bootloader_t r;
+    const char* why = "";
+    CHECK(nv_fw_parse_rm_bootloader(&file, &r, &why), "boot loader parses");
+    CHECK(r.version == 4 && r.data_offset == 0x64 && r.data_size == 0x1000, "boot loader image");
+    CHECK(r.code_offset == 0 && r.data_off == 0 && r.manifest_offset == 0, "boot loader offsets");
+}
+
+static void test_gsp_layout(void) {
+    // The RTX 2060 in the bring-up photos: 6 GiB, VGA workspace at
+    // 0x17FF00000, FWSEC-FRTS put FRTS at 0x17FE00000.
+    CHECK(nv_vidmem_size(0x60u | 0xAu) == 6ull << 30, "VRAM size register");
+    uint64_t fb = 6ull << 30;
+    uint64_t vga = nv_gsp_vga_workspace(((uint32_t)(0x17FF00000ull >> 16) << 8) | 0x8u, fb);
+    CHECK(vga == 0x17FF00000ull, "VGA workspace from the display register");
+    CHECK(nv_gsp_vga_workspace(0, fb) == fb - 0x20000, "VGA workspace fallback");
+
+    nv_gsp_layout_t l;
+    nv_gsp_layout(&l, fb, vga, 0x1000, 0x1600000);
+    CHECK(l.frts_addr == 0x17FE00000ull && l.frts_size == 0x100000, "FRTS where FWSEC put it");
+    CHECK(l.boot_addr == 0x17FDFF000ull, "boot loader below FRTS");
+    CHECK(l.elf_addr == 0x17E7F0000ull, "GSP-RM image below the boot loader, 64 KiB aligned");
+    CHECK(l.heap_size == 105ull << 20 && l.heap_addr == 0x177E00000ull, "heap: 8 + 1 + 96 MiB");
+    CHECK(l.wpr2_addr < l.heap_addr && l.heap_addr - l.wpr2_addr <= 0x100000, "WPR2 starts below the heap");
+    CHECK(l.wpr2_end == 0x17FF00000ull && l.nonwpr_addr == l.wpr2_addr - 0x100000, "WPR2 end, non-WPR heap");
+
+    nv_gsp_wpr_meta_t m;
+    memset(&m, 0, sizeof m);
+    nv_gsp_fill_wpr_meta(&m, &l);
+    CHECK(m.magic == NV_GSP_WPR_META_MAGIC && m.frtsOffset == l.frts_addr && m.fbSize == fb, "WPR meta");
+
+    CHECK(nv_radix3_pages(0x1600000, 2) == 11 && nv_radix3_pages(0x1600000, 1) == 1 &&
+          nv_radix3_pages(0x1600000, 0) == 1, "radix3 table sizes");
+}
+
+static void test_rpc(void) {
+    CHECK(nv_libos_id8("LOGINIT") == 0x4C4F47494E4954ull, "LibOS id8");
+    CHECK(nv_libos_id8("RMARGS") == 0x524D41524753ull, "LibOS id8, short");
+
+    uint8_t msg[24] = { 0 };
+    put64(msg, 0x1111111122222222ull);
+    put64(msg + 8, 0x0000000100000002ull);
+    put32(msg + 16, 0x5);
+    CHECK(nv_gsp_checksum(msg, 20) == ((0x11111111u ^ 0x22222222u) ^ (1u ^ 2u) ^ 5u), "checksum");
+    CHECK(nv_gsp_msg_slots(48 + 32) == 1 && nv_gsp_msg_slots(0x1001) == 2, "queue slots");
+
+    uint8_t reg[64];
+    nv_reg_entry_t e[1] = { { "RMSecBusResetEnable", 1 } };
+    uint32_t n = nv_gsp_pack_registry(reg, sizeof reg, e, 1);
+    CHECK(n == 24 + 20 && reg[0] == 44 && reg[4] == 1, "registry table header");
+    CHECK(reg[8] == 24 && reg[12] == 1 && reg[16] == 1 && reg[20] == 4, "registry entry");
+    CHECK(memcmp(reg + 24, "RMSecBusResetEnable", 20) == 0, "registry name");
+    CHECK(nv_gsp_pack_registry(reg, 30, e, 1) == 0, "registry overflow");
+
+    CHECK(nv_seq_payload_dwords(NV_SEQ_REG_POLL) == 5 && nv_seq_payload_dwords(9) == -1, "sequencer sizes");
+}
+
 int main(void) {
+    test_booter();
+    test_rm_bootloader();
+    test_gsp_layout();
+    test_rpc();
     test_push();
     test_bin();
     test_elf();

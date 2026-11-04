@@ -9,7 +9,38 @@ runs in programs, in mosWM and on the build PC).
 | What | A picture, 8-bit RGB or RGBA (transparency, like PNG) | Frames in 32-bit ARGB8888 (including transparency), a frame rate and an `.adi` soundtrack |
 | Compression | Lossless, about PNG's size, faster to decode | Lossless, only changed tiles are stored |
 | Opens with | Photos (`0:/programs/mos_photos.run`), and as a wallpaper in Settings | Video (`0:/programs/mos_video.run`) |
+| In the terminal | `img 0:/users/me/Pictures/cat.img` | `video 0:/users/me/Videos/clip.vid` |
+| In Mxplorer | `<img src="cat.img">`, or open the file's address | `<video src="clip.vid" controls>`, or open the file's address |
 | Make one | `mosmedia img picture.png out.img` | `mosmedia vid movie.mp4 out.vid` |
+
+## In the terminal
+
+The MOSdesk terminal opens pictures and videos in their apps:
+
+```sh
+video 0:/users/me/Videos/clip.vid     # also: vid
+img ~/Pictures/cat.img                # also: image, photo
+```
+
+Relative paths are inside the current folder.
+
+## On web pages
+
+Mxplorer shows `.img` pictures in `<img>` and plays `.vid` videos in
+`<video>`, with sound. It picks files by their extension, so other
+pictures (PNG, JPEG) still show a placeholder:
+
+```html
+<img src="logo.img" alt="Logo" width="200">
+<video src="clip.vid" controls autoplay muted loop poster="still.img"></video>
+<video controls><source src="clip.vid"></video>
+```
+
+A video's sound plays from a file, so a downloaded video is written to
+`0:/data/mxplorer-video.vid` the first time it plays with sound. Downloads
+are limited to 32 MiB; local files (`0:/...` in the address bar, or
+`run Mxplorer 0:/path/page.html`) have no limit, and local videos are read
+as they play. Pages from the network cannot use local files.
 
 ## Making files
 

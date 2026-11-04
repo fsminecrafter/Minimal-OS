@@ -154,30 +154,51 @@ bool nv_vbios_parse(const nv_fw_file_t* f, nv_vbios_info_t* out, const char** wh
     out->desc_version = (h >> 8) & 0xFFu;
     out->desc_size = h >> 16;
     out->stored_size = rd32(&r, d + 4);
-    if (out->desc_version != 3) { *why = "FWSEC descriptor is not version 3"; return false; }
-    out->interface_offset = rd32(&r, d + 12);
-    out->imem_phys = rd32(&r, d + 16);
-    out->imem_load = rd32(&r, d + 20);
-    out->imem_virt = rd32(&r, d + 24);
-    out->dmem_phys = rd32(&r, d + 28);
-    out->dmem_load = rd32(&r, d + 32);
-    out->engine_mask = (uint16_t)rd16(&r, d + 36);
-    out->ucode_id = (uint8_t)rd8(&r, d + 38);
-    out->signature_count = (uint8_t)rd8(&r, d + 39);
-    // The descriptor is 44 bytes, then one 3072-bit RSA signature per key.
-    if (out->desc_size != 44u + out->signature_count * 384u) {
-        *why = "FWSEC descriptor size does not match its signatures";
+    if (out->desc_version == 2) {
+        // Turing (nouveau nvfw_falcon_ucode_desc_v2): no signatures in the
+        // descriptor; it is loaded through the ACR boot loader (acr/bl.bin)
+        // and DMEM sits at its own offset in the image.
+        out->imem_load = rd32(&r, d + 24);
+        out->interface_offset = rd32(&r, d + 16);
+        out->imem_phys = rd32(&r, d + 20);
+        out->imem_virt = rd32(&r, d + 28);
+        out->imem_sec_base = rd32(&r, d + 32);
+        out->imem_sec_size = rd32(&r, d + 36);
+        out->dmem_offset = rd32(&r, d + 40);
+        out->dmem_phys = rd32(&r, d + 44);
+        out->dmem_load = rd32(&r, d + 48);
+        if (out->desc_size < 60) { *why = "FWSEC v2 descriptor too short"; return false; }
+    } else if (out->desc_version == 3) {
+        // Ampere and newer (nvfw_falcon_ucode_desc_v3).
+        out->interface_offset = rd32(&r, d + 12);
+        out->imem_phys = rd32(&r, d + 16);
+        out->imem_load = rd32(&r, d + 20);
+        out->imem_virt = rd32(&r, d + 24);
+        out->dmem_phys = rd32(&r, d + 28);
+        out->dmem_load = rd32(&r, d + 32);
+        out->engine_mask = (uint16_t)rd16(&r, d + 36);
+        out->ucode_id = (uint8_t)rd8(&r, d + 38);
+        out->signature_count = (uint8_t)rd8(&r, d + 39);
+        out->dmem_offset = out->imem_load;
+        // The descriptor is 44 bytes, then one 3072-bit RSA signature per key.
+        if (out->desc_size != 44u + out->signature_count * 384u) {
+            *why = "FWSEC descriptor size does not match its signatures";
+            return false;
+        }
+    } else {
+        *why = "unknown FWSEC descriptor version (expected 2 or 3)";
         return false;
     }
     out->image_offset = d + out->desc_size;
     if ((uint64_t)out->image_offset + out->stored_size > f->size ||
-        (uint64_t)out->imem_load + out->dmem_load > out->stored_size) {
+        (uint64_t)out->imem_load > out->stored_size ||
+        (uint64_t)out->dmem_offset + out->dmem_load > out->stored_size) {
         *why = "FWSEC image runs past the ROM";
         return false;
     }
 
-    // DMEM follows IMEM in the image; the interface table lists the mapper.
-    uint32_t dmem = out->image_offset + out->imem_load;
+    // The interface table in DMEM lists the mapper.
+    uint32_t dmem = out->image_offset + out->dmem_offset;
     uint32_t appif = dmem + out->interface_offset;
     uint32_t ahdr = rd8(&r, appif + 1), asize = rd8(&r, appif + 2), acount = rd8(&r, appif + 3);
     if (out->interface_offset >= out->dmem_load || asize < 8) {

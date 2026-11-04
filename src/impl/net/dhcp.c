@@ -57,6 +57,9 @@ static void dhcp_send(uint8_t msg_type, uint32_t requested_ip, uint32_t server_i
     pkt.htype = DHCP_HTYPE_ETH;
     pkt.hlen = 6;
     pkt.xid = net_htonl(g_xid);
+    // Ask for broadcast replies: we have no address yet, and some routers
+    // otherwise unicast the OFFER in ways small stacks miss.
+    pkt.flags = net_htons(0x8000);
     memcpy(pkt.chaddr, g_local_mac, 6);
     pkt.magic_cookie = net_htonl(DHCP_MAGIC_COOKIE);
 
@@ -152,10 +155,17 @@ static bool dhcp_acquire_internal(uint32_t timeout_ms, bool quiet) {
     if (!quiet) serial_write_str("DHCP: sending DISCOVER\n");
     dhcp_send(DHCPDISCOVER, 0, 0);
 
+    // Resend every 2 s: on real hardware the link is often still
+    // negotiating when the first DISCOVER goes out, and it is then lost.
     uint64_t start = time_get_uptime_ms();
+    uint64_t last = start;
     while (!g_offer_received && time_get_uptime_ms() - start < timeout_ms) {
         network_manager_poll();
         sleep(10);
+        if (!g_offer_received && time_get_uptime_ms() - last >= 2000) {
+            last = time_get_uptime_ms();
+            dhcp_send(DHCPDISCOVER, 0, 0);
+        }
     }
     if (!g_offer_received) {
         if (!quiet) serial_write_str("DHCP: no OFFER received\n");
@@ -167,9 +177,14 @@ static bool dhcp_acquire_internal(uint32_t timeout_ms, bool quiet) {
     dhcp_send(DHCPREQUEST, g_offered_ip, g_server_ip);
 
     start = time_get_uptime_ms();
+    last = start;
     while (!g_ack_received && !g_nak_received && time_get_uptime_ms() - start < timeout_ms) {
         network_manager_poll();
         sleep(10);
+        if (!g_ack_received && !g_nak_received && time_get_uptime_ms() - last >= 2000) {
+            last = time_get_uptime_ms();
+            dhcp_send(DHCPREQUEST, g_offered_ip, g_server_ip);
+        }
     }
     udp_unregister_handler(DHCP_CLIENT_PORT);
 

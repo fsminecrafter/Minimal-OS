@@ -152,8 +152,10 @@ bool nv_fw_elf_section(const nv_fw_file_t* f, const char* name, uint64_t* offset
 // Turing boots GSP-RM: booter_load runs on SEC2 (heavy-secure), checks
 // and starts the GSP-RM image on the GSP core through its boot loader.
 // The images are signed per chip; the signature section differs between
-// TU10x and TU11x.
+// TU10x and TU11x. Turing's VBIOS FWSEC (v2 descriptor) is loaded
+// through the ACR boot loader, as nouveau does.
 static const nv_fw_entry_t k_tu10x[] = {
+    { "acr/bl.bin", NV_FW_KIND_BIN, "boot loader FWSEC runs through", { 0, 0 } },
     { GSP_FILE("booter_load"), NV_FW_KIND_BIN, "SEC2 program that starts GSP-RM", { 0, 0 } },
     { GSP_FILE("booter_unload"), NV_FW_KIND_BIN, "SEC2 program that stops GSP-RM", { 0, 0 } },
     { GSP_FILE("bootloader"), NV_FW_KIND_BIN, "GSP RISC-V boot loader", { 0, 0 } },
@@ -162,6 +164,7 @@ static const nv_fw_entry_t k_tu10x[] = {
 };
 
 static const nv_fw_entry_t k_tu11x[] = {
+    { "acr/bl.bin", NV_FW_KIND_BIN, "boot loader FWSEC runs through", { 0, 0 } },
     { GSP_FILE("booter_load"), NV_FW_KIND_BIN, "SEC2 program that starts GSP-RM", { 0, 0 } },
     { GSP_FILE("booter_unload"), NV_FW_KIND_BIN, "SEC2 program that stops GSP-RM", { 0, 0 } },
     { GSP_FILE("bootloader"), NV_FW_KIND_BIN, "GSP RISC-V boot loader", { 0, 0 } },

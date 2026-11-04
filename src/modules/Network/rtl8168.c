@@ -34,7 +34,13 @@
 #define REG_TX_CONFIG    0x40
 #define REG_RX_CONFIG    0x44
 #define REG_CFG9346      0x50
+#define REG_PHYAR        0x60    // MII access, chips before the 8168G
 #define REG_PHY_STATUS   0x6C
+#define REG_PMCH         0x6F    // PLL power
+#define REG_GPHY_OCP     0xB8    // PHY access, 8168G and newer
+#define REG_MAC_OCP      0xB0
+#define REG_MCU          0xD3
+#define REG_MISC         0xF0
 #define REG_RX_MAX_SIZE  0xDA
 #define REG_CPLUS_CMD    0xE0
 #define REG_RX_DESC_LO   0xE4
@@ -48,14 +54,31 @@
 #define CFG9346_UNLOCK   0xC0
 #define CFG9346_LOCK     0x00
 #define PHY_LINK_UP      0x02
+#define OCP_FLAG         (1u << 31)
+#define MCU_NOW_IS_OOB   0x80    // MAC still owned by the board firmware
+#define MCU_RXTX_EMPTY   0x30
+#define MCU_LL_READY     0x02
+#define MISC_RXDV_GATE   (1u << 19)  // blocks the receive path when set
+#define TXCFG_EMPTY      (1u << 11)
+#define BMCR_ANRESTART   (1u << 9)
+#define BMCR_PDOWN       (1u << 11)
+#define BMCR_ANENABLE    (1u << 12)
 
-// RxConfig: accept everything (filtering happens in software), unlimited
-// DMA bursts, the 8168's multi-descriptor fetch and no early Rx.
+// RxConfig: accept everything (filtering happens in software) and
+// unlimited DMA bursts. Newer families add multi-descriptor fetch and
+// "no early Rx"; see rx_config(). Values follow Linux's rtl_init_rxcfg.
 #define RX_ACCEPT_ALL    0x0F            // all/physical/multicast/broadcast
-#define RX_CONFIG        ((1u << 15) | (1u << 14) | (1u << 11) | (7u << 8) | RX_ACCEPT_ALL)
-// TxConfig: standard inter-frame gap, unlimited DMA bursts, automatic
-// Tx FIFO (RTL8168e-vl and newer; ignored by older chips).
-#define TX_CONFIG        ((3u << 24) | (7u << 8) | (1u << 7))
+#define RX_128_INT       (1u << 15)
+#define RX_MULTI_EN      (1u << 14)
+#define RX_EARLY_OFF     (1u << 11)
+#define RX_DMA_BURST     (7u << 8)
+// TxConfig: standard inter-frame gap, unlimited DMA bursts; automatic
+// Tx FIFO only on the RTL8168E-VL and newer.
+#define TX_CONFIG        ((3u << 24) | (7u << 8))
+#define TX_AUTO_FIFO     (1u << 7)
+
+// Chip families, from the TxConfig XID (Linux rtl_chip_infos).
+enum { FAM_OLD, FAM_D, FAM_EVL, FAM_G };
 
 #define DESC_OWN         (1u << 31)
 #define DESC_END         (1u << 30)      // last descriptor of the ring
@@ -84,6 +107,11 @@ static uint32_t g_tx_next;
 static uint8_t g_mac[6];
 static bool g_present;
 static bool g_link_reported;
+static uint32_t g_xid;
+static int g_family;
+static uint16_t g_bmcr_at_start;
+static bool g_was_oob;
+static uint32_t g_rx_frames, g_rx_errors, g_tx_frames;
 
 static inline uint8_t rd8(uint32_t r) { return g_regs[r]; }
 static inline uint16_t rd16(uint32_t r) { return *(volatile uint16_t*)(g_regs + r); }
@@ -116,6 +144,130 @@ static bool map_registers(pci_device_t* dev) {
         return true;
     }
     return false;
+}
+
+// Each MMIO read takes roughly a microsecond on PCIe; good enough as a
+// delay base before the timer is trusted.
+static void delay_us(uint32_t us) {
+    for (uint32_t i = 0; i < us; i++) (void)rd8(REG_CHIP_CMD);
+}
+
+static int family_of(uint32_t xid) {
+    switch (xid & 0x7CF) {
+        case 0x4C0: case 0x4C1: case 0x509: case 0x5C8:      // 8168G
+        case 0x541: case 0x6C0:                              // 8168H / 8168M
+        case 0x502: case 0x503:                              // 8168EP
+            return FAM_G;
+        case 0x480: case 0x481: case 0x488: case 0x489:      // 8168F, 8411
+        case 0x2C8: case 0x2C9:                              // 8168E-VL
+            return FAM_EVL;
+        default: break;
+    }
+    switch (xid & 0x7C8) {
+        case 0x2C0: case 0x280: case 0x288: return FAM_D;    // 8168D/DP/E
+        default: break;
+    }
+    // Unknown, newer IDs share the 8168G programming model.
+    if ((xid & 0x7CF) > 0x4C0 && (xid & 0x7CF) != 0x7CF) return FAM_G;
+    return FAM_OLD;
+}
+
+static uint32_t rx_config(void) {
+    switch (g_family) {
+        case FAM_G:   return RX_128_INT | RX_MULTI_EN | RX_DMA_BURST | RX_EARLY_OFF | RX_ACCEPT_ALL;
+        case FAM_EVL:
+        case FAM_D:   return RX_128_INT | RX_MULTI_EN | RX_DMA_BURST | RX_ACCEPT_ALL;
+        default:      return RX_128_INT | RX_DMA_BURST | RX_ACCEPT_ALL;
+    }
+}
+
+static bool wait_set8(uint32_t reg, uint8_t mask, uint32_t us) {
+    for (uint32_t i = 0; i < us; i += 10) {
+        if ((rd8(reg) & mask) == mask) return true;
+        delay_us(10);
+    }
+    return false;
+}
+
+static void mac_ocp_write(uint32_t reg, uint16_t v) {
+    wr32(REG_MAC_OCP, OCP_FLAG | ((reg >> 1) << 16) | v);
+}
+
+static uint16_t mac_ocp_read(uint32_t reg) {
+    wr32(REG_MAC_OCP, (reg >> 1) << 16);
+    return (uint16_t)rd32(REG_MAC_OCP);
+}
+
+/* PHY (MII) registers: through the PHY OCP window on 8168G and newer,
+ * through PHYAR before that. */
+static uint16_t phy_read(uint32_t reg) {
+    if (g_family == FAM_G) {
+        wr32(REG_GPHY_OCP, (0xA400u + reg * 2) << 15);
+        for (int i = 0; i < 100; i++) {
+            delay_us(25);
+            uint32_t v = rd32(REG_GPHY_OCP);
+            if (v & OCP_FLAG) return (uint16_t)v;
+        }
+        return 0xFFFF;
+    }
+    wr32(REG_PHYAR, (reg & 0x1F) << 16);
+    for (int i = 0; i < 100; i++) {
+        delay_us(25);
+        uint32_t v = rd32(REG_PHYAR);
+        if (v & OCP_FLAG) return (uint16_t)v;
+    }
+    return 0xFFFF;
+}
+
+static void phy_write(uint32_t reg, uint16_t v) {
+    uint32_t r = g_family == FAM_G ? REG_GPHY_OCP : REG_PHYAR;
+    uint32_t cmd = g_family == FAM_G ? (OCP_FLAG | ((0xA400u + reg * 2) << 15) | v)
+                                     : (OCP_FLAG | ((reg & 0x1F) << 16) | v);
+    wr32(r, cmd);
+    for (int i = 0; i < 100; i++) {
+        delay_us(25);
+        if (!(rd32(r) & OCP_FLAG)) break;
+    }
+    delay_us(20);
+}
+
+/*
+ * After UEFI the MAC can still be in "out of band" mode (owned by the
+ * board's management firmware): it then never hands frames to the host.
+ * Linux's rtl_hw_init_8168g takes it back. 8168G and newer only.
+ */
+static void take_from_firmware(void) {
+    g_was_oob = (rd8(REG_MCU) & MCU_NOW_IS_OOB) != 0;
+    wr32(REG_MISC, rd32(REG_MISC) | MISC_RXDV_GATE);
+    for (int i = 0; i < 42 && !(rd32(REG_TX_CONFIG) & TXCFG_EMPTY); i++) delay_us(100);
+    wait_set8(REG_MCU, MCU_RXTX_EMPTY, 4200);
+    wr8(REG_CHIP_CMD, rd8(REG_CHIP_CMD) & ~(CMD_RX_ENABLE | CMD_TX_ENABLE));
+    delay_us(1000);
+    wr8(REG_MCU, rd8(REG_MCU) & ~MCU_NOW_IS_OOB);
+    mac_ocp_write(0xE8DE, mac_ocp_read(0xE8DE) & ~(1u << 14));
+    wait_set8(REG_MCU, MCU_LL_READY, 4200);
+    mac_ocp_write(0xE8DE, mac_ocp_read(0xE8DE) | (1u << 15));
+    wait_set8(REG_MCU, MCU_LL_READY, 4200);
+}
+
+/* PLL and PHY may have been powered down by the firmware (no PXE, or
+ * after ExitBootServices). Linux: rtl_pll_power_up + phy_resume. */
+static void power_up_phy(void) {
+    if (g_family == FAM_G) wr8(REG_PMCH, rd8(REG_PMCH) | 0xC0);
+    else if (g_family != FAM_OLD) wr8(REG_PMCH, rd8(REG_PMCH) | 0x80);
+    delay_us(1000);
+
+    if (g_family != FAM_G) phy_write(0x1F, 0);             // standard register page
+    uint16_t bmcr = phy_read(0);
+    g_bmcr_at_start = bmcr;
+    if (bmcr == 0xFFFF) return;                             // PHY did not answer
+    bool link = rd8(REG_PHY_STATUS) & PHY_LINK_UP;
+    if ((bmcr & BMCR_PDOWN) || !(bmcr & BMCR_ANENABLE) || !link) {
+        // Power up and (re)start autonegotiation; the link follows in
+        // about 2-4 seconds. DHCP keeps retrying meanwhile.
+        bmcr = (uint16_t)((bmcr & ~BMCR_PDOWN) | BMCR_ANENABLE | BMCR_ANRESTART);
+        phy_write(0, bmcr);
+    }
 }
 
 static bool wait_reset_done(void) {
@@ -176,8 +328,13 @@ static bool rtl8168_init(void) {
         return false;
     }
 
+    g_xid = (rd32(REG_TX_CONFIG) >> 20) & 0xFCF;
+    g_family = family_of(g_xid);
+
     // Stop everything and reset the MAC.
     wr16(REG_INTR_MASK, 0);
+    if (g_family == FAM_G) take_from_firmware();
+    power_up_phy();
     wr8(REG_CHIP_CMD, CMD_RESET);
     if (!wait_reset_done()) {
         serial_write_str("RTL8168: reset timeout\n");
@@ -191,8 +348,6 @@ static bool rtl8168_init(void) {
         return false;
     }
 
-    uint32_t xid = (rd32(REG_TX_CONFIG) >> 20) & 0xFCF;   // chip version, for the log
-
     wr8(REG_CFG9346, CFG9346_UNLOCK);
     wr16(REG_CPLUS_CMD, rd16(REG_CPLUS_CMD) & ~((1u << 5) | (1u << 6)));  // no checksum offload, no VLAN strip
     wr8(REG_MAX_TX_SIZE, 0x3F);                            // 8064 bytes, in 128-byte units
@@ -205,19 +360,22 @@ static bool rtl8168_init(void) {
     (void)rd16(REG_CPLUS_CMD);                             // flush posted writes
 
     wr8(REG_CHIP_CMD, CMD_RX_ENABLE | CMD_TX_ENABLE);
-    wr32(REG_RX_CONFIG, RX_CONFIG);
-    wr32(REG_TX_CONFIG, TX_CONFIG);
+    wr32(REG_RX_CONFIG, rx_config());
+    wr32(REG_TX_CONFIG, TX_CONFIG | (g_family >= FAM_EVL ? TX_AUTO_FIFO : 0));
     wr32(REG_MAR0, 0xFFFFFFFF);                            // all multicast groups
     wr32(REG_MAR0 + 4, 0xFFFFFFFF);
     wr16(REG_INTR_MASK, 0);                                // polled
     wr16(REG_INTR_STATUS, 0xFFFF);
+    // Open the receive path (closed by take_from_firmware, or left closed
+    // by the firmware's own driver on shutdown).
+    if (g_family >= FAM_EVL) wr32(REG_MISC, rd32(REG_MISC) & ~MISC_RXDV_GATE);
 
     g_rx_next = 0;
     g_tx_next = 0;
     g_present = true;
 
     serial_write_str("RTL8168: initialized, XID 0x");
-    serial_write_hex(xid);
+    serial_write_hex(g_xid);
     serial_write_str(", MAC=");
     for (int i = 0; i < 6; i++) {
         serial_write_hex(g_mac[i]);
@@ -259,6 +417,7 @@ static void rtl8168_send(const void* frame, uint16_t len) {
                     (i == TX_COUNT - 1 ? DESC_END : 0) | len;
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
     wr8(REG_TX_POLL, TX_POLL_NORMAL);
+    g_tx_frames++;
 }
 
 static void rtl8168_poll(void) {
@@ -278,7 +437,10 @@ static void rtl8168_poll(void) {
         uint32_t len = opts1 & DESC_LEN_MASK;                // includes the 4-byte CRC
         bool whole = (opts1 & (DESC_FIRST | DESC_LAST)) == (DESC_FIRST | DESC_LAST);
         if (whole && !(opts1 & RX_DESC_ERROR) && len > 4 + 14 && len - 4 <= ETH_FRAME_MAX) {
+            g_rx_frames++;
             eth_handle_frame(g_rx_buf[i], (uint16_t)(len - 4));
+        } else {
+            g_rx_errors++;
         }
         rx_give(i);
         g_rx_next = (i + 1) % RX_COUNT;
@@ -299,7 +461,20 @@ static int rtl8168_link_state(uint32_t* speed, bool* full) {
     return (status & PHY_LINK_UP) ? SYSCALL_NET_LINK_UP : SYSCALL_NET_LINK_DOWN;
 }
 
+// One line for the screen (the user's PC has no serial port).
+static void rtl8168_describe(char* buf, uint32_t size) {
+    uint8_t st = g_present ? rd8(REG_PHY_STATUS) : 0;
+    uint32_t speed = (st & 0x10) ? 1000u : (st & 0x08) ? 100u : (st & 0x04) ? 10u : 0u;
+    static const char* fam[] = { "8168B/C", "8168D/E", "8168E-VL/F", "8168G/H" };
+    snprintf(buf, size,
+             "RTL%s XID %03X, link %s %u Mbit, PHY BMCR %04X%s, rx %u (bad %u) tx %u",
+             fam[g_family], g_xid, (st & PHY_LINK_UP) ? "up" : "DOWN", speed,
+             g_bmcr_at_start, g_was_oob ? ", was in firmware mode" : "",
+             g_rx_frames, g_rx_errors, g_tx_frames);
+}
+
 static const network_hw_driver_t rtl8168_driver = {
+    .describe = rtl8168_describe,
     .link_state = rtl8168_link_state,
     .name    = "RTL8168",
     .init    = rtl8168_init,

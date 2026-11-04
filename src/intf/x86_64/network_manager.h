@@ -9,6 +9,8 @@ void network_manager_poll(void);
 void network_manager_send(const void* frame, uint16_t len);
 bool network_manager_has_driver(void);
 void network_manager_get_mac(uint8_t mac[6]);
+// Driver name plus its diagnostics line; empty without a driver.
+void network_manager_describe(char* buf, uint32_t size);
 
 // Fills SYS_NET_ADAPTERS data (defined in syscall.h).
 #include "x86_64/syscall.h"

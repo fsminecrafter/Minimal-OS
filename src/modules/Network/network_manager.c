@@ -49,6 +49,14 @@ void network_manager_get_mac(uint8_t mac[6]) {
     }
 }
 
+void network_manager_describe(char* buf, uint32_t size) {
+    if (!size) return;
+    buf[0] = 0;
+    if (!g_driver) return;
+    if (g_driver->describe) g_driver->describe(buf, size);
+    else snprintf(buf, size, "%s", g_driver->name ? g_driver->name : "Network adapter");
+}
+
 void network_manager_adapters(syscall_net_adapters_t* out) {
     memset(out, 0, sizeof(*out));
     if (!g_driver) return;

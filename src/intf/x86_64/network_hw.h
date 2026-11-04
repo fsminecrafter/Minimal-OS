@@ -10,5 +10,7 @@ typedef struct {
     void (*get_mac)(uint8_t mac[6]);
     // Optional: SYSCALL_NET_LINK_* now, link speed in Mbit/s (0 unknown).
     int (*link_state)(uint32_t* speed_mbps, bool* full_duplex);
+    // Optional: one-line diagnostics (chip, link, counters) for the screen.
+    void (*describe)(char* buf, uint32_t size);
     uint8_t wireless;                   // 1 for Wi-Fi adapters
 } network_hw_driver_t;

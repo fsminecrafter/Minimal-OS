@@ -234,6 +234,8 @@ typedef struct {
     uint32_t interface_offset;  // DMEM offset of the application interface table
     uint32_t imem_phys, imem_load, imem_virt;
     uint32_t dmem_phys, dmem_load;
+    uint32_t dmem_offset;       // DMEM's offset in the image (v3: right after IMEM)
+    uint32_t imem_sec_base, imem_sec_size;  // v2: the secure part of IMEM
     uint16_t engine_mask;
     uint8_t ucode_id, signature_count;
     uint32_t image_offset;      // ROM offset of the ucode image

@@ -48,17 +48,28 @@ prepare() {
 	# GRUB reading the proxy-DHCP reply (some UEFI GRUB builds ignore it).
 	local prefix="(tftp,$SERVER_IP)/boot/grub"
 
+	# Startup script built into GRUB: load the menu straight away. Without
+	# it, GRUB first probes for per-machine files (grub.cfg-01-<mac>,
+	# grub.cfg-<ip>, ...) and can hang for minutes retrying them.
+	cat > "$OUT/early.cfg" <<-EOF
+	echo "Minimal-OS netboot: loading menu from $SERVER_IP ..."
+	set root=(tftp,$SERVER_IP)
+	set prefix=$prefix
+	configfile $prefix/grub.cfg
+	echo "Minimal-OS netboot: could not load $prefix/grub.cfg"
+	EOF
+
 	echo "netboot: building GRUB for BIOS PXE"
 	mkdir -p "$TFTP/boot/grub/i386-pc"
 	cp "$GRUB_PC_DIR"/*.mod "$GRUB_PC_DIR"/*.lst "$TFTP/boot/grub/i386-pc/"
-	grub-mkimage -d "$GRUB_PC_DIR" -O i386-pc-pxe -p "$prefix" \
+	grub-mkimage -d "$GRUB_PC_DIR" -O i386-pc-pxe -p "$prefix" -c "$OUT/early.cfg" \
 		-o "$TFTP/boot/grub/i386-pc/core.0" pxe $GRUB_MODULES
 
 	if [ -d "$GRUB_EFI_DIR" ]; then
 		echo "netboot: building GRUB for UEFI PXE"
 		mkdir -p "$TFTP/boot/grub/x86_64-efi"
 		cp "$GRUB_EFI_DIR"/*.mod "$GRUB_EFI_DIR"/*.lst "$TFTP/boot/grub/x86_64-efi/"
-		grub-mkimage -d "$GRUB_EFI_DIR" -O x86_64-efi -p "$prefix" \
+		grub-mkimage -d "$GRUB_EFI_DIR" -O x86_64-efi -p "$prefix" -c "$OUT/early.cfg" \
 			-o "$TFTP/boot/grub/x86_64-efi/core.efi" efinet $GRUB_MODULES
 	else
 		echo "netboot: $GRUB_EFI_DIR missing, UEFI netboot disabled (install grub-efi-amd64-bin)" >&2
@@ -81,7 +92,6 @@ log-dhcp
 
 enable-tftp
 tftp-root=$TFTP
-tftp-single-port
 
 pxe-prompt="Minimal-OS network boot",1
 # BIOS: dnsmasq adds ".0" to the BIOS file name itself.

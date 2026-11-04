@@ -27,7 +27,11 @@ void cmd_ifconfig(int argc, const char** argv) {
     network_manager_get_mac(mac);
     char buf[64];
 
-    graphics_write_textr("eth0  HWaddr ");
+    char info[160];
+    network_manager_describe(info, sizeof(info));
+    graphics_write_textr("eth0  ");
+    graphics_write_textr(info);
+    graphics_write_textr("\n      HWaddr ");
     snprintf(buf, sizeof(buf), "%02X:%02X:%02X:%02X:%02X:%02X\n",
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     graphics_write_textr(buf);
@@ -64,7 +68,14 @@ void cmd_dhcp(int argc, const char** argv) {
         graphics_write_textr(ip_str);
         graphics_write_textr("\n");
     } else {
-        if (!background) graphics_write_textr("DHCP failed (no router response?)\n");
+        if (!background) {
+            graphics_write_textr("DHCP failed (no router response?)\n");
+            char info[160];
+            network_manager_describe(info, sizeof(info));
+            graphics_write_textr("  ");
+            graphics_write_textr(info);
+            graphics_write_textr("\n");
+        }
     }
 }
 

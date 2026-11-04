@@ -201,7 +201,13 @@ static void report_vbios(gpu_adapter_t* a, void (*print)(const char* text)) {
         }
         print("\n");
     }
-    if (v.fwsec_desc) {
+    if (v.fwsec_desc && v.desc_version == 2) {
+        snprintf(line, sizeof(line),
+                 "  FWSEC at 0x%05x: descriptor v2, IMEM %u (secure %u) + DMEM %u bytes\n",
+                 (unsigned)v.fwsec_desc, (unsigned)v.imem_load, (unsigned)v.imem_sec_size,
+                 (unsigned)v.dmem_load);
+        print(line);
+    } else if (v.fwsec_desc) {
         snprintf(line, sizeof(line),
                  "  FWSEC at 0x%05x: descriptor v%u, %u signature(s), IMEM %u + DMEM %u bytes\n",
                  (unsigned)v.fwsec_desc, (unsigned)v.desc_version, (unsigned)v.signature_count,

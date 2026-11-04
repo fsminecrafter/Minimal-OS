@@ -179,7 +179,7 @@ static void cmd_vid(int argc, char** argv) {
     FILE* f = fopen(out, "w+b");
     if (!p || !f) die("cannot start", out);
     mvid_writer_t v;
-    if (!mvid_writer_begin(&v, w, h, fn, fd, false, key, fast, file_write, f, malloc, free))
+    if (!mvid_writer_begin(&v, w, h, fn, fd, true, key, fast, file_write, f, malloc, free))
         die("video too large", in);
     uint32_t* px = malloc((size_t)w * h * 4);
     while (fread(px, 4, (size_t)w * h, p) == (size_t)w * h) {

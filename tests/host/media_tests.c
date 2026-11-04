@@ -96,26 +96,27 @@ static bool mem_read(void* ctx, uint64_t off, void* d, size_t n) {
     return true;
 }
 
-static void video_frame(uint32_t* px, uint32_t w, uint32_t h, uint32_t stride, uint32_t t) {
+static void video_frame(uint32_t* px, uint32_t w, uint32_t h, uint32_t stride, uint32_t t, bool alpha) {
     for (uint32_t y = 0; y < h; y++)
         for (uint32_t x = 0; x < w; x++) {
-            uint32_t c = 0xFF000000u | (x * 3) << 16 | (y * 2) << 8 | 0x40;
+            uint32_t a = alpha ? (x * 7u + y * 11u + t * 13u) & 255u : 255u;
+            uint32_t c = a << 24 | (x * 3) << 16 | (y * 2) << 8 | 0x40;
             // a moving box, a ticking counter area, some noise in one corner
-            if (x >= t * 5 % w && x < t * 5 % w + 30 && y >= 20 && y < 60) c = 0xFFFF2020u;
-            if (x < 16 && y < 16 && t % 3 == 0) c = 0xFF000000u | rnd();
+            if (x >= t * 5 % w && x < t * 5 % w + 30 && y >= 20 && y < 60) c = a << 24 | 0x00FF2020u;
+            if (x < 16 && y < 16 && t % 3 == 0) c = alpha ? rnd() : 0xFF000000u | rnd();
             px[(size_t)y * stride + x] = c;
         }
 }
 
-static void test_video(uint32_t w, uint32_t h, bool fast) {
+static void test_video(uint32_t w, uint32_t h, bool fast, bool alpha) {
     membuf_t m = {0};
     mvid_writer_t v;
-    CHECK(mvid_writer_begin(&v, w, h, 30, 1, false, 10, fast, mem_write, &m, malloc, free), "begin");
+    CHECK(mvid_writer_begin(&v, w, h, 30, 1, alpha, 10, fast, mem_write, &m, malloc, free), "begin");
     uint32_t frames = 37, stride = w + 5;
     uint32_t* px = malloc((size_t)stride * h * 4);
     uint32_t* all = malloc((size_t)w * h * 4 * frames);
     for (uint32_t t = 0; t < frames; t++) {
-        video_frame(px, w, h, stride, t);
+        video_frame(px, w, h, stride, t, alpha);
         for (uint32_t y = 0; y < h; y++) memcpy(all + ((size_t)t * h + y) * w, px + (size_t)y * stride, w * 4);
         CHECK(mvid_writer_frame(&v, px, stride), "frame");
     }
@@ -124,7 +125,8 @@ static void test_video(uint32_t w, uint32_t h, bool fast) {
 
     mvid_reader_t r;
     CHECK(mvid_open(&r, mem_read, &m, m.size, malloc), "open");
-    CHECK(r.info.frame_count == frames && r.info.width == w && r.info.has_audio, "video info");
+    CHECK(r.info.frame_count == frames && r.info.width == w && r.info.has_audio &&
+          r.info.alpha == alpha, "video info");
     CHECK(r.info.duration_ms == frames * 1000 / 30, "duration");
     CHECK(r.info.audio_size == sizeof(adi) - 1 && !memcmp(m.data + r.info.audio_offset, adi, sizeof(adi) - 1),
           "soundtrack stored unchanged");
@@ -171,9 +173,10 @@ int main(void) {
     for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++)
         for (int kind = 0; kind < 3; kind++)
             for (int alpha = 0; alpha < 2; alpha++) test_image(sizes[i][0], sizes[i][1], kind, alpha);
-    test_video(160, 90, false);
-    test_video(160, 90, true);
-    test_video(67, 129, false);
+    test_video(160, 90, false, false);
+    test_video(160, 90, true, false);
+    test_video(67, 129, false, false);
+    test_video(67, 129, false, true);
     if (failures) {
         printf("media tests: %d failure(s)\n", failures);
         return 1;

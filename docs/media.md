@@ -6,7 +6,7 @@ runs in programs, in mosWM and on the build PC).
 
 | | .img | .vid |
 | --- | --- | --- |
-| What | A picture, 8-bit RGB or RGBA (transparency, like PNG) | Frames, a frame rate and an `.adi` soundtrack |
+| What | A picture, 8-bit RGB or RGBA (transparency, like PNG) | Frames in 32-bit ARGB8888 (including transparency), a frame rate and an `.adi` soundtrack |
 | Compression | Lossless, about PNG's size, faster to decode | Lossless, only changed tiles are stored |
 | Opens with | Photos (`0:/programs/mos_photos.run`), and as a wallpaper in Settings | Video (`0:/programs/mos_video.run`) |
 | Make one | `mosmedia img picture.png out.img` | `mosmedia vid movie.mp4 out.vid` |
@@ -17,6 +17,19 @@ runs in programs, in mosWM and on the build PC).
 ffmpeg for everything it reads and writes, and
 `tools/audioconverter/wavtoadi.py` for the soundtrack.
 
+For viewing and debugging `.img`, `.vid`, and `.adi` files on Linux or
+Windows, see the Python player in [tools/media](../tools/media/README.md).
+
+Small sample files are included: [sample.img](examples/sample.img) is a
+320x180 RGBA gradient with transparent corners, and
+[sample.vid](examples/sample.vid) is a 2-second, 12 fps color test video.
+Open either in the [Python player](../tools/media/README.md), for example:
+
+```sh
+python tools/media/mosplayer.py docs/examples/sample.img
+python tools/media/mosplayer.py docs/examples/sample.vid
+```
+
 ```sh
 build/tools/mosmedia img logo.png logo.img        # any picture ffmpeg reads; keeps transparency
 build/tools/mosmedia png logo.img logo.png        # and back
@@ -24,6 +37,11 @@ build/tools/mosmedia vid clip.mp4 clip.vid --width 640 --fps 30
 build/tools/mosmedia unvid clip.vid check.mp4     # to look at the result (check.raw: exact pixels)
 build/tools/mosmedia info clip.vid
 ```
+
+The codec preserves all 8 bits per color channel. `.img` files may store
+opaque pictures as RGB or pictures with transparency as RGBA; `.vid` files
+may store RGB or RGBA frames. The `mosmedia vid` converter writes RGBA and
+preserves any source alpha channel.
 
 `vid` options: `--width N` scales (keeping the shape), `--fps N` sets the
 frame rate (the source's, at most 60), `--key N` puts a keyframe every N

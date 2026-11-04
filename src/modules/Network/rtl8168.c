@@ -41,6 +41,8 @@
 #define REG_MAC_OCP      0xB0
 #define REG_MCU          0xD3
 #define REG_MISC         0xF0
+#define REG_ERIDR        0x70    // extended registers, data
+#define REG_ERIAR        0x74    // extended registers, address/command
 #define REG_RX_MAX_SIZE  0xDA
 #define REG_CPLUS_CMD    0xE0
 #define REG_RX_DESC_LO   0xE4
@@ -112,6 +114,9 @@ static int g_family;
 static uint16_t g_bmcr_at_start;
 static bool g_was_oob;
 static uint32_t g_rx_frames, g_rx_errors, g_tx_frames;
+static uint16_t g_status_seen;           // every IntrStatus bit seen since start
+static uint32_t g_rx_bcast, g_rx_ucast;  // good frames by destination
+static uint32_t g_rx_resyncs;            // times our ring position was repaired
 
 static inline uint8_t rd8(uint32_t r) { return g_regs[r]; }
 static inline uint16_t rd16(uint32_t r) { return *(volatile uint16_t*)(g_regs + r); }
@@ -250,6 +255,33 @@ static void take_from_firmware(void) {
     wait_set8(REG_MCU, MCU_LL_READY, 4200);
 }
 
+/* Extended (ERI) registers, 8168G family. mask = byte enables. */
+static void eri_write(uint32_t addr, uint32_t mask, uint32_t v) {
+    wr32(REG_ERIDR, v);
+    wr32(REG_ERIAR, OCP_FLAG | (mask << 12) | addr);
+    for (int i = 0; i < 100 && (rd32(REG_ERIAR) & OCP_FLAG); i++) delay_us(10);
+}
+
+static uint32_t eri_read(uint32_t addr) {
+    wr32(REG_ERIAR, (0xFu << 12) | addr);
+    for (int i = 0; i < 100; i++) {
+        if (rd32(REG_ERIAR) & OCP_FLAG) return rd32(REG_ERIDR);
+        delay_us(10);
+    }
+    return 0;
+}
+
+/* Linux rtl_hw_start_8168g/h: FIFO thresholds, then a reset of the
+ * receive packet filter. Without these the firmware's leftovers apply. */
+static void setup_fifo_and_filter(void) {
+    eri_write(0xC8, 0xF, (0x08u << 16) | 0x02u);   // rx static / dynamic
+    eri_write(0xE8, 0xF, (0x10u << 16) | 0x06u);   // tx static / dynamic
+    eri_write(0xCC, 0x1, 0x38);
+    eri_write(0xD0, 0x1, 0x48);
+    eri_write(0xDC, 0xF, eri_read(0xDC) & ~1u);    // packet filter off ...
+    eri_write(0xDC, 0xF, eri_read(0xDC) | 1u);     // ... and on again
+}
+
 /* PLL and PHY may have been powered down by the firmware (no PXE, or
  * after ExitBootServices). Linux: rtl_pll_power_up + phy_resume. */
 static void power_up_phy(void) {
@@ -368,6 +400,7 @@ static bool rtl8168_init(void) {
     wr16(REG_INTR_STATUS, 0xFFFF);
     // Open the receive path (closed by take_from_firmware, or left closed
     // by the firmware's own driver on shutdown).
+    if (g_family == FAM_G) setup_fifo_and_filter();
     if (g_family >= FAM_EVL) wr32(REG_MISC, rd32(REG_MISC) & ~MISC_RXDV_GATE);
 
     g_rx_next = 0;
@@ -426,7 +459,27 @@ static void rtl8168_poll(void) {
     // Acknowledge status (Rx OK, ring empty, FIFO overflow, ...): some
     // chips stop receiving until "Rx descriptor unavailable" is cleared.
     uint16_t status = rd16(REG_INTR_STATUS);
+    g_status_seen |= status;
     if (status) wr16(REG_INTR_STATUS, status);
+
+    // Out of step with the card: our slot is still the card's, but it has
+    // filled another one. The card fills in ring order, so the oldest
+    // filled slot is the first one after a card-owned run.
+    if (g_rx[g_rx_next].opts1 & DESC_OWN) {
+        for (uint32_t k = 1; k < RX_COUNT; k++) {
+            uint32_t j = (g_rx_next + k) % RX_COUNT;
+            if (g_rx[j].opts1 & DESC_OWN) continue;
+            while (!(g_rx[(j + RX_COUNT - 1) % RX_COUNT].opts1 & DESC_OWN) &&
+                   (j + RX_COUNT - 1) % RX_COUNT != g_rx_next)
+                j = (j + RX_COUNT - 1) % RX_COUNT;
+            // The card fills in order: if it has since filled our slot too,
+            // we are in step after all.
+            if (!(g_rx[g_rx_next].opts1 & DESC_OWN)) break;
+            g_rx_next = j;
+            g_rx_resyncs++;
+            break;
+        }
+    }
 
     for (uint32_t budget = 0; budget < RX_COUNT; budget++) {
         uint32_t i = g_rx_next;
@@ -438,6 +491,7 @@ static void rtl8168_poll(void) {
         bool whole = (opts1 & (DESC_FIRST | DESC_LAST)) == (DESC_FIRST | DESC_LAST);
         if (whole && !(opts1 & RX_DESC_ERROR) && len > 4 + 14 && len - 4 <= ETH_FRAME_MAX) {
             g_rx_frames++;
+            if (g_rx_buf[i][0] & 1) g_rx_bcast++; else g_rx_ucast++;
             eth_handle_frame(g_rx_buf[i], (uint16_t)(len - 4));
         } else {
             g_rx_errors++;
@@ -466,11 +520,24 @@ static void rtl8168_describe(char* buf, uint32_t size) {
     uint8_t st = g_present ? rd8(REG_PHY_STATUS) : 0;
     uint32_t speed = (st & 0x10) ? 1000u : (st & 0x08) ? 100u : (st & 0x04) ? 10u : 0u;
     static const char* fam[] = { "8168B/C", "8168D/E", "8168E-VL/F", "8168G/H" };
+    uint32_t owned = 0;
+    for (uint32_t k = 0; g_present && k < RX_COUNT; k++)
+        if (g_rx[k].opts1 & DESC_OWN) owned++;
+    // Second line: registers that say whether the receiver is running.
+    // IntrStatus bits: 1 RxOK, 2 RxErr, 4 TxOK, 10 no free Rx descriptor,
+    // 40 Rx FIFO overflow.
     snprintf(buf, size,
-             "RTL%s XID %03X, link %s %u Mbit, PHY BMCR %04X%s, rx %u (bad %u) tx %u",
+             "RTL%s XID %03X, link %s %u Mbit, PHY BMCR %04X%s\n"
+             "      rx %u (bcast %u, ucast %u, bad %u) tx %u | seen %04X cmd %02X "
+             "rxcfg %08X misc %08X mcu %02X\n"
+             "      ring: next %u, card-owned %u of %u, repaired %u",
              fam[g_family], g_xid, (st & PHY_LINK_UP) ? "up" : "DOWN", speed,
              g_bmcr_at_start, g_was_oob ? ", was in firmware mode" : "",
-             g_rx_frames, g_rx_errors, g_tx_frames);
+             g_rx_frames, g_rx_bcast, g_rx_ucast, g_rx_errors, g_tx_frames,
+             g_status_seen, g_present ? rd8(REG_CHIP_CMD) : 0,
+             g_present ? rd32(REG_RX_CONFIG) : 0, g_present ? rd32(REG_MISC) : 0,
+             g_present ? rd8(REG_MCU) : 0,
+             g_rx_next, owned, (uint32_t)RX_COUNT, g_rx_resyncs);
 }
 
 static const network_hw_driver_t rtl8168_driver = {

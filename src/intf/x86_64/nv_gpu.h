@@ -54,5 +54,17 @@ bool nv_falcon_wait_halted(gpu_adapter_t* a, const nv_falcon_t* f, uint32_t time
 // The falcons the report shows for a chipset (NULL-name terminated).
 const nv_falcon_t* nv_falcons(uint16_t chipset);
 
+// Reads the VBIOS through BAR0's PROM window (ctx = the adapter). The
+// caller turns ROM shadowing off around it (NV_PCI_ROM_SHADOW bit 0).
+bool nv_prom_read(void* ctx, uint64_t offset, void* buf, uint32_t len);
+
+// Step 2b, first part: runs the VBIOS's FWSEC on the GSP falcon with the
+// FRTS command, which sets up the protected WPR2 region GSP-RM boots in.
+// Writes to the card; 'gpu nvidia boot'. Prints what it does.
+bool nv_gsp_fwsec_frts(gpu_adapter_t* a, void (*print)(const char* text));
+
+// WPR2 bounds as set by FWSEC-FRTS; false while there is none.
+bool nv_gsp_wpr2(gpu_adapter_t* a, uint64_t* lo, uint64_t* hi);
+
 // Prints the bring-up status of an NVIDIA adapter, line by line.
 void nv_bringup_report(gpu_adapter_t* a, void (*print)(const char* text));

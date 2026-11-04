@@ -27,7 +27,7 @@ void cmd_ifconfig(int argc, const char** argv) {
     network_manager_get_mac(mac);
     char buf[64];
 
-    char info[160];
+    char info[400];
     network_manager_describe(info, sizeof(info));
     graphics_write_textr("eth0  ");
     graphics_write_textr(info);
@@ -70,11 +70,16 @@ void cmd_dhcp(int argc, const char** argv) {
     } else {
         if (!background) {
             graphics_write_textr("DHCP failed (no router response?)\n");
-            char info[160];
+            char info[400];
             network_manager_describe(info, sizeof(info));
             graphics_write_textr("  ");
             graphics_write_textr(info);
-            graphics_write_textr("\n");
+            uint32_t replies, other;
+            dhcp_last_stats(&replies, &other);
+            snprintf(info, sizeof(info),
+                     "\n  DHCP replies received: %u (for other clients: %u)\n",
+                     replies, other);
+            graphics_write_textr(info);
         }
     }
 }

@@ -13,7 +13,8 @@
  * Status:
  *   1. firmware files: checked (nv_fw.c)                         done
  *   2a. FWSEC found in the VBIOS (nv_vbios.c), reported         done, untested on a card
- *   2b. GSP boot (FWSEC-FRTS, booter_load on SEC2, GSP-RM)       to do
+ *   2b. GSP boot: FWSEC-FRTS (nv_gsp.c, 'gpu nvidia boot')      written, untested on a card
+ *       booter_load on SEC2, GSP-RM                              to do
  *   3. RM channel + TURING_A, first clear (nv_push_clear_xrgb)   to do
  *   4. draws: pushbuffers + SASS from the shader IR (fgpu_ir.c)  IR done, encoder to do
  *
@@ -151,7 +152,7 @@ static bool check_file(const char* chip, const nv_fw_entry_t* e, char* result, s
 }
 
 // Reads the VBIOS through the PROM window, a 32-bit register at a time.
-static bool prom_read(void* ctx, uint64_t offset, void* buf, uint32_t len) {
+bool nv_prom_read(void* ctx, uint64_t offset, void* buf, uint32_t len) {
     gpu_adapter_t* a = (gpu_adapter_t*)ctx;
     if (offset + len > NV_VBIOS_PROM_SIZE) return false;
     uint8_t* out = (uint8_t*)buf;
@@ -179,7 +180,7 @@ static void report_vbios(gpu_adapter_t* a, void (*print)(const char* text)) {
         return;
     }
     nv_wr32(a, NV_PCI_ROM_SHADOW, shadow & ~1u);
-    nv_fw_file_t rom = { prom_read, a, NV_VBIOS_PROM_SIZE };
+    nv_fw_file_t rom = { nv_prom_read, a, NV_VBIOS_PROM_SIZE };
     nv_vbios_info_t v;
     const char* why = "";
     bool ok = nv_vbios_parse(&rom, &v, &why);
@@ -290,7 +291,15 @@ void nv_bringup_report(gpu_adapter_t* a, void (*print)(const char* text)) {
     }
 
     if (is_turing(chip)) report_vbios(a, print);
-    print("\nStep 2b FWSEC-FRTS, booter_load on SEC2, GSP-RM   to do (needs 2a ok)\n");
+    uint64_t wlo, whi;
+    if (is_turing(chip) && nv_gsp_wpr2(a, &wlo, &whi)) {
+        snprintf(line, sizeof(line),
+                 "\nStep 2b FWSEC-FRTS done (WPR2 0x%llx - 0x%llx); booter_load, GSP-RM to do\n",
+                 (unsigned long long)wlo, (unsigned long long)whi);
+        print(line);
+    } else {
+        print("\nStep 2b FWSEC-FRTS: run 'gpu nvidia boot'; booter_load, GSP-RM to do\n");
+    }
     print("Step 3  channel + TURING_A, first clear   waits for step 2\n");
     print("Step 4  draws: pushbuffers + shader code  shader IR ready, SASS encoder to do\n");
     const char* why = "";

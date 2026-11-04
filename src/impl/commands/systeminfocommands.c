@@ -360,6 +360,19 @@ static void gpu_size_text(uint64_t bytes) {
 
 void cmd_gpu(int argc, const char** argv) {
     uint32_t count = gpu_adapter_count();
+    if (argc >= 3 && strcmp(argv[1], "nvidia") == 0 && strcmp(argv[2], "boot") == 0) {
+        // GSP boot, as far as it is written (FWSEC-FRTS). Writes to the card.
+        bool any = false;
+        for (uint32_t i = 0; i < count; i++) {
+            gpu_adapter_t* a = gpu_adapter_get(i);
+            if (a->vendor != GPU_VENDOR_NVIDIA) continue;
+            info_text("GSP boot, step 2b: FWSEC-FRTS\n");
+            nv_gsp_fwsec_frts(a, info_text);
+            any = true;
+        }
+        if (!any) info_text("No NVIDIA GPU found.\n");
+        return;
+    }
     if (argc >= 2 && strcmp(argv[1], "nvidia") == 0) {
         // Hardware rendering bring-up status (read only).
         bool any = false;
@@ -373,7 +386,7 @@ void cmd_gpu(int argc, const char** argv) {
         return;
     }
     if (argc >= 2) {
-        info_text("Usage: gpu [nvidia]\n");
+        info_text("Usage: gpu [nvidia [boot]]\n");
         return;
     }
     if (count == 0) info_text("No GPU adapter found.\n");

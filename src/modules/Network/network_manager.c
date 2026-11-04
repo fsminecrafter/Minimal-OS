@@ -29,8 +29,20 @@ bool network_manager_init(void) {
     return false;
 }
 
+/*
+ * The timer interrupt polls on every tick, and blocking callers (dhcp,
+ * tcp, dns, ...) poll in loops on any core. Two polls at once walk the
+ * NIC's receive ring together and leave it out of step with the card,
+ * which then stops receiving. Only one poll runs; a poll that finds
+ * another in progress (an interrupt on the same core included) returns.
+ */
+static volatile int g_poll_busy;
+
 void network_manager_poll(void) {
-    if (g_driver && g_driver->poll) g_driver->poll();
+    if (!g_driver || !g_driver->poll) return;
+    if (__atomic_exchange_n(&g_poll_busy, 1, __ATOMIC_ACQUIRE)) return;
+    g_driver->poll();
+    __atomic_store_n(&g_poll_busy, 0, __ATOMIC_RELEASE);
 }
 
 void network_manager_send(const void* frame, uint16_t len) {

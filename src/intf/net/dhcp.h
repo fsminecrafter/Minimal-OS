@@ -10,4 +10,8 @@ bool dhcp_acquire(uint32_t timeout_ms);
 // Same acquisition flow without diagnostic output, for background services.
 bool dhcp_acquire_quiet(uint32_t timeout_ms);
 
+// DHCP packets that reached port 68 during the last attempt, and how many
+// of them were for another client's transaction.
+void dhcp_last_stats(uint32_t* replies, uint32_t* other_xid);
+
 #endif

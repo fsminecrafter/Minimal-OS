@@ -42,6 +42,7 @@ static uint32_t g_offered_netmask = 0xFFFFFF00u;
 static uint32_t g_offered_gateway;
 static uint32_t g_offered_dns;
 static uint32_t g_xid;
+static uint32_t g_replies_seen, g_replies_other_xid;
 
 static uint8_t* dhcp_put_option(uint8_t* p, uint8_t code, uint8_t len, const void* data) {
     *p++ = code;
@@ -119,9 +120,10 @@ static void dhcp_apply_network_options(const dhcp_packet_t* pkt, uint16_t opt_le
 static void dhcp_handle_reply(uint32_t src_ip, uint16_t src_port,
                               const uint8_t* data, uint16_t len) {
     (void)src_ip; (void)src_port;
+    g_replies_seen++;
     if (len < offsetof(dhcp_packet_t, options)) return;
     const dhcp_packet_t* pkt = (const dhcp_packet_t*)data;
-    if (net_ntohl(pkt->xid) != g_xid) return;
+    if (net_ntohl(pkt->xid) != g_xid) { g_replies_other_xid++; return; }
     if (net_ntohl(pkt->magic_cookie) != DHCP_MAGIC_COOKIE) return;
 
     uint16_t opt_len = (uint16_t)(len - offsetof(dhcp_packet_t, options));
@@ -152,6 +154,7 @@ static bool dhcp_acquire_internal(uint32_t timeout_ms, bool quiet) {
     g_offered_gateway = 0;
     g_offered_dns = 0;
     g_xid = (uint32_t)time_get_uptime_ms() ^ 0xA5A5A5A5u;
+    g_replies_seen = g_replies_other_xid = 0;
 
     udp_register_handler(DHCP_CLIENT_PORT, dhcp_handle_reply);
 
@@ -213,4 +216,9 @@ bool dhcp_acquire(uint32_t timeout_ms) {
 
 bool dhcp_acquire_quiet(uint32_t timeout_ms) {
     return dhcp_acquire_internal(timeout_ms, true);
+}
+
+void dhcp_last_stats(uint32_t* replies, uint32_t* other_xid) {
+    *replies = g_replies_seen;
+    *other_xid = g_replies_other_xid;
 }

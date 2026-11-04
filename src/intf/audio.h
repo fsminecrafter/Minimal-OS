@@ -81,6 +81,7 @@ typedef struct {
     // Current state
     uint32_t current_offset;     // Current position in file
     uint32_t data_offset;   // absolute file offset of the first ADI audio byte
+    uint32_t base_offset;   // where the ADI header starts (non-zero inside a .vid)
     uint32_t total_size;         // Total file size
     uint8_t* buffer;             // Chunk buffer
     uint8_t* prefetch_buf;     // leftover audio bytes from header scan

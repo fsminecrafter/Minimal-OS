@@ -811,7 +811,8 @@ typedef struct {
 #define SYS_AUDIO 42
 #define SYS_AUDIO_ABI_VERSION 1u
 
-#define SYS_AUDIO_OPEN   1u   // path: load and start playing
+#define SYS_AUDIO_OPEN   1u   // path: load and start playing; value: byte offset of
+                              // the .adi data in the file (0; a .vid soundtrack)
 #define SYS_AUDIO_PAUSE  2u
 #define SYS_AUDIO_RESUME 3u   // also restarts a file that has ended
 #define SYS_AUDIO_STOP   4u   // stop and unload

@@ -473,12 +473,14 @@ ci-test:
 
 .PHONY: test-host
 test-host: build/tests/host/gfx_blit_tests build/tests/host/fgpu_raster_tests build/tests/host/fgsl_tests \
-		build/tests/host/fgpu_ir_tests build/tests/host/nv_hw_tests build/tests/host/hid_mouse_tests
+		build/tests/host/fgpu_ir_tests build/tests/host/nv_hw_tests build/tests/host/hid_mouse_tests \
+		build/tests/host/media_tests
 	./build/tests/host/gfx_blit_tests
 	./build/tests/host/fgpu_raster_tests
 	./build/tests/host/fgsl_tests
 	./build/tests/host/fgpu_ir_tests
 	./build/tests/host/nv_hw_tests
+	./build/tests/host/media_tests
 	./build/tests/host/hid_mouse_tests
 
 build/tests/host/hid_mouse_tests: tests/host/hid_mouse_tests.c src/modules/USB/hid_mouse.c src/intf/mouse/hid_mouse.h
@@ -501,6 +503,14 @@ build/tests/host/fgpu_ir_tests: tests/host/fgpu_ir_tests.c src/modules/GPU/fgpu_
 build/tests/host/nv_hw_tests: tests/host/nv_hw_tests.c src/modules/GPU/nv_fw.c src/modules/GPU/nv_vbios.c $(header_files)
 	mkdir -p $(dir $@)
 	$(HOSTCC) $(HOST_CFLAGS) $(filter %.c,$^) -o $@
+
+build/tests/host/media_tests: tests/host/media_tests.c Minimal-OS-SDK/include/mosmedia.h
+	mkdir -p $(dir $@)
+	$(HOSTCC) $(HOST_CFLAGS) -idirafter Minimal-OS-SDK/include tests/host/media_tests.c -o $@
+
+build/tools/mosmedia: tools/media/mosmedia.c Minimal-OS-SDK/include/mosmedia.h
+	mkdir -p $(dir $@)
+	$(HOSTCC) -std=c11 -O2 -Wall -Wextra -idirafter Minimal-OS-SDK/include tools/media/mosmedia.c -o $@
 
 build/tests/host/gfx_blit_tests: tests/host/gfx_blit_tests.c src/impl/handlers/gfx_blit.c
 	mkdir -p $(dir $@)

@@ -6,6 +6,8 @@
 // One system-wide player shared by the terminal's play/stop/pause/volume
 // commands and SYS_AUDIO. Return values are SYS_SUCCESS / SYS_ERR_*.
 uint64_t audio_ctl_open(const char* path);
+// Plays .adi data that starts `offset` bytes into the file (a .vid soundtrack).
+uint64_t audio_ctl_open_at(const char* path, uint32_t offset);
 uint64_t audio_ctl_pause(void);
 uint64_t audio_ctl_resume(void);
 uint64_t audio_ctl_stop(void);

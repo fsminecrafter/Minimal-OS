@@ -348,6 +348,11 @@ static const uint8_t* audio_find_bytes(const uint8_t* haystack, uint32_t haystac
 
                                        bool adi_parse_header_from_stream(audio_datastream_t* stream, adi_header_t* header);
 
+/* Where the .adi data starts inside the file being opened: 0 for an .adi
+ * file, the soundtrack's offset for one embedded in a .vid video. Set by
+ * audio_ctl_open_at() only while it creates the player. */
+static uint32_t g_open_base_offset;
+
                                        audio_datastream_t* streamfile(const char* path, bool write_mode,
                                                                       uint32_t chunk_size, bool include_metadata) {
                                            if (!path || chunk_size == 0) return NULL;
@@ -368,6 +373,7 @@ static const uint8_t* audio_find_bytes(const uint8_t* haystack, uint32_t haystac
                                            stream->current_offset  = 0;
                                            stream->end_of_stream   = false;
                                            stream->data_offset     = 0;
+                                           stream->base_offset     = include_metadata ? g_open_base_offset : 0;
                                            stream->total_size      = 0;
 
                                            stream->buffer = (uint8_t*)alloc(chunk_size);
@@ -531,7 +537,7 @@ static const uint8_t* audio_find_bytes(const uint8_t* haystack, uint32_t haystac
                                                                           char* header_buf = (char*)alloc(HEADER_SIZE);
                                                                           if (!header_buf) return false;
 
-                                                                          minimafs_seek(stream->file_handle, 0);
+                                                                          minimafs_seek(stream->file_handle, stream->base_offset);
                                                                           uint32_t read_bytes =
                                                                           minimafs_read(stream->file_handle, header_buf, HEADER_SIZE);
 
@@ -554,7 +560,7 @@ static const uint8_t* audio_find_bytes(const uint8_t* haystack, uint32_t haystac
                                                                               /* #DATA marker — everything after this is audio payload */
                                                                               if ((end - line) >= 5 &&
                                                                                   (strncmp(line, "#DATA", 5) == 0 || strncmp(line, "DATA", 4) == 0)) {
-                                                                                  header->data_offset = (uint32_t)((end - header_buf) + 1);
+                                                                                  header->data_offset = stream->base_offset + (uint32_t)((end - header_buf) + 1);
                                                                               free_mem(header_buf);
                                                                               return true;
                                                                                   }
@@ -1156,12 +1162,18 @@ static void audio_ctl_reset_decoder(audio_player_t* p) {
 }
 
 uint64_t audio_ctl_open(const char* path) {
+    return audio_ctl_open_at(path, 0);
+}
+
+uint64_t audio_ctl_open_at(const char* path, uint32_t offset) {
     if (!path || !path[0]) return SYS_ERR_INVAL;
     audio_ctl_unload();
     if (!audio_manager_driver_name()) return SYS_ERR_GENERIC;   /* no sound card */
     if (!minimafs_exists(path)) return SYS_ERR_NOTFOUND;
 
+    g_open_base_offset = offset;
     audio_player_t* p = audio_player_create(path);
+    g_open_base_offset = 0;
     if (!p) return SYS_ERR_INVAL;               /* not a playable .adi */
     g_ctl_player = p;
     strncpy(g_ctl_path, path, sizeof(g_ctl_path) - 1);
@@ -1373,7 +1385,7 @@ uint64_t audio_syscall(syscall_audio_request_t* req) {
             char path[SYSCALL_AUDIO_PATH_MAX];
             req->path[SYSCALL_AUDIO_PATH_MAX - 1] = '\0';
             normalize_file_path(req->path, path, sizeof(path));
-            return audio_ctl_open(path);
+            return audio_ctl_open_at(path, req->value);
         }
         case SYS_AUDIO_PAUSE:  return audio_ctl_pause();
         case SYS_AUDIO_RESUME: return audio_ctl_resume();

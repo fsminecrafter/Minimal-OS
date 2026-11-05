@@ -154,7 +154,7 @@ lists successfully parsed and registered services.
 
 ## ROADMAP
 
-Last synced 2026 - oct 20, 15:29
+Last synced 2026 - 11-05, 09:00
 
 #### X = Done
 #### C = Come back later
@@ -220,7 +220,7 @@ Last synced 2026 - oct 20, 15:29
 
 ##### V  0.4.53
 
-- [ ] Webbrowser (Mxplorer)
+- [X] Webbrowser (Mxplorer)
 
 ## Usage
 

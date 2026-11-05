@@ -58,4 +58,4 @@ Fix various apps. [X]
 
 V 0.4.53
 
-Webbrowser (Mxplorer) [ ]
+Webbrowser (Mxplorer) [X]

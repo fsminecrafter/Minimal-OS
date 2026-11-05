@@ -1,4 +1,4 @@
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -7,10 +7,17 @@ RUN apt-get update \
         dbus-x11 \
         firefox-esr \
         fonts-dejavu \
+        build-essential \
+        grub-common \
+        grub-pc-bin \
+        libzstd1 \
+        nasm \
         novnc \
+        python3 \
         supervisor \
         websockify \
         x11vnc \
+        xorriso \
         xfce4 \
         xfce4-terminal \
         xvfb \
@@ -28,5 +35,6 @@ RUN chmod 0755 /usr/local/bin/start-desktop
 
 EXPOSE 6080
 VOLUME ["/home/desktop"]
+ENV PATH="/home/desktop/cross/bin:${PATH}"
 
 ENTRYPOINT ["/usr/local/bin/start-desktop"]

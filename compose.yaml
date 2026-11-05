@@ -5,13 +5,18 @@ services:
     env_file:
       - path: ./env/vnc/.env
         required: false
+    environment:
+      CROSS_TOOLCHAIN_PATH: ${HOME:?Set HOME to the host account with the cross-toolchain}/cross
     init: true
     ports:
       - "127.0.0.1:6080:6080"
     restart: unless-stopped
     shm_size: 1gb
+    working_dir: /Minimal-OS
     volumes:
+      - .:/Minimal-OS
       - desktop-home:/home/desktop
+      - ${HOME:?Set HOME to the host account with the cross-toolchain}/cross:${HOME}/cross:ro
 
 volumes:
   desktop-home:

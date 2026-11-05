@@ -2,13 +2,18 @@
 
 This optional Docker Compose service provides an XFCE desktop with Firefox ESR.
 The desktop profile, including Firefox data, is kept in a named Docker volume.
+The repository is mounted at `/Minimal-OS` and linked from
+`~/Documents/Minimal-OS`. The host's `$HOME/cross` cross-toolchain is mounted
+read-only at its original path in the desktop container, with `~/cross` linked
+to it and added to `PATH`.
 
 ## Start
 
 From the repository root, copy `env/vnc/.env.example` to `env/vnc/.env` and set
 `NOVNC_PASSWORD` to exactly eight alphanumeric characters. The VNC password
 protocol used by this desktop accepts only eight characters. The local `.env`
-file is ignored by Git.
+file is ignored by Git. The account used to run Compose must have the
+cross-toolchain at `$HOME/cross`.
 
 Build and start the desktop:
 

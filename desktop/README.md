@@ -4,8 +4,8 @@ This optional Docker Compose service provides an XFCE desktop with Firefox ESR.
 The desktop profile, including Firefox data, is kept in a named Docker volume.
 The repository is mounted at `/Minimal-OS` and linked from
 `~/Documents/Minimal-OS`. The host's `$HOME/cross` cross-toolchain is mounted
-read-only at its original path in the desktop container, with `~/cross` linked
-to it and added to `PATH`.
+read-only at both its original path and `~/cross` in the desktop container,
+and is added to `PATH`.
 
 ## Start
 

@@ -15,6 +15,8 @@ summarized in [docs/system-overview.md](docs/system-overview.md).
 [shading language FGSL](docs/fgsl.md), and the GPU side in
 [docs/gpu.md](docs/gpu.md) (including what hardware rendering on NVIDIA
 cards needs).
+An optional browser-accessible XFCE desktop with Firefox is documented in
+[desktop/README.md](desktop/README.md).
 
 ##### Nvidia firmware setup
 

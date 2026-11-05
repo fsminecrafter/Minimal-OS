@@ -1,0 +1,17 @@
+services:
+  novnc-desktop:
+    build:
+      context: ./desktop
+    env_file:
+      - path: ./env/vnc/.env
+        required: false
+    init: true
+    ports:
+      - "127.0.0.1:6080:6080"
+    restart: unless-stopped
+    shm_size: 1gb
+    volumes:
+      - desktop-home:/home/desktop
+
+volumes:
+  desktop-home:

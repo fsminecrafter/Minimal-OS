@@ -15,6 +15,7 @@ dist/
 .venv
 planning
 .vscode
+/env/vnc/.env
 
 # Ignore vendored SDK subtree until it is intentionally used
 Minimal-OS-SDK/

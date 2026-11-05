@@ -11,6 +11,9 @@ Install packages and service definitions are documented in
 [docs/install-and-services.md](docs/install-and-services.md).
 The full kernel, boot, storage, networking, process, and build architecture is
 summarized in [docs/system-overview.md](docs/system-overview.md).
+New contributors can use the [development workflow](docs/development-workflow.md),
+[build target reference](docs/build-targets.md), and
+[testing guide](docs/testing.md) to navigate and validate changes.
 3D graphics: [FarcadeGL](docs/farcadegl.md) (the 3D API), its GLSL-style
 [shading language FGSL](docs/fgsl.md), and the GPU side in
 [docs/gpu.md](docs/gpu.md) (including what hardware rendering on NVIDIA

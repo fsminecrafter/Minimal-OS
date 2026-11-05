@@ -243,3 +243,110 @@ const char* nv_rpc_name(uint32_t function) {
         default:                               return "?";
     }
 }
+
+/* ------------------------------------------ FWSEC-FRTS (Turing, v2) */
+
+bool nv_fw_parse_acr_bl(const nv_fw_file_t* f, nv_acr_bl_t* out, const char** why) {
+    const char* dummy;
+    if (!why) why = &dummy;
+    nv_fw_bin_hdr_t bin;
+    if (!nv_fw_parse_bin(f, &bin, why)) return false;
+    // nvfw_bl_desc: start_tag, dmem_load_off, code_off, code_size,
+    // data_off, data_size
+    uint32_t d[6];
+    for (int i = 0; i < 6; i++)
+        if (!read32(f, (uint64_t)bin.header_offset + 4u * i, &d[i])) {
+            *why = "boot loader descriptor outside the file";
+            return false;
+        }
+    nv_acr_bl_t b = { 0 };
+    b.start_tag = d[0];
+    b.dmem_load_off = d[1];
+    b.code_offset = bin.data_offset + d[2];
+    b.code_size = d[3];
+    if (b.code_size == 0 || b.code_size > 0x10000u || d[2] > bin.data_size ||
+        b.code_size > bin.data_size - d[2] || !inside(b.code_offset, b.code_size, f->size)) {
+        *why = "boot loader code outside the file";
+        return false;
+    }
+    if (b.start_tag > 0xFFFFu) { *why = "bad boot loader start tag"; return false; }
+    *out = b;
+    return true;
+}
+
+void nv_fwsec_bl_desc(nv_bl_dmem_desc_t* d, const nv_vbios_info_t* v, uint64_t image_pa) {
+    for (size_t i = 0; i < sizeof(*d); i++) ((uint8_t*)d)[i] = 0;
+    // tu102_gsp_fwsec_load_bld: the non-secure part of IMEM starts at its
+    // physical base, the secure part at its own base; DMEM follows in
+    // the image at its offset.
+    d->ctx_dma = NV_FALCON_DMAIDX_PHYS_SYS_NCOH;
+    d->code_dma_base = image_pa;
+    d->non_sec_code_off = v->imem_phys;
+    d->non_sec_code_size = v->imem_load - v->imem_sec_size;
+    d->sec_code_off = v->imem_sec_base;
+    d->sec_code_size = v->imem_sec_size;
+    d->code_entry_point = 0;
+    d->data_dma_base = image_pa + v->dmem_offset;
+    d->data_size = v->dmem_load;
+}
+
+static void put_le32(uint8_t* p, uint32_t v) {
+    for (int i = 0; i < 4; i++) p[i] = (uint8_t)(v >> (8 * i));
+}
+
+bool nv_fwsec_patch_frts(uint8_t* image, const nv_vbios_info_t* v, uint64_t frts_addr,
+                         uint64_t frts_size, const char** why) {
+    const char* dummy;
+    if (!why) why = &dummy;
+    if (!v->mapper_offset || v->mapper_offset < v->image_offset) {
+        *why = "FWSEC has no DMEM mapper";
+        return false;
+    }
+    if (!(v->mapper_cmd_mask0 & (1u << NV_FWSEC_CMD_FRTS))) {
+        *why = "this FWSEC does not offer the FRTS command";
+        return false;
+    }
+    if ((frts_addr | frts_size) & 0xFFFu || (frts_addr >> 12) > 0xFFFFFFFFull || !frts_size) {
+        *why = "FRTS region not 4 KiB aligned";
+        return false;
+    }
+    // The mapper (nvfw_falcon_appif_dmemmapper_v3): init_cmd at +44, the
+    // command buffer's DMEM offset at +8 and size at +12.
+    uint32_t mapper = v->mapper_offset - v->image_offset;
+    if ((uint64_t)mapper + 64u > v->stored_size) { *why = "DMEM mapper outside the image"; return false; }
+    uint32_t cmd_size = rd_le32(image + mapper + 12);
+    uint32_t cmd_in = v->mapper_cmd_in;
+    if (cmd_size < NV_FWSEC_FRTS_CMD_BYTES || cmd_in > v->dmem_load ||
+        v->dmem_load - cmd_in < NV_FWSEC_FRTS_CMD_BYTES ||
+        (uint64_t)v->dmem_offset + cmd_in + NV_FWSEC_FRTS_CMD_BYTES > v->stored_size) {
+        *why = "FWSEC's command buffer is too small for FRTS";
+        return false;
+    }
+    put_le32(image + mapper + 44, NV_FWSEC_CMD_FRTS);
+
+    uint8_t* cmd = image + v->dmem_offset + cmd_in;
+    for (uint32_t i = 0; i < NV_FWSEC_FRTS_CMD_BYTES; i++) cmd[i] = 0;
+    // read_vbios: version 1, 24 bytes, no image (FWSEC reads the ROM
+    // itself), flags 2.
+    put_le32(cmd + 0, 1);
+    put_le32(cmd + 4, 24);
+    put_le32(cmd + 20, 2);
+    // frts_region: version 1, 20 bytes, address and size in 4 KiB pages, in VRAM.
+    put_le32(cmd + 24, 1);
+    put_le32(cmd + 28, 20);
+    put_le32(cmd + 32, (uint32_t)(frts_addr >> 12));
+    put_le32(cmd + 36, (uint32_t)(frts_size >> 12));
+    put_le32(cmd + 40, NV_FWSEC_FRTS_REGION_FB);
+    *why = "";
+    return true;
+}
+
+bool nv_wpr2_decode(uint32_t lo_reg, uint32_t hi_reg, uint64_t* lo, uint64_t* hi) {
+    if (nv_pri_error(lo_reg) || nv_pri_error(hi_reg)) return false;
+    uint64_t l = (uint64_t)(lo_reg >> 4) << 12;
+    uint64_t h = (uint64_t)(hi_reg >> 4) << 12;
+    if (!h || h <= l) return false;
+    if (lo) *lo = l;
+    if (hi) *hi = h;
+    return true;
+}

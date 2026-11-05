@@ -323,6 +323,76 @@ static void test_rpc(void) {
     CHECK(nv_seq_payload_dwords(NV_SEQ_REG_POLL) == 5 && nv_seq_payload_dwords(9) == -1, "sequencer sizes");
 }
 
+// FWSEC-FRTS on Turing: the ACR boot loader, its DMEM descriptor, the
+// FRTS patch and WPR2.
+static void test_fwsec_frts(void) {
+    // acr/bl.bin: bin header, nvfw_bl_desc at 0x18, code at 0x100.
+    static uint8_t f[0x600];
+    memset(f, 0, sizeof f);
+    uint32_t bin[6] = { 0x10DE, 1, sizeof f, 0x18, 0x100, 0x500 };
+    for (int i = 0; i < 6; i++) put32(f + 4 * i, bin[i]);
+    uint32_t bld[6] = { 0xFD, 0, 0x0, 0x400, 0x400, 0x100 };
+    for (int i = 0; i < 6; i++) put32(f + 0x18 + 4 * i, bld[i]);
+    mem_t m = { f, sizeof f };
+    nv_fw_file_t file = { mem_read, &m, sizeof f };
+    nv_acr_bl_t bl;
+    const char* why = "";
+    CHECK(nv_fw_parse_acr_bl(&file, &bl, &why), "acr/bl.bin parses");
+    CHECK(bl.start_tag == 0xFD && bl.code_offset == 0x100 && bl.code_size == 0x400,
+          "boot loader code and tag");
+    put32(f + 0x18 + 12, 0x600);
+    CHECK(!nv_fw_parse_acr_bl(&file, &bl, &why), "boot loader past its data rejected");
+
+    // A v2 FWSEC image: IMEM 0x400 (secure 0x100 at 0x300), DMEM 0x200 at
+    // image offset 0x400, mapper at DMEM 0x40, command buffer at DMEM 0x100.
+    static uint8_t img[0x600];
+    memset(img, 0xEE, sizeof img);
+    nv_vbios_info_t v;
+    memset(&v, 0, sizeof v);
+    v.desc_version = 2;
+    v.image_offset = 0x9000;
+    v.stored_size = sizeof img;
+    v.imem_phys = 0; v.imem_load = 0x400; v.imem_sec_base = 0x300; v.imem_sec_size = 0x100;
+    v.dmem_offset = 0x400; v.dmem_load = 0x200;
+    v.mapper_offset = v.image_offset + 0x400 + 0x40;
+    v.mapper_cmd_in = 0x100;
+    v.mapper_cmd_mask0 = 1u << NV_FWSEC_CMD_FRTS;
+    put32(img + 0x440 + 12, 0x100);                         // command buffer size
+    CHECK(nv_fwsec_patch_frts(img, &v, 0x3FD00000ull, 0x100000, &why), "FRTS patch");
+    uint8_t* cmd = img + 0x400 + 0x100;
+    CHECK(img[0x440 + 44] == NV_FWSEC_CMD_FRTS && img[0x440 + 45] == 0, "mapper init command");
+    CHECK(cmd[0] == 1 && cmd[4] == 24 && cmd[8] == 0 && cmd[16] == 0 && cmd[20] == 2,
+          "read_vbios arguments");
+    CHECK(cmd[24] == 1 && cmd[28] == 20 && cmd[40] == NV_FWSEC_FRTS_REGION_FB, "frts_region header");
+    CHECK(cmd[32] == 0x00 && cmd[33] == 0xFD && cmd[34] == 0x03 && cmd[36] == 0x00 && cmd[37] == 0x01,
+          "FRTS region in 4 KiB pages");
+    CHECK(cmd[44] == 0xEE, "nothing written past the command");
+
+    put32(img + 0x440 + 12, 40);
+    CHECK(!nv_fwsec_patch_frts(img, &v, 0x3FD00000ull, 0x100000, &why), "small command buffer rejected");
+    put32(img + 0x440 + 12, 0x100);
+    v.mapper_cmd_mask0 = 0;
+    CHECK(!nv_fwsec_patch_frts(img, &v, 0x3FD00000ull, 0x100000, &why), "FWSEC without FRTS rejected");
+    v.mapper_cmd_mask0 = 1u << NV_FWSEC_CMD_FRTS;
+    CHECK(!nv_fwsec_patch_frts(img, &v, 0x3FD00800ull, 0x100000, &why), "unaligned region rejected");
+
+    nv_bl_dmem_desc_t d;
+    nv_fwsec_bl_desc(&d, &v, 0x12345000ull);
+    const uint8_t* raw = (const uint8_t*)&d;
+    CHECK(d.ctx_dma == NV_FALCON_DMAIDX_PHYS_SYS_NCOH && raw[32] == 4, "descriptor DMA index at 32");
+    CHECK(d.code_dma_base == 0x12345000ull && raw[36] == 0x00 && raw[37] == 0x50, "code base at 36");
+    CHECK(d.non_sec_code_off == 0 && d.non_sec_code_size == 0x300, "non-secure code");
+    CHECK(d.sec_code_off == 0x300 && d.sec_code_size == 0x100, "secure code");
+    CHECK(d.data_dma_base == 0x12345400ull && raw[64] == 0x00 && raw[65] == 0x54, "data base at 64");
+    CHECK(d.data_size == 0x200 && raw[72] == 0x00 && raw[73] == 0x02, "data size at 72");
+
+    uint64_t lo = 0, hi = 0;
+    CHECK(nv_wpr2_decode(0x003FD000u, 0x003FE000u, &lo, &hi) && lo == 0x3FD00000ull && hi == 0x3FE00000ull,
+          "WPR2 decoded");
+    CHECK(!nv_wpr2_decode(0, 0, &lo, &hi), "no WPR2");
+    CHECK(!nv_wpr2_decode(0xBADF1100u, 0x003FE000u, &lo, &hi), "PRI error is no WPR2");
+}
+
 int main(void) {
     test_booter();
     test_rm_bootloader();
@@ -333,6 +403,7 @@ int main(void) {
     test_elf();
     test_manifest();
     test_vbios();
+    test_fwsec_frts();
     if (failures) {
         printf("nv hw tests: %d failure(s)\n", failures);
         return 1;

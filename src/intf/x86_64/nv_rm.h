@@ -42,6 +42,73 @@ typedef struct {
 
 bool nv_fw_parse_booter(const nv_fw_file_t* f, nv_booter_t* out, const char** why);
 
+/* ------------------------------------------ FWSEC-FRTS (Turing, v2) */
+
+/* Step 2b, first part (nv_gsp.c). Turing's FWSEC (VBIOS descriptor v2)
+ * is not loaded into the GSP falcon directly: the ACR boot loader
+ * (acr/bl.bin) goes into the top of IMEM, a descriptor at DMEM 0 tells it
+ * where the FWSEC image is in sysmem, and it DMAs the image in and runs
+ * it. The image is patched first so FWSEC carries out the FRTS command:
+ * set up the 1 MiB FRTS region and the WPR2 protection around it. As
+ * nouveau does it (gsp/fwsec.c, gsp/tu102.c, falcon/gm200.c). */
+
+// acr/bl.bin: nv_fw_bin_hdr_t, then this at the header offset.
+typedef struct {
+    uint32_t code_offset, code_size;    // boot loader code in the file
+    uint32_t start_tag;                 // IMEM tag; boot vector = start_tag << 8
+    uint32_t dmem_load_off;
+} nv_acr_bl_t;
+
+bool nv_fw_parse_acr_bl(const nv_fw_file_t* f, nv_acr_bl_t* out, const char** why);
+
+// What the boot loader finds at DMEM 0 (flcn_bl_dmem_desc_v2).
+#define NV_FALCON_DMAIDX_PHYS_SYS_NCOH 4u
+typedef struct __attribute__((packed)) {
+    uint32_t reserved[4];
+    uint32_t signature[4];
+    uint32_t ctx_dma;                   // NV_FALCON_DMAIDX_*
+    uint64_t code_dma_base;             // sysmem address of the image
+    uint32_t non_sec_code_off, non_sec_code_size;
+    uint32_t sec_code_off, sec_code_size;
+    uint32_t code_entry_point;
+    uint64_t data_dma_base;             // sysmem address of the DMEM part
+    uint32_t data_size;
+    uint32_t argc, argv;
+} nv_bl_dmem_desc_t;
+
+_Static_assert(sizeof(nv_bl_dmem_desc_t) == 84, "flcn_bl_dmem_desc_v2 is 84 bytes");
+
+// The descriptor for FWSEC's image (`v` from nv_vbios_parse) at `image_pa`.
+void nv_fwsec_bl_desc(nv_bl_dmem_desc_t* d, const nv_vbios_info_t* v, uint64_t image_pa);
+
+// FRTS command arguments, written into the DMEM mapper's command buffer
+// (nvfw_fwsec_frts_cmd): no VBIOS image passed in, and the FRTS region
+// in VRAM in 4 KiB units.
+#define NV_FWSEC_FRTS_CMD_BYTES 44u
+#define NV_FWSEC_FRTS_REGION_FB 2u
+
+// Patches FWSEC's ucode image (`image`, v->stored_size bytes, as read
+// from the ROM at v->image_offset) to run the FRTS command for the
+// region at `frts_addr`. False (with *why) if the mapper cannot take it.
+bool nv_fwsec_patch_frts(uint8_t* image, const nv_vbios_info_t* v, uint64_t frts_addr,
+                         uint64_t frts_size, const char** why);
+
+/* WPR2, set up by FWSEC-FRTS. Each register holds address bits 39:12 in
+ * bits 31:4; the low bound is inclusive, the high bound exclusive. */
+#define NV_PFB_PRI_MMU_WPR2_ADDR_LO 0x1FA824u
+#define NV_PFB_PRI_MMU_WPR2_ADDR_HI 0x1FA828u
+// False when there is no WPR2 (the high bound is 0, or the reads failed).
+bool nv_wpr2_decode(uint32_t lo_reg, uint32_t hi_reg, uint64_t* lo, uint64_t* hi);
+
+// FWSEC's result: bits 31:16 of SW_SCRATCH 0x0E, 0 on success.
+#define NV_PBUS_SW_SCRATCH_0E      0x001438u
+// The VBIOS's own boot (GFW) must have finished before FWSEC runs:
+// bit 0 of the priv level mask is set and the progress byte is 0xFF.
+#define NV_PGC6_AON_SECURE_SCRATCH_GROUP_05_PRIV_LEVEL_MASK 0x118128u
+#define NV_PGC6_AON_SECURE_SCRATCH_GROUP_05_0_GFW_BOOT      0x118234u
+// A falcon's DMA aperture settings, one per DMA index.
+#define NV_FALCON_FBIF_TRANSCFG(i) (0x600u + (i) * 4u)
+
 /* ----------------------------------------------- GSP RISC-V boot loader */
 
 // RM_RISCV_UCODE_DESC (version 4) at the bin header's header_offset.

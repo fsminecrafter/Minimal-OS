@@ -34,9 +34,11 @@ AHCI disk, RTL8139 networking, and audio devices.
 build. The install1 rule then copies it into `src/resources/install1` before
 building the embedded package.
 
-`clean` removes kernel and distribution output, `Minimal-OS-SDK/build`, generated
-`.run` files, generated minimaSSL bundles, and package objects. It does not
-remove source resources or the disk image.
+`clean` removes kernel and distribution output, `Minimal-OS-SDK/build`,
+minimaSSL bundles, and package objects. It also deletes every `*.run` file
+under the repository, including any hand-authored bundles; preserve any such
+files before running it. It does not remove source resources or the disk image.
+See [Build Targets](build-targets.md#cleanup) for details.
 
 ## Resource Rebuilds
 

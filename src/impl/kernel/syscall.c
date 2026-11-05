@@ -1,5 +1,6 @@
 #include "x86_64/syscall.h"
 #include "x86_64/wm_watchdog.h"
+#include "x86_64/acpi.h"
 #include "graphics.h"
 #include "serial.h"
 #include "prochandler.h"
@@ -67,6 +68,16 @@ bool syscall_user_range_ok(const void* ptr, size_t len, bool write) {
 
 static uint64_t sys_write_impl(int fd, const char* buf, uint64_t len) {
     if (!buf) return SYS_ERR_INVAL;
+    // fd 3: the kernel log only (serial and the network log), not the
+    // screen - for program diagnostics such as Mxplorer's console.
+    if (fd == 3) {
+        serial_write_str("[");
+        serial_write_str(current_process ? current_process->name : "app");
+        serial_write_str("] ");
+        for (uint64_t i = 0; i < len; i++) serial_write(buf[i]);
+        if (len && buf[len - 1] != '\n') serial_write('\n');
+        return len;
+    }
     if (fd != 1 && fd != 2) return SYS_ERR_BADFD;
 
     // No memory protection between processes exists yet (every
@@ -1056,6 +1067,21 @@ static void syscall_dispatch_inner(syscall_regs_t* regs) {
             regs->rax = audio_syscall
                 ? audio_syscall((syscall_audio_request_t*)regs->rdi)
                 : SYS_ERR_INVAL;
+            return;
+        }
+        case SYS_POWER: {
+            uint64_t op = regs->rdi;
+            if (op != SYS_POWER_SHUTDOWN && op != SYS_POWER_REBOOT) {
+                regs->rax = SYS_ERR_INVAL;
+                return;
+            }
+            serial_write_str(op == SYS_POWER_SHUTDOWN ? "Power: shutdown requested by "
+                                                      : "Power: reboot requested by ");
+            serial_write_str(current_process ? current_process->name : "?");
+            serial_write_str("\n");
+            bool done = op == SYS_POWER_SHUTDOWN ? acpi_shutdown() : acpi_reboot();
+            (void)done;
+            regs->rax = SYS_ERR_GENERIC;    // still here: it did not work
             return;
         }
         case SYS_AUDIO_MIXER: {

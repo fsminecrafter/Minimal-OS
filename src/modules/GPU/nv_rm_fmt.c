@@ -302,10 +302,10 @@ bool nv_fwsec_patch_frts(uint8_t* image, const nv_vbios_info_t* v, uint64_t frts
         *why = "FWSEC has no DMEM mapper";
         return false;
     }
-    if (!(v->mapper_cmd_mask0 & (1u << NV_FWSEC_CMD_FRTS))) {
-        *why = "this FWSEC does not offer the FRTS command";
-        return false;
-    }
+    // ucode_cmd_mask0 is not checked: nouveau and OpenRM both just write
+    // init_cmd. Its encoding is not 1 << cmd - a TU106 VBIOS whose FWSEC
+    // does run FRTS reports 0x00044000 (FRTS 0x15 and SB 0x19 both appear
+    // shifted down by 7), so gating on it rejected working hardware.
     if ((frts_addr | frts_size) & 0xFFFu || (frts_addr >> 12) > 0xFFFFFFFFull || !frts_size) {
         *why = "FRTS region not 4 KiB aligned";
         return false;

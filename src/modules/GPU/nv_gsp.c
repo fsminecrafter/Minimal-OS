@@ -130,7 +130,11 @@ static bool load_acr_bl(const char* chip, nv_acr_bl_t* bl, uint8_t* code, uint32
 }
 
 // Engine reset (gp102_flcn_reset_eng), then IMEM/DMEM scrubbing.
+// Same steps as falcon_reset() in nv_gsp_rm.c, including the chip id in
+// FALCON_RM that signed ucode checks.
 static bool gsp_reset(void) {
+    fwr(NV_FALCON_ITFEN, frd(NV_FALCON_ITFEN) & ~3u);
+    fwr(NV_FALCON_IRQMCLR, 0xFFFFFFFFu);
     fwr(NV_FALCON_ENGINE, frd(NV_FALCON_ENGINE) | 1u);
     (void)frd(NV_FALCON_ENGINE);
     sleep(1);
@@ -138,7 +142,10 @@ static bool gsp_reset(void) {
     uint64_t end = time_get_uptime_ms() + 100;
     for (;;) {
         uint32_t v = frd(NV_FALCON_DMACTL);
-        if (!nv_pri_error(v) && !(v & 0x6u)) return true;
+        if (!nv_pri_error(v) && !(v & 0x6u)) {
+            fwr(NV_FALCON_RM, rd(NV_PMC_BOOT_0));
+            return true;
+        }
         if (time_get_uptime_ms() >= end) return false;
         sleep(1);
     }

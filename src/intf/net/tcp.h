@@ -45,6 +45,7 @@ typedef enum {
  * Cost: see TCP_MAX_CONNS above.
  */
 #define TCP_RX_BUF_SIZE 32768
+#define TCP_OOO_RANGES 4
 
 typedef struct {
     bool in_use;
@@ -60,6 +61,12 @@ typedef struct {
 
     uint8_t  rx_buf[TCP_RX_BUF_SIZE];
     uint32_t rx_len;
+    // Segments that arrived ahead of rcv_nxt, already copied into rx_buf
+    // at rx_len + (seq - rcv_nxt): sequence ranges [start, end). Joined
+    // into the stream once the gap before them fills, so one lost
+    // segment does not throw away the rest of the window.
+    uint32_t ooo_start[TCP_OOO_RANGES], ooo_end[TCP_OOO_RANGES];
+    uint8_t  ooo_count;
 
     bool remote_closed;
     bool reset;

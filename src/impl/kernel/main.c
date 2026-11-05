@@ -1,4 +1,5 @@
 #include "x86_64/ramdisk.h"
+#include "x86_64/netlog.h"
 #include "x86_64/hyperv.h"
 #include "print.h"
 #include "x86_64/commandhandler.h"
@@ -116,6 +117,12 @@ void kernel_main(uint64_t mb2_info_addr) {
     }
     multiboot2_get_cmdline_value(mb_info, "root=", kernel_boot_root,
                                  sizeof(kernel_boot_root));
+    {
+        // netlog=<ip>[:<port>]: send the kernel log to that PC (make netboot)
+        char netlog[40];
+        if (multiboot2_get_cmdline_value(mb_info, "netlog=", netlog, sizeof(netlog)))
+            netlog_configure(netlog);
+    }
     uint64_t total_ram_bytes = get_total_memory(mb_info);
     print_clear();
     commandhandler_init();
@@ -246,6 +253,7 @@ void kernel_main(uint64_t mb2_info_addr) {
     sti();
     createProcess("busy", busy);
     createProcess("kernelaudio", audioupdate);
+    netlog_start();
     terminal_program_entry();
     while(1);
 }

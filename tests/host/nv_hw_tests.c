@@ -356,7 +356,7 @@ static void test_fwsec_frts(void) {
     v.dmem_offset = 0x400; v.dmem_load = 0x200;
     v.mapper_offset = v.image_offset + 0x400 + 0x40;
     v.mapper_cmd_in = 0x100;
-    v.mapper_cmd_mask0 = 1u << NV_FWSEC_CMD_FRTS;
+    v.mapper_cmd_mask0 = 0x00044000u;                       // RTX 2060 TU106 value
     put32(img + 0x440 + 12, 0x100);                         // command buffer size
     CHECK(nv_fwsec_patch_frts(img, &v, 0x3FD00000ull, 0x100000, &why), "FRTS patch");
     uint8_t* cmd = img + 0x400 + 0x100;
@@ -371,9 +371,9 @@ static void test_fwsec_frts(void) {
     put32(img + 0x440 + 12, 40);
     CHECK(!nv_fwsec_patch_frts(img, &v, 0x3FD00000ull, 0x100000, &why), "small command buffer rejected");
     put32(img + 0x440 + 12, 0x100);
-    v.mapper_cmd_mask0 = 0;
-    CHECK(!nv_fwsec_patch_frts(img, &v, 0x3FD00000ull, 0x100000, &why), "FWSEC without FRTS rejected");
-    v.mapper_cmd_mask0 = 1u << NV_FWSEC_CMD_FRTS;
+    // The command mask is informational only (see nv_fwsec_patch_frts):
+    // the RTX 2060's own value must not stop the patch.
+    v.mapper_cmd_mask0 = 0x00044000u;
     CHECK(!nv_fwsec_patch_frts(img, &v, 0x3FD00800ull, 0x100000, &why), "unaligned region rejected");
 
     nv_bl_dmem_desc_t d;

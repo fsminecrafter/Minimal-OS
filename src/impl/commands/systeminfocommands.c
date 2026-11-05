@@ -17,6 +17,7 @@
 #include "x86_64/scheduler.h"
 #include "x86_64/minimafs.h"
 #include "time.h"
+#include "x86_64/isr_crash.h"
 
 static void cpuid(uint32_t leaf, uint32_t subleaf, uint32_t* eax,
                   uint32_t* ebx, uint32_t* ecx, uint32_t* edx) {
@@ -528,7 +529,43 @@ void cmd_hyperv(int argc, const char** argv) {
     hyperv_report(info_text);
 }
 
+// crashes: the last user programs killed by a CPU exception. The offset
+// is into the program image (linked at 0):
+//   addr2line -f -e Minimal-OS-SDK/build/<program>/<program>.elf 0x<offset>
+static void cmd_crashes(int argc, const char** argv) {
+    (void)argc; (void)argv;
+    uint32_t n = isr_user_crash_count();
+    if (!n) { graphics_write_textr("No program has crashed since boot.\n"); return; }
+    uint64_t now = time_get_uptime_ms();
+    for (uint32_t i = 0; i < n; i++) {
+        const user_crash_info_t* c = isr_user_crash_get(i);
+        graphics_write_textr(c->name);
+        graphics_write_textr(" (pid ");
+        graphics_write_textr_dec((int64_t)c->pid);
+        graphics_write_textr("), ");
+        graphics_write_textr_dec((int64_t)((now - c->uptime_ms) / 1000));
+        graphics_write_textr(" s ago: vector ");
+        graphics_write_textr_dec(c->vector);
+        if (c->rip >= c->image_base && c->rip - c->image_base < c->image_size) {
+            graphics_write_textr(" at offset ");
+            graphics_write_textr_hex64(c->rip - c->image_base);
+        } else {
+            graphics_write_textr(" at rip ");
+            graphics_write_textr_hex64(c->rip);
+            graphics_write_textr(" (outside the program)");
+        }
+        graphics_write_textr(", error ");
+        graphics_write_textr_hex64(c->error_code);
+        if (c->vector == 14) {
+            graphics_write_textr(", address ");
+            graphics_write_textr_hex64(c->fault_address);
+        }
+        graphics_write_textr("\n");
+    }
+}
+
 void register_system_info_commands(void) {
+    command_register("crashes", cmd_crashes);
     command_register("clear", cmd_clear);
     command_register("info", cmd_info);
     command_register("cpu", cmd_cpu);

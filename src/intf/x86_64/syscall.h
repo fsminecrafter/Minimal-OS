@@ -876,4 +876,15 @@ typedef struct {
     char outputs[SYSCALL_AUDIO_MAX_OUTPUTS][SYSCALL_AUDIO_OUTPUT_NAME];
 } syscall_audio_mixer_t;
 
+// ---------------------------------------------------------------------------
+// POWER (SYS_POWER)
+// ---------------------------------------------------------------------------
+// rdi = SYS_POWER_SHUTDOWN or SYS_POWER_REBOOT. Open to user programs (the
+// desktop's shutdown button). Returns only when the machine could not do
+// it, with SYS_ERR_GENERIC.
+#define SYS_POWER 44
+
+#define SYS_POWER_SHUTDOWN 1u
+#define SYS_POWER_REBOOT   2u
+
 #endif // SYSCALL_H

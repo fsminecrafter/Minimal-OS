@@ -367,6 +367,61 @@ int32_t tcp_send(tcp_conn_t* conn, const void* data, uint32_t len, uint32_t time
     return (int32_t)acked_off;
 }
 
+/* Out-of-order segments (see tcp_conn_t.ooo_*). Sequence numbers are
+ * compared as signed differences so they work across wrap-around. */
+static uint32_t tcp_ooo_extent(const tcp_conn_t* conn) {
+    uint32_t extent = 0;
+    for (uint8_t i = 0; i < conn->ooo_count; i++) {
+        uint32_t e = conn->ooo_end[i] - conn->rcv_nxt;
+        if ((int32_t)e > 0 && e > extent) extent = e;
+    }
+    return extent;
+}
+
+static void tcp_ooo_store(tcp_conn_t* conn, uint32_t seq, const uint8_t* data, uint32_t len) {
+    int32_t ahead = (int32_t)(seq - conn->rcv_nxt);
+    if (ahead <= 0) return;                                  /* old duplicate */
+    if ((uint64_t)conn->rx_len + (uint32_t)ahead + len > TCP_RX_BUF_SIZE) return;
+    uint32_t start = seq, end = seq + len;
+    /* merge with ranges it touches */
+    for (uint8_t i = 0; i < conn->ooo_count;) {
+        if ((int32_t)(start - conn->ooo_end[i]) <= 0 && (int32_t)(conn->ooo_start[i] - end) <= 0) {
+            if ((int32_t)(conn->ooo_start[i] - start) < 0) start = conn->ooo_start[i];
+            if ((int32_t)(conn->ooo_end[i] - end) > 0) end = conn->ooo_end[i];
+            conn->ooo_start[i] = conn->ooo_start[conn->ooo_count - 1];
+            conn->ooo_end[i] = conn->ooo_end[conn->ooo_count - 1];
+            conn->ooo_count--;
+            continue;
+        }
+        i++;
+    }
+    if (conn->ooo_count >= TCP_OOO_RANGES) return;           /* full: the peer resends it */
+    memcpy(conn->rx_buf + conn->rx_len + (uint32_t)ahead, data, len);
+    conn->ooo_start[conn->ooo_count] = start;
+    conn->ooo_end[conn->ooo_count] = end;
+    conn->ooo_count++;
+}
+
+static void tcp_ooo_join(tcp_conn_t* conn) {
+    bool joined = true;
+    while (joined) {
+        joined = false;
+        for (uint8_t i = 0; i < conn->ooo_count; i++) {
+            if ((int32_t)(conn->ooo_start[i] - conn->rcv_nxt) > 0) continue;
+            int32_t gain = (int32_t)(conn->ooo_end[i] - conn->rcv_nxt);
+            if (gain > 0) {
+                conn->rx_len += (uint32_t)gain;
+                conn->rcv_nxt += (uint32_t)gain;
+            }
+            conn->ooo_start[i] = conn->ooo_start[conn->ooo_count - 1];
+            conn->ooo_end[i] = conn->ooo_end[conn->ooo_count - 1];
+            conn->ooo_count--;
+            joined = true;
+            break;
+        }
+    }
+}
+
 int32_t tcp_recv(tcp_conn_t* conn, void* buf, uint32_t maxlen) {
     if (!conn || !conn->in_use) return -1;
     network_manager_poll();
@@ -378,7 +433,9 @@ int32_t tcp_recv(tcp_conn_t* conn, void* buf, uint32_t maxlen) {
 
     uint32_t copy_len = conn->rx_len < maxlen ? conn->rx_len : maxlen;
     memcpy(buf, conn->rx_buf, copy_len);
-    memmove(conn->rx_buf, conn->rx_buf + copy_len, conn->rx_len - copy_len);
+    // Move segments kept ahead of rcv_nxt along with the stream.
+    memmove(conn->rx_buf, conn->rx_buf + copy_len,
+            conn->rx_len - copy_len + tcp_ooo_extent(conn));
     conn->rx_len -= copy_len;
     return (int32_t)copy_len;
 }
@@ -530,10 +587,14 @@ void tcp_handle_packet(uint32_t src_ip, const uint8_t* seg, uint16_t len) {
         memcpy(conn->rx_buf + conn->rx_len, data, copy_len);
         conn->rx_len += copy_len;
         conn->rcv_nxt += copy_len;
+        tcp_ooo_join(conn);
         tcp_send_segment(conn, TCP_FLAG_ACK, NULL, 0);
     } else if (data_len > 0) {
-        // Out-of-order/duplicate - no reassembly buffer in this simplified
-        // stack; just re-ACK our current rcv_nxt.
+        // Ahead of rcv_nxt (an earlier segment was lost or reordered):
+        // keep it in place; the duplicate ACK below makes the peer resend
+        // just the missing segment (fast retransmit). Old duplicates are
+        // only re-ACKed.
+        tcp_ooo_store(conn, seq, data, data_len);
         tcp_send_segment(conn, TCP_FLAG_ACK, NULL, 0);
     }
 

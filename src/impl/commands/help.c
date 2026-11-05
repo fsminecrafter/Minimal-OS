@@ -98,6 +98,7 @@ static void help_diagnostics(void) {
     help_item("testwrite", "Run the MinimaFS write test.");
     help_item("verifyfile", "Verify a file on disk.");
     help_item("diskusage", "Show disk usage.");
+    help_item("crashes", "Show the last programs that crashed and where.");
     help_item("trace_on", "Enable execution tracing.");
     help_item("trace_off", "Disable execution tracing.");
     help_item("trace_stack", "Show the execution trace stack.");

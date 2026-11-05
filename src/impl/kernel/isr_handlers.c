@@ -5,10 +5,23 @@
 #include "x86_64/scheduler.h"
 #include "x86_64/isr_crash.h"
 
+#include "time.h"
+
 static user_crash_info_t g_last_crash;
+static user_crash_info_t g_crash_history[ISR_CRASH_HISTORY];
+static uint32_t g_crash_total;
 
 const user_crash_info_t* isr_last_user_crash(void) {
     return &g_last_crash;
+}
+
+uint32_t isr_user_crash_count(void) {
+    return g_crash_total < ISR_CRASH_HISTORY ? g_crash_total : ISR_CRASH_HISTORY;
+}
+
+const user_crash_info_t* isr_user_crash_get(uint32_t index) {
+    if (index >= isr_user_crash_count()) return NULL;
+    return &g_crash_history[(g_crash_total - 1 - index) % ISR_CRASH_HISTORY];
 }
 
 static const char* exception_name(uint64_t vector) {
@@ -104,6 +117,9 @@ void isr_generic_handler(uint64_t vector, uint64_t error_code,
             if (!current_process->name[i]) break;
         }
         g_last_crash.name[sizeof(g_last_crash.name) - 1] = 0;
+        g_last_crash.uptime_ms = time_get_uptime_ms();
+        g_crash_history[g_crash_total % ISR_CRASH_HISTORY] = g_last_crash;
+        g_crash_total++;
         serial_write_str("  Image base: 0x");
         serial_write_hex(current_process->user_image_address);
         serial_write_str("\n");

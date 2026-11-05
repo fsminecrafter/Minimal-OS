@@ -30,6 +30,24 @@ interface and removes them again when it stops.
 Settings: `NETBOOT_IFACE` (default: the default-route interface, wired
 first) and `NETBOOT_ISO`.
 
+## Network log
+
+While `make netboot` runs, the booted PC sends its whole log back: boot
+messages, everything the kernel writes to serial, program output, and
+Mxplorer's console (site errors, failed loads, navigations). It appears in
+the `make netboot` terminal as `[<pc ip>] ...` and is saved to
+`build/netboot/logs/` (`latest.log` is the newest run).
+
+How: the script adds `netlog=<this pc>:5140` to the kernel arguments in the
+served `grub.cfg`. The kernel keeps every log line in a 512 KiB buffer
+from the start of boot and sends it over UDP once the network has an
+address (it runs DHCP itself if nothing else did after 20 s). Programs
+write to the log, without showing it on screen, with `mos_log()` from
+`minimalos.h` (file descriptor 3).
+
+`NETBOOT_LOG_PORT=0 make netboot` turns it off; another number changes
+the port. UDP 5140 is opened in ufw along with the PXE ports.
+
 ## Target PC BIOS setup (ASRock)
 
 In the UEFI setup (press F2 or Del at power on):

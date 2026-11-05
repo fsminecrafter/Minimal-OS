@@ -4,6 +4,7 @@
 #include "x86_64/random.h"
 #include "x86_64/allocator.h"
 #include "time.h"
+#include "x86_64/scheduler.h"
 #include "string.h"
 #include "serial.h"
 
@@ -56,7 +57,7 @@ static bool send_all(tcp_conn_t* c, const uint8_t* p, uint32_t len) {
     while (sent<len) {
         int32_t n=tcp_send(c,p+sent,len-sent,5000);
         if (n<0) return false;
-        if (n==0) { if (time_get_uptime_ms()-last>6000) return false; continue; }
+        if (n==0) { if (time_get_uptime_ms()-last>6000) return false; sleep(1); continue; }
         sent+=(uint32_t)n; last=time_get_uptime_ms();
     }
     return true;
@@ -67,7 +68,15 @@ static bool recv_all(tcp_conn_t* c, uint8_t* p, uint32_t len, uint32_t timeout) 
     while (got<len) {
         int32_t n=tcp_recv(c,p+got,len-got);
         if (n<0) return false;
-        if (n==0) { if (time_get_uptime_ms()-start>timeout) return false; tcp_poll(); continue; }
+        if (n==0) {
+            if (time_get_uptime_ms()-start>timeout) return false;
+            // Yield instead of spinning. Syscalls run with interrupts off,
+            // and the uptime clock only moves on cpu0's PIT interrupt, so a
+            // spin here never times out and freezes cpu0 until the hang
+            // watchdog panics. sleep() lets the timer and other processes run.
+            sleep(1);
+            continue;
+        }
         got+=(uint32_t)n; start=time_get_uptime_ms();
     }
     return true;

@@ -12,12 +12,19 @@
 # Settings (environment variables):
 #   NETBOOT_IFACE   LAN interface to serve on   (default: interface of the default route)
 #   NETBOOT_ISO     ISO to boot                 (default: dist/x86_64/kernel.iso)
+#   NETBOOT_LOG_PORT  UDP port for the network log (default: 5140; 0 turns it off)
+#
+# Network log: the booted PC sends its whole kernel log (boot messages,
+# program output, Mxplorer's console with site errors) back here. It is
+# printed while 'serve' runs and saved in build/netboot/logs/ (latest.log
+# is the newest).
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 ISO="${NETBOOT_ISO:-$REPO/dist/x86_64/kernel.iso}"
 OUT="$REPO/build/netboot"
 TFTP="$OUT/tftp"
+LOG_PORT="${NETBOOT_LOG_PORT:-5140}"
 GRUB_PC_DIR=/usr/lib/grub/i386-pc
 GRUB_EFI_DIR=/usr/lib/grub/x86_64-efi
 
@@ -48,6 +55,11 @@ prepare() {
 		sed -i 's|\[ -f /boot/mosfirmware.mpkg \]|true|' "$TFTP/boot/grub/grub.cfg"
 	else
 		sed -i 's|\[ -f /boot/mosfirmware.mpkg \]|false|' "$TFTP/boot/grub/grub.cfg"
+	fi
+	# Tell the kernel where to send its log (netlog.c).
+	if [ "$LOG_PORT" != 0 ]; then
+		sed -i "s|^\(\s*multiboot2 /boot/kernel.bin\)\(.*\)$|\1\2 netlog=$SERVER_IP:$LOG_PORT|" \
+			"$TFTP/boot/grub/grub.cfg"
 	fi
 	# The ISO's BIOS GRUB modules are replaced by the host's matching set below.
 	rm -rf "$TFTP/boot/grub/i386-pc" "$TFTP/boot/grub/x86_64-efi"
@@ -110,10 +122,11 @@ EOF
 }
 
 UFW_RULES=("67/udp" "69/udp" "4011/udp")
+[ "$LOG_PORT" != 0 ] && UFW_RULES+=("$LOG_PORT/udp")
 
 firewall_open() {
 	command -v ufw >/dev/null && ufw status | grep -q "Status: active" || return 0
-	echo "netboot: opening firewall on $IFACE (udp 67, 69, 4011)"
+	echo "netboot: opening firewall on $IFACE (udp ${UFW_RULES[*]%/udp})"
 	for r in "${UFW_RULES[@]}"; do
 		ufw allow in on "$IFACE" to any port "${r%/*}" proto udp comment minimal-os-netboot >/dev/null
 	done
@@ -139,7 +152,18 @@ serve() {
 	write_dnsmasq_conf
 
 	firewall_open
-	trap firewall_close EXIT
+	LOG_PID=
+	if [ "$LOG_PORT" != 0 ]; then
+		# Runs as the normal user so the log files are not owned by root.
+		if [ -n "${SUDO_USER:-}" ]; then
+			sudo -u "$SUDO_USER" python3 "$REPO/tools/netboot/netlog_listen.py" \
+				--port "$LOG_PORT" --dir "$OUT/logs" &
+		else
+			python3 "$REPO/tools/netboot/netlog_listen.py" --port "$LOG_PORT" --dir "$OUT/logs" &
+		fi
+		LOG_PID=$!
+	fi
+	trap '[ -n "$LOG_PID" ] && kill "$LOG_PID" 2>/dev/null; firewall_close' EXIT
 	echo
 	echo "netboot: serving Minimal-OS on $IFACE ($SERVER_IP). Ctrl+C to stop."
 	echo "netboot: on the other PC, pick the network/PXE boot entry in the boot menu."

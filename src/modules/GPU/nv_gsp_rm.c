@@ -7,6 +7,7 @@
 #include "x86_64/scheduler.h"
 #include "string.h"
 #include "time.h"
+#include "serial.h"
 
 /*
  * Step 2b, second part: booter_load on SEC2 starts GSP-RM on the GSP
@@ -140,14 +141,23 @@ static minimafs_file_handle_t* open_fw(const char* chip, const char* name, nv_fw
 
 /* ----------------------------------------------------------- falcons */
 
-// Engine reset (gp102_flcn_reset_eng), then wait for IMEM/DMEM scrubbing.
+// nouveau's nvkm_falcon_reset: disable (interfaces off, interrupts
+// masked), engine reset (gp102_flcn_reset_eng), wait for IMEM/DMEM
+// scrubbing, then enable, which writes the chip id into FALCON_RM.
+// Signed ucode (booter_load) checks that register first and gives up
+// early - error 0x31 - when it does not hold PMC_BOOT_0.
 static bool falcon_reset(const nv_falcon_t* f) {
+    fwr(f, NV_FALCON_ITFEN, frd(f, NV_FALCON_ITFEN) & ~3u);
+    fwr(f, NV_FALCON_IRQMCLR, 0xFFFFFFFFu);
     fwr(f, NV_FALCON_ENGINE, frd(f, NV_FALCON_ENGINE) | 1u);
     udelay(10);
     fwr(f, NV_FALCON_ENGINE, frd(f, NV_FALCON_ENGINE) & ~1u);
     for (int i = 0; i < 1000; i++) {
         uint32_t v = frd(f, NV_FALCON_DMACTL);
-        if (!nv_pri_error(v) && !(v & 0x6u)) return true;
+        if (!nv_pri_error(v) && !(v & 0x6u)) {
+            fwr(f, NV_FALCON_RM, rd(NV_PMC_BOOT_0));
+            return true;
+        }
         udelay(10);
     }
     return false;
@@ -442,7 +452,7 @@ static nv_rpc_hdr_t* rpc_wait(uint32_t want, uint32_t ms) {
 
 // PIO load of booter_load (gm200_flcn_fw_load without a DMA context):
 // non-secure code at IMEM 0, the HS application at its own offset
-// (secure), data at DMEM 0. Then start at the application.
+// (secure), data at DMEM 0. Then start at the non-secure code.
 static bool run_booter(uint32_t mbox0, uint32_t mbox1, uint32_t* out0, uint32_t* out1) {
     if (!falcon_reset(&k_sec2)) { say("  SEC2: reset/scrub timeout\n"); return false; }
     fwr(&k_sec2, NV_FALCON_FBIF_CTL, frd(&k_sec2, NV_FALCON_FBIF_CTL) | 0x80u);
@@ -456,7 +466,10 @@ static bool run_booter(uint32_t mbox0, uint32_t mbox1, uint32_t* out0, uint32_t*
     nv_falcon_dmem_write(g.a, &k_sec2, 0, img + g.booter.os_data_offset, g.booter.os_data_size);
     fwr(&k_sec2, NV_FALCON_MAILBOX0, mbox0);
     fwr(&k_sec2, NV_FALCON_MAILBOX1, mbox1);
-    nv_falcon_start(g.a, &k_sec2, g.booter.app_offset);
+    // Start in the non-secure stub (tu102_gsp_booter_ctor: boot_addr =
+    // os_code_offset), which enters the signed application itself.
+    // Starting at the application directly fails with 0x31.
+    nv_falcon_start(g.a, &k_sec2, g.booter.os_code_offset);
     bool halted = wait_halt(&k_sec2, 5000);
     *out0 = frd(&k_sec2, NV_FALCON_MAILBOX0);
     *out1 = frd(&k_sec2, NV_FALCON_MAILBOX1);
@@ -536,6 +549,43 @@ static bool run_sequencer(const uint32_t* p, uint32_t dwords) {
         }
     }
     return true;
+}
+
+/* ------------------------------------------------- failure details */
+
+// GSP-RM's LibOS log buffers (LOGINIT, LOGINTR, LOGRM): word 0 is the
+// put pointer (entries written, in 8-byte words), then the page list,
+// then the entries. Entries are binary (format strings live in a debug
+// file NVIDIA does not ship), so they go out as hex: on a netbooted
+// machine they arrive in build/netboot/logs/, where
+// tools/gpu/gsp_log_strings.py looks up any string the values point at.
+static void dump_gsp_logs(void) {
+    static const char* names[3] = { "LOGINIT", "LOGINTR", "LOGRM" };
+    uint32_t pte_words = NV_GSP_LOG_SIZE / 4096u;
+    uint32_t max_words = NV_GSP_LOG_SIZE / 8u - 1u - pte_words;
+    for (int i = 0; i < 3; i++) {
+        volatile uint64_t* buf = (volatile uint64_t*)g.log[i].va;
+        uint64_t put = buf[0];
+        say("  %s: %llu words\n", names[i], (unsigned long long)put);
+        if (!put) continue;
+        uint32_t n = put < max_words ? (uint32_t)put : max_words;
+        if (n > 512) n = 512;
+        const volatile uint64_t* entries = buf + 1 + pte_words;
+        char line[160];
+        for (uint32_t w = 0; w < n; w += 4) {
+            int used = snprintf(line, sizeof(line), "gsplog %s %04u:", names[i], w);
+            for (uint32_t k = w; k < n && k < w + 4; k++)
+                used += snprintf(line + used, sizeof(line) - (size_t)used, " %016llx",
+                                 (unsigned long long)entries[k]);
+            snprintf(line + used, sizeof(line) - (size_t)used, "\n");
+            serial_write_str(line);
+            if (w < 32) say("  %s", line + 7);       // the first few on screen too
+        }
+    }
+    say("  GSP: mailbox 0x%x 0x%x, RISC-V %s, cpuctl 0x%x; queues: ours write %u read %u, GSP's write %u\n",
+        frd(&k_gsp, NV_FALCON_MAILBOX0), frd(&k_gsp, NV_FALCON_MAILBOX1),
+        riscv_active() ? "active" : "stopped", frd(&k_gsp, NV_FALCON_CPUCTL),
+        g.cmdq->tx.writePtr, g.msgq->readPtr, g.msgq->tx.writePtr);
 }
 
 /* -------------------------------------------------------- the RPCs */
@@ -667,6 +717,7 @@ bool nv_gsp_rm_boot(gpu_adapter_t* a, void (*print)(const char* text)) {
     if (!r) {
         say("  GSP-RM did not report GSP_INIT_DONE within 15 s. GSP mailbox 0x%x 0x%x\n",
             frd(&k_gsp, NV_FALCON_MAILBOX0), frd(&k_gsp, NV_FALCON_MAILBOX1));
+        dump_gsp_logs();
         save_log();
         return false;
     }

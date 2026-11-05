@@ -41,8 +41,11 @@ static inline bool nv_pri_error(uint32_t v) {
 #define NV_FALCON_SEC2          0x840000u   // Pascal GP102 and later
 #define NV_FALCON_GSP           0x110000u   // Turing and later
 
+#define NV_FALCON_IRQMCLR       0x014u      // write 1s: mask interrupts
 #define NV_FALCON_MAILBOX0      0x040u
 #define NV_FALCON_MAILBOX1      0x044u
+#define NV_FALCON_ITFEN         0x048u      // bits 1:0 context/method interface enables
+#define NV_FALCON_RM            0x084u      // chip id (PMC_BOOT_0) for signed ucode
 #define NV_FALCON_CPUCTL        0x100u
 #define   NV_FALCON_CPUCTL_STARTCPU (1u << 1)
 #define   NV_FALCON_CPUCTL_HALTED   (1u << 4)

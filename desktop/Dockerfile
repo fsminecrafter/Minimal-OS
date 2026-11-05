@@ -7,14 +7,26 @@ RUN apt-get update \
         dbus-x11 \
         firefox-esr \
         fonts-dejavu \
+        bison \
         build-essential \
+        curl \
+        flex \
         grub-common \
         grub-pc-bin \
+        libgmp3-dev \
+        libisl-dev \
+        libmpc-dev \
+        libmpfr-dev \
         libzstd1 \
+        make \
+        mtools \
         nasm \
         novnc \
         python3 \
+        qemu-system \
         supervisor \
+        texinfo \
+        wget \
         websockify \
         x11vnc \
         xorriso \

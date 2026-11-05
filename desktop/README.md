@@ -6,6 +6,8 @@ The repository is mounted at `/Minimal-OS` and linked from
 `~/Documents/Minimal-OS`. The host's `$HOME/cross` cross-toolchain is mounted
 read-only at both its original path and `~/cross` in the desktop container,
 and is added to `PATH`.
+The image includes the kernel build dependencies (including QEMU and the
+cross-toolchain build libraries) in addition to the desktop packages.
 
 ## Start
 

@@ -14,6 +14,8 @@
 #include "x86_64/mmio.h"
 #include "x86_64/gpucore.h"
 #include "x86_64/nv_gpu.h"
+#include "x86_64/fgpu.h"
+#include "x86_64/fgpu_backend.h"
 #include "x86_64/scheduler.h"
 #include "x86_64/minimafs.h"
 #include "time.h"
@@ -377,7 +379,18 @@ void cmd_gpu(int argc, const char** argv) {
                 info_text("GSP boot, step 2b: FWSEC-FRTS\n");
                 frts = nv_gsp_fwsec_frts(a, info_text);
             }
-            if (frts) nv_gsp_rm_boot(a, info_text);
+            // Step 3: channel on a copy engine, then pixels on the screen;
+            // FGPU then sends clears of VRAM surfaces to the GPU.
+            if (frts && nv_gsp_rm_boot(a, info_text) && nv_rm_chan_init(a, info_text)) {
+                nv_rm_screen_test(a, info_text);
+                fgpu_backend_select();
+                const char* why = "";
+                const fgpu_backend_t* hw = fgpu_hw_backend(&why);
+                info_text(hw ? "FGPU: clears of VRAM surfaces now run on the GPU.\n"
+                             : "FGPU: still on the CPU: ");
+                if (!hw) { info_text(why); info_text("\n"); }
+            }
+            nv_rm_chan_quiet();
         }
         if (!any) info_text("No NVIDIA GPU found.\n");
         return;

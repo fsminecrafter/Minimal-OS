@@ -187,9 +187,12 @@ as before.
 | Pushbuffers: method headers, GPFIFO entries, a ready-made `TURING_A` clear | `nv_fw.c` | done, tested (method offsets unverified on hardware) |
 | VBIOS: ROM image chain, BIT table, falcon ucode table, FWSEC's descriptor and DMEM mapper (where the FRTS command goes), read through the BAR0 PROM window | `nv_vbios.c` | done, tested on a synthetic ROM, not yet on a card |
 | GSP boot: FWSEC-FRTS | `nv_gsp.c` | works on an RTX 2060 |
-| GSP boot: `booter_load` on SEC2, GSP-RM (WPR meta, radix3 image, LibOS args, message queues, CPU sequencer) | `nv_rm.h`, `nv_rm_fmt.c`, `nv_gsp_rm.c` | written; formats tested against the real firmware headers, not yet run on a card |
-| RM RPC: first round trip (`GET_GSP_STATIC_INFO`) | `nv_gsp_rm.c` | written, not yet run on a card |
-| RM RPC: channel, GPFIFO and class allocation through GSP-RM | | to do |
+| GSP boot: `booter_load` on SEC2, GSP-RM (WPR meta, radix3 image, LibOS args, message queues, CPU sequencer) | `nv_rm.h`, `nv_rm_fmt.c`, `nv_gsp_rm.c` | works on an RTX 2060 |
+| RM RPC: first round trip (`GET_GSP_STATIC_INFO`) | `nv_gsp_rm.c` | works on an RTX 2060 |
+| RM RPC: client, device, subdevice, VA space; FIFO device info; channel on a copy engine (TURING_CHANNEL_GPFIFO_A + TURING_DMA_COPY_A) | `nv_rm_chan.c`, `nv_rm.h` | works on an RTX 2060 (channel 0 on CE2) |
+| GPU page tables (GMMU v2, in VRAM, written through BAR1): sysmem GPFIFO/pushbuffer/semaphore, all of the BAR1 window's VRAM 1:1 in 2 MiB pages; GSP-RM gets the top three levels (COPY_SERVER_RESERVED_PDES) | `nv_rm_chan.c` | works on an RTX 2060 |
+| Copy engine fills: test pattern on screen, FGPU clears of VRAM surfaces | `nv_push_ce_fill`, `nv_rm_ce_fill`, `fgpu_backend_nv.c` | works on an RTX 2060 (test squares read back right) |
+| 3D class (TURING_A): needs GR context buffers and the golden context from the driver side | | to do |
 
 `gpu nvidia` prints the bring-up state. It only reads registers, so it is
 safe on any card: which firmware files are present and well-formed, and
@@ -280,8 +283,40 @@ evaluator) and the CPU shader machine, and checks that they agree.
    for: `booter_load halted, mailbox 0x0 0x0` (non-zero mailbox 0 is
    booter's error code), `GSP RISC-V running`, then `GSP-RM is running`
    and the GPU's name from the first RPC.
-3. Allocate RM objects and a channel through RM RPC, submit `nv_push_clear_xrgb` and
-   check the surface changed: then `clear()` in `fgpu_backend_nv.c` can
-   return true.
+   First run on an RTX 2060 (2026-11-06): booter_load worked, GSP-RM's
+   init task logged two entries (the second right after mapping RMARGS)
+   and stopped with GSP mailbox `0xCA`. Cause: the RMARGS region was 0x50
+   bytes; LibOS's region mapper (init task, ~0x568de1c) asserts that sizes
+   are whole 4 KiB pages, logs the address and size, and panics (its
+   panic routine at 0x402521c writes `0xCA` to mailbox 0 and halts).
+   RMARGS is now one page, as in nouveau. Mailbox `0xCA` in general means
+   a LibOS crash; the last LOGINIT/LOGRM entries say where.
+   Next run: GSP-RM booted, read both queued RPCs and sent
+   RUN_CPU_SEQUENCER; our CORE_RESUME reset the GSP core before
+   restarting booter, which killed it. Now it only rewrites the GSP
+   mailboxes and restarts SEC2, as nouveau does.
+3. `gpu nvidia boot` continues on its own once GSP-RM answers:
+   step 3b allocates the RM objects, builds the page tables and opens a
+   channel on an async copy engine (it lists the copy engines it found
+   and which one took the channel), submits a first job and reads it
+   back. Step 3c draws four squares (red, green, blue, white) in the
+   top right corner of the screen with the copy engine and reads them
+   back through BAR1. Then FGPU sends clears of surfaces in VRAM to the
+   copy engine. Failure lines to look for: `RM error 0x..` (with the
+   object or control that failed), `no semaphore after 2000 ms` (with
+   GP_GET/GP_PUT: GP_GET still 0 means the doorbell or the channel
+   setup, GP_GET moved means the copy engine or its page tables),
+   `channel error (RC)` and `GPU page fault` from GSP-RM. A failed job
+   switches the GPU path off again, so the desktop keeps working.
+   First run (2026-11-06): everything up to the channel worked (CE2,
+   runlist 8), but the job's USERD read back `0xBAD0ACC5` and the
+   desktop froze: GSP-RM switches BAR1 into virtual mode with its own
+   page tables while it starts (nouveau adopts them, `bar/r535.c`), so
+   the kernel's 1:1 BAR1 window onto VRAM - the screen, the VRAM heap,
+   our page tables - stopped working. `nv_bar1_keep_physical` puts BAR1
+   back into physical mode (0xB80F40 bit 31) after GSP-RM starts and
+   before each job, and says so (`BAR1: ... back to physical`).
+   Second run: the first job and the four test squares read back right,
+   and FGPU switched its VRAM clears to the copy engine.
 4. Encode the IR as SASS (Mesa's NAK, `src/nouveau/compiler/nak/sm70.rs`,
    has the Volta/Turing encodings), then draws.

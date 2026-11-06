@@ -72,6 +72,47 @@ bool nv_gsp_wpr2(gpu_adapter_t* a, uint64_t* lo, uint64_t* hi);
 // what it does and saves it to 0:/gsp_boot.log.
 bool nv_gsp_rm_boot(gpu_adapter_t* a, void (*print)(const char* text));
 bool nv_gsp_rm_running(gpu_adapter_t* a);
+void nv_gsp_rm_set_print(void (*print)(const char* text));
+// RM's internal client and subdevice (from GET_GSP_STATIC_INFO), for
+// internal controls. False if not known.
+bool nv_gsp_rm_internal_handles(gpu_adapter_t* a, uint32_t* client, uint32_t* subdevice);
+// GSP-RM puts BAR1 into virtual mode with its own page tables; this puts
+// it back into physical mode (BAR1 offset = VRAM address), which the
+// screen and the VRAM heap rely on. True if it had to.
+bool nv_bar1_keep_physical(gpu_adapter_t* a);
+
+// Sends an RPC to the running GSP-RM and waits for the reply of the same
+// function, handling events meanwhile. Returns the reply's nv_rpc_hdr_t
+// (payload after it), valid until the next RPC; NULL on timeout.
+void* nv_gsp_rpc(gpu_adapter_t* a, uint32_t function, const void* payload, uint32_t len,
+                 uint32_t timeout_ms);
+// Handles messages GSP-RM has queued (events, error reports).
+void nv_gsp_rm_poll(gpu_adapter_t* a);
+
+// Step 3b (nv_rm_chan.c): RM client/device/VA space, GPU page tables,
+// a channel on a copy engine, then (step 4a) the 3D engine's context and
+// channel. Prints what it does. Needs GSP-RM running. True when at least
+// the copy engine works.
+bool nv_rm_chan_init(gpu_adapter_t* a, void (*print)(const char* text));
+bool nv_rm_chan_ready(gpu_adapter_t* a);
+// Fills a pitch-linear rectangle of 32-bit elements in VRAM (offset into
+// the adapter's aperture) with `value`, through the copy engine; waits
+// until it is done. False if the channel is not up or the GPU did not
+// finish.
+bool nv_rm_ce_fill(gpu_adapter_t* a, uint64_t vram_offset, uint32_t width, uint32_t height,
+                   uint32_t pitch_bytes, uint32_t value);
+// Step 4a: the 3D engine (TURING_A) has a channel and a context.
+bool nv_rm_3d_ready(gpu_adapter_t* a);
+// Clears a pitch-linear XRGB8888 rectangle in VRAM with the 3D engine
+// (alpha written as 0xFF); offset and pitch 128-byte aligned. Waits.
+bool nv_rm_3d_clear(gpu_adapter_t* a, uint64_t vram_offset, uint32_t width, uint32_t height,
+                    uint32_t pitch_bytes, uint32_t xrgb);
+// Step 3c: draws a test pattern on the screen with the copy engine
+// (and with the 3D engine when it is up).
+bool nv_rm_screen_test(gpu_adapter_t* a, void (*print)(const char* text));
+// After the command that set things up returns: later messages (channel
+// errors, page faults) go to the serial/network log only.
+void nv_rm_chan_quiet(void);
 bool nv_gsp_rm_rpc_ok(gpu_adapter_t* a);
 
 // Prints the bring-up status of an NVIDIA adapter, line by line.

@@ -393,6 +393,36 @@ static void test_fwsec_frts(void) {
     CHECK(!nv_wpr2_decode(0xBADF1100u, 0x003FE000u, &lo, &hi), "PRI error is no WPR2");
 }
 
+static void test_channel_formats(void) {
+    // GMMU v2 entries, as nouveau's gp100_vmm_pde / gp100_vmm_valid build them.
+    CHECK(nv_gmmu_pde(0x12345000ull, NV_GMMU_PDE_VRAM) == ((0x12345000ull >> 4) | 2u), "PDE in VRAM");
+    CHECK(nv_gmmu_pde(0x1000ull, NV_GMMU_PDE_SYS_COH) == (0x100ull | 4u | 8u), "PDE in sysmem is volatile");
+    CHECK(nv_gmmu_pte(0x200000ull, NV_GMMU_APER_VRAM) == (0x20000ull | 1u), "VRAM PTE");
+    CHECK(nv_gmmu_pte(0xB6A1B000ull, NV_GMMU_APER_SYS_COH) == ((0xB6A1B000ull >> 4) | 1u | 4u | 8u),
+          "coherent sysmem PTE");
+    CHECK(nv_gmmu_index(0x40000000ull, 2) == 2 && nv_gmmu_index(0x80000000ull, 2) == 4, "PD1 index");
+    CHECK(nv_gmmu_index(0x40003000ull, 0) == 3 && nv_gmmu_index(0x40200000ull, 1) == 1, "PT/PD0 index");
+    CHECK(nv_gmmu_index(1ull << 47, 4) == 1 && nv_gmmu_index(1ull << 38, 3) == 1, "PD3/PD2 index");
+
+    uint32_t words[64];
+    nv_push_t p;
+    nv_push_init(&p, words, 64);
+    nv_push_ce_fill(&p, 0x80001000ull, 640, 480, 2560, 0xFF102030u, 0x40005000ull, 7);
+    CHECK(!p.overflow, "fill fits");
+    CHECK(words[0] == nv_push_header(NV_PUSH_TYPE_INC, 4, 0, 1) && words[1] == 0xC5B5u, "SET_OBJECT copy engine");
+    CHECK(words[2] == nv_push_header(NV_PUSH_TYPE_INC, 4, NVC5B5_SET_REMAP_CONST_A, 3) && words[3] == 0xFF102030u &&
+          words[5] == (4u | (3u << 16)), "remap: CONST_A into 4-byte elements");
+    CHECK(words[6] == nv_push_header(NV_PUSH_TYPE_INC, 4, NVC5B5_OFFSET_OUT_UPPER, 6) && words[7] == 0 &&
+          words[8] == 0x80001000u && words[10] == 2560 && words[11] == 640 && words[12] == 480, "fill geometry");
+    CHECK(words[13] == nv_push_header(NV_PUSH_TYPE_INC, 4, NVC5B5_SET_SEMAPHORE_A, 3) && words[15] == 0x40005000u &&
+          words[16] == 7, "semaphore");
+    CHECK(words[17] == nv_push_header(NV_PUSH_TYPE_INC, 4, NVC5B5_LAUNCH_DMA, 1) && words[18] == 0x78Eu &&
+          p.count == 19, "LAUNCH_DMA last");
+    uint32_t gp[2];
+    nv_gpfifo_entry(0x40001000ull, 19, gp);
+    CHECK(gp[0] == 0x40001000u && gp[1] == (19u << 10), "GPFIFO entry");
+}
+
 int main(void) {
     test_booter();
     test_rm_bootloader();
@@ -404,6 +434,7 @@ int main(void) {
     test_manifest();
     test_vbios();
     test_fwsec_frts();
+    test_channel_formats();
     if (failures) {
         printf("nv hw tests: %d failure(s)\n", failures);
         return 1;

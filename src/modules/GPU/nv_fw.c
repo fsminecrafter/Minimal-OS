@@ -50,7 +50,7 @@ void nv_push_clear_xrgb(nv_push_t* p, uint64_t gpu_va, uint32_t width, uint32_t 
     // one layer.
     uint32_t rt[8] = {
         (uint32_t)(gpu_va >> 32), (uint32_t)gpu_va, pitch_bytes, height,
-        NV_RT_FORMAT_BGRX8_UNORM, NV_3D_RT_TILE_MODE_LINEAR, 1, 0,
+        NV_RT_FORMAT_BGRA8_UNORM, NV_3D_RT_TILE_MODE_LINEAR, 1, 0,
     };
     nv_push_method(p, 0, NV_3D_RT_ADDRESS_HIGH(0), rt, 8);
     nv_push_1(p, 0, NV_3D_RT_CONTROL, (076543210u << 4) | 1u);   // one target, identity map

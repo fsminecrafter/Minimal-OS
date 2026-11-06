@@ -29,7 +29,7 @@
  */
 
 #define NV_PBUS_BAR1_BLOCK   0x001704   // Fermi-Volta, bit 31: BAR1 uses a GPU page table
-#define NV_BAR1_BLOCK_TU     0xB80F48   // Turing and later, same meaning
+#define NV_BAR1_BLOCK_TU     0xB80F40   // Turing and later (0xB80F48 is BAR2), same meaning
 #define NV_PFB_MEM_SIZE_GP   0x100CE0   // Pascal (GP102+), Volta, Turing: size encoding
 #define NV_PFB_MEM_SIZE_GA   0x1183A4   // Ampere (GA102) and later: size in MiB
 #define NV_THERM_TSENSOR_GP  0x020460

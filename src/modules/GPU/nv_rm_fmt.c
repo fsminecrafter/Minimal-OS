@@ -231,6 +231,9 @@ int nv_seq_payload_dwords(uint32_t opcode) {
 const char* nv_rpc_name(uint32_t function) {
     switch (function) {
         case NV_RPC_GET_GSP_STATIC_INFO:       return "GET_GSP_STATIC_INFO";
+        case NV_RPC_FREE:                      return "FREE";
+        case NV_RPC_GSP_RM_CONTROL:            return "GSP_RM_CONTROL";
+        case NV_RPC_GSP_RM_ALLOC:              return "GSP_RM_ALLOC";
         case NV_RPC_GSP_SET_SYSTEM_INFO:       return "GSP_SET_SYSTEM_INFO";
         case NV_RPC_SET_REGISTRY:              return "SET_REGISTRY";
         case NV_RPC_EVENT_GSP_INIT_DONE:       return "GSP_INIT_DONE";
@@ -240,6 +243,7 @@ const char* nv_rpc_name(uint32_t function) {
         case NV_RPC_EVENT_MMU_FAULT_QUEUED:    return "MMU_FAULT_QUEUED";
         case NV_RPC_EVENT_OS_ERROR_LOG:        return "OS_ERROR_LOG";
         case NV_RPC_EVENT_UCODE_LIBOS_PRINT:   return "UCODE_LIBOS_PRINT";
+        case NV_RPC_EVENT_GSP_SEND_USER_SHARED_DATA: return "GSP_SEND_USER_SHARED_DATA";
         default:                               return "?";
     }
 }
@@ -349,4 +353,33 @@ bool nv_wpr2_decode(uint32_t lo_reg, uint32_t hi_reg, uint64_t* lo, uint64_t* hi
     if (lo) *lo = l;
     if (hi) *hi = h;
     return true;
+}
+
+/* ------------------------------------------------ copy engine fill */
+
+void nv_push_ce_fill(nv_push_t* p, uint64_t dst, uint32_t width, uint32_t height,
+                     uint32_t pitch_bytes, uint32_t value, uint64_t sem, uint32_t payload) {
+    const uint32_t s = NV_CE_SUBCHANNEL;
+    nv_push_1(p, s, NV_3D_SET_OBJECT, NV_CLASS_TURING_DMA_COPY_A);
+    // DST_X = CONST_A, 4-byte components, one source and one destination
+    // component per element.
+    uint32_t remap[3] = { value, 0, 4u | (3u << 16) };
+    nv_push_method(p, s, NVC5B5_SET_REMAP_CONST_A, remap, 3);
+    uint32_t geom[6] = {
+        (uint32_t)(dst >> 32) & 0x1FFFFu, (uint32_t)dst,    // OFFSET_OUT_UPPER/LOWER
+        pitch_bytes, pitch_bytes,                           // PITCH_IN, PITCH_OUT
+        width, height,                                      // LINE_LENGTH_IN (elements), LINE_COUNT
+    };
+    nv_push_method(p, s, NVC5B5_OFFSET_OUT_UPPER, geom, 6);
+    uint32_t semv[3] = { (uint32_t)(sem >> 32) & 0x1FFFFu, (uint32_t)sem, payload };
+    nv_push_method(p, s, NVC5B5_SET_SEMAPHORE_A, semv, 3);
+    // NON_PIPELINED | FLUSH | one-word semaphore release | pitch source
+    // and destination | multi-line | remap; both addresses virtual.
+    uint32_t launch = 2u | (1u << 2) | (1u << 3) | (1u << 7) | (1u << 8) | (1u << 9) | (1u << 10);
+    nv_push_1(p, s, NVC5B5_LAUNCH_DMA, launch);
+}
+
+void nv_push_host_semaphore(nv_push_t* p, uint64_t sem, uint32_t payload) {
+    uint32_t v[5] = { (uint32_t)sem, (uint32_t)(sem >> 32) & 0xFFu, payload, 0, NVC46F_SEM_RELEASE_WFI };
+    nv_push_method(p, 0, NVC46F_SEM_ADDR_LO, v, 5);
 }

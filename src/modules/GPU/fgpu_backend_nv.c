@@ -1,5 +1,6 @@
 #include "x86_64/fgpu_backend.h"
 #include "x86_64/fgpu_ir.h"
+#include "x86_64/fgpu_abi.h"
 #include "x86_64/nv_gpu.h"
 #include "x86_64/minimafs.h"
 #include "x86_64/allocator.h"
@@ -14,9 +15,10 @@
  *   1. firmware files: checked (nv_fw.c)                         done
  *   2a. FWSEC found in the VBIOS (nv_vbios.c), reported         done, untested on a card
  *   2b. GSP boot: FWSEC-FRTS (nv_gsp.c, 'gpu nvidia boot')      works on an RTX 2060
- *       booter_load on SEC2, GSP-RM (nv_gsp_rm.c)                written, untested on a card
- *   3a. first RPC to GSP-RM (nv_gsp_rm.c)                        written, untested on a card
- *   3b. RM channel + TURING_A, first clear (nv_push_clear_xrgb)  to do
+ *       booter_load on SEC2, GSP-RM (nv_gsp_rm.c)                works on an RTX 2060
+ *   3a. first RPC to GSP-RM (nv_gsp_rm.c)                        works on an RTX 2060
+ *   3b. RM objects, page tables, copy engine channel (nv_rm_chan.c) works on an RTX 2060
+ *   3c. copy engine fills: test pattern on screen, FGPU clears  works on an RTX 2060
  *   4. draws: pushbuffers + SASS from the shader IR (fgpu_ir.c)  IR done, encoder to do
  *
  * Until step 2 works, init() declines and everything runs on the CPU
@@ -85,17 +87,39 @@ static void nv_program_destroy(void* program) {
 
 static bool is_turing(uint16_t chipset) { return chipset >= 0x160 && chipset < 0x170; }
 
+static gpu_adapter_t* g_adapter;
+
 static bool nv_init(gpu_adapter_t* a, const char** why) {
     if (!a || a->vendor != GPU_VENDOR_NVIDIA || !a->mmio) { *why = "not an NVIDIA adapter"; return false; }
     if (!is_turing(nv_chipset(a))) { *why = "hardware rendering is planned for Turing first"; return false; }
-    *why = nv_gsp_rm_running(a) ? "GSP-RM runs; channel setup (step 3b) is not written yet"
-                                : "GSP-RM is not running (see 'gpu nvidia')";
-    return false;
+    if (!nv_gsp_rm_running(a)) { *why = "GSP-RM is not running (see 'gpu nvidia')"; return false; }
+    if (!nv_rm_chan_ready(a)) { *why = "GSP-RM runs, but the copy engine channel is not up (step 3b)"; return false; }
+    g_adapter = a;
+    return true;
 }
 
+static uint32_t float_bits(float f) {
+    uint32_t u;
+    memcpy(&u, &f, 4);
+    return u;
+}
+
+// Clears of surfaces in VRAM run on the copy engine (synchronously, so
+// finish() has nothing to wait for). Anything else goes back to the CPU.
 static bool nv_clear(const fgpu_hw_target_t* t, uint32_t flags, uint32_t color, float depth) {
-    (void)t; (void)flags; (void)color; (void)depth;
-    return false;       // step 3: nv_push_clear_xrgb on a channel
+    bool want_color = (flags & FGPU_CLEAR_COLOR) && t->cpu.color;
+    bool want_depth = (flags & FGPU_CLEAR_DEPTH) && t->cpu.depth;
+    if (!want_color && !want_depth) return false;
+    if ((want_color && !t->color.in_vram) || (want_depth && !t->depth.in_vram)) return false;
+    if (want_color && !nv_rm_ce_fill(g_adapter, t->color.vram_offset, t->cpu.width, t->cpu.height,
+                                     t->cpu.color_pitch * 4u, color | 0xFF000000u))
+        return false;
+    if (want_depth && !nv_rm_ce_fill(g_adapter, t->depth.vram_offset, t->cpu.width, t->cpu.height,
+                                     t->cpu.depth_pitch * 4u, float_bits(depth))) {
+        // The color part is done; the CPU redoing it is harmless.
+        return false;
+    }
+    return true;
 }
 
 static bool nv_draw(const fgpu_hw_draw_t* d, uint32_t* triangles) {
@@ -304,8 +328,10 @@ void nv_bringup_report(gpu_adapter_t* a, void (*print)(const char* text)) {
     } else {
         print("\nStep 2b GSP boot: run 'gpu nvidia boot' (log in 0:/gsp_boot.log)\n");
     }
-    if (nv_gsp_rm_rpc_ok(a))
-        print("Step 3a RPC to GSP-RM works; 3b channel + TURING_A, first clear   to do\n");
+    if (nv_rm_chan_ready(a))
+        print("Step 3  RPC, copy engine channel and fills work (clears of VRAM surfaces on the GPU)\n");
+    else if (nv_gsp_rm_rpc_ok(a))
+        print("Step 3a RPC to GSP-RM works; 3b copy engine channel not up (run 'gpu nvidia boot')\n");
     else
         print("Step 3  RPC, channel + TURING_A, first clear   waits for step 2b\n");
     print("Step 4  draws: pushbuffers + shader code  shader IR ready, SASS encoder to do\n");

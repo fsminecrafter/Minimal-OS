@@ -216,7 +216,13 @@ _Static_assert(sizeof(nv_libos_region_t) == 32, "LibosMemoryRegionInitArgument")
 
 #define NV_LIBOS_KIND_CONTIGUOUS 1u
 #define NV_LIBOS_LOC_SYSMEM      1u
-#define NV_GSP_LOG_SIZE          0x10000u
+// LibOS log buffers. Sizes must match the firmware's log sections
+// (.section_log_init_buffer_instance 64 KiB, .section_log_rm_buffer_instance
+// 256 KiB) and nouveau's r535_gsp_libos_init; a short LOGRM stops the
+// init task right after it maps RMARGS (GSP mailbox 0xCA).
+#define NV_GSP_LOGINIT_SIZE      0x10000u
+#define NV_GSP_LOGINTR_SIZE      0x10000u
+#define NV_GSP_LOGRM_SIZE        0x40000u
 
 uint64_t nv_libos_id8(const char* name);
 
@@ -291,6 +297,7 @@ _Static_assert(sizeof(nv_rpc_hdr_t) == 32, "rpc_message_header_v03_00");
 #define NV_RPC_EVENT_MMU_FAULT_QUEUED        0x1005u
 #define NV_RPC_EVENT_OS_ERROR_LOG            0x1006u
 #define NV_RPC_EVENT_UCODE_LIBOS_PRINT       0x100Cu
+#define NV_RPC_EVENT_GSP_SEND_USER_SHARED_DATA 0x101Bu
 
 const char* nv_rpc_name(uint32_t function);
 
@@ -353,3 +360,335 @@ int nv_seq_payload_dwords(uint32_t opcode);
 #define NV_FALCON_RISCV_CORE_STATUS 0x1240u // Turing GSP RISC-V: bit 0 active
 #define NV_PTIMER_TIME_0        0x009400u   // ns, low word
 #define NV_PTIMER_TIME_1        0x009410u
+
+/* ===================================================================
+ * Step 3b: RM objects, GPU page tables and a copy-engine channel.
+ *
+ * Layouts from the 535.113.01 SDK headers nouveau ships
+ * (include/nvrm/535.113.01/...), the order from nouveau's r535 code
+ * (gsp/r535.c client/device, mmu/r535.c VA space, fifo/r535.c channel,
+ * ce/r535.c copy engine object). GSP-RM owns the hardware state; we
+ * own the memory: GPU page tables, the channel's instance block and
+ * USERD (in VRAM), its GPFIFO ring and pushbuffers (in sysmem).
+ * =================================================================== */
+
+#define NV_RPC_FREE              10u
+#define NV_RPC_CONTINUATION      71u
+#define NV_RPC_GSP_RM_CONTROL    76u
+#define NV_RPC_GSP_RM_ALLOC      103u
+
+// rpc_gsp_rm_alloc_v03_00; the class's parameters follow.
+typedef struct {
+    uint32_t hClient, hParent, hObject, hClass;
+    uint32_t status;
+    uint32_t paramsSize;
+    uint32_t flags;
+    uint8_t reserved[4];
+} nv_rm_alloc_rpc_t;
+
+// rpc_gsp_rm_control_v03_00; the command's parameters follow (and come
+// back in the reply).
+typedef struct {
+    uint32_t hClient, hObject, cmd;
+    uint32_t status;
+    uint32_t paramsSize;
+    uint32_t flags;
+} nv_rm_control_rpc_t;
+
+// rpc_free_v03_00 (NVOS00_PARAMETERS_v03_00).
+typedef struct {
+    uint32_t hRoot, hObjectParent, hObjectOld, status;
+} nv_rm_free_rpc_t;
+
+_Static_assert(sizeof(nv_rm_alloc_rpc_t) == 32, "rpc_gsp_rm_alloc_v03_00");
+_Static_assert(sizeof(nv_rm_control_rpc_t) == 24, "rpc_gsp_rm_control_v03_00");
+
+/* Classes and their allocation parameters. */
+#define NV_CLASS_ROOT            0x0000u    // NV01_ROOT (a client)
+#define NV_CLASS_DEVICE          0x0080u    // NV01_DEVICE_0
+#define NV_CLASS_SUBDEVICE       0x2080u    // NV20_SUBDEVICE_0
+#define NV_CLASS_VASPACE         0x90F1u    // FERMI_VASPACE_A
+
+typedef struct {                // NV0000_ALLOC_PARAMETERS
+    uint32_t hClient;
+    uint32_t processID;
+    char processName[100];
+} nv_root_alloc_t;
+
+typedef struct {                // NV0080_ALLOC_PARAMETERS
+    uint32_t deviceId;
+    uint32_t hClientShare, hTargetClient, hTargetDevice;
+    uint32_t flags;
+    uint32_t pad0;
+    uint64_t vaSpaceSize, vaStartInternal, vaLimitInternal;
+    uint32_t vaMode;
+    uint32_t pad1;
+} nv_device_alloc_t;
+
+typedef struct {                // NV2080_ALLOC_PARAMETERS
+    uint32_t subDeviceId;
+} nv_subdevice_alloc_t;
+
+typedef struct {                // NV_VASPACE_ALLOCATION_PARAMETERS
+    uint32_t index;             // 0 = NV_VASPACE_ALLOCATION_INDEX_GPU_NEW
+    uint32_t flags;
+    uint64_t vaSize, vaStartInternal, vaLimitInternal;
+    uint32_t bigPageSize;
+    uint32_t pad;
+    uint64_t vaBase;
+} nv_vaspace_alloc_t;
+
+typedef struct {                // NV_MEMORY_DESC_PARAMS
+    uint64_t base, size;
+    uint32_t addressSpace;      // 1 sysmem, 2 VRAM
+    uint32_t cacheAttrib;
+} nv_mem_desc_t;
+
+#define NV_ADDR_SYSMEM 1u
+#define NV_ADDR_FBMEM  2u
+
+typedef struct {                // NV_CHANNEL_ALLOC_PARAMS
+    uint32_t hObjectError, hObjectBuffer;
+    uint64_t gpFifoOffset;      // GPU VA of the GPFIFO ring
+    uint32_t gpFifoEntries;
+    uint32_t flags;             // NVOS04_FLAGS_*
+    uint32_t hContextShare, hVASpace;
+    uint32_t hUserdMemory[8];
+    uint64_t userdOffset[8];
+    uint32_t engineType;        // NV2080_ENGINE_TYPE_*
+    uint32_t cid, subDeviceId, hObjectEccError;
+    nv_mem_desc_t instanceMem, userdMem, ramfcMem, mthdbufMem;
+    uint32_t hPhysChannelGroup;
+    uint32_t internalFlags;
+    nv_mem_desc_t errorNotifierMem, eccErrorNotifierMem;
+    uint32_t ProcessID, SubProcessID;
+    uint32_t encryptIv[3], decryptIv[3], hmacNonce[8];
+} nv_channel_alloc_t;
+
+_Static_assert(sizeof(nv_root_alloc_t) == 108, "NV0000_ALLOC_PARAMETERS");
+_Static_assert(sizeof(nv_device_alloc_t) == 56, "NV0080_ALLOC_PARAMETERS");
+_Static_assert(sizeof(nv_vaspace_alloc_t) == 48, "NV_VASPACE_ALLOCATION_PARAMETERS");
+_Static_assert(sizeof(nv_mem_desc_t) == 24, "NV_MEMORY_DESC_PARAMS");
+_Static_assert(offsetof(nv_channel_alloc_t, engineType) == 128, "NV_CHANNEL_ALLOC_PARAMS");
+_Static_assert(offsetof(nv_channel_alloc_t, instanceMem) == 144, "NV_CHANNEL_ALLOC_PARAMS");
+_Static_assert(offsetof(nv_channel_alloc_t, hPhysChannelGroup) == 240, "NV_CHANNEL_ALLOC_PARAMS");
+_Static_assert(offsetof(nv_channel_alloc_t, ProcessID) == 296, "NV_CHANNEL_ALLOC_PARAMS");
+_Static_assert(sizeof(nv_channel_alloc_t) == 360, "NV_CHANNEL_ALLOC_PARAMS");
+
+// NVOS04_FLAGS (alloc_channel.h), the bits nouveau sets.
+#define NVOS04_FLAGS_PRIVILEGED_CHANNEL        (1u << 5)
+#define NVOS04_FLAGS_USERD_INDEX(i)            (((i) & 7u) << 8)
+#define NVOS04_FLAGS_USERD_INDEX_PAGE(p)       (((p) & 0x1FFu) << 12)
+#define NVOS04_FLAGS_USERD_INDEX_PAGE_FIXED    (1u << 21)
+// NV_KERNELCHANNEL_ALLOC_INTERNALFLAGS: privilege 1:0 (1 = admin),
+// error notifier type 3:2 and ECC notifier type 5:4 (1 = none).
+#define NV_CHANNEL_INTERNAL_ADMIN_NO_NOTIFIERS (1u | (1u << 2) | (1u << 4))
+
+typedef struct {                // NVC0B5_ALLOCATION_PARAMETERS (copy engine object)
+    uint32_t version;           // 1
+    uint32_t engineType;
+} nv_ce_alloc_t;
+
+/* RM controls used. */
+#define NV2080_CTRL_CMD_FIFO_GET_DEVICE_INFO_TABLE      0x20801112u
+#define NV2080_CTRL_CMD_CE_GET_FAULT_METHOD_BUFFER_SIZE 0x20802A08u
+#define NV90F1_CTRL_CMD_VASPACE_COPY_SERVER_RESERVED_PDES 0x90F10106u
+#define NVA06F_CTRL_CMD_GPFIFO_SCHEDULE                 0xA06F0103u
+#define NVA06F_CTRL_CMD_BIND                            0xA06F0104u
+
+typedef struct {                // NV2080_CTRL_FIFO_DEVICE_ENTRY
+    uint32_t engineData[16];    // indexed by NV_ENGINE_INFO_*
+    uint32_t pbdmaIds[2];
+    uint32_t pbdmaFaultIds[2];
+    uint32_t numPbdmas;
+    char engineName[16];
+} nv_fifo_device_entry_t;
+
+typedef struct {                // NV2080_CTRL_FIFO_GET_DEVICE_INFO_TABLE_PARAMS
+    uint32_t baseIndex;
+    uint32_t numEntries;
+    uint8_t bMore;
+    uint8_t pad[3];
+    nv_fifo_device_entry_t entries[32];
+} nv_fifo_device_info_t;
+
+_Static_assert(sizeof(nv_fifo_device_entry_t) == 100, "NV2080_CTRL_FIFO_DEVICE_ENTRY");
+_Static_assert(sizeof(nv_fifo_device_info_t) == 3212, "NV2080_CTRL_FIFO_GET_DEVICE_INFO_TABLE_PARAMS");
+
+// ENGINE_INFO_TYPE (g_kernel_fifo_nvoc.h)
+#define NV_ENGINE_INFO_ENG_DESC         0u
+#define NV_ENGINE_INFO_RM_ENGINE_TYPE   2u
+#define NV_ENGINE_INFO_RUNLIST          3u
+#define NV_ENGINE_INFO_RUNLIST_PRI_BASE 11u
+
+// RM_ENGINE_TYPE and NV2080_ENGINE_TYPE agree on these.
+#define NV_ENGINE_GR0    0x01u
+#define NV_ENGINE_COPY0  0x09u
+#define NV_ENGINE_COPY9  0x12u
+
+typedef struct {                // NV90F1_CTRL_VASPACE_COPY_SERVER_RESERVED_PDES_PARAMS
+    uint32_t hSubDevice;
+    uint32_t subDeviceId;
+    uint64_t pageSize;
+    uint64_t virtAddrLo, virtAddrHi;
+    uint32_t numLevelsToCopy;
+    uint32_t pad;
+    struct {
+        uint64_t physAddress;
+        uint64_t size;
+        uint32_t aperture;      // 1 = VRAM (GMMU_APERTURE_VIDEO)
+        uint8_t pageShift;
+        uint8_t pad[3];
+    } levels[6];
+} nv_copy_pdes_t;
+
+_Static_assert(sizeof(nv_copy_pdes_t) == 184, "NV90F1_CTRL_VASPACE_COPY_SERVER_RESERVED_PDES_PARAMS");
+
+typedef struct { uint8_t bEnable, bSkipSubmit; } nv_gpfifo_schedule_t;
+
+/* ------------------------------------------- GPU page tables (GMMU v2) */
+
+/* Pascal..Ampere 49-bit VA, 5 levels (nouveau vmmgp100.c):
+ *   PD3 VA 48:47 (4 entries), PD2 46:38, PD1 37:29 (512 each, 8 bytes),
+ *   PD0 28:21 (256 entries of 16 bytes: big-page PT, small-page PT),
+ *   PT  20:12 (512 entries, 4 KiB pages).
+ * A PD0 entry can also map a 2 MiB page directly (a PTE in its first
+ * 8 bytes). Each table is 4 KiB here (PD3 uses its first 32 bytes). */
+#define NV_GMMU_APER_VRAM      0u   // PTE apertures
+#define NV_GMMU_APER_SYS_COH   2u
+#define NV_GMMU_APER_SYS_NCOH  3u
+#define NV_GMMU_PDE_VRAM       1u   // PDE apertures
+#define NV_GMMU_PDE_SYS_COH    2u
+
+static inline uint64_t nv_gmmu_pde(uint64_t table_addr, uint32_t aperture) {
+    uint64_t d = (table_addr >> 4) | ((uint64_t)aperture << 1);
+    if (aperture == NV_GMMU_PDE_SYS_COH) d |= 1ull << 3;     // volatile
+    return d;
+}
+
+// A valid PTE, pitch kind, read-write.
+static inline uint64_t nv_gmmu_pte(uint64_t addr, uint32_t aperture) {
+    uint64_t d = (addr >> 4) | 1ull | ((uint64_t)aperture << 1);
+    if (aperture == NV_GMMU_APER_SYS_COH || aperture == NV_GMMU_APER_SYS_NCOH) d |= 1ull << 3;
+    return d;
+}
+
+static inline uint32_t nv_gmmu_index(uint64_t va, int level) {
+    // level 4 = PD3 ... 0 = PT
+    static const uint8_t shift[5] = { 12, 21, 29, 38, 47 };
+    static const uint16_t mask[5] = { 511, 255, 511, 511, 3 };
+    return (uint32_t)(va >> shift[level]) & mask[level];
+}
+
+/* ------------------------------------------------------ copy engine */
+
+/* TURING_DMA_COPY_A (clc5b5.h). A fill is a remapped copy with no
+ * source: every 4-byte element of the destination gets CONST_A. */
+#define NVC5B5_SET_SEMAPHORE_A      0x0240u
+#define NVC5B5_SET_SEMAPHORE_B      0x0244u
+#define NVC5B5_SET_SEMAPHORE_PAYLOAD 0x0248u
+#define NVC5B5_LAUNCH_DMA           0x0300u
+#define NVC5B5_OFFSET_OUT_UPPER     0x0408u
+#define NVC5B5_OFFSET_OUT_LOWER     0x040Cu
+#define NVC5B5_PITCH_IN             0x0410u
+#define NVC5B5_PITCH_OUT            0x0414u
+#define NVC5B5_LINE_LENGTH_IN       0x0418u
+#define NVC5B5_LINE_COUNT           0x041Cu
+#define NVC5B5_SET_REMAP_CONST_A    0x0700u
+#define NVC5B5_SET_REMAP_COMPONENTS 0x0708u
+
+#define NV_CE_SUBCHANNEL 4u
+
+// Pushes a fill of a pitch-linear XRGB8888 (or float32) rectangle at
+// GPU VA `dst`, then a one-word semaphore release of `payload` at `sem`.
+void nv_push_ce_fill(nv_push_t* p, uint64_t dst, uint32_t width, uint32_t height,
+                     uint32_t pitch_bytes, uint32_t value, uint64_t sem, uint32_t payload);
+
+/* Channel memory (nouveau gf100_chan_inst, gv100_chan_userd). */
+#define NV_CHAN_INST_SIZE   0x1000u
+#define NV_CHAN_RAMFC_SIZE  0x200u
+#define NV_CHAN_USERD_SIZE  0x200u
+#define NV_USERD_GP_GET     0x88u
+#define NV_USERD_GP_PUT     0x8Cu
+#define NV_USERMODE_BASE    0x810000u       // BAR0, TURING_USERMODE_A
+// Ring the doorbell by writing runlist << 16 | channel id to
+// NV_USERMODE_BASE + NV_USERMODE_NOTIFY_CHANNEL_PENDING (nouveau r535/tu102).
+
+/* BAR1 (Turing, nouveau bar/tu102.c). The firmware leaves BAR1 in
+ * physical mode: BAR1 offset = VRAM address, which is how the kernel
+ * draws the screen and reaches the VRAM heap. GSP-RM switches it to
+ * virtual mode with its own page tables while it starts (nouveau then
+ * takes those over); we switch it back. */
+#define NV_BAR1_BLOCK_TU     0xB80F40u      // bit 31: virtual mode
+#define NV_BAR_BIND_STATUS   0xB80F50u      // bits 1:0 BAR1 bind pending/outstanding
+
+/* GspStaticConfigInfo (GET_GSP_STATIC_INFO reply), 535.113.01: size and
+ * the offsets used, computed by compiling nouveau's headers. */
+#define NV_STATIC_INFO_SIZE            2168u
+#define NV_STATIC_INFO_GPU_NAME        1820u
+#define NV_STATIC_INFO_INTERNAL_CLIENT 2152u    // then device, subdevice
+
+/* ===================================================================
+ * Graphics (nouveau gr/r535.c): context buffers the driver allocates
+ * and hands to GSP-RM ("promotes"), a golden context RM records on a
+ * throwaway channel when the first 3D object is made, then the 3D
+ * channel with its own buffers.
+ * =================================================================== */
+
+#define NV2080_CTRL_CMD_INTERNAL_STATIC_KGR_GET_CONTEXT_BUFFERS_INFO 0x20800A32u
+#define NV2080_CTRL_CMD_GPU_PROMOTE_CTX                              0x2080012Bu
+
+typedef struct { uint32_t size, alignment; } nv_ctxbuf_info_t;
+typedef struct {                // NV2080_CTRL_INTERNAL_STATIC_GR_GET_CONTEXT_BUFFERS_INFO_PARAMS
+    nv_ctxbuf_info_t engine[8][25];   // [GR engine][NV0080 ENGINE_ID]
+} nv_ctxbuf_infos_t;
+_Static_assert(sizeof(nv_ctxbuf_infos_t) == 1600, "GET_CONTEXT_BUFFERS_INFO_PARAMS");
+
+// NV0080_CTRL_FIFO_GET_ENGINE_CONTEXT_PROPERTIES_ENGINE_ID_*
+#define NV_CTX_ENGINE_GRAPHICS          0x00u
+#define NV_CTX_ENGINE_PATCH             0x10u
+#define NV_CTX_ENGINE_BUNDLE_CB         0x11u
+#define NV_CTX_ENGINE_PAGEPOOL_GLOBAL   0x12u
+#define NV_CTX_ENGINE_ATTRIBUTE_CB      0x13u
+#define NV_CTX_ENGINE_RTV_CB_GLOBAL     0x14u
+#define NV_CTX_ENGINE_FECS_EVENT        0x17u
+#define NV_CTX_ENGINE_PRIV_ACCESS_MAP   0x18u
+
+// NV2080_CTRL_GPU_PROMOTE_CTX_BUFFER_ID_*
+#define NV_PROMOTE_MAIN                 0u
+#define NV_PROMOTE_PATCH                2u
+#define NV_PROMOTE_BUNDLE_CB            3u
+#define NV_PROMOTE_PAGEPOOL             4u
+#define NV_PROMOTE_ATTRIBUTE_CB         5u
+#define NV_PROMOTE_RTV_CB_GLOBAL        6u
+#define NV_PROMOTE_FECS_EVENT           9u
+#define NV_PROMOTE_PRIV_ACCESS_MAP      10u
+#define NV_PROMOTE_UNRESTRICTED_PRIV_ACCESS_MAP 11u
+
+typedef struct {                // NV2080_CTRL_GPU_PROMOTE_CTX_BUFFER_ENTRY
+    uint64_t gpuPhysAddr, gpuVirtAddr, size;
+    uint32_t physAttr;
+    uint16_t bufferId;
+    uint8_t bInitialize, bNonmapped;
+} nv_promote_entry_t;
+
+typedef struct {                // NV2080_CTRL_GPU_PROMOTE_CTX_PARAMS
+    uint32_t engineType;
+    uint32_t hClient, ChID, hChanClient, hObject, hVirtMemory;
+    uint64_t virtAddress, size;
+    uint32_t entryCount;
+    uint32_t pad;
+    nv_promote_entry_t promoteEntry[16];
+} nv_promote_ctx_t;
+
+_Static_assert(sizeof(nv_promote_entry_t) == 32, "NV2080_CTRL_GPU_PROMOTE_CTX_BUFFER_ENTRY");
+_Static_assert(offsetof(nv_promote_ctx_t, promoteEntry) == 48, "NV2080_CTRL_GPU_PROMOTE_CTX_PARAMS");
+_Static_assert(sizeof(nv_promote_ctx_t) == 560, "NV2080_CTRL_GPU_PROMOTE_CTX_PARAMS");
+
+/* Channel (host) methods, any subchannel (clc46f.h): a semaphore release
+ * that first waits for the channel's engine to go idle. */
+#define NVC46F_SEM_ADDR_LO      0x005Cu
+#define NVC46F_SEM_EXECUTE      0x006Cu     // after ADDR_HI, PAYLOAD_LO/HI
+#define NVC46F_SEM_RELEASE_WFI  (1u | (1u << 20))     // RELEASE, WFI, 32-bit payload
+
+void nv_push_host_semaphore(nv_push_t* p, uint64_t sem, uint32_t payload);

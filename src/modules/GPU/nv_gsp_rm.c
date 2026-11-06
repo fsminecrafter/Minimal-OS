@@ -41,6 +41,7 @@ static struct {
     bool running;                       // GSP_INIT_DONE received
     bool rpc_ok;                        // step 3a answered
     char gpu_name[64];                  // from GET_GSP_STATIC_INFO, if found
+    uint32_t internal_client, internal_device, internal_subdevice;
 
     nv_gsp_layout_t layout;
     nv_rm_bootloader_t bl;
@@ -73,6 +74,7 @@ static void say(const char* fmt, ...) {
     vsnprintf(line, sizeof(line), fmt, ap);
     va_end(ap);
     if (g.print) g.print(line);
+    else serial_write_str(line);
     for (const char* p = line; *p && g.log_len + 1 < RM_LOG_SIZE; p++) g.log_text[g.log_len++] = *p;
 }
 
@@ -283,16 +285,19 @@ static bool load_gsp_image(const char* chip, uint16_t chipset) {
 
 /* -------------------------------------------------- sysmem structures */
 
+static const char* const k_log_names[3] = { "LOGINIT", "LOGINTR", "LOGRM" };
+static const uint32_t k_log_sizes[3] = { NV_GSP_LOGINIT_SIZE, NV_GSP_LOGINTR_SIZE, NV_GSP_LOGRM_SIZE };
+
 static bool build_libos(void) {
-    static const char* names[3] = { "LOGINIT", "LOGINTR", "LOGRM" };
     if (!rm_alloc(&g.libos, 4096)) return false;
     nv_libos_region_t* args = (nv_libos_region_t*)g.libos.va;
     for (int i = 0; i < 3; i++) {
-        if (!rm_alloc(&g.log[i], NV_GSP_LOG_SIZE)) return false;
+        uint32_t size = k_log_sizes[i];
+        if (!rm_alloc(&g.log[i], size)) return false;
         // Each log buffer starts with a put pointer, then its own page list.
         uint64_t* pte = (uint64_t*)(g.log[i].va + 8);
-        for (uint32_t p = 0; p < NV_GSP_LOG_SIZE / 4096u; p++) pte[p] = pa(g.log[i].va) + p * 4096ull;
-        args[i] = (nv_libos_region_t){ nv_libos_id8(names[i]), pa(g.log[i].va), NV_GSP_LOG_SIZE,
+        for (uint32_t p = 0; p < size / 4096u; p++) pte[p] = pa(g.log[i].va) + p * 4096ull;
+        args[i] = (nv_libos_region_t){ nv_libos_id8(k_log_names[i]), pa(g.log[i].va), size,
                                        NV_LIBOS_KIND_CONTIGUOUS, NV_LIBOS_LOC_SYSMEM, { 0 } };
     }
 
@@ -316,13 +321,16 @@ static bool build_libos(void) {
     g.slots = g.cmdq->tx.msgCount;
     g.seq = 0;
 
-    if (!rm_alloc(&g.rmargs, sizeof(nv_gsp_rmargs_t))) return false;
+    // LibOS maps every region in whole pages and stops (GSP mailbox 0xCA)
+    // when a size is not a multiple of 4 KiB, so RMARGS gets a full page,
+    // as in nouveau and NVIDIA's driver.
+    if (!rm_alloc(&g.rmargs, NV_GSP_PAGE)) return false;
     nv_gsp_rmargs_t* ra = (nv_gsp_rmargs_t*)g.rmargs.va;
     ra->sharedMemPhysAddr = pa(g.shm.va);
     ra->pageTableEntryCount = pte_count;
     ra->cmdQueueOffset = pte_bytes;
     ra->statQueueOffset = pte_bytes + NV_GSP_QUEUE_SIZE;
-    args[3] = (nv_libos_region_t){ nv_libos_id8("RMARGS"), pa(g.rmargs.va), sizeof(nv_gsp_rmargs_t),
+    args[3] = (nv_libos_region_t){ nv_libos_id8("RMARGS"), pa(g.rmargs.va), NV_GSP_PAGE,
                                    NV_LIBOS_KIND_CONTIGUOUS, NV_LIBOS_LOC_SYSMEM, { 0 } };
 
     return rm_alloc(&g.tx, RM_MAX_SLOTS * NV_GSP_PAGE) && rm_alloc(&g.rx, RM_MAX_SLOTS * NV_GSP_PAGE);
@@ -423,8 +431,19 @@ static nv_rpc_hdr_t* handle(nv_rpc_hdr_t* r, uint32_t want) {
             say("  GSP-RM error log: %s\n", text);
             break;
         }
+        case NV_RPC_EVENT_RC_TRIGGERED:
+            // rpc_rc_triggered_v17_02: engine, channel, exception, scope
+            if (plen >= 16) {
+                const uint32_t* w = (const uint32_t*)payload;
+                say("  GSP-RM: channel error (RC) on engine 0x%x, channel %u, exception %u\n", w[0], w[1], w[2]);
+            }
+            break;
+        case NV_RPC_EVENT_MMU_FAULT_QUEUED:
+            say("  GSP-RM: GPU page fault (MMU_FAULT_QUEUED)\n");
+            break;
         case NV_RPC_EVENT_UCODE_LIBOS_PRINT:
         case NV_RPC_EVENT_POST_EVENT:
+        case NV_RPC_EVENT_GSP_SEND_USER_SHARED_DATA:
             break;
         default:
             if (g.events <= 12)
@@ -493,13 +512,20 @@ static bool run_sequencer(const uint32_t* p, uint32_t dwords) {
     uint32_t* save = (uint32_t*)&p[2];     // regSaveArea[8]
     const uint32_t* cmd = p + 10;
     if (used > dwords - 10) used = dwords - 10;
-    for (uint32_t i = 0; i < used;) {
+    // Opcode trace, printed when a step fails (W write, M modify, P poll,
+    // D delay, S store, R core reset, G core start, H wait halt, U resume).
+    char trace[64];
+    uint32_t tn = 0;
+    bool ok = true;
+    for (uint32_t i = 0; i < used && ok;) {
         uint32_t op = cmd[i];
         int n = nv_seq_payload_dwords(op);
         if (n < 0 || i + 1 + (uint32_t)n > used) {
             say("  sequencer: bad opcode %u\n", op);
             return false;
         }
+        if (tn + 1 < sizeof(trace)) trace[tn++] = "WMPDSRGHU"[op];
+        trace[tn] = 0;
         const uint32_t* a = cmd + i + 1;
         i += 1 + (uint32_t)n;
         switch (op) {
@@ -512,7 +538,8 @@ static bool run_sequencer(const uint32_t* p, uint32_t dwords) {
                 while ((rd(a[0]) & a[1]) != a[2]) {
                     if (ptimer_ns() > end || time_get_uptime_ms() > guard) {
                         say("  sequencer: poll 0x%x timed out\n", a[0]);
-                        return false;
+                        ok = false;
+                        break;
                     }
                     udelay(10);
                 }
@@ -532,48 +559,56 @@ static bool run_sequencer(const uint32_t* p, uint32_t dwords) {
                     fwr(&k_gsp, NV_FALCON_CPUCTL, NV_FALCON_CPUCTL_STARTCPU);
                 break;
             case NV_SEQ_CORE_WAIT_HALT:
-                if (!wait_halt(&k_gsp, 2000)) { say("  sequencer: GSP did not halt\n"); return false; }
+                if (!wait_halt(&k_gsp, 2000)) { say("  sequencer: GSP did not halt\n"); ok = false; }
                 break;
             case NV_SEQ_CORE_RESUME: {
                 // Restart GSP-RM through booter (nouveau r535 CORE_RESUME).
-                gsp_prepare();
-                fwr(&k_sec2, NV_FALCON_CPUCTL, NV_FALCON_CPUCTL_STARTCPU);
+                // No GSP reset here: GSP-RM already reset the core through
+                // its own CORE_RESET step and booter resumes from WPR.
+                fwr(&k_gsp, NV_FALCON_MAILBOX0, (uint32_t)pa(g.libos.va));
+                fwr(&k_gsp, NV_FALCON_MAILBOX1, (uint32_t)(pa(g.libos.va) >> 32));
+                if (frd(&k_sec2, NV_FALCON_CPUCTL) & NV_FALCON_CPUCTL_ALIAS_EN)
+                    fwr(&k_sec2, NV_FALCON_CPUCTL_ALIAS, NV_FALCON_CPUCTL_STARTCPU);
+                else
+                    fwr(&k_sec2, NV_FALCON_CPUCTL, NV_FALCON_CPUCTL_STARTCPU);
                 uint64_t end = time_get_uptime_ms() + 2000;
                 while (!(rd(0x1180F8) & 0x04000000u) && time_get_uptime_ms() < end) udelay(100);
                 uint32_t mb = frd(&k_sec2, NV_FALCON_MAILBOX0);
-                if (mb) { say("  sequencer: resume via SEC2 failed, mailbox 0x%x\n", mb); return false; }
+                if (mb) { say("  sequencer: resume via SEC2 failed, mailbox 0x%x\n", mb); ok = false; break; }
                 fwr(&k_gsp, NV_FALCON_OS, g.bl.app_version);
-                if (!riscv_active()) { say("  sequencer: GSP RISC-V not running after resume\n"); return false; }
+                if (!riscv_active()) { say("  sequencer: GSP RISC-V not running after resume\n"); ok = false; }
                 break;
             }
         }
     }
-    return true;
+    if (!ok) say("  sequencer steps: %s (%u dwords)\n", trace, used);
+    return ok;
 }
 
 /* ------------------------------------------------- failure details */
 
 // GSP-RM's LibOS log buffers (LOGINIT, LOGINTR, LOGRM): word 0 is the
-// put pointer (entries written, in 8-byte words), then the page list,
-// then the entries. Entries are binary (format strings live in a debug
+// put pointer, then the page list, then the entries. The put pointer
+// counts 8-byte words from word 1, page list included. Entries are binary (format strings live in a debug
 // file NVIDIA does not ship), so they go out as hex: on a netbooted
 // machine they arrive in build/netboot/logs/, where
 // tools/gpu/gsp_log_strings.py looks up any string the values point at.
 static void dump_gsp_logs(void) {
-    static const char* names[3] = { "LOGINIT", "LOGINTR", "LOGRM" };
-    uint32_t pte_words = NV_GSP_LOG_SIZE / 4096u;
-    uint32_t max_words = NV_GSP_LOG_SIZE / 8u - 1u - pte_words;
     for (int i = 0; i < 3; i++) {
+        const char* name = k_log_names[i];
+        uint32_t pte_words = k_log_sizes[i] / 4096u;
+        uint32_t max_words = k_log_sizes[i] / 8u - 1u - pte_words;
         volatile uint64_t* buf = (volatile uint64_t*)g.log[i].va;
         uint64_t put = buf[0];
-        say("  %s: %llu words\n", names[i], (unsigned long long)put);
-        if (!put) continue;
-        uint32_t n = put < max_words ? (uint32_t)put : max_words;
+        uint64_t words = put > pte_words ? put - pte_words : 0;
+        say("  %s: %llu words\n", name, (unsigned long long)words);
+        if (!words) continue;
+        uint32_t n = words < max_words ? (uint32_t)words : max_words;
         if (n > 512) n = 512;
         const volatile uint64_t* entries = buf + 1 + pte_words;
         char line[160];
         for (uint32_t w = 0; w < n; w += 4) {
-            int used = snprintf(line, sizeof(line), "gsplog %s %04u:", names[i], w);
+            int used = snprintf(line, sizeof(line), "gsplog %s %04u:", name, w);
             for (uint32_t k = w; k < n && k < w + 4; k++)
                 used += snprintf(line + used, sizeof(line) - (size_t)used, " %016llx",
                                  (unsigned long long)entries[k]);
@@ -626,6 +661,19 @@ static void first_rpc(void) {
     g.rpc_ok = r->rpc_result == 0;
     const char* s = (const char*)(r + 1);
     uint32_t len = r->length > sizeof(*r) ? r->length - (uint32_t)sizeof(*r) : 0;
+    // GspStaticConfigInfo (535.113.01, offsets computed from nouveau's
+    // headers): the GPU name at 1820 confirms the layout, then the
+    // handles of RM's internal client/device/subdevice, which internal
+    // controls (graphics context buffer sizes) have to go to.
+    if (len >= NV_STATIC_INFO_SIZE && memcmp(s + NV_STATIC_INFO_GPU_NAME, "NVIDIA", 6) == 0) {
+        memcpy(&g.internal_client, s + NV_STATIC_INFO_INTERNAL_CLIENT, 4);
+        memcpy(&g.internal_device, s + NV_STATIC_INFO_INTERNAL_CLIENT + 4, 4);
+        memcpy(&g.internal_subdevice, s + NV_STATIC_INFO_INTERNAL_CLIENT + 8, 4);
+        say("  RM internal handles: client 0x%x, device 0x%x, subdevice 0x%x\n", g.internal_client,
+            g.internal_device, g.internal_subdevice);
+    } else {
+        say("  static info layout not as expected (no GPU name at %u)\n", NV_STATIC_INFO_GPU_NAME);
+    }
     for (uint32_t i = 0; i + 6 < len; i++) {
         if (memcmp(s + i, "NVIDIA", 6) != 0) continue;
         uint32_t k = 0;
@@ -722,12 +770,56 @@ bool nv_gsp_rm_boot(gpu_adapter_t* a, void (*print)(const char* text)) {
         return false;
     }
     g.running = true;
+    nv_bar1_keep_physical(a);              // the screen is drawn through BAR1
     say("  ok: GSP-RM is running.\n");
     first_rpc();
-    say("\nNext: step 3b, RM objects and a channel (not written yet).\n");
+    nv_bar1_keep_physical(a);
     save_log();
     return true;
 }
 
 bool nv_gsp_rm_running(gpu_adapter_t* a) { return g.running && g.a == a; }
+
+bool nv_bar1_keep_physical(gpu_adapter_t* a) {
+    uint32_t v = nv_rd32(a, NV_BAR1_BLOCK_TU);
+    if (nv_pri_error(v) || !(v & 0x80000000u)) return false;
+    nv_wr32(a, NV_BAR1_BLOCK_TU, v & ~0x80000000u);
+    uint64_t end = time_get_uptime_ms() + 100;
+    while ((nv_rd32(a, NV_BAR_BIND_STATUS) & 3u) && time_get_uptime_ms() < end) asm volatile("pause");
+    char line[120];
+    snprintf(line, sizeof(line), "  BAR1: GSP-RM had switched it to virtual mode (0x%08x); back to physical\n", v);
+    serial_write_str(line);
+    if (g.print) g.print(line);
+    return true;
+}
+
+void nv_gsp_rm_set_print(void (*print)(const char* text)) { g.print = print; }
+
+bool nv_gsp_rm_internal_handles(gpu_adapter_t* a, uint32_t* client, uint32_t* subdevice) {
+    if (!g.running || g.a != a || !g.internal_client) return false;
+    *client = g.internal_client;
+    *subdevice = g.internal_subdevice;
+    return true;
+}
+
+void* nv_gsp_rpc(gpu_adapter_t* a, uint32_t function, const void* payload, uint32_t len,
+                 uint32_t timeout_ms) {
+    if (!g.running || g.a != a) return NULL;
+    if (!rpc_send(function, payload, len)) {
+        say("  RPC 0x%x: does not fit in the command queue\n", function);
+        return NULL;
+    }
+    nv_rpc_hdr_t* r = rpc_wait(function, timeout_ms);
+    if (!r) say("  RPC 0x%x %s: no reply within %u ms\n", function, nv_rpc_name(function), timeout_ms);
+    return r;
+}
+
+void nv_gsp_rm_poll(gpu_adapter_t* a) {
+    if (!g.running || g.a != a) return;
+    for (int i = 0; i < 16; i++) {
+        nv_rpc_hdr_t* r = rpc_recv();
+        if (!r) break;
+        handle(r, 0xFFFFFFFFu);
+    }
+}
 bool nv_gsp_rm_rpc_ok(gpu_adapter_t* a) { return g.running && g.a == a && g.rpc_ok; }

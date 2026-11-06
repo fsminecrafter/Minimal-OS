@@ -1008,6 +1008,10 @@ static bool syscall_user_may_call(uint64_t syscall_num, const syscall_regs_t* re
             return user_range_ok((const void*)regs->rdi,
                                  sizeof(syscall_gpu_request_t), true);
 
+        case SYS_MEDIA:
+            return user_range_ok((const void*)regs->rdi,
+                                 sizeof(syscall_media_request_t), true);
+
         case SYS_STORAGE:
             return user_range_ok((const void*)regs->rdi,
                                  sizeof(syscall_storage_request_t), true);
@@ -1061,6 +1065,13 @@ static void syscall_dispatch_inner(syscall_regs_t* regs) {
         case SYS_GPU:
             regs->rax = fgpu_syscall((syscall_gpu_request_t*)regs->rdi);
             return;
+        case SYS_MEDIA: {
+            extern uint64_t media_syscall(syscall_media_request_t* request) __attribute__((weak));
+            regs->rax = media_syscall
+                ? media_syscall((syscall_media_request_t*)regs->rdi)
+                : SYS_ERR_AGAIN;
+            return;
+        }
         case SYS_AUDIO: {
             // Weak: a build without the audio module answers "invalid".
             extern uint64_t audio_syscall(syscall_audio_request_t* r) __attribute__((weak));

@@ -176,6 +176,11 @@ Everything below builds into the kernel and changes nothing until the
 hardware backend's `init()` succeeds; until then all work runs on the CPU
 as before.
 
+The current RTX 2060 backend can accelerate copy-engine clears, but its
+3D draw path is not implemented. `hw-3d` is reported only when a backend
+actually provides hardware draws; successful GSP-RM or copy-engine
+bring-up alone does not mean FarcadeGL triangles run on the GPU.
+
 | Piece | Where | State |
 | --- | --- | --- |
 | Backend interface: FGPU offers every clear and draw to a hardware backend first and falls back to the CPU per command; GPU work is finished before the CPU touches a surface or buffer | `fgpu_backend.h`, `fgpu.c` | done |

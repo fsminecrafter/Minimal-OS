@@ -49,6 +49,11 @@ Programs do not depend on the backend: when a GPU driver can execute FGPU
 work on the card itself (see `docs/gpu.md` in Minimal-OS for the plan for
 NVIDIA cards), the same programs and the same shader bytecode run there.
 
+The kernel reports the active adapter and available caps through
+`fglGetDeviceInfo()`. If you want to auto-detect the 3D path in user code,
+check `info.caps & FGPU_CAP_HW_3D`, or use the convenience helpers
+`fglHasHardware3D()` and `fglHasShaders()` from `farcadegl.h`.
+
 ## A first program
 
 ```c

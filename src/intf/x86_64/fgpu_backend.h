@@ -47,6 +47,7 @@ typedef struct {
 
 typedef struct {
     const char* name;           // reported as syscall_gpu_info_t.backend
+    uint32_t caps;              // FGPU_CAP_* capabilities actually provided
 
     // Takes the adapter, or returns false and sets *why.
     bool (*init)(gpu_adapter_t* adapter, const char** why);

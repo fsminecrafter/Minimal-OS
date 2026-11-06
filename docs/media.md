@@ -326,11 +326,16 @@ files, which must fail cleanly.
 
 ## Hardware decoding
 
-Everything runs on the CPU for now. The GPU's video engines (NVDEC and
-NVENC on NVIDIA cards) only run NVIDIA-signed firmware, which needs the
-GSP boot that `docs/gpu.md` describes and which is not finished. The
-tiles codec avoids work that a CPU does badly: there is no transform or
-motion search, unchanged tiles cost nothing, and tiles are independent,
-which also suits decoding in parallel later. The motion codec decodes
-sequentially (a range coder per frame), but its decoder has no search,
-so it is cheap: the encoder does the hard work.
+`.vid` uses custom codecs, so NVIDIA's NVDEC cannot decode these files
+directly. The tiles codec is decoded in parallel on the OS's CPU cores:
+each changed tile is independent, and the kernel runs the tile jobs on its
+SMP workers. If the kernel cannot use that path (for example, on an older
+kernel or for frames larger than its bounded work buffers), the SDK uses
+the same CPU decoder in the calling process. This is CPU acceleration, not
+GPU video decoding.
+
+The motion codec still decodes sequentially: its range coder carries state
+across macroblocks. Its decoder has no motion search, so decoding remains
+cheap; the encoder does the hard work. GPU video-engine support for a
+standard codec would require the unfinished GSP boot described in
+`docs/gpu.md`, as well as a compatible bitstream.

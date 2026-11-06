@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include "fgpu_abi.h"
+#include "media_abi.h"
 
 #define SYS_WRITE   1
 #define SYS_EXIT    2

@@ -125,6 +125,12 @@ build/modules/%.o: src/modules/%.c $(header_files)
 	mkdir -p $(dir $@)
 	$(CC) $(BUILD_DATE_CFLAG) -c -I src/intf $(KERNEL_CFLAGS) $< -o $@
 
+build/modules/Media/vid_decode.o: src/modules/Media/vid_decode.c $(header_files) \
+	Minimal-OS-SDK/include/mosmedia.h Minimal-OS-SDK/include/mosmedia_motion.h
+	mkdir -p $(dir $@)
+	$(CC) $(BUILD_DATE_CFLAG) -c -I src/intf -I Minimal-OS-SDK/include \
+		$(KERNEL_CFLAGS) $< -o $@
+
 build/modules/%.o: src/modules/%.asm
 	mkdir -p $(dir $@)
 	nasm -f elf64 $< -o $@
@@ -480,13 +486,14 @@ ci-test:
 .PHONY: test-host
 test-host: build/tests/host/gfx_blit_tests build/tests/host/fgpu_raster_tests build/tests/host/fgsl_tests \
 		build/tests/host/fgpu_ir_tests build/tests/host/nv_hw_tests build/tests/host/hid_mouse_tests \
-		build/tests/host/media_tests
+		build/tests/host/media_tests build/tests/host/media_parallel_tests
 	./build/tests/host/gfx_blit_tests
 	./build/tests/host/fgpu_raster_tests
 	./build/tests/host/fgsl_tests
 	./build/tests/host/fgpu_ir_tests
 	./build/tests/host/nv_hw_tests
 	./build/tests/host/media_tests
+	./build/tests/host/media_parallel_tests
 	./build/tests/host/hid_mouse_tests
 
 build/tests/host/hid_mouse_tests: tests/host/hid_mouse_tests.c src/modules/USB/hid_mouse.c src/intf/mouse/hid_mouse.h
@@ -513,6 +520,14 @@ build/tests/host/nv_hw_tests: tests/host/nv_hw_tests.c src/modules/GPU/nv_fw.c s
 build/tests/host/media_tests: tests/host/media_tests.c Minimal-OS-SDK/include/mosmedia.h Minimal-OS-SDK/include/mosmedia_motion.h
 	mkdir -p $(dir $@)
 	$(HOSTCC) $(HOST_CFLAGS) -idirafter Minimal-OS-SDK/include tests/host/media_tests.c -o $@
+
+build/tests/host/media_parallel_tests: tests/host/media_parallel_tests.c \
+		src/modules/Media/vid_decode.c Minimal-OS-SDK/include/mosmedia.h \
+		Minimal-OS-SDK/include/mosmedia_motion.h Minimal-OS-SDK/include/media_abi.h \
+		src/intf/x86_64/media_abi.h src/intf/x86_64/smp_par.h src/intf/x86_64/syscall.h
+	mkdir -p $(dir $@)
+	$(HOSTCC) $(HOST_CFLAGS) -pthread -I src/intf -idirafter Minimal-OS-SDK/include \
+		tests/host/media_parallel_tests.c src/modules/Media/vid_decode.c -o $@
 
 build/tools/mosmedia: tools/media/mosmedia.c Minimal-OS-SDK/include/mosmedia.h Minimal-OS-SDK/include/mosmedia_motion.h
 	mkdir -p $(dir $@)

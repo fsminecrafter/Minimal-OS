@@ -130,7 +130,8 @@ static bool nv_draw(const fgpu_hw_draw_t* d, uint32_t* triangles) {
 static void nv_finish(void) {}
 
 const fgpu_backend_t fgpu_backend_nvidia = {
-    .name = "nvidia (Turing)",
+    .name = "nvidia copy engine",
+    .caps = 0,
     .init = nv_init,
     .program_create = nv_program_create,
     .program_destroy = nv_program_destroy,

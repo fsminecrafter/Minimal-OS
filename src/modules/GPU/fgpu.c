@@ -508,7 +508,7 @@ static uint64_t op_info(syscall_gpu_request_t* r) {
         strcpy(info.name, "no GPU");
     }
     info.caps |= FGPU_CAP_SHADERS;
-    if (g_hw) info.caps |= FGPU_CAP_HW_3D;
+    if (g_hw) info.caps |= g_hw->caps;
     info.screen_width = graphics_get_width();
     info.screen_height = graphics_get_height();
     *out = info;

@@ -116,7 +116,8 @@ they set `codec`.
 | `--no-audio` | drop the sound |
 
 What to expect, on a 3-minute camera clip at 200x112 (PSNR against the
-source; the original MP4 is 854x480 at 0.74 Mbit/s):
+source; the original MP4 is 854x480 at 0.74 Mbit/s; measured with the
+first version of the encoder):
 
 | Encoding | Picture data | PSNR |
 | --- | --- | --- |
@@ -132,9 +133,9 @@ about 1.7 times the size of x264 at the same quality. Its sharp colour
 edges are limited by 4:2:0 colour (half-resolution colour, like nearly all
 video): lossless x264 in 4:2:0 reaches 38 dB on the same clip. The
 soundtrack (IMA ADPCM, 44.1 kHz stereo) adds 2.6 MB a minute either way.
-Decoding a 480p motion video takes about 4 ms a frame on one core of the
-build PC. Encoding 480p takes about 26 ms a frame on one core (18 ms with
-`--fast`) and scales with the cores. MinimaFS files stop at 4 GiB.
+Decoding a 480p motion video takes under 10 ms a frame on one core of the
+build PC. Encoding 480p takes about 40 ms a frame on one core (about 30 ms
+with `--fast`) and scales with the cores. MinimaFS files stop at 4 GiB.
 
 ## How the tiles codec works
 

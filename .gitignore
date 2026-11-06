@@ -29,3 +29,8 @@ src/resources/install2/DeliverManager.run
 
 # NVIDIA firmware set up by tools/gpu/setup-gpu.sh (NVIDIA licence, not ours to commit)
 /firmware/
+
+# Built by make into the install packages (programs/dlr, libraries/minimaSSL)
+src/resources/install1/minimaSSL.slib
+src/resources/install2/dlr.run
+src/resources/install2/dlrconnect.run

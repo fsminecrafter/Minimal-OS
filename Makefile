@@ -539,7 +539,7 @@ build/tests/host/nv_hw_tests: tests/host/nv_hw_tests.c src/modules/GPU/nv_fw.c s
 	mkdir -p $(dir $@)
 	$(HOSTCC) $(HOST_CFLAGS) $(filter %.c,$^) -o $@
 
-build/tests/host/media_tests: tests/host/media_tests.c Minimal-OS-SDK/include/mosmedia.h Minimal-OS-SDK/include/mosmedia_motion.h
+build/tests/host/media_tests: tests/host/media_tests.c Minimal-OS-SDK/include/mosmedia.h Minimal-OS-SDK/include/mosmedia_motion.h Minimal-OS-SDK/include/mosmedia_h264.h docs/examples/sample-h264.vid
 	mkdir -p $(dir $@)
 	$(HOSTCC) $(HOST_CFLAGS) -idirafter Minimal-OS-SDK/include tests/host/media_tests.c -o $@
 
@@ -551,7 +551,13 @@ build/tests/host/media_parallel_tests: tests/host/media_parallel_tests.c \
 	$(HOSTCC) $(HOST_CFLAGS) -pthread -I src/intf -idirafter Minimal-OS-SDK/include \
 		tests/host/media_parallel_tests.c src/modules/Media/vid_decode.c -o $@
 
-build/tools/mosmedia: tools/media/mosmedia.c Minimal-OS-SDK/include/mosmedia.h Minimal-OS-SDK/include/mosmedia_motion.h
+# The H.264 decoder against ffmpeg's, on streams x264 encodes with many
+# settings (needs ffmpeg with libx264; not part of test-host).
+.PHONY: test-h264
+test-h264:
+	HOSTCC=$(HOSTCC) sh tools/media/h264_check.sh
+
+build/tools/mosmedia: tools/media/mosmedia.c Minimal-OS-SDK/include/mosmedia.h Minimal-OS-SDK/include/mosmedia_motion.h Minimal-OS-SDK/include/mosmedia_h264.h
 	mkdir -p $(dir $@)
 	$(HOSTCC) -std=c11 -O2 -Wall -Wextra -pthread -idirafter Minimal-OS-SDK/include tools/media/mosmedia.c -o $@
 

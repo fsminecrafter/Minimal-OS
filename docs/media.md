@@ -4,24 +4,26 @@ Minimal-OS has its own picture and video formats, in
 `Minimal-OS-SDK/include/mosmedia.h` (plain C, no libc, so they run in
 programs, in mosWM and on the build PC).
 
-A `.vid` file uses one of two codecs, the way an `.adi` file is PCM16 or
+A `.vid` file uses one of three codecs, the way an `.adi` file is PCM16 or
 ADPCM:
 
 | Codec | For | How |
 | --- | --- | --- |
 | `tiles` | screen recordings, drawings, animation, games | lossless (or near-lossless with `--loss`), keeps transparency; only changed tiles are stored |
 | `motion` | camera footage, films | lossy and built like H.264: motion vectors, a transform, a range coder. RGB only; tens of times smaller on camera footage |
+| `h264` | video that comes from, or goes to, the rest of the world | H.264 (AVC), Constrained Baseline profile: the codec of most video on the web. Smaller than `motion` at the same quality; encoded by x264 on the build PC |
 
-Every player reads both: the Video app, Mxplorer and the Python player.
+Every player reads all three: the Video app, Mxplorer and the Python
+player (which uses ffmpeg for `h264`).
 
 | | .img | .vid |
 | --- | --- | --- |
 | What | A picture, 8-bit RGB or RGBA (transparency, like PNG) | Frames in 32-bit ARGB8888 (including transparency), a frame rate and an `.adi` soundtrack |
-| Compression | Lossless, about PNG's size, faster to decode | `tiles`: lossless, only changed tiles are stored; `motion`: lossy, like H.264 |
+| Compression | Lossless, about PNG's size, faster to decode | `tiles`: lossless, only changed tiles are stored; `motion`: lossy, like H.264; `h264`: H.264 itself |
 | Opens with | Photos (`0:/programs/mos_photos.run`), and as a wallpaper in Settings | Video (`0:/programs/mos_video.run`) |
 | In the terminal | `img 0:/users/me/Pictures/cat.img` | `video 0:/users/me/Videos/clip.vid` |
 | In Mxplorer | `<img src="cat.img">`, or open the file's address | `<video src="clip.vid" controls>`, or open the file's address |
-| Make one | `mosmedia img picture.png out.img` | `mosmedia vid movie.mp4 out.vid` (motion), `mosmedia vid screen.mkv out.vid --codec tiles` |
+| Make one | `mosmedia img picture.png out.img` | `mosmedia vid movie.mp4 out.vid` (motion), `mosmedia vid screen.mkv out.vid --codec tiles`, `mosmedia vid movie.mp4 out.vid --codec h264` |
 
 ## In the terminal
 
@@ -74,8 +76,9 @@ Windows, see the Python player in [tools/media](../tools/media/README.md).
 Small sample files are included: [sample.img](examples/sample.img) is a
 320x180 RGBA gradient with transparent corners,
 [sample.vid](examples/sample.vid) is a 2-second, 12 fps color test video
-(tiles codec), and [sample-motion.vid](examples/sample-motion.vid) is the
-same video in the motion codec.
+(tiles codec), and [sample-motion.vid](examples/sample-motion.vid) and
+[sample-h264.vid](examples/sample-h264.vid) are the same video in the
+motion and h264 codecs.
 Open either in the [Python player](../tools/media/README.md), for example:
 
 ```sh
@@ -88,6 +91,7 @@ build/tools/mosmedia img logo.png logo.img        # any picture ffmpeg reads; ke
 build/tools/mosmedia png logo.img logo.png        # and back
 build/tools/mosmedia vid film.mp4 film.vid --width 640 --q 26   # motion codec
 build/tools/mosmedia vid screen.mkv screen.vid --codec tiles      # lossless
+build/tools/mosmedia vid film.mp4 film.vid --codec h264 --width 640   # H.264 (needs ffmpeg with libx264)
 build/tools/mosmedia unvid clip.vid check.mp4     # to look at the result (check.raw: exact pixels)
 build/tools/mosmedia info clip.vid
 ```
@@ -104,10 +108,10 @@ they set `codec`.
 
 | Option | Meaning |
 | --- | --- |
-| `--codec motion` / `--codec tiles` | the codec (default `motion`; use `tiles` for screen recordings, drawings and anything with transparency) |
-| `--q N` | motion: quality, 0 (best) to 51 (smallest), default 26; 6 steps double or halve the quantizer step |
+| `--codec motion` / `--codec tiles` / `--codec h264` | the codec (default `motion`; use `tiles` for screen recordings, drawings and anything with transparency) |
+| `--q N` | motion: quality, 0 (best) to 51 (smallest), default 26; 6 steps double or halve the quantizer step. h264: x264's quality setting (`-crf`), the same scale |
 | `--loss N` | tiles: each colour may end up to N away from the source (alpha stays exact); 0, lossless, is the default |
-| `--fast` | quicker, a little larger (motion: about 25% quicker and 3% larger; tiles: delta frames only use the last frame) |
+| `--fast` | quicker, a little larger (motion: about 25% quicker and 3% larger; tiles: delta frames only use the last frame; h264: x264's `veryfast` preset instead of `medium`) |
 | `--threads N` | motion: encoder threads (default: one per CPU core) |
 | `--no-hwaccel` | decode the input on the CPU only |
 | `--width N` | scale (keeping the shape) |
@@ -208,6 +212,80 @@ macroblock:
 - each block: a coded flag (context: whether the left and above blocks
   have coefficients) and its coefficients.
 
+## The H.264 codec
+
+`Minimal-OS-SDK/include/mosmedia_h264.h` is an H.264 decoder written for
+Minimal-OS: plain C without libc, so it runs in programs and in mosWM
+like the other codecs. Videos made elsewhere are almost always H.264, so
+this is the codec to carry them in, and the first piece a web video
+player needs.
+
+**What it decodes: the Constrained Baseline profile.**
+
+| Part | State |
+| --- | --- |
+| I and P frames, several slices per picture | yes |
+| CAVLC entropy coding | yes |
+| Intra prediction: 4x4 (9 modes), 16x16, colour, I_PCM; constrained intra prediction | yes |
+| Inter prediction: 16x16 down to 4x4 blocks, quarter-pixel motion (6-tap filter), up to 16 reference frames, reference list reordering and memory management commands | yes |
+| In-loop deblocking filter, with per-slice offsets | yes |
+| 4:2:0, 8 bits, progressive, cropping to any size; BT.601 and BT.709, full and limited range | yes |
+| CABAC, B frames, the 8x8 transform (Main and High profile) | **no** - refused with a message, not garbled |
+| Interlaced video, slice groups (FMO/ASO), weighted prediction, 4:2:2 / 4:4:4, more than 8 bits | no |
+
+Main and High profile are what most downloaded films and the higher
+resolutions of video sites use, so they are the next step for this
+decoder (CABAC and B frames first). `mosmedia vid --codec h264` always
+writes Constrained Baseline, so every `.vid` it makes plays.
+
+**It is exact.** H.264 defines the decoded pictures bit for bit.
+`make test-h264` (`tools/media/h264_check.sh`, needs ffmpeg with libx264)
+lets x264 encode 23 test videos with very different settings - all block
+sizes, 1 to 16 reference frames, several slices, the best and the worst
+quality, deblocking off and at its extremes, constrained intra, noise,
+odd sizes from 16x16 to 1280x720 - and compares every byte of every frame
+with ffmpeg's decoder. `make test-host` checks the sample file against a
+checksum made the same way, seeks in it, and decodes 400 damaged copies,
+which must fail cleanly. Parts no test stream uses yet: I_PCM blocks,
+long-term reference frames and the memory management commands (x264 does
+not emit them in this profile).
+
+**Speed.** 854x480 decodes in about 4 ms a frame on one core of the build
+PC, without any SIMD.
+
+**In a `.vid`.** A frame is the 4-byte frame header (bit 0 of the first
+byte: keyframe) and one access unit in Annex B form (NAL units behind
+`00 00 01` start codes). A keyframe is an IDR picture and carries its
+parameter sets (SPS, PPS), so decoding can start at any keyframe. There
+are no B frames, so frames are stored in the order they are shown. The
+converter writes full-range BT.601 colour, like the motion codec, which
+lets the same colour conversion - on the CPU or on the graphics card -
+serve both; streams from elsewhere are converted by their own matrix and
+range.
+
+**In programs.** `mvid_open` / `mvid_decode` handle it like the other
+codecs. The decoder on its own:
+
+```c
+#include "mosmedia_h264.h"
+
+h264_t d;
+h264_init(&d, malloc, largest_access_unit);
+if (h264_decode(&d, unit, unit_size))                   // one frame's NAL units
+    h264_to_argb(&d, pixels, h264_width(&d), h264_height(&d), stride);
+else if (h264_error(&d)[0]) puts(h264_error(&d));       // e.g. "CABAC (Main and High profile) is not supported"
+h264_free(&d, free);
+```
+
+Recording (`mvid_writer_frame`) stays tiles or motion: there is no H.264
+encoder in the OS. `mvid_writer_h264_frame` stores frames something else
+encoded.
+
+**What a web video player still needs.** Sites deliver H.264 inside MP4
+(or fragmented MP4 over DASH/HLS) with AAC sound, usually in Main or High
+profile. This decoder is the video half for the Baseline streams; an MP4
+demuxer, an AAC decoder and the missing profiles are separate work.
+
 ## .img layout
 
 All numbers are little-endian.
@@ -263,7 +341,7 @@ previous value starts at 0 and the index at all zeros in every tile.
 | 40 | 8 | where the soundtrack starts |
 | 48 | 8 | soundtrack size |
 | 56 | 4 | keyframe interval (information only) |
-| 60 | 4 | version 2: the codec, 0 tiles or 1 motion; version 1: 0 |
+| 60 | 4 | version 2: the codec, 0 tiles, 1 motion or 2 h264; version 1: 0 |
 
 The tiles codec writes version 1, so players from before the motion codec
 still read those files; a motion file is version 2, which they reject
@@ -280,6 +358,9 @@ Frames follow the header. A tiles frame has:
 
 A motion frame has a flags byte (bit 0: keyframe), its QP, 2 zero bytes,
 then the range-coded frame.
+
+An h264 frame has a flags byte (bit 0: keyframe), 3 zero bytes, then one
+H.264 access unit in Annex B form.
 
 The index has 16 bytes per frame: 8-byte offset, 4-byte size and 4-byte
 flags (bit 0: keyframe). To show frame n, a player decodes from the
@@ -328,10 +409,10 @@ files, which must fail cleanly.
 
 What runs where:
 
-| Step | tiles | motion |
-| --- | --- | --- |
-| Entropy decoding, prediction, transform, deblocking | CPU, changed tiles in parallel on the kernel's SMP workers | CPU, one core |
-| Colour conversion (4:2:0 YCbCr to RGB) | - | **GPU** when FarcadeGL runs on the card (`hw-3d`), else CPU |
+| Step | tiles | motion | h264 |
+| --- | --- | --- | --- |
+| Entropy decoding, prediction, transform, deblocking | CPU, changed tiles in parallel on the kernel's SMP workers | CPU, one core | CPU, one core |
+| Colour conversion (4:2:0 YCbCr to RGB) | - | **GPU** when FarcadeGL runs on the card (`hw-3d`), else CPU | the same, for full-range BT.601 streams (what the converter writes) |
 
 `.vid` uses its own codecs, so the card's fixed-function video decoder
 (NVDEC), which only knows H.264, HEVC, VP9 and AV1 bitstreams, cannot read
@@ -359,6 +440,13 @@ reference, bit for bit. Those steps are sequential by design; a
 rasterizer cannot run them, and hardware decoders do them in dedicated
 circuits for the standard codecs only. Decoding has no motion search, so
 this part is cheap.
+
+**H.264 and the card's video decoder.** H.264 is one of the formats
+NVDEC decodes completely in hardware, so `h264` videos are the ones that
+could one day be decoded on the card from the first bit to the last.
+That needs an NVDEC channel through GSP-RM and its picture-parameter
+interface, which the driver does not have yet; today the H.264 decoder
+is the CPU one above.
 
 **Tiles codec.** Each changed tile is independent, so the kernel decodes
 the tiles of a frame in parallel on its CPU cores

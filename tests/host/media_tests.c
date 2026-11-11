@@ -323,6 +323,99 @@ static void test_motion_order(void) {
     free(px); free(a.data); free(b.data);
 }
 
+/* ------------------------------------------------------------- H.264 */
+
+// The decoded planes of every frame of docs/examples/sample-h264.vid,
+// hashed (FNV-1a) as ffmpeg decodes them: H.264 decoding is exact, so the
+// decoder here must reach the same number. tools/media/h264_check.sh
+// compares many more streams when ffmpeg is installed.
+#define SAMPLE_H264 "docs/examples/sample-h264.vid"
+#define SAMPLE_H264_HASH 0x5429ff1e233bf1b8ull
+
+static uint64_t hash_planes(const h264_t* d, uint64_t hash) {
+    const h264_sps_t* s = d->active;
+    uint32_t w = h264_width(d), h = h264_height(d);
+    for (int p = 0; p < 3; p++) {
+        uint32_t pw = p ? (w + 1) / 2 : w, ph = p ? (h + 1) / 2 : h, stride = p ? d->cw : d->w;
+        const uint8_t* base = d->out->plane[p] + (size_t)(p ? s->crop_t / 2 : s->crop_t) * stride +
+                              (p ? s->crop_l / 2 : s->crop_l);
+        for (uint32_t y = 0; y < ph; y++)
+            for (uint32_t x = 0; x < pw; x++) hash = (hash ^ base[(size_t)y * stride + x]) * 0x100000001b3ull;
+    }
+    return hash;
+}
+
+static void test_h264(void) {
+    membuf_t m = {0};
+    FILE* f = fopen(SAMPLE_H264, "rb");
+    CHECK(f != NULL, "sample H.264 video is there (run from the repository root)");
+    if (!f) return;
+    fseek(f, 0, SEEK_END);
+    m.size = m.cap = (size_t)ftell(f);
+    fseek(f, 0, SEEK_SET);
+    m.data = malloc(m.size);
+    CHECK(fread(m.data, 1, m.size, f) == m.size, "sample read");
+    fclose(f);
+
+    mvid_reader_t r;
+    CHECK(mvid_open(&r, mem_read, &m, m.size, malloc), "h264 video opens");
+    CHECK(r.info.codec == MVID_CODEC_H264 && r.info.width == 160 && r.info.height == 90 &&
+          r.info.frame_count == 24 && !r.info.alpha, "h264 video header");
+    size_t px = (size_t)r.info.width * r.info.height;
+    uint32_t* out = malloc(px * 4);
+    uint32_t* frame20 = malloc(px * 4);
+    uint32_t* again = malloc(px * 4);
+    uint64_t hash = 0xcbf29ce484222325ull;
+    bool ok = true;
+    for (uint32_t n = 0; n < r.info.frame_count && ok; n++) {
+        ok = mvid_decode(&r, n, out);
+        if (!ok) break;
+        hash = hash_planes(&r.h264, hash);
+        if (n == 20) memcpy(frame20, out, px * 4);
+        if (n == 0) {
+            // The pixels are the decoder's own conversion, opaque.
+            h264_to_argb(&r.h264, again, r.info.width, r.info.height, r.info.width);
+            CHECK(!memcmp(out, again, px * 4) && (out[0] >> 24) == 0xFF, "h264 pixels");
+            CHECK(h264_is_full_601(&r.h264), "the converter writes full-range BT.601, like the motion codec");
+        }
+    }
+    CHECK(ok, "every h264 frame decodes");
+    CHECK(hash == SAMPLE_H264_HASH, "h264 frames are exactly what ffmpeg decodes");
+    // Seeking: back to the start, then straight to frame 20 (from its keyframe).
+    CHECK(mvid_decode(&r, 3, out) && mvid_decode(&r, 20, out) && !memcmp(out, frame20, px * 4), "h264 seeking");
+    mvid_close(&r, free);
+
+    // Damaged copies must fail cleanly or decode something: never crash
+    // or read outside their buffers (ASan checks that).
+    uint64_t index_at = mm_get64(m.data + 32);
+    membuf_t bad = {malloc(m.size), m.size, m.size};
+    int decoded = 0;
+    for (int round = 0; round < 400; round++) {
+        memcpy(bad.data, m.data, m.size);
+        int hits = 1 + (int)(rnd() % 3u);
+        for (int k = 0; k < hits; k++) {
+            size_t at = 64 + rnd() % (index_at - 64);
+            if (round & 1) bad.data[at] ^= (uint8_t)(1u << (rnd() % 8u));
+            else bad.data[at] = (uint8_t)rnd();
+        }
+        mvid_reader_t b;
+        if (mvid_open(&b, mem_read, &bad, bad.size, malloc))
+            for (uint32_t n = 0; n < b.info.frame_count; n++) decoded += mvid_decode(&b, n, out);
+        mvid_close(&b, free);
+    }
+    CHECK(decoded > 0, "damaged h264 videos still decode where they can");
+
+    // What the decoder does not do, it says.
+    h264_t d;
+    CHECK(h264_init(&d, malloc, 64), "decoder init");
+    static const uint8_t cabac_pps[] = { 0, 0, 1, 0x68, 0xE0, 0x80 };      // entropy_coding_mode_flag = 1
+    CHECK(!h264_decode(&d, cabac_pps, sizeof cabac_pps) && strstr(h264_error(&d), "CABAC"), "CABAC is refused by name");
+    static const uint8_t slice_only[] = { 0, 0, 1, 0x65, 0x88, 0x80, 0x40 };
+    CHECK(!h264_decode(&d, slice_only, sizeof slice_only) && h264_error(&d)[0], "a slice without parameter sets fails");
+    h264_free(&d, free);
+    free(out); free(frame20); free(again); free(bad.data); free(m.data);
+}
+
 int main(void) {
     test_swar();
     uint32_t sizes[][2] = {{1, 1}, {64, 64}, {65, 3}, {3, 130}, {130, 70}, {200, 129}};
@@ -343,6 +436,7 @@ int main(void) {
     test_video_motion(33, 17, 0);
     test_video_motion(48, 32, 51);
     test_motion_order();
+    test_h264();
     if (failures) {
         printf("media tests: %d failure(s)\n", failures);
         return 1;

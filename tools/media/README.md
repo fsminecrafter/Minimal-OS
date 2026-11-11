@@ -29,9 +29,10 @@ The pygame-ce dependency supplies cross-platform sound playback.
 - The status line shows format, dimensions, frame count/rate, and whether a
   video contains an embedded soundtrack.
 
-The player supports RGB/RGBA `.img`, `.vid` in both codecs (tiles and
-motion; motion decoding is slow in Python, about 50 ms a frame at
-200x112), PCM16 and IMA-ADPCM `.adi`,
+The player supports RGB/RGBA `.img`, `.vid` in all three codecs (tiles,
+motion and h264; motion decoding is slow in Python, about 50 ms a frame at
+200x112; h264 frames are decoded by ffmpeg, which must be in `PATH` for
+those files), PCM16 and IMA-ADPCM `.adi`,
 including `.adi` soundtracks embedded in `.vid`. Unsupported audio codecs
 are reported instead of being silently misplayed. Large media files and
 images have safety limits to avoid accidental excessive memory use.

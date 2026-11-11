@@ -10,9 +10,11 @@
  *         --key N      a keyframe every N frames (default 2 seconds)
  *         --no-audio   leave the sound out
  *         --fast       quicker, a little larger
- *         --codec C    motion (default: lossy, H.264-like, for camera footage)
- *                      or tiles (lossless, for screens and drawings)
- *         --q N        motion: quality, 0 (best) to 51, default 26
+ *         --codec C    motion (default: lossy, H.264-like, for camera footage),
+ *                      tiles (lossless, for screens and drawings) or
+ *                      h264 (H.264 Constrained Baseline, encoded by x264)
+ *         --q N        motion: quality, 0 (best) to 51, default 26;
+ *                      h264: x264's quality (crf), the same scale
  *         --loss N     tiles: colours may move up to N (0-255, default 0 =
  *                      lossless)
  *         --threads N  motion: encoder threads (default: one per CPU core)
@@ -375,6 +377,74 @@ static uint32_t* reader_next(reader_t* r, bool* taken) {
     return frame;
 }
 
+static const char* codec_name(uint32_t codec) {
+    return codec == MVID_CODEC_H264 ? "h264" : (codec == MVID_CODEC_MOTION ? "motion" : "tiles");
+}
+
+/* H.264: x264 (through ffmpeg) encodes Constrained Baseline, the profile
+ * mosmedia_h264.h decodes, with an access unit delimiter in front of
+ * every frame, parameter sets at every keyframe, and full-range BT.601
+ * colour like the motion codec. The stream is cut at the delimiters. */
+static uint32_t encode_h264(mvid_writer_t* v, const char* in, const char* out, uint32_t w, uint32_t h, uint32_t fn,
+                            uint32_t fd, uint32_t key, uint32_t q_value, bool fast, bool hwaccel, int threads) {
+    char cmd[8192];
+    snprintf(cmd, sizeof cmd,
+             "ffmpeg -v error %s-i %s -an -vf scale=%u:%u:out_range=full:out_color_matrix=bt601,fps=%u/%u "
+             "-c:v libx264 -profile:v baseline -preset %s -crf %u -threads %d -pix_fmt yuv420p -color_range pc "
+             "-colorspace smpte170m -x264-params aud=1:repeat-headers=1:keyint=%u:fullrange=on:colormatrix=smpte170m "
+             "-f h264 -",
+             hwaccel ? "-hwaccel auto " : "", q(in), w, h, fn, fd, fast ? "veryfast" : "medium", q_value, threads,
+             key);
+    FILE* p = popen(cmd, PIPE_READ);
+    if (!p) die("cannot start ffmpeg for", in);
+    size_t cap = 1u << 20, have = 0, start = 0, scan = 0;
+    uint8_t* buf = malloc(cap);
+    if (!buf) die("out of memory", NULL);
+    bool eof = false;
+    while (!eof || start < have) {
+        if (!eof) {
+            if (cap - have < (1u << 16)) {
+                /* Keep only what belongs to the frame being collected. */
+                memmove(buf, buf + start, have - start);
+                have -= start; scan -= start; start = 0;
+                if (cap - have < (1u << 16)) {
+                    cap *= 2;
+                    if (!(buf = realloc(buf, cap))) die("out of memory", NULL);
+                }
+            }
+            size_t got = fread(buf + have, 1, cap - have, p);
+            have += got;
+            if (!got) eof = true;
+        }
+        /* A frame ends where the next delimiter (NAL type 9) starts. */
+        for (;;) {
+            size_t end = 0;
+            if (scan < start + 4) scan = start + 4;
+            for (; scan + 4 <= have; scan++) {
+                if (buf[scan] == 0 && buf[scan + 1] == 0 && buf[scan + 2] == 1 && (buf[scan + 3] & 31) == 9) {
+                    end = scan;
+                    /* The delimiter's start code may have a leading zero byte. */
+                    if (end > start && buf[end - 1] == 0) end--;
+                    break;
+                }
+            }
+            if (!end && eof && have > start) end = have;
+            if (!end) break;
+            bool idr = false;
+            for (size_t i = start; i + 4 <= end; i++)
+                if (buf[i] == 0 && buf[i + 1] == 0 && buf[i + 2] == 1 && (buf[i + 3] & 31) == 5) idr = true;
+            if (!v->info.frame_count && !idr) die("the H.264 stream does not start with a keyframe", in);
+            if (!mvid_writer_h264_frame(v, buf + start, end - start, idr)) die("cannot write", out);
+            if (v->info.frame_count % 30 == 0) { fprintf(stderr, "\r%u frames", v->info.frame_count); fflush(stderr); }
+            start = end;
+            scan = end + 4;
+        }
+    }
+    free(buf);
+    if (pclose(p) != 0) die("ffmpeg could not encode H.264 (is libx264 built in?) from", in);
+    return v->info.frame_count;
+}
+
 static void cmd_vid(int argc, char** argv) {
     const char* in = argv[2];
     const char* out = argv[3];
@@ -395,7 +465,8 @@ static void cmd_vid(int argc, char** argv) {
             const char* c = argv[++i];
             if (!strcmp(c, "tiles")) codec = MVID_CODEC_TILES;
             else if (!strcmp(c, "motion")) codec = MVID_CODEC_MOTION;
-            else die("unknown codec (tiles or motion)", c);
+            else if (!strcmp(c, "h264")) codec = MVID_CODEC_H264;
+            else die("unknown codec (tiles, motion or h264)", c);
         }
         else die("unknown option", argv[i]);
     }
@@ -410,41 +481,46 @@ static void cmd_vid(int argc, char** argv) {
     if (!key) key = (uint32_t)((fn + fd - 1) / fd) * 2u;
     if (loss > 255) loss = 255;
     if (qp > 51) qp = 51;
-    if (codec == MVID_CODEC_MOTION) { w = (w + 1) & ~1u; h = (h + 1) & ~1u; }
+    if (codec != MVID_CODEC_TILES) { w = (w + 1) & ~1u; h = (h + 1) & ~1u; }
 
     char cmd[8192];
     if (threads < 1) threads = 1;
     if (threads > 256) threads = 256;
     snprintf(cmd, sizeof cmd, "ffmpeg -v error %s-i %s -vf scale=%u:%u,fps=%u/%u -f rawvideo -pix_fmt bgra -",
              hwaccel ? "-hwaccel auto " : "", q(in), w, h, fn, fd);
-    FILE* p = popen(cmd, PIPE_READ);
+    FILE* p = codec == MVID_CODEC_H264 ? NULL : popen(cmd, PIPE_READ);
     FILE* f = fopen(out, "w+b");
-    if (!p || !f) die("cannot start", out);
+    if ((!p && codec != MVID_CODEC_H264) || !f) die("cannot start", out);
     mvid_writer_t v;
     if (!mvid_writer_begin(&v, w, h, fn, fd, true, key, fast, file_write, f, malloc, free))
         die("video too large", in);
     v.loss = loss;
     v.codec = codec;
     v.qp = qp;
-    wavefront_t wf = {.threads = threads};
-    if (threads > 1) { v.parallel = wavefront_run; v.parallel_ctx = &wf; }
-    reader_t rd = {.pipe = p, .frame_bytes = (size_t)w * h * 4};
-    mutex_init(&rd.lock);
-    cond_init(&rd.changed);
-    for (int i = 0; i < READ_AHEAD; i++)
-        if (!(rd.slots[i] = malloc(rd.frame_bytes))) die("out of memory", NULL);
-    thread_t reader;
-    if (!thread_start(&reader, reader_thread, &rd)) die("cannot start a thread", NULL);
-    uint32_t* px;
-    bool taken = false;
-    while ((px = reader_next(&rd, &taken))) {
-        if (!mvid_writer_frame(&v, px, w)) die("cannot write", out);
-        if (v.info.frame_count % 30 == 0) { fprintf(stderr, "\r%u frames", v.info.frame_count); fflush(stderr); }
+    if (codec == MVID_CODEC_H264) {
+        /* x264 reads and scales the source itself. */
+        encode_h264(&v, in, out, w, h, fn, fd, key, qp, fast, hwaccel, threads);
+    } else {
+        wavefront_t wf = {.threads = threads};
+        if (threads > 1) { v.parallel = wavefront_run; v.parallel_ctx = &wf; }
+        reader_t rd = {.pipe = p, .frame_bytes = (size_t)w * h * 4};
+        mutex_init(&rd.lock);
+        cond_init(&rd.changed);
+        for (int i = 0; i < READ_AHEAD; i++)
+            if (!(rd.slots[i] = malloc(rd.frame_bytes))) die("out of memory", NULL);
+        thread_t reader;
+        if (!thread_start(&reader, reader_thread, &rd)) die("cannot start a thread", NULL);
+        uint32_t* px;
+        bool taken = false;
+        while ((px = reader_next(&rd, &taken))) {
+            if (!mvid_writer_frame(&v, px, w)) die("cannot write", out);
+            if (v.info.frame_count % 30 == 0) { fprintf(stderr, "\r%u frames", v.info.frame_count); fflush(stderr); }
+        }
+        thread_join(reader);
+        pclose(p);
+        for (int i = 0; i < READ_AHEAD; i++) free(rd.slots[i]);
+        free(wf.done);
     }
-    thread_join(reader);
-    pclose(p);
-    for (int i = 0; i < READ_AHEAD; i++) free(rd.slots[i]);
-    free(wf.done);
     if (!v.info.frame_count) die("no frames in", in);
     size_t adi_size = 0;
     uint8_t* adi = audio ? make_soundtrack(in, &adi_size) : NULL;
@@ -455,7 +531,7 @@ static void cmd_vid(int argc, char** argv) {
     fclose(f);
     fprintf(stderr, "\r");
     printf("%s: %ux%u %s, %u frames at %.2f fps, %s, %.1f MB (%.1f%% of raw)\n", out, w, h,
-           codec == MVID_CODEC_MOTION ? "motion" : "tiles", frames,
+           codec_name(codec), frames,
            (double)fn / fd, adi ? "with sound" : "no sound", (double)size / 1e6,
            100.0 * (double)size / ((double)w * h * 3 * frames));
     free(adi);
@@ -496,7 +572,7 @@ static void cmd_info(const char* in) {
         printf("%s: image %ux%u %s, %zu bytes\n", in, img.width, img.height, img.alpha ? "RGBA" : "RGB", size);
     } else if (size >= MVID_HEADER_SIZE && mvid_parse_header(d, size, &vid)) {
         printf("%s: video %ux%u %s, %u frames at %.2f fps (%u:%02u), keyframe every %u, %s\n", in, vid.width,
-               vid.height, vid.codec == MVID_CODEC_MOTION ? "motion" : "tiles", vid.frame_count, (double)vid.fps_num / vid.fps_den, vid.duration_ms / 60000,
+               vid.height, codec_name(vid.codec), vid.frame_count, (double)vid.fps_num / vid.fps_den, vid.duration_ms / 60000,
                vid.duration_ms / 1000 % 60, vid.keyframe_interval,
                vid.has_audio ? "with sound" : "no sound");
     } else {

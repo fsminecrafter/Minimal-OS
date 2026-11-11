@@ -574,7 +574,7 @@ ci-test:
 .PHONY: test-host
 test-host: build/tests/host/gfx_blit_tests build/tests/host/fgpu_raster_tests build/tests/host/fgsl_tests \
 		build/tests/host/fgpu_ir_tests build/tests/host/nv_hw_tests build/tests/host/nv_sass_tests \
-		build/tests/host/video_gpu_tests build/tests/host/hid_mouse_tests \
+		build/tests/host/video_gpu_tests build/tests/host/audio_stream_tests build/tests/host/hid_mouse_tests \
 		build/tests/host/media_tests build/tests/host/media_parallel_tests
 	./build/tests/host/gfx_blit_tests
 	./build/tests/host/fgpu_raster_tests
@@ -583,9 +583,14 @@ test-host: build/tests/host/gfx_blit_tests build/tests/host/fgpu_raster_tests bu
 	./build/tests/host/nv_hw_tests
 	./build/tests/host/nv_sass_tests
 	./build/tests/host/video_gpu_tests
+	./build/tests/host/audio_stream_tests
 	./build/tests/host/media_tests
 	./build/tests/host/media_parallel_tests
 	./build/tests/host/hid_mouse_tests
+
+build/tests/host/audio_stream_tests: tests/host/audio_stream_tests.c src/modules/Audio/audio_streams.c $(header_files)
+	mkdir -p $(dir $@)
+	$(HOSTCC) $(HOST_CFLAGS) $(filter %.c,$^) -o $@
 
 build/tests/host/hid_mouse_tests: tests/host/hid_mouse_tests.c src/modules/USB/hid_mouse.c src/intf/mouse/hid_mouse.h
 	mkdir -p $(dir $@)

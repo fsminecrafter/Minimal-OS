@@ -16,6 +16,7 @@ extern const audio_hw_driver_t* ac97_get_driver(void) __attribute__((weak));
 #include "graphics.h"
 #include "x86_64/exec_trace.h"
 #include "x86_64/global_audio_state.h"
+#include "x86_64/audio_streams.h"
 
 audio_state_t g_audio_state = {0};
 
@@ -179,7 +180,12 @@ static const uint8_t* audio_find_bytes(const uint8_t* haystack, uint32_t haystac
                                         * driver can decide not to queue a "valid" buffer that's
                                         * actually silence, without ever looking at audio_player_t
                                         * itself - only audio.c is allowed to know that struct. */
+                                       static bool audio_player_has_data(void);
                                        static bool audio_has_data_ready(void) {
+                                           return audio_player_has_data() || audio_streams_have_data();
+                                       }
+
+                                       static bool audio_player_has_data(void) {
                                            audio_player_t* player = g_audio_state.player;
                                            if (!player || !g_audio_state.playing || !player->playing) return false;
 
@@ -221,7 +227,7 @@ static const uint8_t* audio_find_bytes(const uint8_t* haystack, uint32_t haystac
                                         * Called by the AC97 driver to fill one hardware DMA buffer.
                                         * Drains decoded PCM from the player's ring buffer.
                                         * ============================================================ */
-                                       void audio_mix_streams(int16_t* out, uint32_t frames) {
+                                       static void audio_mix_player(int16_t* out, uint32_t frames) {
                                            if (!out || frames == 0) return;
 
                                            uint32_t out_samples = frames * AUDIO_CHANNELS;
@@ -325,6 +331,43 @@ static const uint8_t* audio_find_bytes(const uint8_t* haystack, uint32_t haystac
                                        }
 
                                        /* ============================================================
+ * The mix: the file player, then the programs' streams on top
+ * (SYS_AUDIO_STREAM, audio_streams.c), at the rate the sound card was
+ * last set to.
+ * ============================================================ */
+
+static volatile uint32_t g_mix_rate = 48000;    /* what both drivers start at */
+static volatile bool g_hw_started;
+
+uint32_t audio_mix_rate(void) { return g_mix_rate; }
+
+static void audio_set_rate(uint32_t rate) {
+    g_mix_rate = rate;
+    audio_manager_set_sample_rate(rate);
+}
+
+static void audio_start_hw(void) {
+    g_hw_started = true;
+    audio_manager_start();
+}
+
+/* A stream got its first frames: the sound card has to be running for
+ * them, which it is not if no file has played since boot. */
+bool audio_have_device(void) { return audio_manager_driver_name() != NULL; }
+
+void audio_ensure_running(void) {
+    if (g_hw_started || !audio_manager_driver_name()) return;
+    audio_set_rate(g_mix_rate);
+    audio_start_hw();
+}
+
+void audio_mix_streams(int16_t* out, uint32_t frames) {
+    if (!out || frames == 0) return;
+    audio_mix_player(out, frames);
+    audio_streams_mix(out, frames, g_mix_rate);
+}
+
+/* ============================================================
                                         * String utilities
                                         * ============================================================ */
 
@@ -940,7 +983,7 @@ static bool decode_ima_adpcm_mono(const uint8_t* input, uint32_t input_size,
 
                                                                                                                 /* Set sample rate BEFORE priming buffers */
                                                                                                                 if (player->stream->adi_header.sample_rate != 0) {
-                                                                                                                    audio_manager_set_sample_rate(player->stream->adi_header.sample_rate);
+                                                                                                                    audio_set_rate(player->stream->adi_header.sample_rate);
                                                                                                                 }
 
                                                                                                                 /*
@@ -985,7 +1028,7 @@ static bool decode_ima_adpcm_mono(const uint8_t* input, uint32_t input_size,
                                                                                                                 player->playing        = true;
 
                                                                                                                 /* Start DMA — primes all AC97 HW buffers from the player's ring */
-                                                                                                                audio_manager_start();
+                                                                                                                audio_start_hw();
 
                                                                                                                 serial_write_str("[PLAYER] Playback started\n");
                                                                                                             }
@@ -1214,7 +1257,7 @@ uint64_t audio_ctl_resume(void) {
         /* Keep the decoded audio that was waiting when we paused. */
         p->playing = true;
         g_audio_state.playing = true;
-        audio_manager_start();
+        audio_start_hw();
     } else {
         audio_player_play(p);
     }

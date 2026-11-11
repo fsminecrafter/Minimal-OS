@@ -61,6 +61,7 @@ int main(void) {
 | `SYSCALL_WINDOW_MAXIMIZED` | Fills the desktop area |
 | `SYSCALL_WINDOW_MINIMIZED` | Hidden in the taskbar |
 | `SYSCALL_WINDOW_FOCUSED` | Has keyboard focus. Read-only for applications: only mosWM sets it |
+| `SYSCALL_WINDOW_POINTER_LOCK` | Wants the mouse to itself (games): see `mos_window_set_pointer_lock` |
 
 ## `mos_window_create`
 
@@ -163,7 +164,7 @@ queue is empty, `SYS_ERR_NOTFOUND` / `SYS_ERR_PERM` for a bad window.
 | --- | --- |
 | `id` | Window the event is for |
 | `type` | One of the event types below |
-| `x`, `y` | Pointer position in window coordinates (mouse events) |
+| `x`, `y` | Pointer position in window coordinates (mouse events); how far the mouse moved (`MOUSE_RELATIVE`) |
 | `width`, `height` | New content size (`RESIZED`) |
 | `key` | USB HID usage code (`KEY`) |
 | `buttons` | `KEY`: 1 = pressed, 0 = released. `MOUSE`: button mask, bit 0 left, bit 1 right, bit 2 middle |
@@ -185,6 +186,7 @@ Event types:
 | `SYSCALL_WINDOW_EVENT_KEY` | A key was pressed or released while it had focus |
 | `SYSCALL_WINDOW_EVENT_MOUSE` | The pointer moved over it, or a button changed |
 | `SYSCALL_WINDOW_EVENT_MOUSE_WHEEL` | The wheel turned over it |
+| `SYSCALL_WINDOW_EVENT_MOUSE_RELATIVE` | The mouse moved while the window holds pointer lock: `x`, `y` are the motion, `buttons` the button mask |
 
 **Notes**
 
@@ -333,6 +335,28 @@ uint64_t mos_window_set_resizable(uint32_t id, bool resizable);
 ```
 
 Sets or clears `SYSCALL_WINDOW_RESIZABLE`.
+
+## `mos_window_set_pointer_lock`
+
+```c
+uint64_t mos_window_set_pointer_lock(uint32_t id, bool locked);
+```
+
+Sets or clears `SYSCALL_WINDOW_POINTER_LOCK`, for games that steer with
+the mouse. While the window has the flag, is focused, visible and not
+minimised (and no menu, dialog or the lock screen is open), mosWM hides
+the cursor, stops it at the window, and sends every move as
+`SYSCALL_WINDOW_EVENT_MOUSE_RELATIVE` with the distance moved instead of a
+position. Buttons and the wheel still come as `MOUSE` and `MOUSE_WHEEL`.
+Moves made while the queue is full are added up and sent with the next
+event, so no motion is lost.
+
+The lock ends by itself when the window loses focus and comes back when it
+is focused again. Clear the flag when the mouse is needed as a pointer
+again (a menu, a paused game). Doom (`programs/doom`) locks while a level
+is played.
+
+**Returns** the result of `mos_window_set_flags`.
 
 ## `mos_window_set_visible`
 

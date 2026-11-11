@@ -260,6 +260,24 @@ static void storage_install_firmware(uint8_t drive_number, storage_progress_fn p
     }
 }
 
+// Games: an ISO made with 'make mosdesk-doom' carries a "mosgames" boot
+// module (an .mpkg holding Doom.run and its Doom/ data folder), unpacked
+// into N:/programs next to the other programs. Like the firmware it is
+// optional and a failure is not fatal.
+static void storage_install_games(uint8_t drive_number, storage_progress_fn progress) {
+    memlayout_module_t m;
+    if (!kernel_multiboot_info ||
+        !memlayout_find_module(kernel_multiboot_info, "mosgames", &m)) return;
+    if (m.end <= m.start || m.end - m.start > 0xFFFFFFFFull) return;
+    char dir[16];
+    snprintf(dir, sizeof(dir), "%u:/programs", (unsigned)drive_number);
+    setup_say(progress, 92, "Installing games");
+    if (!format_install_package((const uint8_t*)(uintptr_t)m.start,
+                                (uint32_t)(m.end - m.start), dir)) {
+        serial_write_str("setup: games could not be installed\n");
+    }
+}
+
 bool storage_populate_system(uint8_t drive_number, storage_progress_fn progress) {
     minimafs_drive_t* drive = get_drive(drive_number);
     if (!drive || !drive->mounted) return false;
@@ -311,6 +329,7 @@ bool storage_populate_system(uint8_t drive_number, storage_progress_fn progress)
         return false;
     }
     storage_install_firmware(drive_number, progress);
+    storage_install_games(drive_number, progress);
     minimafs_refresh_storage_desc(drive);
     return true;
 }

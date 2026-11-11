@@ -30,6 +30,9 @@ src/resources/install2/DeliverManager.run
 # NVIDIA firmware set up by tools/gpu/setup-gpu.sh (NVIDIA licence, not ours to commit)
 /firmware/
 
+# Doom (make mosdesk-doom): the games boot module
+targets/x86_64/iso/boot/mosgames.mpkg
+
 # Built by make into the install packages (programs/dlr, libraries/minimaSSL)
 src/resources/install1/minimaSSL.slib
 src/resources/install2/dlr.run

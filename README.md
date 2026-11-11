@@ -288,6 +288,13 @@ boot the desktop-enabled image, run:
 make run-mosdesk
 ```
 
+With Doom (1993) on the desktop - the original engine on FarcadeGL, with the
+free Freedoom levels, or your own `DOOM_WAD=/path/to/DOOM.WAD`:
+
+```sh
+make run-mosdesk-doom
+```
+
 This uses the same cross-compiler and `sata256.img` prerequisites above. The
 desktop files and mosWM startup service are installed when `format` is run in
 Minimal-OS; formatting erases the selected disk, so back up an existing disk

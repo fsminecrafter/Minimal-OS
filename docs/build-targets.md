@@ -16,6 +16,8 @@ NASM, Python 3, GRUB utilities, and xorriso.
 | `make run` | Build the ISO, create the install target image if needed, and boot the ISO in QEMU |
 | `make mosdesk` | Build the ISO with MOSdesk included |
 | `make run-mosdesk` | Build and run the MOSdesk ISO in QEMU |
+| `make mosdesk-doom` | Build the MOSdesk ISO with Doom (1993) included |
+| `make run-mosdesk-doom` | Build and run the MOSdesk ISO with Doom in QEMU |
 | `make netboot` | Serve the built ISO for PXE boot on the LAN; requires elevated network setup |
 | `make run-installed` | Boot `INSTALL_DISK` as a BIOS-installed system |
 | `make run-installed-uefi` | Boot `INSTALL_DISK` with OVMF UEFI firmware |
@@ -75,6 +77,17 @@ it. The targets build MOSdesk programs against this checkout's SDK. The
 `MOSDESK_DIR` variable can point to another MOSdesk checkout, and
 `MOSDESK_USE_LOCAL=1` tells the build to use already checked-out submodule
 contents without fetching pinned revisions.
+
+`make mosdesk-doom` builds the same desktop ISO with Doom on it: id
+Software's GPL Doom engine, ported in `Minimal-OS-SDK/programs/doom` (its
+README has the controls and details), drawing through FarcadeGL. The game
+data is Freedoom: Phase 1, which the build downloads once and checks against
+its SHA-256; `make mosdesk-doom DOOM_WAD=/path/to/DOOM.WAD` uses your own copy
+of Doom instead (id's WADs are not free to redistribute, so none is bundled).
+Doom and its data go on the ISO as the `mosgames` boot module, which setup
+(`format`, `install`, RamFS) unpacks into `0:/programs`; the launcher then
+lists Doom. RamFS boots get a larger RAM disk when the module is there. A
+plain `make mosdesk` afterwards leaves Doom out again.
 
 NVIDIA firmware is an optional build input. `make gpu-setup` downloads firmware
 for the default supported card; choose another supported model with, for

@@ -132,6 +132,17 @@ void nv_gpfifo_entry(uint64_t gpu_va, uint32_t words, uint32_t out[2]);
 #define NV_3D_RT_CONTROL            0x121Cu                     // count | map << 4
 #define NV_3D_CLEAR_COLOR(i)        (0x0D80u + (i) * 4u)        // r, g, b, a floats (clc597.h)
 #define NV_3D_CLEAR_BUFFERS         0x19D0u
+#define NV_3D_WAIT_FOR_IDLE         0x0110u
+#define NV_3D_WINDOW_OFFSET_X       0x0DF8u
+#define NV_3D_SCISSOR_ENABLE(i)     (0x0E00u + (i) * 16u)
+#define NV_3D_SINGLE_CT_WRITE_CONTROL 0x0F90u
+#define NV_3D_CT_MRT_ENABLE         0x0FACu
+#define NV_3D_CLEAR_SURFACE_CONTROL 0x10F8u
+#define NV_3D_ZT_SELECT             0x1538u
+#define NV_3D_RENDER_ENABLE_C       0x1558u
+#define NV_3D_ANTI_ALIAS            0x15D0u
+#define NV_3D_COLOR_COMPRESSION(i)  (0x19E0u + (i) * 4u)
+#define NV_3D_CT_WRITE(i)           (0x1A00u + (i) * 4u)
 #define   NV_3D_CLEAR_BUFFERS_RGBA  0x3Cu                       // | rt << 6
 #define NV_RT_FORMAT_BGRA8_UNORM    0xCFu
 #define NV_RT_FORMAT_BGRX8_UNORM    0xE6u

@@ -1253,11 +1253,15 @@ static void syscall_dispatch_inner(syscall_regs_t* regs) {
                 break;
             }
             regs->rax = minimafs_write(handle, buf, (uint32_t)len);
-            serial_write_str("SYS_FWRITE: requested=");
-            serial_write_dec((uint32_t)len);
-            serial_write_str(" wrote=");
-            serial_write_dec((uint32_t)regs->rax);
-            serial_write_str("\n");
+            // Logged only when short: a line per write made every small
+            // write cost a few ms of serial output.
+            if (regs->rax != len) {
+                serial_write_str("SYS_FWRITE: requested=");
+                serial_write_dec((uint32_t)len);
+                serial_write_str(" wrote=");
+                serial_write_dec((uint32_t)regs->rax);
+                serial_write_str("\n");
+            }
             break;
         }
 

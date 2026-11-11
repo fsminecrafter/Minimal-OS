@@ -38,10 +38,15 @@ static void test_push(void) {
     CHECK(words[0] == 0x20010000u && words[1] == NV_CLASS_TURING_A, "binds TURING_A");
     CHECK(words[2] == nv_push_header(1, 0, 0x800, 8) && words[3] == 0x1 && words[4] == 0x23456000u,
           "render target address");
-    CHECK(words[p.count - 2] == nv_push_header(1, 0, NV_3D_CLEAR_BUFFERS, 1), "ends with CLEAR_BUFFERS");
+    CHECK(words[p.count - 4] == nv_push_header(1, 0, NV_3D_CLEAR_BUFFERS, 1), "CLEAR_BUFFERS");
+    CHECK(words[p.count - 2] == nv_push_header(1, 0, NV_3D_WAIT_FOR_IDLE, 1), "then WAIT_FOR_IDLE");
     float r;
-    memcpy(&r, &words[p.count - 6], 4);
+    memcpy(&r, &words[p.count - 8], 4);
     CHECK(r == 1.0f, "clear red = 1.0");
+    bool mask = false;
+    for (uint32_t i = 0; i + 1 < p.count; i++)
+        if (words[i] == nv_push_header(1, 0, NV_3D_CT_WRITE(0), 1) && words[i + 1] == 0x1111u) mask = true;
+    CHECK(mask, "sets the colour write mask");
 
     nv_push_init(&p, words, 3);
     uint32_t data[4] = { 1, 2, 3, 4 };

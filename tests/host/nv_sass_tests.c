@@ -379,7 +379,7 @@ static void test_pushbuffers(void) {
           find_method(&p, 0x19D0, 0) == 0x3D, "clear of color and depth");
 
     uint32_t th[8];
-    nv3d_texture_header(th, 0x80500000ull, 1024, 256, 128);
+    nv3d_texture_header(th, 0x80500000ull, 1024, 256, 128, false);
     CHECK((th[0] & 0x7F) == 0x08 && ((th[2] >> 21) & 7) == 2 && (th[1] >> 5) == (0x80500000u >> 5) &&
           (th[3] & 0xFFFF) == 1024 / 32 && (th[4] & 0xFFFF) == 255 && (th[5] & 0xFFFF) == 127 &&
           ((th[4] >> 23) & 0xF) == 7 && (th[5] >> 31) == 1, "pitch-linear texture header");

@@ -36,18 +36,22 @@ Examples: `programs/fglcube` (shipped as `0:/programs/fglcube.run`; run
 
 ## How it runs
 
-The kernel executes command buffers through its FGPU command processor.
-Today its backend runs on the CPU: vertex stage, clipping, perspective-
-correct rasterization, depth test, fragment stage, blending. Shaders are
-compiled in your program to FGPU bytecode, checked by the kernel when you
-create them, and run per vertex and per pixel by the kernel's shader
-machine. Surfaces and buffers are placed in the graphics card's video
-memory when the GPU driver can hand some out (`gpu` in the terminal shows
-the VRAM heap).
+The kernel executes command buffers through its FGPU command processor,
+on one of two backends:
 
-Programs do not depend on the backend: when a GPU driver can execute FGPU
-work on the card itself (see `docs/gpu.md` in Minimal-OS for the plan for
-NVIDIA cards), the same programs and the same shader bytecode run there.
+- **The graphics card** (NVIDIA RTX 20 / GTX 16, after `gpu nvidia boot`
+  passed its draw test): shaders are translated to the card's machine
+  code when you create them, and clears and draws run on its 3D engine.
+  Surfaces, textures and buffers live in video memory.
+  This path is new and has not been confirmed on a card yet; see
+  `docs/gpu.md` in Minimal-OS.
+- **The CPU** (everything else, and the fallback): vertex stage, clipping,
+  perspective-correct rasterization, depth test, fragment stage and
+  blending in software, on every core.
+
+Programs do not choose: the same calls and the same shader bytecode run on
+both. A shader the card's compiler does not take yet (one that reads
+`gl_FrontFacing`) is drawn by the CPU.
 
 The kernel reports the active adapter and available caps through
 `fglGetDeviceInfo()`. If you want to auto-detect the 3D path in user code,

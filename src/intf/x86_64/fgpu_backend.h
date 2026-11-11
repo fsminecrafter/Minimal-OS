@@ -71,6 +71,12 @@ typedef struct {
                  void* dst, uint32_t dst_pitch);
     // Optional. A surface is going away: drop what the backend keeps for it.
     void (*surface_destroy)(const fgpu_mem_t* mem);
+    // Optional. The motion video codec's last stage on the GPU: 4:2:0
+    // YCbCr planes (rows of w and cw bytes) to width x height 0xFFRRGGBB
+    // pixels (rows of `width`), exactly as the CPU decoder converts them.
+    // False = not now; the caller converts on the CPU.
+    bool (*video_convert)(const uint8_t* y, const uint8_t* cb, const uint8_t* cr, uint32_t w, uint32_t h,
+                          uint32_t cw, uint32_t ch, uint32_t* out, uint32_t width, uint32_t height);
 } fgpu_backend_t;
 
 // NVIDIA Turing (fgpu_backend_nv.c). init() fails until GSP-RM and the

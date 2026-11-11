@@ -176,17 +176,21 @@ Everything below builds into the kernel and changes nothing until the
 hardware backend's `init()` succeeds; until then all work runs on the CPU
 as before.
 
-The current RTX 2060 backend can accelerate copy-engine clears, but its
-3D draw path is not implemented. `hw-3d` is reported only when a backend
-actually provides hardware draws; successful GSP-RM or copy-engine
-bring-up alone does not mean FarcadeGL triangles run on the GPU.
+FGPU draws - and so FarcadeGL - go to the card's 3D engine once the
+backend's own test passes (step 4b below): `gpu` then shows `hw-3d` and
+the backend `nvidia 3D engine`. Until then clears use the copy engine and
+draws the CPU, as before. Steps 4a and 4b are written from NVIDIA's
+published class headers and Mesa's NVK/NAK and checked on the build PC,
+but **have not run on a card yet**; the test and its log lines exist to
+find out what the hardware disagrees with.
 
 | Piece | Where | State |
 | --- | --- | --- |
 | Backend interface: FGPU offers every clear and draw to a hardware backend first and falls back to the CPU per command; GPU work is finished before the CPU touches a surface or buffer | `fgpu_backend.h`, `fgpu.c` | done |
-| NVIDIA backend: chosen at boot for NVIDIA adapters; compiles every shader program to the IR below; declines `init()` with the reason | `fgpu_backend_nv.c` | stub |
+| NVIDIA backend: shader programs compiled to machine code and uploaded, built-in programs from FGSL, a GPU depth buffer per depth surface, clears and draws as 3D jobs, a draw self-test | `fgpu_backend_nv.c` | written, not yet run on a card |
 | Shader compiler, first half: FGPU bytecode → scalar SSA IR (one op per hardware instruction), if-conversion of jumps, constant folding, CSE, dead code removal, linear-scan register allocation, SASS-style listing | `fgpu_ir.h`, `fgpu_ir.c` | done, tested |
-| Shader compiler, second half: IR → encoded Turing SASS (128-bit instructions with scheduling bits) | | to do |
+| Shader compiler, second half: IR → encoded Turing SASS (128-bit instructions with scheduling bits) and the shader program header | `nv_sass.h`, `nv_sass.c` | done; tested against the CPU shader machine with a simulator, not yet on a card |
+| 3D pushbuffers: color and depth targets, viewport, depth/cull/blend state, vertex streams and attributes, shader stages, constant buffer, texture headers and samplers, draw | `nv_3d.h`, `nv_3d.c` | done, tested on the build PC, not yet on a card |
 | Firmware: list of files per chip, parsers for NVIDIA's `.bin` containers and the GSP-RM ELF image | `nv_hw.h`, `nv_fw.c` | done, tested |
 | Falcons: read state; IMEM/DMEM upload, start, wait | `nv_falcon.c` | reading used, the rest ready for GSP boot |
 | Pushbuffers: method headers, GPFIFO entries, a ready-made `TURING_A` clear | `nv_fw.c` | done, tested (method offsets unverified on hardware) |
@@ -197,7 +201,8 @@ bring-up alone does not mean FarcadeGL triangles run on the GPU.
 | RM RPC: client, device, subdevice, VA space; FIFO device info; channel on a copy engine (TURING_CHANNEL_GPFIFO_A + TURING_DMA_COPY_A) | `nv_rm_chan.c`, `nv_rm.h` | works on an RTX 2060 (channel 0 on CE2) |
 | GPU page tables (GMMU v2, in VRAM, written through BAR1): sysmem GPFIFO/pushbuffer/semaphore, all of the BAR1 window's VRAM 1:1 in 2 MiB pages; GSP-RM gets the top three levels (COPY_SERVER_RESERVED_PDES) | `nv_rm_chan.c` | works on an RTX 2060 |
 | Copy engine fills: test pattern on screen, FGPU clears of VRAM surfaces | `nv_push_ce_fill`, `nv_rm_ce_fill`, `fgpu_backend_nv.c` | works on an RTX 2060 (test squares read back right) |
-| 3D class (TURING_A): needs GR context buffers and the golden context from the driver side | | to do |
+| 3D class (TURING_A): graphics context buffers, golden context, 3D channel, first clear | `nv_rm_chan.c` | written, not yet run on a card |
+| Readback: the copy engine copies VRAM to staging memory in system RAM (16 MiB, mapped once), so presenting a frame never reads through BAR1 | `nv_rm_ce_read` | written, not yet run on a card |
 
 `gpu nvidia` prints the bring-up state. It only reads registers, so it is
 safe on any card: which firmware files are present and well-formed, and
@@ -323,5 +328,66 @@ evaluator) and the CPU shader machine, and checks that they agree.
    before each job, and says so (`BAR1: ... back to physical`).
    Second run: the first job and the four test squares read back right,
    and FGPU switched its VRAM clears to the copy engine.
-4. Encode the IR as SASS (Mesa's NAK, `src/nouveau/compiler/nak/sm70.rs`,
-   has the Volta/Turing encodings), then draws.
+4. `gpu nvidia boot` goes on by itself. **Step 4a** (3D channel) prints
+   `golden context recorded`, the channel, and `first 3D clear: reads
+   back 0xffff8000 (ok)`. **Step 4b** compiles the built-in shader, then
+   clears a 64x64 surface and draws two triangles with depth test and
+   back-face culling, and prints three pixels:
+
+   ```text
+   Step 4b: FarcadeGL draws on the 3D engine
+     shaders: vertex and pixel stage compiled (19 + 13 registers)
+     clockwise front: centre 0xff4080bf, left 0xffff0000, corner 0xff102030
+     ok: triangles, shaders, depth test and culling work on the 3D engine.
+   ```
+
+   The centre is inside both triangles (the near, blue-ish one must win),
+   `left` only inside the far red one, `corner` in neither. If the first
+   try shows only the clear color, the test repeats with the other
+   winding as "front" and keeps what works. What other results mean:
+
+   | Result | Look at |
+   | --- | --- |
+   | `the test draw did not finish`, with `channel error (RC)` or `GPU page fault` above it | a method or address the engine rejects: `nv3d_push_init` / `nv3d_push_draw` in `nv_3d.c` (the error names the method offset) |
+   | all three pixels are the clear color with both windings | nothing was rasterized: vertex stream/attribute setup, the vertex stage's code or header (`nv_sass.c`), or the viewport |
+   | centre and left have a color, but the wrong one | the pixel stage: interpolation (`IPA`), the output registers, or the constant buffer |
+   | centre is red | the depth buffer: block-linear layout or depth state |
+
+   After `ok`, FGPU puts new color surfaces, textures and buffers in VRAM
+   and sends clears and draws to the 3D engine. `gpu nvidia` shows how
+   many ran. A job that does not finish later switches the 3D path off
+   and rendering continues on the CPU.
+
+#### How a draw runs on the card
+
+- **Shaders.** `nv_sass.c` turns each IR operation into one to three
+  instructions (immediates and operands with modifiers the instruction
+  cannot take go through scratch registers), in "serial" scheduling:
+  every instruction waits for the one before it, which is slow for a GPU
+  and always right. Uniforms are constant buffer 0, loaded with every
+  draw; texture handles sit behind them. The vertex stage writes every
+  varying and the pixel stage's header lists every varying as read, so
+  the two always agree. Not encoded yet: front-facing (`gl_FrontFacing`);
+  such a program stays on the CPU.
+- **Built-in programs** (color, Gouraud, Phong) are FGSL source in
+  `nv_builtin_fgsl.h`, compiled in the kernel with the SDK's `fglsl.h`
+  the first time they are drawn.
+- **Memory.** Color targets are pitch-linear in VRAM, pitch a multiple of
+  128 bytes (FGPU pads surfaces to 32 pixels when draws run on the card).
+  Depth is a block-linear ZF32 buffer of the backend's own per depth
+  surface, because the hardware has no pitch-linear depth. The CPU depth
+  buffer only follows the clears, so a frame that mixes GPU draws with a
+  draw that must fall back to the CPU (a refused shader, memory outside
+  VRAM, a full-screen page-flip surface whose pitch does not fit) does
+  not depth-test between the two.
+- **One job per clear or draw**, submitted and waited for. Batching a
+  frame into one job is the obvious next speed-up.
+- **Reading back.** `fglPresent` into a window and `fglReadPixels` copy
+  the frame out of VRAM with the copy engine (`nv_rm_ce_read`).
+
+`make test-host` runs `tests/host/nv_sass_tests.c`: it decodes the
+machine code with a small simulator and compares every output with the
+CPU shader machine on random inputs (built-in programs, textures with
+`discard`, math and branches), and checks the pushbuffers word by word.
+That proves the encoder against the IR; only a card can prove the
+encodings themselves.

@@ -36,19 +36,27 @@ void nv3d_zeta_size(uint32_t width, uint32_t height, nv3d_zeta_t* z) {
 }
 
 void nv3d_texture_header(uint32_t out[8], uint64_t va, uint32_t pitch_bytes, uint32_t width,
-                         uint32_t height) {
+                         uint32_t height, bool r8) {
     for (int i = 0; i < 8; i++) out[i] = 0;
-    // 0xAARRGGBB words are bytes B, G, R, A: the hardware's A8B8G8R8
-    // with red and blue swapped.
-    bits(out, 0, 7, 0x08);                  // A8B8G8R8
-    bits(out, 7, 10, 2);                    // r, g, b, a: unsigned normalized
-    bits(out, 10, 13, 2);
-    bits(out, 13, 16, 2);
-    bits(out, 16, 19, 2);
-    bits(out, 19, 22, 4);                   // x = B
-    bits(out, 22, 25, 3);                   // y = G
-    bits(out, 25, 28, 2);                   // z = R
-    bits(out, 28, 31, 5);                   // w = A
+    if (r8) {
+        // One byte per texel (a video plane): x = the byte, y = z = 0, w = 1.
+        bits(out, 0, 7, 0x1D);              // R8
+        bits(out, 7, 10, 2);                // unsigned normalized
+        bits(out, 19, 22, 2);               // x = R
+        bits(out, 28, 31, 7);               // w = 1.0
+    } else {
+        // 0xAARRGGBB words are bytes B, G, R, A: the hardware's A8B8G8R8
+        // with red and blue swapped.
+        bits(out, 0, 7, 0x08);              // A8B8G8R8
+        bits(out, 7, 10, 2);                // r, g, b, a: unsigned normalized
+        bits(out, 10, 13, 2);
+        bits(out, 13, 16, 2);
+        bits(out, 16, 19, 2);
+        bits(out, 19, 22, 4);               // x = B
+        bits(out, 22, 25, 3);               // y = G
+        bits(out, 25, 28, 2);               // z = R
+        bits(out, 28, 31, 5);               // w = A
+    }
     bits(out, 37, 64, (uint32_t)(va >> 5) & 0x7FFFFFFu);
     bits(out, 64, 80, (uint32_t)(va >> 32) & 0xFFFFu);
     bits(out, 85, 88, 2);                   // pitch-linear header

@@ -326,16 +326,42 @@ files, which must fail cleanly.
 
 ## Hardware decoding
 
-`.vid` uses custom codecs, so NVIDIA's NVDEC cannot decode these files
-directly. The tiles codec is decoded in parallel on the OS's CPU cores:
-each changed tile is independent, and the kernel runs the tile jobs on its
-SMP workers. If the kernel cannot use that path (for example, on an older
-kernel or for frames larger than its bounded work buffers), the SDK uses
-the same CPU decoder in the calling process. This is CPU acceleration, not
-GPU video decoding.
+What runs where:
 
-The motion codec still decodes sequentially: its range coder carries state
-across macroblocks. Its decoder has no motion search, so decoding remains
-cheap; the encoder does the hard work. GPU video-engine support for a
-standard codec would require the unfinished GSP boot described in
-`docs/gpu.md`, as well as a compatible bitstream.
+| Step | tiles | motion |
+| --- | --- | --- |
+| Entropy decoding, prediction, transform, deblocking | CPU, changed tiles in parallel on the kernel's SMP workers | CPU, one core |
+| Colour conversion (4:2:0 YCbCr to RGB) | - | **GPU** when FarcadeGL runs on the card (`hw-3d`), else CPU |
+
+`.vid` uses its own codecs, so the card's fixed-function video decoder
+(NVDEC), which only knows H.264, HEVC, VP9 and AV1 bitstreams, cannot read
+it. What a GPU can take over is what a 3D engine is good at: the same
+small computation for every pixel.
+
+**Motion codec, on the GPU.** The decoder's result is three planes (Y,
+Cb, Cr). `mvid_decode` hands them to the kernel
+(`SYS_MEDIA_CONVERT_YCBCR`); the NVIDIA backend uploads them as
+one-byte textures, draws one triangle with a shader that upsamples the
+colour planes and converts to RGB, and copies the picture back with the
+copy engine. The shader does `mmc_to_argb`'s arithmetic on whole numbers,
+so the pixels are exactly the CPU's (`tests/host/video_gpu_tests.c` runs
+the same shader bytecode on the CPU rasterizer and compares every pixel).
+Without `hw-3d` the call answers "not now" once and the file is converted
+on the CPU as before. Every player gets this without changes: the Video
+app, Mxplorer, anything using `mvid_decode`. `gpu nvidia` counts the
+frames converted on the GPU. Like the 3D path it rides on, this has not
+run on a card yet.
+
+**Why not more of the motion codec.** The range coder carries its state
+from one macroblock to the next, intra prediction reads the pixels of the
+blocks before it, and the deblocking filter's output is the next frame's
+reference, bit for bit. Those steps are sequential by design; a
+rasterizer cannot run them, and hardware decoders do them in dedicated
+circuits for the standard codecs only. Decoding has no motion search, so
+this part is cheap.
+
+**Tiles codec.** Each changed tile is independent, so the kernel decodes
+the tiles of a frame in parallel on its CPU cores
+(`SYS_MEDIA_DECODE_TILES`). A tile itself is a byte-by-byte code (runs,
+an index of recent values), which a GPU cannot split up; this stays CPU
+work.

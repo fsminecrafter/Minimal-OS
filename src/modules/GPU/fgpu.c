@@ -105,6 +105,13 @@ const fgpu_backend_t* fgpu_hw_backend(const char** why) {
     return g_hw;
 }
 
+// The motion video codec's colour conversion on the GPU (SYS_MEDIA).
+bool fgpu_video_convert(const uint8_t* y, const uint8_t* cb, const uint8_t* cr, uint32_t w, uint32_t h,
+                        uint32_t cw, uint32_t ch, uint32_t* out, uint32_t width, uint32_t height) {
+    const fgpu_backend_t* hw = g_hw;
+    return hw && hw->video_convert && hw->video_convert(y, cb, cr, w, h, cw, ch, out, width, height);
+}
+
 // Waits for queued GPU work before the CPU reads or writes GPU memory.
 static void hw_sync(void) {
     if (g_hw && g_hw_pending) g_hw->finish();

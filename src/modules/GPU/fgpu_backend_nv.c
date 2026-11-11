@@ -80,7 +80,7 @@ static struct {
 #define POOL_TIC   0u
 #define POOL_TSC   (NV3D_POOL_ENTRIES * 32u)
 #define POOL_CB    4096u
-#define POOL_ZERO  8192u
+#define POOL_ZERO  8192u            // 4096..8191: two constant buffers (draws, video)
 #define POOL_BYTES 12288u
 
 static void vram_write(uint64_t offset, const void* data, uint32_t bytes) {
@@ -362,7 +362,7 @@ static bool nv_draw(const fgpu_hw_draw_t* d, uint32_t* triangles) {
             mem->cpu == d->target->color.cpu)       // sampling the target it draws to
             return false;
         uint32_t words[8];
-        nv3d_texture_header(words, nv_rm_vram_va(mem->vram_offset), pitch, tex->width, tex->height);
+        nv3d_texture_header(words, nv_rm_vram_va(mem->vram_offset), pitch, tex->width, tex->height, false);
         vram_write(g.pools + POOL_TIC + (u + 1u) * 32u, words, 32);
         nv3d_sampler(words, tex->flags);
         vram_write(g.pools + POOL_TSC + (u + 1u) * 32u, words, 32);
@@ -406,6 +406,148 @@ static bool nv_draw(const fgpu_hw_draw_t* d, uint32_t* triangles) {
 }
 
 static void nv_finish(void) {}
+
+/* ---------------------------------------------------------------- video */
+
+/* The motion codec's colour conversion as a draw: the three planes become
+ * one-byte textures, a shader (NV_VIDEO_FS) does mmc_to_argb's arithmetic
+ * per pixel, and the copy engine brings the picture back to system
+ * memory. Entropy decoding, prediction and deblocking stay on the CPU:
+ * they are sequential by design (docs/media.md). */
+
+#define TEX_FIRST_VIDEO 5u          // texture header / sampler entries 5, 6, 7
+#define POOL_CB_VIDEO   (POOL_CB + NV_SASS_CB_BYTES)
+
+static struct {
+    volatile int busy;
+    nv_program_t* program;
+    bool tried;
+    int32_t reg_inv, reg_cmax;
+    uint32_t unit[3];               // texture units of the y, cb, cr samplers
+    uint32_t w, h, cw, ch, width, height;       // what the memory below is for
+    uint64_t plane[3], target, vbo;             // VRAM, GPU_VRAM_INVALID = none
+    uint32_t pitch[3], target_pitch;
+    float uniforms[FGPU_SHADER_MAX_UNIFORMS * 4];
+    uint32_t frames;
+} v = { .plane = { GPU_VRAM_INVALID, GPU_VRAM_INVALID, GPU_VRAM_INVALID },
+        .target = GPU_VRAM_INVALID, .vbo = GPU_VRAM_INVALID };
+
+static void video_free(void) {
+    uint64_t* all[5] = { &v.plane[0], &v.plane[1], &v.plane[2], &v.target, &v.vbo };
+    for (int i = 0; i < 5; i++) {
+        if (*all[i] != GPU_VRAM_INVALID) gpu_vram_free(g.a, *all[i]);
+        *all[i] = GPU_VRAM_INVALID;
+    }
+    v.w = 0;
+}
+
+static bool video_program(void) {
+    if (v.tried) return v.program != NULL;
+    v.tried = true;
+    fglsl_program_t* c = (fglsl_program_t*)alloc_unzeroed(sizeof(fglsl_program_t));
+    if (!c) return false;
+    fgpu_program_t prog;
+    const char* why = "";
+    if (fglsl_compile(c, NV_VIDEO_VS, NV_VIDEO_FS) == 0 && fgpu_program_check(c->words, c->size, &prog, &why))
+        v.program = (nv_program_t*)nv_program_create(&prog);
+    if (v.program) {
+        static const char* const names[3] = { "ty", "tu", "tv" };
+        int inv = fglsl_find_uniform(c, "u_inv"), cmax = fglsl_find_uniform(c, "u_cmax");
+        v.reg_inv = inv >= 0 ? (int32_t)c->uniforms[inv].reg : -1;
+        v.reg_cmax = cmax >= 0 ? (int32_t)c->uniforms[cmax].reg : -1;
+        bool ok = v.reg_inv >= 0 && v.reg_cmax >= 0;
+        for (int i = 0; i < 3; i++) {
+            int u = fglsl_find_uniform(c, names[i]);
+            if (u < 0 || c->uniforms[u].reg >= FGPU_MAX_TEXTURE_UNITS) ok = false;
+            else v.unit[i] = c->uniforms[u].reg;
+        }
+        if (!ok) { nv_program_destroy(v.program); v.program = NULL; }
+    }
+    free_mem(c);
+    return v.program != NULL;
+}
+
+static bool video_memory(uint32_t w, uint32_t h, uint32_t cw, uint32_t ch, uint32_t width, uint32_t height) {
+    if (v.w == w && v.h == h && v.cw == cw && v.ch == ch && v.width == width && v.height == height) return true;
+    video_free();
+    uint64_t limit = nv_rm_vram_mapped(g.a);
+    for (int p = 0; p < 3; p++) {
+        v.pitch[p] = ((p ? cw : w) + 31u) & ~31u;
+        uint64_t bytes = (uint64_t)v.pitch[p] * (p ? ch : h);
+        v.plane[p] = gpu_vram_alloc(g.a, bytes, 4096, 0);
+        if (v.plane[p] == GPU_VRAM_INVALID || v.plane[p] + bytes > limit) { video_free(); return false; }
+    }
+    v.target_pitch = ((width + 31u) & ~31u) * 4u;
+    v.target = gpu_vram_alloc(g.a, (uint64_t)v.target_pitch * height, 4096, 0);
+    v.vbo = gpu_vram_alloc(g.a, 4096, 4096, 0);
+    if (v.target == GPU_VRAM_INVALID || v.vbo == GPU_VRAM_INVALID ||
+        v.target + (uint64_t)v.target_pitch * height > limit || v.vbo + 4096u > limit) {
+        video_free();
+        return false;
+    }
+    // One triangle over the whole picture: clip position, pixel position.
+    float fw = (float)width, fh = (float)height;
+    float tri[3][4] = { { -1, 1, 0, 0 }, { -1, -3, 0, 2 * fh }, { 3, 1, 2 * fw, 0 } };
+    vram_write(v.vbo, tri, sizeof(tri));
+    v.w = w; v.h = h; v.cw = cw; v.ch = ch; v.width = width; v.height = height;
+    return true;
+}
+
+static bool nv_video_convert(const uint8_t* y, const uint8_t* cb, const uint8_t* cr, uint32_t w, uint32_t h,
+                             uint32_t cw, uint32_t ch, uint32_t* out, uint32_t width, uint32_t height) {
+    if (!g.hw3d || !width || !height || width > w || height > h || (width + 1u) / 2u > cw ||
+        (height + 1u) / 2u > ch || w > 8192u || h > 8192u)
+        return false;
+    if (__atomic_exchange_n(&v.busy, 1, __ATOMIC_ACQUIRE)) return false;
+    bool ok = false;
+    if (!video_program() || !video_memory(w, h, cw, ch, width, height)) goto out;
+
+    const uint8_t* src[3] = { y, cb, cr };
+    nv3d_draw_t d;
+    memset(&d, 0, sizeof(d));
+    for (int p = 0; p < 3; p++) {
+        uint32_t pw = p ? cw : w, ph = p ? ch : h;
+        for (uint32_t row = 0; row < ph; row++)
+            memcpy((void*)(g.a->aperture + v.plane[p] + (uint64_t)row * v.pitch[p]), src[p] + (size_t)row * pw, pw);
+        uint32_t words[8], slot = TEX_FIRST_VIDEO + (uint32_t)p;
+        nv3d_texture_header(words, nv_rm_vram_va(v.plane[p]), v.pitch[p], pw, ph, true);
+        vram_write(g.pools + POOL_TIC + slot * 32u, words, 32);
+        nv3d_sampler(words, FGPU_TEXTURE_CLAMP);                // nearest texel
+        vram_write(g.pools + POOL_TSC + slot * 32u, words, 32);
+        d.tex_handle[v.unit[p]] = slot | (slot << 20);
+    }
+    memset(v.uniforms, 0, sizeof(v.uniforms));
+    float inv[4] = { 1.0f / (float)w, 1.0f / (float)h, 1.0f / (float)cw, 1.0f / (float)ch };
+    memcpy(&v.uniforms[v.reg_inv * 4], inv, sizeof(inv));
+    v.uniforms[v.reg_cmax * 4] = (float)(cw - 1u);
+    v.uniforms[v.reg_cmax * 4 + 1] = (float)(ch - 1u);
+
+    static const uint32_t attrib[2] = { FGPU_ATTRIB(0, 2), FGPU_ATTRIB(2, 2) };
+    d.color = (nv3d_color_t){ nv_rm_vram_va(v.target), v.target_pitch, width, height };
+    d.vp_w = (int32_t)width;
+    d.vp_h = (int32_t)height;
+    d.front_ccw = g.front_ccw;
+    d.vs = (nv3d_stage_t){ nv_rm_vram_va(v.program->vs.vram), v.program->vs.regs };
+    d.fs = (nv3d_stage_t){ nv_rm_vram_va(v.program->fs.vram), v.program->fs.regs };
+    d.cb_va = nv_rm_vram_va(g.pools + POOL_CB_VIDEO);
+    d.uniforms = v.uniforms;
+    d.textures_changed = true;
+    d.stride_bytes = 16;
+    d.attrib_count = 2;
+    d.attrib = attrib;
+    d.vb_va = nv_rm_vram_va(v.vbo);
+    d.vb_bytes = 48;
+    d.count = 3;
+    nv_push_t* p = begin_job();
+    if (!p) goto out;
+    nv3d_push_draw(p, &d);
+    if (!end_job(p)) goto out;
+    ok = nv_rm_ce_read(g.a, v.target, width * 4u, height, v.target_pitch, out, width * 4u);
+    if (ok) v.frames++;
+out:
+    __atomic_store_n(&v.busy, 0, __ATOMIC_RELEASE);
+    return ok;
+}
 
 /* ------------------------------------------------------------ self-test */
 
@@ -545,6 +687,7 @@ fgpu_backend_t fgpu_backend_nvidia = {
     .finish = nv_finish,
     .read = nv_read,
     .surface_destroy = nv_surface_destroy,
+    .video_convert = nv_video_convert,
 };
 
 /* ------------------------------------------------------- bring-up report */
@@ -745,6 +888,9 @@ void nv_bringup_report(gpu_adapter_t* a, void (*print)(const char* text)) {
     if (g.hw3d) {
         snprintf(line, sizeof(line), "Step 4  FarcadeGL draws run on the 3D engine (%u draws, %u clears so far)\n",
                  (unsigned)g.draws, (unsigned)g.clears);
+        print(line);
+        snprintf(line, sizeof(line), "        video: colour conversion of motion .vid frames on the GPU (%u frames so far)\n",
+                 (unsigned)v.frames);
         print(line);
     } else if (nv_rm_3d_ready(a)) {
         print("Step 4  3D channel is up, but the draw self-test failed (run 'gpu nvidia boot' to see it)\n");

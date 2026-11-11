@@ -68,6 +68,13 @@
 #define GPFIFO_ENTRIES 128u
 #define PUSH_WORDS   (4u * 4096u / 4u)
 
+// Staging: system memory the copy engine copies VRAM into, so the CPU
+// never reads VRAM through BAR1 (uncached, very slow). Mapped once, at
+// VA_STAGE, when the page tables are built.
+#define VA_STAGE     (VA_SYS + (16ull << 20))
+#define STAGE_MAX_PAGES 4096u       // 16 MiB: a 1920x1080 frame fits
+#define STAGE_MIN_PAGES 256u
+
 #define RPC_TIMEOUT_MS 5000u
 #define MAX_CTXBUF 10
 
@@ -103,6 +110,10 @@ static struct {
     void (*print)(const char* text);
 
     uint64_t pd3, pd2, pd1, pd0_sys, pt_sys, pd0_vram[4];
+    uint64_t pt_stage[STAGE_MAX_PAGES / 512u];
+    uint8_t* stage;                     // staging memory, NULL = none
+    uint32_t stage_pages;
+    uint32_t reads;
     uint64_t vram_mapped;               // bytes of VRAM mapped at VA_VRAM
     uint32_t mthdbuf_size;
     uint32_t gr_runlist;
@@ -111,7 +122,7 @@ static struct {
     ctxbuf_t ctx[MAX_CTXBUF];
     uint32_t ctx_count;
 
-    uint32_t fills, clears3d;
+    uint32_t fills, clears3d, jobs3d;
 } c;
 
 static const uint32_t k_chids[] = { 0, 8, 16, 24, 32, 64 };
@@ -311,6 +322,24 @@ static bool build_page_tables(void) {
             vram_wr64(c.pt_sys + 8u * nv_gmmu_index(chan_va_sys(ch) + i * 4096ull, 0),
                       nv_gmmu_pte(pa(ch->sys + i * 4096u), NV_GMMU_APER_SYS_COH));
     }
+
+    // Staging memory: one page table per 2 MiB.
+    for (uint32_t pages = STAGE_MAX_PAGES; pages >= STAGE_MIN_PAGES && !c.stage; pages /= 2u) {
+        c.stage = (uint8_t*)pmm_try_alloc_pages_zeroed(pages);
+        if (c.stage) c.stage_pages = pages;
+    }
+    for (uint32_t i = 0; i < c.stage_pages; i++) {
+        uint64_t va = VA_STAGE + (uint64_t)i * 4096u;
+        if ((i % 512u) == 0) {
+            uint64_t pt;
+            if (!vram_page(&pt, "page table")) { c.stage_pages = i; break; }
+            vram_wr64(c.pd0_sys + 16u * nv_gmmu_index(va, 1) + 8, nv_gmmu_pde(pt, NV_GMMU_PDE_VRAM));
+            c.pt_stage[i / 512u] = pt;
+        }
+        vram_wr64(c.pt_stage[i / 512u] + 8u * nv_gmmu_index(va, 0),
+                  nv_gmmu_pte(pa(c.stage + (uint64_t)i * 4096u), NV_GMMU_APER_SYS_COH));
+    }
+    if (!c.stage_pages) c.stage = NULL;
 
     // VRAM 1:1 at VA_VRAM in 2 MiB pages, PTEs straight in PD0.
     uint64_t size = c.a->aperture_size;
@@ -559,6 +588,79 @@ bool nv_rm_3d_clear(gpu_adapter_t* a, uint64_t vram_offset, uint32_t width, uint
     if (!lock()) return false;
     nv_bar1_keep_physical(a);
     bool ok = clear3d_locked(vram_offset, width, height, pitch_bytes, xrgb);
+    unlock();
+    return ok;
+}
+
+/* ------------------------------------------------- 3D jobs (nv_3d.c) */
+
+static nv_push_t g_job;
+
+// Takes the GPU and returns the 3D channel's empty pushbuffer, or NULL
+// when the 3D engine is not up or the GPU is busy.
+nv_push_t* nv_rm_3d_begin(gpu_adapter_t* a) {
+    if (!c.gr_ready || c.a != a || !lock()) return NULL;
+    nv_bar1_keep_physical(a);
+    nv_push_init(&g_job, push_words(&g_gr), PUSH_WORDS - 8u);    // room for the semaphore
+    return &g_job;
+}
+
+void nv_rm_3d_cancel(void) { unlock(); }
+
+// Submits what nv_rm_3d_begin's pushbuffer holds and waits for the 3D
+// engine to finish it. A job that does not finish switches the 3D path
+// off (the copy engine stays).
+bool nv_rm_3d_submit(void) {
+    uint32_t payload = ++g_gr.payload;
+    g_job.capacity = PUSH_WORDS;
+    nv_push_host_semaphore(&g_job, sem_va(&g_gr), payload);
+    bool ok = !g_job.overflow;
+    if (ok) {
+        wc_flush();
+        ok = submit_and_wait(&g_gr, g_job.count, payload, 2000);
+        if (!ok) {
+            c.gr_ready = false;
+            say("  3D channel disabled after a failed job (%u done before)\n", c.jobs3d);
+        } else {
+            c.jobs3d++;
+        }
+    }
+    unlock();
+    return ok;
+}
+
+uint64_t nv_rm_vram_va(uint64_t vram_offset) { return VA_VRAM + vram_offset; }
+uint64_t nv_rm_vram_mapped(gpu_adapter_t* a) { return c.a == a ? c.vram_mapped : 0; }
+void nv_rm_3d_disable(void) { c.gr_ready = false; }
+void nv_rm_say(const char* text) { say("%s", text); }
+
+// Copies `rows` rows of `row_bytes` bytes from VRAM into system memory:
+// the copy engine copies to the staging memory, the CPU copies from
+// there. False when it does not fit or the GPU did not finish (the
+// caller then reads through BAR1).
+bool nv_rm_ce_read(gpu_adapter_t* a, uint64_t vram_offset, uint32_t row_bytes, uint32_t rows,
+                   uint32_t src_pitch, void* dst, uint32_t dst_pitch) {
+    if (!c.ready || c.a != a || !c.stage || !row_bytes || !rows || src_pitch < row_bytes) return false;
+    uint32_t stage_pitch = (row_bytes + 63u) & ~63u;
+    if ((uint64_t)stage_pitch * rows > (uint64_t)c.stage_pages * 4096u) return false;
+    if (vram_offset + (uint64_t)(rows - 1u) * src_pitch + row_bytes > c.vram_mapped) return false;
+    if (!lock()) return false;
+    nv_bar1_keep_physical(a);
+    nv_push_t p;
+    nv_push_init(&p, push_words(&g_ce), PUSH_WORDS);
+    uint32_t payload = ++g_ce.payload;
+    nv_push_ce_copy(&p, VA_VRAM + vram_offset, src_pitch, VA_STAGE, stage_pitch, row_bytes, rows,
+                    sem_va(&g_ce), payload);
+    wc_flush();
+    bool ok = !p.overflow && submit_and_wait(&g_ce, p.count, payload, 2000);
+    if (ok) {
+        for (uint32_t y = 0; y < rows; y++)
+            memcpy((uint8_t*)dst + (size_t)y * dst_pitch, c.stage + (size_t)y * stage_pitch, row_bytes);
+        c.reads++;
+    } else if (!p.overflow) {
+        c.ready = false;
+        say("  copy engine channel disabled after a failed read\n");
+    }
     unlock();
     return ok;
 }

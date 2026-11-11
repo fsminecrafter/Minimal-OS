@@ -9,6 +9,9 @@
 #include <string.h>
 
 extern bool syscall_user_range_ok(const void* ptr, size_t len, bool write);
+// fgpu.c: the GPU backend's colour conversion; false = none, or not now.
+extern bool fgpu_video_convert(const uint8_t* y, const uint8_t* cb, const uint8_t* cr, uint32_t w, uint32_t h,
+                               uint32_t cw, uint32_t ch, uint32_t* out, uint32_t width, uint32_t height);
 
 typedef struct {
     const uint8_t* data;
@@ -36,7 +39,38 @@ static void decode_tile_job(void* context, uint32_t part, uint32_t worker) {
                              job->tile_y, job->has_previous);
 }
 
+// The motion codec's colour conversion on the graphics card, when its
+// backend can do it (fgpu_backend_nv.c); SYS_ERR_AGAIN sends the caller
+// to its own CPU conversion.
+static uint64_t convert_ycbcr(syscall_media_request_t* request) {
+    syscall_media_planes_t planes;
+    if (request->flags || request->frame_bytes != sizeof(planes) || !request->frame ||
+        !syscall_user_range_ok(request->frame, sizeof(planes), false))
+        return SYS_ERR_INVAL;
+    memcpy(&planes, request->frame, sizeof(planes));
+    uint32_t width = request->width, height = request->height;
+    if (!width || !height || width > SYS_MEDIA_MAX_SIDE || height > SYS_MEDIA_MAX_SIDE ||
+        planes.w < width || planes.h < height || planes.w > SYS_MEDIA_MAX_SIDE + 16u ||
+        planes.h > SYS_MEDIA_MAX_SIDE + 16u || planes.cw < (width + 1u) / 2u || planes.ch < (height + 1u) / 2u ||
+        planes.cw > planes.w || planes.ch > planes.h)
+        return SYS_ERR_INVAL;
+    size_t luma = (size_t)planes.w * planes.h, chroma = (size_t)planes.cw * planes.ch;
+    size_t pixel_bytes = (size_t)width * height * sizeof(uint32_t);
+    if (!planes.y || !planes.cb || !planes.cr || !request->pixels ||
+        ((uintptr_t)request->pixels & (sizeof(uint32_t) - 1u)) != 0 ||
+        !syscall_user_range_ok(planes.y, luma, false) || !syscall_user_range_ok(planes.cb, chroma, false) ||
+        !syscall_user_range_ok(planes.cr, chroma, false) ||
+        !syscall_user_range_ok(request->pixels, pixel_bytes, true))
+        return SYS_ERR_INVAL;
+    return fgpu_video_convert(planes.y, planes.cb, planes.cr, planes.w, planes.h, planes.cw, planes.ch,
+                              request->pixels, width, height) ? SYS_SUCCESS : SYS_ERR_AGAIN;
+}
+
 uint64_t media_syscall(syscall_media_request_t* request) {
+    if (request && syscall_user_range_ok(request, sizeof(*request), true) &&
+        request->size == sizeof(*request) && request->version == SYS_MEDIA_ABI_VERSION &&
+        request->op == SYS_MEDIA_CONVERT_YCBCR && !request->reserved[0] && !request->reserved[1])
+        return convert_ycbcr(request);
     if (!request || !syscall_user_range_ok(request, sizeof(*request), true) ||
         request->size != sizeof(*request) ||
         request->version != SYS_MEDIA_ABI_VERSION ||

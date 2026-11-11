@@ -133,7 +133,56 @@ static bool decode_via_syscall(mvid_reader_t* reader, memory_file_t* file,
     return media_syscall(&request) == SYS_SUCCESS;
 }
 
+/* A stand-in for the GPU backend: converts on the CPU, so the syscall's
+ * checks and plumbing are what is tested. `fake_gpu` switches it off. */
+static bool fake_gpu = true;
+static bool fake_convert(const uint8_t* y, const uint8_t* cb, const uint8_t* cr, uint32_t w, uint32_t h,
+                         uint32_t cw, uint32_t ch, uint32_t* out, uint32_t width, uint32_t height) {
+    mmc_t m;
+    memset(&m, 0, sizeof(m));
+    m.w = w; m.h = h; m.cw = cw; m.ch = ch; m.width = width; m.height = height;
+    m.ref[0] = (uint8_t*)y; m.ref[1] = (uint8_t*)cb; m.ref[2] = (uint8_t*)cr;
+    mmc_to_argb(&m, out, width, height, width);
+    return true;
+}
+bool fgpu_video_convert(const uint8_t* y, const uint8_t* cb, const uint8_t* cr, uint32_t w, uint32_t h,
+                        uint32_t cw, uint32_t ch, uint32_t* out, uint32_t width, uint32_t height) {
+    return fake_gpu && fake_convert(y, cb, cr, w, h, cw, ch, out, width, height);
+}
+
+static uint64_t convert_call(syscall_media_planes_t* planes, uint32_t width, uint32_t height, uint32_t* out) {
+    syscall_media_request_t request = {
+        .size = sizeof(request), .version = SYS_MEDIA_ABI_VERSION, .op = SYS_MEDIA_CONVERT_YCBCR,
+        .width = width, .height = height, .frame_bytes = sizeof(*planes),
+        .frame = (const uint8_t*)planes, .pixels = out
+    };
+    return media_syscall(&request);
+}
+
+static void test_convert(void) {
+    enum { W = 48, H = 32, CW = 24, CH = 16, PW = 45, PH = 30 };
+    static uint8_t y[W * H], cb[CW * CH], cr[CW * CH];
+    static uint32_t got[PW * PH], want[PW * PH];
+    for (int i = 0; i < W * H; i++) y[i] = (uint8_t)(i * 7 + 3);
+    for (int i = 0; i < CW * CH; i++) { cb[i] = (uint8_t)(i * 5); cr[i] = (uint8_t)(255 - i * 3); }
+    syscall_media_planes_t planes = { y, cb, cr, W, H, CW, CH };
+    fake_convert(y, cb, cr, W, H, CW, CH, want, PW, PH);
+    CHECK(convert_call(&planes, PW, PH, got) == SYS_SUCCESS && !memcmp(got, want, sizeof(want)),
+          "colour conversion through the media syscall");
+    CHECK(convert_call(&planes, W + 1, PH, got) == SYS_ERR_INVAL, "picture wider than its planes is refused");
+    planes.cw = 10;
+    CHECK(convert_call(&planes, PW, PH, got) == SYS_ERR_INVAL, "colour planes too small are refused");
+    planes.cw = CW;
+    planes.cb = NULL;
+    CHECK(convert_call(&planes, PW, PH, got) == SYS_ERR_INVAL, "a missing plane is refused");
+    planes.cb = cb;
+    fake_gpu = false;
+    CHECK(convert_call(&planes, PW, PH, got) == SYS_ERR_AGAIN, "without a GPU the caller converts itself");
+    fake_gpu = true;
+}
+
 int main(void) {
+    test_convert();
     const uint32_t width = 256, height = 192, frame_count = 4;
     size_t pixel_count = (size_t)width * height;
     uint32_t* source = (uint32_t*)malloc(pixel_count * frame_count * sizeof(uint32_t));

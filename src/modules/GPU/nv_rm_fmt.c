@@ -379,6 +379,24 @@ void nv_push_ce_fill(nv_push_t* p, uint64_t dst, uint32_t width, uint32_t height
     nv_push_1(p, s, NVC5B5_LAUNCH_DMA, launch);
 }
 
+void nv_push_ce_copy(nv_push_t* p, uint64_t src, uint32_t src_pitch, uint64_t dst, uint32_t dst_pitch,
+                     uint32_t row_bytes, uint32_t rows, uint64_t sem, uint32_t payload) {
+    const uint32_t s = NV_CE_SUBCHANNEL;
+    nv_push_1(p, s, NV_3D_SET_OBJECT, NV_CLASS_TURING_DMA_COPY_A);
+    uint32_t geom[8] = {
+        (uint32_t)(src >> 32) & 0x1FFFFu, (uint32_t)src,    // OFFSET_IN_UPPER/LOWER
+        (uint32_t)(dst >> 32) & 0x1FFFFu, (uint32_t)dst,    // OFFSET_OUT_UPPER/LOWER
+        src_pitch, dst_pitch,                               // PITCH_IN, PITCH_OUT
+        row_bytes, rows,                                    // LINE_LENGTH_IN (bytes), LINE_COUNT
+    };
+    nv_push_method(p, s, NVC5B5_OFFSET_OUT_UPPER - 8u, geom, 8);
+    uint32_t semv[3] = { (uint32_t)(sem >> 32) & 0x1FFFFu, (uint32_t)sem, payload };
+    nv_push_method(p, s, NVC5B5_SET_SEMAPHORE_A, semv, 3);
+    // As the fill, without the remap: bytes are copied as they are.
+    uint32_t launch = 2u | (1u << 2) | (1u << 3) | (1u << 7) | (1u << 8) | (1u << 9);
+    nv_push_1(p, s, NVC5B5_LAUNCH_DMA, launch);
+}
+
 void nv_push_host_semaphore(nv_push_t* p, uint64_t sem, uint32_t payload) {
     uint32_t v[5] = { (uint32_t)sem, (uint32_t)(sem >> 32) & 0xFFu, payload, 0, NVC46F_SEM_RELEASE_WFI };
     nv_push_method(p, 0, NVC46F_SEM_ADDR_LO, v, 5);

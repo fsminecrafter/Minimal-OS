@@ -308,6 +308,11 @@ typedef enum {
 #define SYSCALL_WINDOW_MAXIMIZED   (1u << 3)
 #define SYSCALL_WINDOW_MINIMIZED   (1u << 4)
 #define SYSCALL_WINDOW_FOCUSED     (1u << 5)
+// The window takes the mouse while it is focused (games): the window
+// manager hides the cursor and sends SYSCALL_WINDOW_EVENT_MOUSE_RELATIVE
+// instead of moving it. It ends when the flag is cleared, the window
+// loses focus, or a window manager menu opens.
+#define SYSCALL_WINDOW_POINTER_LOCK (1u << 6)
 
 typedef enum {
     SYSCALL_WINDOW_EVENT_RESIZED = 1,
@@ -320,6 +325,9 @@ typedef enum {
     SYSCALL_WINDOW_EVENT_KEY,
     SYSCALL_WINDOW_EVENT_MOUSE,
     SYSCALL_WINDOW_EVENT_MOUSE_WHEEL,
+    // While the window has SYSCALL_WINDOW_POINTER_LOCK and focus: the
+    // mouse moved by x, y (pixels, y down) since the last such event.
+    SYSCALL_WINDOW_EVENT_MOUSE_RELATIVE,
 } syscall_window_event_type_t;
 
 typedef struct {
@@ -848,6 +856,51 @@ typedef struct {
     char path[SYSCALL_AUDIO_PATH_MAX];
     syscall_audio_status_t status;
 } syscall_audio_request_t;
+
+// ===========================================
+// AUDIO STREAMS (SYS_AUDIO_STREAM)
+// ===========================================
+//
+// rdi = syscall_audio_stream_t*. Sound a program makes itself (a game's
+// effects, a synthesizer), as 16-bit PCM. Up to SYSCALL_AUDIO_STREAMS
+// streams play at once, mixed with each other and with the SYS_AUDIO file
+// player; each has its own sample rate (resampled to the mix), channel
+// count and volume. A stream belongs to the process that opened it and is
+// closed when that process exits.
+//
+// WRITE copies as many frames as fit into the stream's buffer and returns
+// that number (0 when it is full): a program writes a little ahead of
+// what plays and uses QUERY's `queued` to keep about the same amount
+// waiting. Frames that arrive too late are not played late: the stream
+// plays silence until there is something again.
+#define SYS_AUDIO_STREAM 46
+#define SYS_AUDIO_STREAM_ABI_VERSION 1u
+
+#define SYS_AUDIO_STREAM_OPEN   1u  // rate (8000-96000), channels (1-2) -> handle (returned)
+#define SYS_AUDIO_STREAM_WRITE  2u  // handle, samples, frames -> frames taken (returned)
+#define SYS_AUDIO_STREAM_QUERY  3u  // handle -> queued, capacity, mix_rate
+#define SYS_AUDIO_STREAM_VOLUME 4u  // handle, volume (0-100)
+#define SYS_AUDIO_STREAM_CLOSE  5u  // handle
+
+#define SYSCALL_AUDIO_STREAMS 8u
+#define SYSCALL_AUDIO_STREAM_FRAMES 16384u     // buffer of one stream, in frames
+
+typedef struct {
+    uint32_t size;              // sizeof(syscall_audio_stream_t)
+    uint32_t version;           // SYS_AUDIO_STREAM_ABI_VERSION
+    uint32_t op;
+    uint32_t handle;            // 1 .. SYSCALL_AUDIO_STREAMS
+    uint32_t rate;              // OPEN: frames per second
+    uint32_t channels;          // OPEN: 1 mono, 2 stereo (interleaved L, R)
+    uint32_t volume;            // VOLUME: 0-100
+    uint32_t frames;            // WRITE: frames in samples
+    const int16_t* samples;     // WRITE
+    // QUERY (and every op on an open stream) fills in:
+    uint32_t queued;            // frames waiting to be played
+    uint32_t capacity;          // frames the buffer holds
+    uint32_t mix_rate;          // the rate everything is mixed at now
+    uint32_t underruns;         // times the stream ran dry while open
+} syscall_audio_stream_t;
 
 // ===========================================
 // SOUND MIXER (SYS_AUDIO_MIXER)

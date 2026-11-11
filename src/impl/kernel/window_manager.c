@@ -12,10 +12,11 @@
 #define WINDOW_POSITION_LIMIT 32768u
 #define WINDOW_FLAG_MASK (SYSCALL_WINDOW_VISIBLE | SYSCALL_WINDOW_RESIZABLE | \
                           SYSCALL_WINDOW_FULLSCREEN | SYSCALL_WINDOW_MAXIMIZED | \
-                          SYSCALL_WINDOW_MINIMIZED | SYSCALL_WINDOW_FOCUSED)
+                          SYSCALL_WINDOW_MINIMIZED | SYSCALL_WINDOW_FOCUSED | \
+                          SYSCALL_WINDOW_POINTER_LOCK)
 #define WINDOW_CLIENT_FLAG_MASK (SYSCALL_WINDOW_VISIBLE | SYSCALL_WINDOW_RESIZABLE | \
                                  SYSCALL_WINDOW_FULLSCREEN | SYSCALL_WINDOW_MAXIMIZED | \
-                                 SYSCALL_WINDOW_MINIMIZED)
+                                 SYSCALL_WINDOW_MINIMIZED | SYSCALL_WINDOW_POINTER_LOCK)
 
 typedef struct {
     bool active;
@@ -458,7 +459,7 @@ uint64_t window_manager_syscall(const syscall_window_request_t* request,
         case SYS_WINDOW_POST_EVENT: {
             if (!is_manager || !request->event ||
                 request->event->type < SYSCALL_WINDOW_EVENT_RESIZED ||
-                request->event->type > SYSCALL_WINDOW_EVENT_MOUSE_WHEEL) {
+                request->event->type > SYSCALL_WINDOW_EVENT_MOUSE_RELATIVE) {
                 result = is_manager ? SYS_ERR_INVAL : SYS_ERR_PERM;
                 break;
             }

@@ -40,6 +40,7 @@ typedef struct {
     bool in_vram;
     uint64_t vram_offset;
     gpu_adapter_t* adapter;
+    void* shadow;               // system-memory copy for CPU reads of slow VRAM, or NULL
 } fgpu_surface_t;
 
 typedef struct {
@@ -191,15 +192,20 @@ static fgpu_buffer_t* find_buffer(uint32_t id, uint64_t owner) {
     return NULL;
 }
 
+// True when draws run on the graphics card itself: what it renders from
+// and into then has to be in VRAM.
+static bool hw_3d(void) { return g_hw && (g_hw->caps & FGPU_CAP_HW_3D); }
+
 // VRAM if the adapter has room (and, for memory the CPU reads back, if
-// reading VRAM is cheap); otherwise the kernel heap.
-static void* place(uint64_t bytes, bool cpu_reads, bool allow_vram, uint64_t owner,
+// reading VRAM is cheap or the GPU needs it there: `gpu_uses`); otherwise
+// the kernel heap.
+static void* place(uint64_t bytes, bool cpu_reads, bool allow_vram, bool gpu_uses, uint64_t owner,
                    bool* in_vram, uint64_t* offset, gpu_adapter_t** adapter) {
     *in_vram = false;
     *adapter = NULL;
     gpu_adapter_t* a = gpu_primary_adapter();
     if (allow_vram && a && (a->caps & GPU_CAP_VRAM_HEAP) &&
-        (!cpu_reads || (a->caps & GPU_CAP_VRAM_FAST_READ))) {
+        (!cpu_reads || (a->caps & GPU_CAP_VRAM_FAST_READ) || (gpu_uses && hw_3d()))) {
         uint64_t off = gpu_vram_alloc(a, bytes, 4096, owner);
         if (off != GPU_VRAM_INVALID) {
             *in_vram = true;
@@ -216,6 +222,31 @@ static void* place(uint64_t bytes, bool cpu_reads, bool allow_vram, uint64_t own
 static void unplace(void* mem, bool in_vram, uint64_t offset, gpu_adapter_t* adapter) {
     if (in_vram) gpu_vram_free(adapter, offset);
     else if (mem) free_mem(mem);
+}
+
+// Before a surface's memory is freed.
+static void surface_gone(fgpu_surface_t* s) {
+    if (g_hw && g_hw->surface_destroy) {
+        fgpu_mem_t m = surface_mem(s);
+        g_hw->surface_destroy(&m);
+    }
+    if (s->shadow) free_mem(s->shadow);
+    s->shadow = NULL;
+}
+
+// The surface's pixels where the CPU can read them quickly: the surface
+// itself, or (VRAM behind a slow window) a copy the backend just made.
+static void* surface_cpu_view(fgpu_surface_t* s) {
+    if (!s->in_vram || !g_hw || !g_hw->read || !s->adapter ||
+        (s->adapter->caps & GPU_CAP_VRAM_FAST_READ))
+        return s->mem;
+    size_t bytes = (size_t)s->pitch * s->height * 4;
+    if (!s->shadow) s->shadow = alloc_unzeroed(bytes);
+    if (!s->shadow) return s->mem;
+    fgpu_mem_t m = surface_mem(s);
+    if (!g_hw->read(&m, s->width * 4u, s->height, s->pitch * 4u, s->shadow, s->pitch * 4u))
+        return s->mem;
+    return s->shadow;
 }
 
 static void release_flip_locked(void) {
@@ -244,6 +275,7 @@ void fgpu_process_exit(uint64_t pid) {
     for (int i = 0; i < FGPU_MAX_SURFACES; i++) {
         fgpu_surface_t* s = &g_surfaces[i];
         if (s->used && s->owner == pid) {
+            surface_gone(s);
             unplace(s->mem, s->in_vram, s->vram_offset, s->adapter);
             s->used = false;
         }
@@ -523,6 +555,9 @@ static uint64_t op_create_surface(syscall_gpu_request_t* r, uint64_t owner) {
     bool scanout = (r->flags & FGPU_SURFACE_SCANOUT) != 0;
     gpu_adapter_t* a = gpu_primary_adapter();
     uint32_t pitch = r->width;
+    bool color = r->format == FGPU_FORMAT_XRGB8888;
+    // The 3D engine renders to pitches that are multiples of 128 bytes.
+    if (color && hw_3d()) pitch = (r->width + 31u) & ~31u;
     if (scanout) {
         // Must match the screen so the display can show it directly.
         gpu_device_t* screen = getSystemGPU();
@@ -540,7 +575,7 @@ static uint64_t op_create_surface(syscall_gpu_request_t* r, uint64_t owner) {
     // unless VRAM reads are cheap. Scanout surfaces must be in VRAM.
     bool cpu_reads = !scanout;
     bool allow_vram = !(r->flags & FGPU_SURFACE_SYSTEM_MEMORY);
-    s->mem = place(bytes, cpu_reads, allow_vram || scanout, owner,
+    s->mem = place(bytes, cpu_reads, allow_vram || scanout, color, owner,
                    &s->in_vram, &s->vram_offset, &s->adapter);
     if (!s->mem) return SYS_ERR_NOMEM;
     if (scanout && !s->in_vram) {
@@ -566,7 +601,7 @@ static uint64_t op_create_buffer(syscall_gpu_request_t* r, uint64_t owner) {
     if (slot < 0) return SYS_ERR_NOMEM;
     fgpu_buffer_t* b = &g_buffers[slot];
     memset(b, 0, sizeof(*b));
-    b->mem = place(r->bytes, true, true, owner, &b->in_vram, &b->vram_offset, &b->adapter);
+    b->mem = place(r->bytes, true, true, true, owner, &b->in_vram, &b->vram_offset, &b->adapter);
     if (!b->mem) return SYS_ERR_NOMEM;
     b->used = true;
     b->id = g_next_id++;
@@ -597,7 +632,8 @@ static uint64_t op_present(syscall_gpu_request_t* r, uint64_t owner) {
         w.version = SYS_WINDOW_ABI_VERSION;
         w.op = SYS_WINDOW_PRESENT;
         w.id = r->window_id;
-        w.pixels = (const uint32_t*)s->mem;
+        hw_sync();
+        w.pixels = (const uint32_t*)surface_cpu_view(s);
         w.pitch = s->pitch * 4;
         w.width = info.width;
         w.height = info.height;
@@ -614,7 +650,8 @@ static uint64_t op_present(syscall_gpu_request_t* r, uint64_t owner) {
         return SYS_SUCCESS;
     }
     if (g_flipped_owner == owner) release_flip_locked();
-    gfx_surface_t src = { (uint32_t*)s->mem, (size_t)s->pitch * s->height * 4,
+    hw_sync();
+    gfx_surface_t src = { (uint32_t*)surface_cpu_view(s), (size_t)s->pitch * s->height * 4,
                           s->width, s->height, s->pitch };
     gfx_rect_t rect = { 0, 0, (int32_t)s->width, (int32_t)s->height };
     if (!graphics_backbuffer_blit(&src, &rect, r->x, r->y, false)) return SYS_ERR_INVAL;
@@ -687,6 +724,7 @@ uint64_t fgpu_syscall(syscall_gpu_request_t* r) {
             fgpu_surface_t* s = find_surface(r->handle, owner);
             if (!s) { result = SYS_ERR_NOTFOUND; break; }
             if (g_flipped_owner == owner) release_flip_locked();
+            surface_gone(s);
             unplace(s->mem, s->in_vram, s->vram_offset, s->adapter);
             s->used = false;
             result = SYS_SUCCESS;
@@ -741,9 +779,10 @@ uint64_t fgpu_syscall(syscall_gpu_request_t* r) {
             uint64_t row = (uint64_t)s->width * 4;
             if (!r->out || r->pitch < row ||
                 !syscall_user_range_ok(r->out, (size_t)r->pitch * (s->height - 1) + row, true)) break;
+            const uint8_t* view = (const uint8_t*)surface_cpu_view(s);
             for (uint32_t y = 0; y < s->height; y++) {
                 memcpy((uint8_t*)r->out + (size_t)y * r->pitch,
-                       (uint8_t*)s->mem + (size_t)y * s->pitch * 4, (size_t)row);
+                       view + (size_t)y * s->pitch * 4, (size_t)row);
             }
             result = SYS_SUCCESS;
             break;

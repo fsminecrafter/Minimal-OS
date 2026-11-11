@@ -125,6 +125,14 @@ build/modules/%.o: src/modules/%.c $(header_files)
 	mkdir -p $(dir $@)
 	$(CC) $(BUILD_DATE_CFLAG) -c -I src/intf $(KERNEL_CFLAGS) $< -o $@
 
+# The NVIDIA backend compiles FGPU's built-in programs with the SDK's
+# FGSL compiler.
+build/modules/GPU/fgpu_backend_nv.o: src/modules/GPU/fgpu_backend_nv.c $(header_files) \
+	Minimal-OS-SDK/include/fglsl.h
+	mkdir -p $(dir $@)
+	$(CC) $(BUILD_DATE_CFLAG) -c -I src/intf -idirafter Minimal-OS-SDK/include \
+		$(KERNEL_CFLAGS) $< -o $@
+
 build/modules/Media/vid_decode.o: src/modules/Media/vid_decode.c $(header_files) \
 	Minimal-OS-SDK/include/mosmedia.h Minimal-OS-SDK/include/mosmedia_motion.h
 	mkdir -p $(dir $@)
@@ -485,13 +493,15 @@ ci-test:
 
 .PHONY: test-host
 test-host: build/tests/host/gfx_blit_tests build/tests/host/fgpu_raster_tests build/tests/host/fgsl_tests \
-		build/tests/host/fgpu_ir_tests build/tests/host/nv_hw_tests build/tests/host/hid_mouse_tests \
+		build/tests/host/fgpu_ir_tests build/tests/host/nv_hw_tests build/tests/host/nv_sass_tests \
+		build/tests/host/hid_mouse_tests \
 		build/tests/host/media_tests build/tests/host/media_parallel_tests
 	./build/tests/host/gfx_blit_tests
 	./build/tests/host/fgpu_raster_tests
 	./build/tests/host/fgsl_tests
 	./build/tests/host/fgpu_ir_tests
 	./build/tests/host/nv_hw_tests
+	./build/tests/host/nv_sass_tests
 	./build/tests/host/media_tests
 	./build/tests/host/media_parallel_tests
 	./build/tests/host/hid_mouse_tests
@@ -510,6 +520,12 @@ build/tests/host/fgsl_tests: tests/host/fgsl_tests.c src/modules/GPU/fgpu_raster
 	$(HOSTCC) $(HOST_CFLAGS) -idirafter Minimal-OS-SDK/include $(filter %.c,$^) -lm -o $@
 
 build/tests/host/fgpu_ir_tests: tests/host/fgpu_ir_tests.c src/modules/GPU/fgpu_ir.c src/modules/GPU/fgpu_shader.c Minimal-OS-SDK/include/fglsl.h Minimal-OS-SDK/include/fgpu_abi.h $(header_files)
+	mkdir -p $(dir $@)
+	$(HOSTCC) $(HOST_CFLAGS) -idirafter Minimal-OS-SDK/include $(filter %.c,$^) -lm -o $@
+
+# Shader machine code for Turing + 3D pushbuffers, checked against the
+# CPU shader machine with a small simulator.
+build/tests/host/nv_sass_tests: tests/host/nv_sass_tests.c src/modules/GPU/nv_sass.c src/modules/GPU/nv_3d.c src/modules/GPU/nv_fw.c src/modules/GPU/fgpu_ir.c src/modules/GPU/fgpu_shader.c Minimal-OS-SDK/include/fglsl.h $(header_files)
 	mkdir -p $(dir $@)
 	$(HOSTCC) $(HOST_CFLAGS) -idirafter Minimal-OS-SDK/include $(filter %.c,$^) -lm -o $@
 

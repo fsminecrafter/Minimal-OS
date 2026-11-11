@@ -692,3 +692,7 @@ _Static_assert(sizeof(nv_promote_ctx_t) == 560, "NV2080_CTRL_GPU_PROMOTE_CTX_PAR
 #define NVC46F_SEM_RELEASE_WFI  (1u | (1u << 20))     // RELEASE, WFI, 32-bit payload
 
 void nv_push_host_semaphore(nv_push_t* p, uint64_t sem, uint32_t payload);
+// Copies rows of bytes between pitch-linear memory at two GPU VAs with
+// the copy engine, then releases the semaphore.
+void nv_push_ce_copy(nv_push_t* p, uint64_t src, uint32_t src_pitch, uint64_t dst, uint32_t dst_pitch,
+                     uint32_t row_bytes, uint32_t rows, uint64_t sem, uint32_t payload);

@@ -47,7 +47,7 @@ typedef struct {
 
 typedef struct {
     const char* name;           // reported as syscall_gpu_info_t.backend
-    uint32_t caps;              // FGPU_CAP_* capabilities actually provided
+    uint32_t caps;              // FGPU_CAP_* capabilities actually provided; set by init()
 
     // Takes the adapter, or returns false and sets *why.
     bool (*init)(gpu_adapter_t* adapter, const char** why);
@@ -64,11 +64,19 @@ typedef struct {
     // Waits until the GPU finished everything queued, before the CPU
     // touches a surface or buffer.
     void (*finish)(void);
+
+    // Optional. Copies rows of a surface or buffer in VRAM to system
+    // memory faster than the CPU can read VRAM; false = read it directly.
+    bool (*read)(const fgpu_mem_t* mem, uint32_t row_bytes, uint32_t rows, uint32_t src_pitch,
+                 void* dst, uint32_t dst_pitch);
+    // Optional. A surface is going away: drop what the backend keeps for it.
+    void (*surface_destroy)(const fgpu_mem_t* mem);
 } fgpu_backend_t;
 
-// NVIDIA Turing (fgpu_backend_nv.c). Its init() fails until GSP boot
-// and channels are implemented; see 'gpu nvidia'.
-extern const fgpu_backend_t fgpu_backend_nvidia;
+// NVIDIA Turing (fgpu_backend_nv.c). init() fails until GSP-RM and the
+// copy engine channel are up ('gpu nvidia boot'); it reports
+// FGPU_CAP_HW_3D once the 3D engine passed its draw self-test.
+extern fgpu_backend_t fgpu_backend_nvidia;
 
 // The hardware backend in use (NULL = CPU only) and, if none, why.
 const fgpu_backend_t* fgpu_hw_backend(const char** why);

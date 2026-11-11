@@ -130,7 +130,7 @@ void nv_gpfifo_entry(uint64_t gpu_va, uint32_t words, uint32_t out[2]);
 #define NV_3D_SCREEN_SCISSOR_HORIZ  0x0FF4u                     // width << 16 | x
 #define NV_3D_SCREEN_SCISSOR_VERT   0x0FF8u
 #define NV_3D_RT_CONTROL            0x121Cu                     // count | map << 4
-#define NV_3D_CLEAR_COLOR(i)        (0x1590u + (i) * 4u)        // r, g, b, a floats
+#define NV_3D_CLEAR_COLOR(i)        (0x0D80u + (i) * 4u)        // r, g, b, a floats (clc597.h)
 #define NV_3D_CLEAR_BUFFERS         0x19D0u
 #define   NV_3D_CLEAR_BUFFERS_RGBA  0x3Cu                       // | rt << 6
 #define NV_RT_FORMAT_BGRA8_UNORM    0xCFu

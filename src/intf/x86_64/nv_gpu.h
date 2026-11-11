@@ -107,6 +107,23 @@ bool nv_rm_3d_ready(gpu_adapter_t* a);
 // (alpha written as 0xFF); offset and pitch 128-byte aligned. Waits.
 bool nv_rm_3d_clear(gpu_adapter_t* a, uint64_t vram_offset, uint32_t width, uint32_t height,
                     uint32_t pitch_bytes, uint32_t xrgb);
+// 3D jobs (nv_3d.c): begin takes the GPU and returns the 3D channel's
+// empty pushbuffer (NULL: not up, or busy); submit runs it and waits,
+// cancel gives the GPU back unused. A job that does not finish switches
+// the 3D path off.
+nv_push_t* nv_rm_3d_begin(gpu_adapter_t* a);
+bool nv_rm_3d_submit(void);
+void nv_rm_3d_cancel(void);
+void nv_rm_3d_disable(void);
+// GPU virtual address of a VRAM offset, and how much VRAM is mapped.
+uint64_t nv_rm_vram_va(uint64_t vram_offset);
+uint64_t nv_rm_vram_mapped(gpu_adapter_t* a);
+// Reads rows of VRAM into system memory through the copy engine and its
+// staging memory (BAR1 reads are uncached and very slow).
+bool nv_rm_ce_read(gpu_adapter_t* a, uint64_t vram_offset, uint32_t row_bytes, uint32_t rows,
+                   uint32_t src_pitch, void* dst, uint32_t dst_pitch);
+// Prints a line where the bring-up messages go.
+void nv_rm_say(const char* text);
 // Step 3c: draws a test pattern on the screen with the copy engine
 // (and with the 3D engine when it is up).
 bool nv_rm_screen_test(gpu_adapter_t* a, void (*print)(const char* text));

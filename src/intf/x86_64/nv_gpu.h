@@ -115,6 +115,11 @@ nv_push_t* nv_rm_3d_begin(gpu_adapter_t* a);
 bool nv_rm_3d_submit(void);
 void nv_rm_3d_cancel(void);
 void nv_rm_3d_disable(void);
+// Step 5a: the video decoder (NVDEC) has a channel. Jobs as for 3D.
+bool nv_rm_dec_ready(gpu_adapter_t* a);
+nv_push_t* nv_rm_dec_begin(gpu_adapter_t* a);
+bool nv_rm_dec_submit(void);
+void nv_rm_dec_disable(void);
 // GPU virtual address of a VRAM offset, and how much VRAM is mapped.
 uint64_t nv_rm_vram_va(uint64_t vram_offset);
 uint64_t nv_rm_vram_mapped(gpu_adapter_t* a);

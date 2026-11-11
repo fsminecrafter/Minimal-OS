@@ -297,6 +297,7 @@ build-x86_64: minimaSSL-slib $(source_object_files) $(audio_object_files)
 	cp dist/x86_64/kernel.bin targets/x86_64/iso/boot/kernel.bin
 	$(MAKE) --no-print-directory installer-payload
 	$(MAKE) --no-print-directory firmware-payload
+	$(MAKE) --no-print-directory games-payload
 	# grub-mkrescue makes a BIOS + UEFI hybrid image when both GRUB
 	# platforms are installed (grub-pc-bin, grub-efi-amd64-bin, mtools).
 	grub-mkrescue -o dist/x86_64/kernel.iso targets/x86_64/iso
@@ -385,6 +386,85 @@ mosdesk-stage: mosdesk-dlr $(mxplorer_run) $(dlr_run) $(dlrconnect_run) $(fglcub
 
 run-mosdesk:
 	$(MAKE) MOSDESK=1 run
+
+# ---------------------------------------------------------------- Doom
+# Doom (1993) for MOSdesk: id Software's GPL engine (doomgeneric) on
+# FarcadeGL, from Minimal-OS-SDK/programs/doom.
+#   make mosdesk-doom          the desktop ISO with Doom, like 'make mosdesk'
+#   make run-mosdesk-doom      the same in QEMU
+#   make mosdesk-doom DOOM_WAD=/path/to/DOOM.WAD   your own game data
+# The game data is Freedoom: Phase 1 (free, BSD licence), downloaded once
+# and checked against its SHA-256. id's own WADs are not free to share, so
+# they are only used when you point DOOM_WAD at your copy (doom.wad,
+# doomu.wad, doom1.wad or doom2.wad). Doom.run and Doom/ go on the ISO as
+# the "mosgames" boot module, which setup unpacks into 0:/programs; the
+# launcher lists Doom there. Plain 'make mosdesk' leaves Doom out.
+DOOM ?= 0
+DOOM_WAD ?=
+DOOM_DIR := Minimal-OS-SDK/programs/doom
+doom_sources = $(shell find $(DOOM_DIR) -type f \( -name '*.c' -o -name '*.h' -o -path '*/Resources/*' \) ! -path '*/tests/*' 2>/dev/null)
+doom_run := build/games/Doom.run
+games_mpkg := targets/x86_64/iso/boot/mosgames.mpkg
+FREEDOOM_VERSION := 0.13.0
+FREEDOOM_ZIP := build/downloads/freedoom-$(FREEDOOM_VERSION).zip
+FREEDOOM_URL := https://github.com/freedoom/freedoom/releases/download/v$(FREEDOOM_VERSION)/freedoom-$(FREEDOOM_VERSION).zip
+FREEDOOM_SHA256 := 3f9b264f3e3ce503b4fb7f6bdcb1f419d93c7b546f4df3e874dd878db9688f59
+
+$(doom_run): $(doom_sources) Minimal-OS-SDK/build.sh Minimal-OS-SDK/crt0.c Minimal-OS-SDK/link.ld
+	mkdir -p $(dir $@)
+	CC=$(CC) LD=$(LD) Minimal-OS-SDK/build.sh --output $(CURDIR)/$@ $(DOOM_DIR)
+
+$(FREEDOOM_ZIP):
+	mkdir -p $(dir $@)
+	curl -fL --retry 3 -o $@.part $(FREEDOOM_URL)
+	echo "$(FREEDOOM_SHA256)  $@.part" | sha256sum -c -
+	mv $@.part $@
+
+.PHONY: doom-sdk doom-stage games-payload mosdesk-doom run-mosdesk-doom
+# build/games/stage holds exactly what goes into the module.
+doom-stage: $(doom_run) $(if $(DOOM_WAD),,$(FREEDOOM_ZIP))
+	rm -rf build/games/stage
+	mkdir -p build/games/stage/Doom
+	cp $(doom_run) build/games/stage/Doom.run
+	cp $(DOOM_DIR)/README.md build/games/stage/Doom/README.md
+	cp $(DOOM_DIR)/COPYING build/games/stage/Doom/COPYING
+	@if [ -n "$(DOOM_WAD)" ]; then \
+		[ -f "$(DOOM_WAD)" ] || { echo "DOOM_WAD: $(DOOM_WAD) not found" >&2; exit 1; }; \
+		name=$$(basename "$(DOOM_WAD)" | tr 'A-Z' 'a-z'); \
+		cp "$(DOOM_WAD)" "build/games/stage/Doom/$$name"; \
+		echo "doom: game data $(DOOM_WAD) as Doom/$$name"; \
+	else \
+		python3 tools/media/extract_freedoom.py $(FREEDOOM_ZIP) $(FREEDOOM_VERSION) build/games/stage/Doom; \
+		echo "doom: game data Freedoom $(FREEDOOM_VERSION) (Doom/freedoom1.wad)"; \
+	fi
+
+# Called by build-x86_64: packs the stage with DOOM=1, removes the module
+# otherwise (so 'make mosdesk' after 'make mosdesk-doom' has no Doom).
+games-payload:
+	@if [ "$(DOOM)" = 1 ]; then \
+		$(MKPKG) build/games/stage $(games_mpkg) --store && \
+		echo "games: build/games/stage/ packed into the ISO as boot/mosgames.mpkg"; \
+	else \
+		rm -f $(games_mpkg); \
+	fi
+
+# Doom is built from the SDK submodule: fetch it first if it is not
+# checked out (as mosdesk-build does), then stage in a fresh make that
+# sees its files.
+doom-sdk:
+	@if [ "$(MOSDESK_USE_LOCAL)" = 1 ] || [ -e Minimal-OS-SDK/.git ]; then exit 0; fi; \
+	if ! git submodule update --init --recursive Minimal-OS-SDK; then \
+		git -C Minimal-OS-SDK fetch origin && \
+		git -C Minimal-OS-SDK checkout --detach FETCH_HEAD; \
+	fi
+
+mosdesk-doom: doom-sdk
+	$(MAKE) doom-stage
+	$(MAKE) MOSDESK=1 DOOM=1 build-x86_64
+
+run-mosdesk-doom: doom-sdk
+	$(MAKE) doom-stage
+	$(MAKE) MOSDESK=1 DOOM=1 run
 
 # Serves the built ISO over the LAN so another PC can PXE boot it.
 # Needs root for the DHCP/TFTP ports; see docs/netboot.md.
@@ -526,7 +606,7 @@ build/tests/host/fgpu_ir_tests: tests/host/fgpu_ir_tests.c src/modules/GPU/fgpu_
 
 # Shader machine code for Turing + 3D pushbuffers, checked against the
 # CPU shader machine with a small simulator.
-build/tests/host/nv_sass_tests: tests/host/nv_sass_tests.c src/modules/GPU/nv_sass.c src/modules/GPU/nv_3d.c src/modules/GPU/nv_fw.c src/modules/GPU/fgpu_ir.c src/modules/GPU/fgpu_shader.c Minimal-OS-SDK/include/fglsl.h $(header_files)
+build/tests/host/nv_sass_tests: tests/host/nv_sass_tests.c src/modules/GPU/nv_sass.c src/modules/GPU/nv_3d.c src/modules/GPU/nv_nvdec.c src/modules/GPU/nv_fw.c src/modules/GPU/fgpu_ir.c src/modules/GPU/fgpu_shader.c Minimal-OS-SDK/include/fglsl.h $(header_files)
 	mkdir -p $(dir $@)
 	$(HOSTCC) $(HOST_CFLAGS) -idirafter Minimal-OS-SDK/include $(filter %.c,$^) -lm -o $@
 
@@ -539,7 +619,7 @@ build/tests/host/nv_hw_tests: tests/host/nv_hw_tests.c src/modules/GPU/nv_fw.c s
 	mkdir -p $(dir $@)
 	$(HOSTCC) $(HOST_CFLAGS) $(filter %.c,$^) -o $@
 
-build/tests/host/media_tests: tests/host/media_tests.c Minimal-OS-SDK/include/mosmedia.h Minimal-OS-SDK/include/mosmedia_motion.h
+build/tests/host/media_tests: tests/host/media_tests.c Minimal-OS-SDK/include/mosmedia.h Minimal-OS-SDK/include/mosmedia_motion.h Minimal-OS-SDK/include/mosmedia_h264.h docs/examples/sample-h264.vid
 	mkdir -p $(dir $@)
 	$(HOSTCC) $(HOST_CFLAGS) -idirafter Minimal-OS-SDK/include tests/host/media_tests.c -o $@
 
@@ -551,7 +631,13 @@ build/tests/host/media_parallel_tests: tests/host/media_parallel_tests.c \
 	$(HOSTCC) $(HOST_CFLAGS) -pthread -I src/intf -idirafter Minimal-OS-SDK/include \
 		tests/host/media_parallel_tests.c src/modules/Media/vid_decode.c -o $@
 
-build/tools/mosmedia: tools/media/mosmedia.c Minimal-OS-SDK/include/mosmedia.h Minimal-OS-SDK/include/mosmedia_motion.h
+# The H.264 decoder against ffmpeg's, on streams x264 encodes with many
+# settings (needs ffmpeg with libx264; not part of test-host).
+.PHONY: test-h264
+test-h264:
+	HOSTCC=$(HOSTCC) sh tools/media/h264_check.sh
+
+build/tools/mosmedia: tools/media/mosmedia.c Minimal-OS-SDK/include/mosmedia.h Minimal-OS-SDK/include/mosmedia_motion.h Minimal-OS-SDK/include/mosmedia_h264.h
 	mkdir -p $(dir $@)
 	$(HOSTCC) -std=c11 -O2 -Wall -Wextra -pthread -idirafter Minimal-OS-SDK/include tools/media/mosmedia.c -o $@
 

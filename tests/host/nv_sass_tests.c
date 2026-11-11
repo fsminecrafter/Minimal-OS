@@ -15,6 +15,7 @@
 #include "x86_64/fgpu_ir.h"
 #include "x86_64/nv_sass.h"
 #include "x86_64/nv_3d.h"
+#include "x86_64/nv_nvdec.h"
 #include "x86_64/nv_builtin_fgsl.h"
 #include "fglsl.h"
 
@@ -379,13 +380,79 @@ static void test_pushbuffers(void) {
           find_method(&p, 0x19D0, 0) == 0x3D, "clear of color and depth");
 
     uint32_t th[8];
-    nv3d_texture_header(th, 0x80500000ull, 1024, 256, 128, false);
+    nv3d_texture_header(th, 0x80500000ull, 1024, 256, 128, NV3D_TEX_ARGB, 0);
     CHECK((th[0] & 0x7F) == 0x08 && ((th[2] >> 21) & 7) == 2 && (th[1] >> 5) == (0x80500000u >> 5) &&
           (th[3] & 0xFFFF) == 1024 / 32 && (th[4] & 0xFFFF) == 255 && (th[5] & 0xFFFF) == 127 &&
           ((th[4] >> 23) & 0xF) == 7 && (th[5] >> 31) == 1, "pitch-linear texture header");
     uint32_t ts[8];
     nv3d_sampler(ts, FGPU_TEXTURE_LINEAR | FGPU_TEXTURE_CLAMP);
     CHECK(ts[0] == (2u | (2u << 3) | (2u << 6)) && ts[1] == (2u | (2u << 4) | (1u << 6)), "sampler");
+}
+
+static void test_nvdec(void) {
+    _Static_assert(sizeof(nvdec_h264_pic_s) == 764, "nvdec_h264_pic_s as in NVIDIA's nvdec_drv.h");
+    nvdec_layout_t l;
+    nvdec_layout(80, 45, &l);           // 1280x720
+    CHECK(l.width == 1280 && l.height == 720 && l.pitch == 1280 && l.block_log2 == 4 &&
+          l.luma_bytes >= 1280u * 720u && l.chroma_bytes >= 1280u * 360u && !(l.luma_bytes & 4095u),
+          "NV12 picture layout");
+    nvdec_layout(1, 1, &l);
+    CHECK(l.block_log2 == 1 && l.pitch == 64, "small pictures use small blocks");
+
+    static syscall_media_h264_t pic;
+    memset(&pic, 0, sizeof pic);
+    pic.mb_w = 10; pic.mb_h = 6; pic.max_refs = 3; pic.log2_max_frame_num_minus4 = 2;
+    pic.num_ref_l0_default_minus1 = 2; pic.pic_init_qp_minus26 = -3; pic.chroma_qp_offset = 2;
+    pic.second_chroma_qp_offset = 2; pic.deblocking_control = 1; pic.is_reference = 1;
+    pic.frame_num = 5; pic.poc = 10; pic.cur_index = 3; pic.ref_count = 2; pic.slice_count = 2;
+    pic.refs[0] = (syscall_media_h264_ref_t){ 1, 0, 0, 4, 8 };
+    pic.refs[1] = (syscall_media_h264_ref_t){ 2, 1, 0, 0, 2 };
+    nvdec_layout(10, 6, &l);
+    static nvdec_h264_pic_s st;
+    nvdec_h264_setup(&st, &pic, &l, 1000);
+    CHECK(st.stream_len == 1016 && st.slice_count == 2 && st.explicitEOSPresentFlag == 1 &&
+          !memcmp(st.eos, nvdec_h264_eos, 16), "stream length and end-of-stream marker");
+    CHECK(st.PicWidthInMbs == 10 && st.FrameHeightInMbs == 6 && st.frame_mbs_only_flag == 1 &&
+          st.pitch_luma == 192 && st.chroma_format_idc == 1 && st.tileFormat == 1 &&
+          st.gob_height == l.block_log2 - 1, "picture size and layout");
+    CHECK(st.pic_init_qp_minus26 == -3 && st.chroma_qp_index_offset == 2 && st.log2_max_frame_num_minus4 == 2 &&
+          st.num_ref_idx_l0_active_minus1 == 2 && st.deblocking_filter_control_present_flag == 1 &&
+          st.ref_pic_flag == 1 && st.frame_num == 5 && st.CurrFieldOrderCnt[0] == 10 && st.CurrPicIdx == 3,
+          "parameter sets and the picture's numbers");
+    CHECK(st.dpb[0].index == 1 && st.dpb[0].state == 3 && st.dpb[0].top_field_marking == 1 &&
+          st.dpb[0].FrameIdx == 4 && st.dpb[0].FieldOrderCnt[0] == 8 && st.dpb[1].is_long_term == 1 &&
+          st.dpb[1].bottom_field_marking == 2 && st.dpb[2].state == 0, "reference pictures");
+    CHECK(st.WeightScale[5][3][3] == 16 && st.WeightScale8x8[1][7][7] == 16, "flat scaling matrices");
+
+    static uint32_t words[256];
+    nv_push_t p;
+    nv_push_init(&p, words, 256);
+    nvdec_job_t job = { .setup = 0x80100000ull, .stream = 0x80200000ull, .slice_offsets = 0x80101000ull,
+                        .coloc = 0x80300000ull, .history = 0x80400000ull, .mbhist = 0x80500000ull,
+                        .status = 0x80102000ull, .picture_number = 7, .max_refs = 3 };
+    job.luma[3] = 0x80600000ull;
+    job.chroma[3] = 0x80700000ull;
+    nvdec_push_h264(&p, &job);
+    CHECK(!p.overflow, "a decode job fits");
+    CHECK(find_method(&p, 0x0000, 0) == NV_CLASS_NVDEC_TURING && find_method(&p, NVDEC_SET_APPLICATION_ID, 0) == 3,
+          "decoder class, H.264");
+    CHECK((find_method(&p, NVDEC_SET_CONTROL_PARAMS, 0) & 15u) == 3 &&
+          ((find_method(&p, NVDEC_SET_CONTROL_PARAMS, 0) >> 7) & 63u) == 1, "control parameters");
+    CHECK(find_method(&p, NVDEC_SET_DRV_PIC_SETUP_OFFSET, 0) == 0x801000u &&
+          find_method(&p, NVDEC_SET_IN_BUF_BASE_OFFSET, 0) == 0x802000u &&
+          find_method(&p, NVDEC_SET_PICTURE_LUMA_OFFSET(3), 0) == 0x806000u &&
+          find_method(&p, NVDEC_SET_PICTURE_CHROMA_OFFSET(3), 0) == 0x807000u &&
+          find_method(&p, NVDEC_SET_PICTURE_LUMA_OFFSET(0), 0) == 0 &&
+          find_method(&p, NVDEC_H264_SET_MBHIST_BUF_OFFSET, 0) == 0x805000u, "buffers in units of 256 bytes");
+    CHECK(find_method(&p, NVDEC_SET_PICTURE_INDEX, 0) == 7 && p.words[p.count - 1] == 0 &&
+          ((p.words[p.count - 2] & 0xFFFu) << 2) == NVDEC_EXECUTE, "the job ends with EXECUTE");
+
+    uint32_t th[8];
+    nv3d_texture_header(th, 0x80600000ull, 192, 160, 96, NV3D_TEX_R8_BL, 2);
+    CHECK((th[0] & 0x7F) == 0x1D && ((th[2] >> 21) & 7) == 3 && (th[1] >> 9) == (0x80600000u >> 9) &&
+          ((th[3] >> 3) & 7) == 2 && ((th[4] >> 23) & 0xF) == 1, "block-linear luma texture header");
+    nv3d_texture_header(th, 0x80700000ull, 192, 80, 48, NV3D_TEX_RG8_BL, 2);
+    CHECK((th[0] & 0x7F) == 0x18 && ((th[0] >> 22) & 7) == 3, "block-linear colour texture header");
 }
 
 int main(void) {
@@ -398,7 +465,9 @@ int main(void) {
     }
     test_encodings();
     test_pushbuffers();
+    test_nvdec();
     compare("built-in color", NV_BUILTIN_VS_PLAIN, NV_BUILTIN_FS_PLAIN);
+    compare("video NV12 to RGB", NV_VIDEO_VS, NV_VIDEO_NV12_FS);
     compare("built-in gouraud", NV_BUILTIN_VS_GOURAUD, NV_BUILTIN_FS_PLAIN);
     compare("built-in phong", NV_BUILTIN_VS_PLAIN, NV_BUILTIN_FS_PHONG);
     compare("textures and discard",

@@ -202,6 +202,7 @@ find out what the hardware disagrees with.
 | GPU page tables (GMMU v2, in VRAM, written through BAR1): sysmem GPFIFO/pushbuffer/semaphore, all of the BAR1 window's VRAM 1:1 in 2 MiB pages; GSP-RM gets the top three levels (COPY_SERVER_RESERVED_PDES) | `nv_rm_chan.c` | works on an RTX 2060 |
 | Copy engine fills: test pattern on screen, FGPU clears of VRAM surfaces | `nv_push_ce_fill`, `nv_rm_ce_fill`, `fgpu_backend_nv.c` | works on an RTX 2060 (test squares read back right) |
 | 3D class (TURING_A): graphics context buffers, golden context, 3D channel, first clear | `nv_rm_chan.c` | written, not yet run on a card |
+| Video decoder (NVDEC, `NVC4B0_VIDEO_DECODER`): channel, H.264 picture setup (`nvdec_h264_pic_s`) and decode jobs, NV12 to RGB on the 3D engine | `nv_nvdec.h`, `nv_nvdec.c`, `nv_rm_chan.c`, `fgpu_backend_nv.c` | written, not yet run on a card |
 | Readback: the copy engine copies VRAM to staging memory in system RAM (16 MiB, mapped once), so presenting a frame never reads through BAR1 | `nv_rm_ce_read` | written, not yet run on a card |
 
 `gpu nvidia` prints the bring-up state. It only reads registers, so it is
@@ -357,6 +358,15 @@ evaluator) and the CPU shader machine, and checks that they agree.
    and sends clears and draws to the 3D engine. `gpu nvidia` shows how
    many ran. A job that does not finish later switches the 3D path off
    and rendering continues on the CPU.
+
+5. **Step 5a** (video decoder): a channel on NVDEC with the decoder
+   class (`NVC4B0_VIDEO_DECODER`); GSP-RM runs NVDEC's firmware itself.
+   It prints `channel N on NVDEC (runlist R)` and `ok: the video
+   decoder's channel runs.` after an empty first job. `gpu nvidia` then
+   shows step 5 with the number of H.264 pictures NVDEC decoded, or that
+   it was switched off because its pictures differed from the CPU
+   decoder's (see docs/media.md for how files are checked). A failed
+   decode job switches NVDEC off and H.264 goes on on the CPU.
 
 #### How a draw runs on the card
 

@@ -36,13 +36,21 @@ void nv3d_zeta_size(uint32_t width, uint32_t height, nv3d_zeta_t* z) {
 }
 
 void nv3d_texture_header(uint32_t out[8], uint64_t va, uint32_t pitch_bytes, uint32_t width,
-                         uint32_t height, bool r8) {
+                         uint32_t height, int kind, uint32_t block_log2) {
     for (int i = 0; i < 8; i++) out[i] = 0;
-    if (r8) {
+    if (kind == NV3D_TEX_R8 || kind == NV3D_TEX_R8_BL) {
         // One byte per texel (a video plane): x = the byte, y = z = 0, w = 1.
         bits(out, 0, 7, 0x1D);              // R8
         bits(out, 7, 10, 2);                // unsigned normalized
         bits(out, 19, 22, 2);               // x = R
+        bits(out, 28, 31, 7);               // w = 1.0
+    } else if (kind == NV3D_TEX_RG8_BL) {
+        // Two bytes per texel (NV12 colour): x = the first, y = the second.
+        bits(out, 0, 7, 0x18);              // G8R8: R is the first byte
+        bits(out, 7, 10, 2);
+        bits(out, 10, 13, 2);
+        bits(out, 19, 22, 2);               // x = R
+        bits(out, 22, 25, 3);               // y = G
         bits(out, 28, 31, 7);               // w = 1.0
     } else {
         // 0xAARRGGBB words are bytes B, G, R, A: the hardware's A8B8G8R8
@@ -57,13 +65,20 @@ void nv3d_texture_header(uint32_t out[8], uint64_t va, uint32_t pitch_bytes, uin
         bits(out, 25, 28, 2);               // z = R
         bits(out, 28, 31, 5);               // w = A
     }
-    bits(out, 37, 64, (uint32_t)(va >> 5) & 0x7FFFFFFu);
     bits(out, 64, 80, (uint32_t)(va >> 32) & 0xFFFFu);
-    bits(out, 85, 88, 2);                   // pitch-linear header
-    bits(out, 96, 112, (pitch_bytes >> 5) & 0xFFFFu);
+    if (kind == NV3D_TEX_R8_BL || kind == NV3D_TEX_RG8_BL) {
+        bits(out, 41, 64, (uint32_t)(va >> 9) & 0x7FFFFFu);
+        bits(out, 85, 88, 3);               // block-linear header
+        bits(out, 99, 102, block_log2);     // GOBs per block: 1 wide, 2^n high, 1 deep
+        bits(out, 151, 155, 1);             // 2D
+    } else {
+        bits(out, 37, 64, (uint32_t)(va >> 5) & 0x7FFFFFFu);
+        bits(out, 85, 88, 2);               // pitch-linear header
+        bits(out, 96, 112, (pitch_bytes >> 5) & 0xFFFFu);
+        bits(out, 151, 155, 7);             // 2D, one level
+    }
     bits(out, 112, 113, 1);
     bits(out, 128, 144, width - 1u);
-    bits(out, 151, 155, 7);                 // 2D, one level
     bits(out, 157, 160, 7);                 // border color from the sampler
     bits(out, 160, 176, height - 1u);
     bits(out, 191, 192, 1);                 // coordinates 0..1

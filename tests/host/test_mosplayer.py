@@ -1,5 +1,6 @@
 import importlib.util
 import pathlib
+import shutil
 import struct
 import unittest
 from array import array
@@ -113,6 +114,18 @@ class MediaDecoderTests(unittest.TestCase):
     def test_truncated_image_is_rejected(self):
         with self.assertRaises(ValueError):
             mosplayer.ImageFile(b"MIMG")
+
+    @unittest.skipUnless(shutil.which("ffmpeg"), "H.264 frames are decoded by ffmpeg")
+    def test_h264_example_decodes_through_ffmpeg(self):
+        video = mosplayer.VideoFile((ROOT / "docs" / "examples" / "sample-h264.vid").read_bytes())
+        self.assertEqual((video.codec_name, video.width, video.height, video.frame_count),
+                         ("h264", 160, 90, 24))
+        late = list(video.frame(20))        # the second group of pictures
+        early = list(video.frame(3))        # and back to the first
+        self.assertEqual(len(late), 160 * 90)
+        self.assertEqual(late[0] >> 24, 0xFF)
+        self.assertNotEqual(late, early)
+        self.assertEqual(list(video.frame(20)), late)
 
     def test_stereo_ima_adpcm_matches_kernel_sample_order(self):
         adi = (b"AudioFormat=IADPCM\nSampleRate=8000\nChannels=2\n"

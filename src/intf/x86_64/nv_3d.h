@@ -69,11 +69,16 @@ void nv3d_push_clear(nv_push_t* p, const nv3d_color_t* color, const nv3d_zeta_t*
                      uint32_t flags, uint32_t xrgb, float depth);
 void nv3d_push_draw(nv_push_t* p, const nv3d_draw_t* d);
 
-// A texture header for a pitch-linear image - ARGB8888, or with `r8` one
-// byte per texel (read as x) - and a sampler for FGPU_TEXTURE_* flags
-// (8 words each).
+// A texture header (8 words) for an image the backend samples:
+//   NV3D_TEX_ARGB      pitch-linear ARGB8888
+//   NV3D_TEX_R8        pitch-linear, one byte per texel (read as x)
+//   NV3D_TEX_R8_BL     block-linear, one byte per texel: a video decoder's luma plane
+//   NV3D_TEX_RG8_BL    block-linear, two bytes per texel (x, y): its interleaved colour plane
+// `block_log2`: block height in GOBs, as a power of two (block-linear only).
+enum { NV3D_TEX_ARGB = 0, NV3D_TEX_R8 = 1, NV3D_TEX_R8_BL = 2, NV3D_TEX_RG8_BL = 3 };
 void nv3d_texture_header(uint32_t out[8], uint64_t va, uint32_t pitch_bytes, uint32_t width,
-                         uint32_t height, bool r8);
+                         uint32_t height, int kind, uint32_t block_log2);
+// A sampler for FGPU_TEXTURE_* flags (8 words).
 void nv3d_sampler(uint32_t out[8], uint32_t flags);
 
 /* Methods (clc597.h). */

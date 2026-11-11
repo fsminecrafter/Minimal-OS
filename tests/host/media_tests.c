@@ -323,6 +323,226 @@ static void test_motion_order(void) {
     free(px); free(a.data); free(b.data);
 }
 
+/* ------------------------------------------------------------- H.264 */
+
+// The decoded planes of every frame of docs/examples/sample-h264.vid,
+// hashed (FNV-1a) as ffmpeg decodes them: H.264 decoding is exact, so the
+// decoder here must reach the same number. tools/media/h264_check.sh
+// compares many more streams when ffmpeg is installed.
+#define SAMPLE_H264 "docs/examples/sample-h264.vid"
+#define SAMPLE_H264_HASH 0x5429ff1e233bf1b8ull
+
+static uint64_t hash_planes(const h264_t* d, uint64_t hash) {
+    const h264_sps_t* s = d->active;
+    uint32_t w = h264_width(d), h = h264_height(d);
+    for (int p = 0; p < 3; p++) {
+        uint32_t pw = p ? (w + 1) / 2 : w, ph = p ? (h + 1) / 2 : h, stride = p ? d->cw : d->w;
+        const uint8_t* base = d->out->plane[p] + (size_t)(p ? s->crop_t / 2 : s->crop_t) * stride +
+                              (p ? s->crop_l / 2 : s->crop_l);
+        for (uint32_t y = 0; y < ph; y++)
+            for (uint32_t x = 0; x < pw; x++) hash = (hash ^ base[(size_t)y * stride + x]) * 0x100000001b3ull;
+    }
+    return hash;
+}
+
+static void test_h264(void) {
+    membuf_t m = {0};
+    FILE* f = fopen(SAMPLE_H264, "rb");
+    CHECK(f != NULL, "sample H.264 video is there (run from the repository root)");
+    if (!f) return;
+    fseek(f, 0, SEEK_END);
+    m.size = m.cap = (size_t)ftell(f);
+    fseek(f, 0, SEEK_SET);
+    m.data = malloc(m.size);
+    CHECK(fread(m.data, 1, m.size, f) == m.size, "sample read");
+    fclose(f);
+
+    mvid_reader_t r;
+    CHECK(mvid_open(&r, mem_read, &m, m.size, malloc), "h264 video opens");
+    CHECK(r.info.codec == MVID_CODEC_H264 && r.info.width == 160 && r.info.height == 90 &&
+          r.info.frame_count == 24 && !r.info.alpha, "h264 video header");
+    size_t px = (size_t)r.info.width * r.info.height;
+    uint32_t* out = malloc(px * 4);
+    uint32_t* frame20 = malloc(px * 4);
+    uint32_t* again = malloc(px * 4);
+    uint64_t hash = 0xcbf29ce484222325ull;
+    bool ok = true;
+    for (uint32_t n = 0; n < r.info.frame_count && ok; n++) {
+        ok = mvid_decode(&r, n, out);
+        if (!ok) break;
+        hash = hash_planes(&r.h264, hash);
+        if (n == 20) memcpy(frame20, out, px * 4);
+        if (n == 0) {
+            // The pixels are the decoder's own conversion, opaque.
+            h264_to_argb(&r.h264, again, r.info.width, r.info.height, r.info.width);
+            CHECK(!memcmp(out, again, px * 4) && (out[0] >> 24) == 0xFF, "h264 pixels");
+            CHECK(h264_is_full_601(&r.h264), "the converter writes full-range BT.601, like the motion codec");
+        }
+    }
+    CHECK(ok, "every h264 frame decodes");
+    CHECK(hash == SAMPLE_H264_HASH, "h264 frames are exactly what ffmpeg decodes");
+    // Seeking: back to the start, then straight to frame 20 (from its keyframe).
+    CHECK(mvid_decode(&r, 3, out) && mvid_decode(&r, 20, out) && !memcmp(out, frame20, px * 4), "h264 seeking");
+    mvid_close(&r, free);
+
+    // Damaged copies must fail cleanly or decode something: never crash
+    // or read outside their buffers (ASan checks that).
+    uint64_t index_at = mm_get64(m.data + 32);
+    membuf_t bad = {malloc(m.size), m.size, m.size};
+    int decoded = 0;
+    for (int round = 0; round < 400; round++) {
+        memcpy(bad.data, m.data, m.size);
+        int hits = 1 + (int)(rnd() % 3u);
+        for (int k = 0; k < hits; k++) {
+            size_t at = 64 + rnd() % (index_at - 64);
+            if (round & 1) bad.data[at] ^= (uint8_t)(1u << (rnd() % 8u));
+            else bad.data[at] = (uint8_t)rnd();
+        }
+        mvid_reader_t b;
+        if (mvid_open(&b, mem_read, &bad, bad.size, malloc))
+            for (uint32_t n = 0; n < b.info.frame_count; n++) decoded += mvid_decode(&b, n, out);
+        mvid_close(&b, free);
+    }
+    CHECK(decoded > 0, "damaged h264 videos still decode where they can");
+
+    // What the decoder does not do, it says.
+    h264_t d;
+    CHECK(h264_init(&d, malloc, 64), "decoder init");
+    static const uint8_t cabac_pps[] = { 0, 0, 1, 0x68, 0xE0, 0x80 };      // entropy_coding_mode_flag = 1
+    CHECK(!h264_decode(&d, cabac_pps, sizeof cabac_pps) && strstr(h264_error(&d), "CABAC"), "CABAC is refused by name");
+    static const uint8_t slice_only[] = { 0, 0, 1, 0x65, 0x88, 0x80, 0x40 };
+    CHECK(!h264_decode(&d, slice_only, sizeof slice_only) && h264_error(&d)[0], "a slice without parameter sets fails");
+    h264_free(&d, free);
+    free(out); free(frame20); free(again); free(bad.data); free(m.data);
+}
+
+/* A stand-in for the graphics card's H.264 decoder: checks what it is
+ * told about each picture and answers with the right pixels (from a CPU
+ * decoder on the same file), unless asked to fail or to be wrong. */
+typedef struct {
+    mvid_reader_t cpu;
+    uint32_t n;                 // the frame being decoded
+    uint32_t calls, mismatches;
+    int fail_at, wrong_at;      // frame numbers, -1 = never
+    uint32_t seen;              // picture buffers written since the last keyframe
+    bool described;             // every picture description was sound
+} fake_hw_t;
+
+static bool fake_hw_decode(void* ctx, const syscall_media_h264_t* pic, uint32_t* out, uint32_t w, uint32_t h) {
+    fake_hw_t* f = ctx;
+    f->calls++;
+    if ((int)f->n == f->fail_at) return false;
+    bool ok = pic->mb_w == 10 && pic->mb_h == 6 && pic->slice_count >= 1 && pic->data_bytes > 4 &&
+              pic->cur_index < SYS_MEDIA_H264_SURFACES && pic->entropy_coding_mode == 0 && w == 160 && h == 90;
+    if (pic->flags & SYS_MEDIA_H264_RESET) { f->seen = 0; ok = ok && pic->ref_count == 0; }
+    else ok = ok && pic->ref_count >= 1;
+    for (uint32_t i = 0; i < pic->ref_count; i++)     // references are pictures decoded before
+        ok = ok && pic->refs[i].index != pic->cur_index && (f->seen & (1u << pic->refs[i].index));
+    for (uint32_t i = 0; i < pic->slice_count; i++) {
+        const uint8_t* p = pic->data + pic->slice_offset[i];
+        int type = p[3] & 31;
+        ok = ok && pic->slice_offset[i] + 4 <= pic->data_bytes && p[0] == 0 && p[1] == 0 && p[2] == 1 &&
+             (type == 1 || type == 5);
+    }
+    f->seen |= 1u << pic->cur_index;
+    f->described = f->described && ok;
+    if (!mvid_decode(&f->cpu, f->n, out)) return false;
+    if ((int)f->n == f->wrong_at) out[w * 40 + 80] ^= 0x00010000u;
+    return true;
+}
+
+static void fake_hw_mismatch(void* ctx) { ((fake_hw_t*)ctx)->mismatches++; }
+
+// Runs the sample through a reader with the stand-in attached, in the
+// order `frames` gives, and checks every picture against `want`.
+static bool hw_run_more(membuf_t* m, const uint32_t* want, const uint32_t* frames, int count, fake_hw_t* f,
+                        mvid_reader_t* r) {
+    (void)m;
+    size_t px = 160 * 90;
+    uint32_t* out = malloc(px * 4);
+    bool ok = true;
+    for (int i = 0; i < count && ok; i++) {
+        // The reader decodes from a keyframe up to the frame wanted: tell
+        // the stand-in which frame each call is for.
+        uint32_t n = frames[i], from;
+        if (r->decoded >= 0 && (int64_t)n > r->decoded) {
+            from = (uint32_t)r->decoded + 1;
+            for (uint32_t k = n; k > from; k--) if (k % 12 == 0) { from = k; break; }
+        } else {
+            from = n - n % 12;
+        }
+        for (uint32_t k = from; k <= n && ok; k++) {
+            f->n = k;
+            ok = mvid_decode(r, k, out) && !memcmp(out, want + (size_t)k * px, px * 4);
+        }
+    }
+    free(out);
+    return ok;
+}
+
+static bool hw_run(membuf_t* m, const uint32_t* want, const uint32_t* frames, int count, fake_hw_t* f,
+                   mvid_reader_t* r) {
+    bool ok = mvid_open(r, mem_read, m, m->size, malloc) && mvid_open(&f->cpu, mem_read, m, m->size, malloc);
+    r->hw_decode = fake_hw_decode;
+    r->hw_mismatch = fake_hw_mismatch;
+    r->hw_ctx = f;
+    f->described = true;
+    return ok && hw_run_more(m, want, frames, count, f, r);
+}
+
+static void test_h264_hardware(void) {
+    membuf_t m = {0};
+    FILE* file = fopen(SAMPLE_H264, "rb");
+    if (!file) return;          // test_h264 has reported it
+    fseek(file, 0, SEEK_END);
+    m.size = m.cap = (size_t)ftell(file);
+    fseek(file, 0, SEEK_SET);
+    m.data = malloc(m.size);
+    CHECK(fread(m.data, 1, m.size, file) == m.size, "sample read");
+    fclose(file);
+    size_t px = 160 * 90;
+    uint32_t* want = malloc(24 * px * 4);
+    mvid_reader_t plain;
+    CHECK(mvid_open(&plain, mem_read, &m, m.size, malloc), "open");
+    for (uint32_t n = 0; n < 24; n++) CHECK(mvid_decode(&plain, n, want + n * px), "reference frame");
+    mvid_close(&plain, free);
+    uint32_t all[24];
+    for (uint32_t i = 0; i < 24; i++) all[i] = i;
+
+    // A decoder that is right: checked over the first group of pictures,
+    // on its own from the second keyframe.
+    fake_hw_t f = { .fail_at = -1, .wrong_at = -1 };
+    mvid_reader_t r;
+    CHECK(hw_run(&m, want, all, 24, &f, &r), "hardware decoder: every picture is right");
+    CHECK(r.hw_state == MVID_HW_ONLY && f.calls == 24 && f.mismatches == 0 && r.hw_checked == MVID_HW_CHECK_FRAMES,
+          "hardware decoder takes over after the checked pictures");
+    CHECK(f.described, "pictures are described completely to the hardware decoder");
+    CHECK(r.h264.hw_only, "after the hand-over the CPU reads headers only");
+    // Seeking backwards after the hand-over: from the keyframe, on the hardware decoder.
+    uint32_t seek[3] = { 23, 14, 20 };
+    CHECK(hw_run_more(&m, want, seek, 3, &f, &r) && r.hw_state == MVID_HW_ONLY, "seeking on the hardware decoder");
+    mvid_close(&r, free); mvid_close(&f.cpu, free);
+
+    // One wrong pixel while it is being checked: reported, and never used.
+    fake_hw_t bad = { .fail_at = -1, .wrong_at = 5 };
+    CHECK(hw_run(&m, want, all, 24, &bad, &r), "a wrong hardware decoder never reaches the screen");
+    CHECK(r.hw_state == MVID_HW_OFF && bad.mismatches == 1 && bad.calls == 6, "it is reported and switched off");
+    mvid_close(&r, free); mvid_close(&bad.cpu, free);
+
+    // It gives up after taking over: the CPU decoder catches up from the keyframe.
+    fake_hw_t quit = { .fail_at = 17, .wrong_at = -1 };
+    CHECK(hw_run(&m, want, all, 24, &quit, &r), "a hardware decoder that gives up is replaced mid-stream");
+    CHECK(r.hw_state == MVID_HW_OFF && !r.h264.hw_only && quit.mismatches == 0, "the file continues on the CPU");
+    mvid_close(&r, free); mvid_close(&quit.cpu, free);
+
+    // It refuses from the start (no such hardware): nothing changes.
+    fake_hw_t none = { .fail_at = 0, .wrong_at = -1 };
+    CHECK(hw_run(&m, want, all, 24, &none, &r) && r.hw_state == MVID_HW_OFF && none.calls == 1,
+          "without a hardware decoder it is asked once");
+    mvid_close(&r, free); mvid_close(&none.cpu, free);
+    free(want); free(m.data);
+}
+
 int main(void) {
     test_swar();
     uint32_t sizes[][2] = {{1, 1}, {64, 64}, {65, 3}, {3, 130}, {130, 70}, {200, 129}};
@@ -343,6 +563,8 @@ int main(void) {
     test_video_motion(33, 17, 0);
     test_video_motion(48, 32, 51);
     test_motion_order();
+    test_h264();
+    test_h264_hardware();
     if (failures) {
         printf("media tests: %d failure(s)\n", failures);
         return 1;

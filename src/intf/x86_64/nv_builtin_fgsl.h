@@ -94,3 +94,26 @@ static const char* const nv_builtin_uniform_names[8] = {
     "                  lum + floor((454.0 * cb + 128.0) * 0.00390625));\n" \
     "  gl_FragColor = vec4(clamp(rgb, 0.0, 255.0) * 0.00392156862745098, 1.0);\n" \
     "}\n"
+
+/* The same conversion for a hardware video decoder's output (NV12): a
+ * luma plane and one plane of Cb, Cr pairs. */
+#define NV_VIDEO_NV12_FS \
+    "uniform sampler2D ty; uniform sampler2D tc;\n" \
+    "uniform vec4 u_inv; uniform vec2 u_cmax; varying vec2 v_px;\n" \
+    "vec2 q2(vec4 s) { return floor(s.rg * 255.0 + 0.5); }\n" \
+    "void main() {\n" \
+    "  vec2 p = floor(v_px);\n" \
+    "  vec2 c = floor(p * 0.5);\n" \
+    "  vec2 c2 = clamp(c + (p - c * 2.0) * 2.0 - 1.0, vec2(0.0, 0.0), u_cmax);\n" \
+    "  vec2 a = (c + 0.5) * u_inv.zw;\n" \
+    "  vec2 b = (c2 + 0.5) * u_inv.zw;\n" \
+    "  float lum = floor(texture(ty, (p + 0.5) * u_inv.xy).r * 255.0 + 0.5);\n" \
+    "  vec2 uv = floor((9.0 * q2(texture(tc, a)) + 3.0 * q2(texture(tc, vec2(b.x, a.y)))\n" \
+    "    + 3.0 * q2(texture(tc, vec2(a.x, b.y))) + q2(texture(tc, b)) + 8.0) * 0.0625);\n" \
+    "  float cb = uv.x - 128.0;\n" \
+    "  float cr = uv.y - 128.0;\n" \
+    "  vec3 rgb = vec3(lum + floor((359.0 * cr + 128.0) * 0.00390625),\n" \
+    "                  lum - floor((88.0 * cb + 183.0 * cr + 128.0) * 0.00390625),\n" \
+    "                  lum + floor((454.0 * cb + 128.0) * 0.00390625));\n" \
+    "  gl_FragColor = vec4(clamp(rgb, 0.0, 255.0) * 0.00392156862745098, 1.0);\n" \
+    "}\n"

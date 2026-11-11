@@ -525,6 +525,7 @@ _Static_assert(sizeof(nv_fifo_device_info_t) == 3212, "NV2080_CTRL_FIFO_GET_DEVI
 #define NV_ENGINE_GR0    0x01u
 #define NV_ENGINE_COPY0  0x09u
 #define NV_ENGINE_COPY9  0x12u
+#define NV_ENGINE_NVDEC0 0x13u     // the video decoder
 
 typedef struct {                // NV90F1_CTRL_VASPACE_COPY_SERVER_RESERVED_PDES_PARAMS
     uint32_t hSubDevice;

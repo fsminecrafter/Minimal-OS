@@ -95,6 +95,22 @@ void usb_keyboard_process_report(const usb_hid_keyboard_report_t* report) {
     g_keyboard_state.alt   = (mods & (USB_MOD_LALT   | USB_MOD_RALT))   != 0;
     g_keyboard_state.meta  = (mods & (USB_MOD_LMETA  | USB_MOD_RMETA))  != 0;
 
+    // Modifier keys on their own: down/up events with their HID usage
+    // codes (0xE0 left Ctrl .. 0xE7 right GUI), so a program can use Ctrl,
+    // Shift or Alt as ordinary keys (games). Only the raw input queue
+    // gets them; they have no character, so text input ignores them.
+    uint8_t changed = (uint8_t)(mods ^ g_keyboard_state.previous_report.modifiers);
+    if (changed) {
+        uint8_t now = (g_keyboard_state.shift ? SYSCALL_INPUT_MOD_SHIFT : 0) |
+                      (g_keyboard_state.ctrl ? SYSCALL_INPUT_MOD_CTRL : 0) |
+                      (g_keyboard_state.alt ? SYSCALL_INPUT_MOD_ALT : 0);
+        for (uint8_t bit = 0; bit < 8; bit++) {
+            if (!(changed & (1u << bit))) continue;
+            input_event_push((mods & (1u << bit)) ? SYSCALL_INPUT_KEY_DOWN : SYSCALL_INPUT_KEY_UP,
+                             (uint8_t)(0xE0u + bit), now, 0, 0, 0, 0);
+        }
+    }
+
     // Detect new presses
     for (int i = 0; i < 6; i++) {
         uint8_t scancode = report->keys[i];

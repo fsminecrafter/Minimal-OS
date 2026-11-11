@@ -7,6 +7,7 @@ import argparse
 import base64
 import os
 import struct
+import subprocess
 import sys
 import time
 import tkinter as tk
@@ -561,9 +562,9 @@ class VideoFile:
                 data[5] not in (3, 4) or data[6] != 6):
             raise ValueError("not a supported .vid file")
         self.codec = _u32(data, 60) if data[4] == 2 else 0
-        if self.codec not in (0, 1) or (self.codec == 1 and data[5] != 3):
+        if self.codec not in (0, 1, 2) or (self.codec != 0 and data[5] != 3):
             raise ValueError(f"unsupported .vid codec {self.codec}")
-        self.codec_name = "motion" if self.codec else "tiles"
+        self.codec_name = ("tiles", "motion", "h264")[self.codec]
         self.data = data
         (self.width, self.height, fps_num, fps_den, self.frame_count,
          self.duration_ms) = struct.unpack_from("<IIIIII", data, 8)
@@ -592,7 +593,9 @@ class VideoFile:
         self.audio = data[self.audio_offset:self.audio_offset + self.audio_size] if self.audio_size else None
         self._pixels = array("I", [0]) * (self.width * self.height)
         self._decoded = -1
-        self._motion = _MotionDecoder(self.width, self.height) if self.codec else None
+        self._motion = _MotionDecoder(self.width, self.height) if self.codec == 1 else None
+        self._h264_first = -1       # h264: the frames in memory, from one keyframe to the next
+        self._h264_frames: list[array] = []
 
     def _decode_one(self, number: int) -> None:
         offset, size, _ = self.index[number]
@@ -638,9 +641,48 @@ class VideoFile:
             pos = end
         self._decoded = number
 
+    def _h264_frame(self, number: int) -> array:
+        """H.264 frames are decoded by ffmpeg, a group of pictures at a time.
+
+        The C players use Minimal-OS-SDK/include/mosmedia_h264.h; this viewer
+        has no H.264 decoder of its own. Colours can differ by a step or two
+        from the C decoder's conversion.
+        """
+        if not self._h264_first <= number < self._h264_first + len(self._h264_frames):
+            first = number
+            while first and not (self.index[first][2] & 1):
+                first -= 1
+            last = first + 1
+            while last < self.frame_count and not (self.index[last][2] & 1):
+                last += 1
+            stream = b"".join(self.data[o + 4:o + s] for o, s, _ in self.index[first:last])
+            try:
+                done = subprocess.run(
+                    ["ffmpeg", "-v", "error", "-f", "h264", "-i", "-", "-fps_mode", "passthrough", "-f", "rawvideo",
+                     "-pix_fmt", "bgra", "-"],
+                    input=stream, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+            except OSError as error:
+                raise ValueError("H.264 .vid files need ffmpeg in PATH for this player") from error
+            size = self.width * self.height * 4
+            if done.returncode != 0 or len(done.stdout) < size * (number - first + 1):
+                detail = done.stderr.decode("utf-8", "replace").strip().splitlines()
+                raise ValueError("ffmpeg could not decode the H.264 frames" +
+                                 (f": {detail[-1]}" if detail else ""))
+            frames = []
+            for at in range(0, len(done.stdout) - size + 1, size):
+                pixels = array("I")
+                pixels.frombytes(done.stdout[at:at + size])
+                if sys.byteorder != "little":
+                    pixels.byteswap()
+                frames.append(pixels)
+            self._h264_first, self._h264_frames = first, frames
+        return self._h264_frames[number - self._h264_first]
+
     def frame(self, number: int) -> array:
         if not 0 <= number < self.frame_count:
             raise ValueError("frame number is outside the video")
+        if self.codec == 2:
+            return self._h264_frame(number)
         if number == self._decoded:
             return self._pixels
         if self._decoded >= 0 and number > self._decoded:

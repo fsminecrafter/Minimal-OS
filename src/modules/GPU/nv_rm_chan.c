@@ -1,6 +1,7 @@
 #include <stdarg.h>
 #include "x86_64/nv_gpu.h"
 #include "x86_64/nv_rm.h"
+#include "x86_64/nv_nvdec.h"
 #include "x86_64/gpucore.h"
 #include "x86_64/pmm.h"
 #include "x86_64/scheduler.h"
@@ -51,6 +52,7 @@
 #define H_CE       0xCEB50001u
 #define H_3D       0x3D970001u
 #define H_3D_GOLDEN 0x3D970002u
+#define H_NVDEC     0xDEC00001u
 
 #define VA_RM_RSVD 0x20000000ull
 #define VA_RM_SIZE 0x20000000ull
@@ -98,13 +100,17 @@ typedef struct {
 } ctxbuf_t;
 
 static chan_t g_ce = { .name = "copy engine", .slot = 0 }, g_gr = { .name = "3D", .slot = 1 },
-              g_golden = { .name = "golden context", .slot = 2 };
+              g_golden = { .name = "golden context", .slot = 2 },
+              g_dec = { .name = "video decoder", .slot = 3 };
 
 static struct {
     gpu_adapter_t* a;
     bool ready;                         // copy engine channel works
     bool gr_ready;                      // 3D channel works
     bool gr_tried;
+    bool dec_ready, dec_tried;          // NVDEC channel works
+    uint32_t dec_runlist;
+    uint32_t jobs_dec;
     bool client, device, subdevice, vaspace, pdes;
 
     void (*print)(const char* text);
@@ -264,6 +270,7 @@ typedef struct {
 static uint32_t find_copy_engines(ce_t* out, uint32_t cap) {
     static nv_fifo_device_info_t info;
     ce_t all[32];
+    c.dec_runlist = 0xFFFFFFFFu;
     uint32_t n = 0, gr_runlist = 0xFFFFFFFFu;
     for (uint32_t base = 0; base < 256;) {
         memset(&info, 0, sizeof(info));
@@ -276,6 +283,7 @@ static uint32_t find_copy_engines(ce_t* out, uint32_t cap) {
             const uint32_t* d = r->entries[i].engineData;
             uint32_t type = d[NV_ENGINE_INFO_RM_ENGINE_TYPE];
             if (type == NV_ENGINE_GR0) gr_runlist = d[NV_ENGINE_INFO_RUNLIST];
+            if (type == NV_ENGINE_NVDEC0) c.dec_runlist = d[NV_ENGINE_INFO_RUNLIST];
             if (type >= NV_ENGINE_COPY0 && type <= NV_ENGINE_COPY9 && n < 32)
                 all[n++] = (ce_t){ type, d[NV_ENGINE_INFO_RUNLIST] };
         }
@@ -313,8 +321,8 @@ static bool build_page_tables(void) {
     vram_wr64(c.pd0_sys + 16u * nv_gmmu_index(VA_SYS, 1) + 8, nv_gmmu_pde(c.pt_sys, NV_GMMU_PDE_VRAM));
 
     // Sysmem for every channel, mapped now so no PTE changes later.
-    chan_t* chans[3] = { &g_ce, &g_gr, &g_golden };
-    for (int k = 0; k < 3; k++) {
+    chan_t* chans[4] = { &g_ce, &g_gr, &g_golden, &g_dec };
+    for (int k = 0; k < 4; k++) {
         chan_t* ch = chans[k];
         ch->sys = (uint8_t*)pmm_try_alloc_pages_zeroed(SYS_PAGES);
         if (!ch->sys) { say("  out of memory for the %s channel's GPFIFO and pushbuffer\n", ch->name); return false; }
@@ -820,6 +828,69 @@ static bool make_3d(void) {
     return true;
 }
 
+/* ------------------------------------------------------- video decoder */
+
+// Step 5a: a channel on NVDEC with the decoder class. GSP-RM runs the
+// engine's firmware itself; like a copy engine it needs no context from
+// us (nouveau: nvkm/engine/nvdec/r535.c).
+static bool make_nvdec(void) {
+    say("\nStep 5a: video decoder (NVDEC)\n");
+    if (c.dec_runlist == 0xFFFFFFFFu) { say("  no video decoder in the device info table\n"); return false; }
+    if (!chan_open(&g_dec, NV_ENGINE_NVDEC0, c.dec_runlist, true)) { say("  no channel for the video decoder\n"); return false; }
+    // NV_BSP_ALLOCATION_PARAMETERS: size, prohibitMultipleInstances, engineInstance.
+    uint32_t params[3] = { sizeof(params), 0, 0 };
+    if (rm_alloc(g_dec.handle, H_NVDEC, NV_CLASS_NVDEC_TURING, params, sizeof(params), "video decoder object")) {
+        chan_close(&g_dec);
+        return false;
+    }
+    say("  channel %u on NVDEC (runlist %u), doorbell token 0x%x\n", g_dec.chid, g_dec.runlist, g_dec.token);
+    // First job: nothing but the semaphore, to see the channel run.
+    nv_push_t p;
+    nv_push_init(&p, push_words(&g_dec), PUSH_WORDS);
+    uint32_t payload = ++g_dec.payload;
+    nv_push_1(&p, NV_NVDEC_SUBCHANNEL, 0x0000, NV_CLASS_NVDEC_TURING);
+    nv_push_host_semaphore(&p, sem_va(&g_dec), payload);
+    while (!lock()) __asm__ volatile("pause");
+    bool ok = submit_and_wait(&g_dec, p.count, payload, 2000);
+    unlock();
+    if (!ok) { say("  the first video decoder job did not finish\n"); chan_close(&g_dec); return false; }
+    say("  ok: the video decoder's channel runs.\n");
+    return true;
+}
+
+static nv_push_t g_dec_job;
+
+bool nv_rm_dec_ready(gpu_adapter_t* a) { return c.dec_ready && c.a == a; }
+
+// Like nv_rm_3d_begin / nv_rm_3d_submit, for the video decoder's channel.
+nv_push_t* nv_rm_dec_begin(gpu_adapter_t* a) {
+    if (!c.dec_ready || c.a != a || !lock()) return NULL;
+    nv_bar1_keep_physical(a);
+    nv_push_init(&g_dec_job, push_words(&g_dec), PUSH_WORDS - 8u);
+    return &g_dec_job;
+}
+
+bool nv_rm_dec_submit(void) {
+    uint32_t payload = ++g_dec.payload;
+    g_dec_job.capacity = PUSH_WORDS;
+    nv_push_host_semaphore(&g_dec_job, sem_va(&g_dec), payload);
+    bool ok = !g_dec_job.overflow;
+    if (ok) {
+        wc_flush();
+        ok = submit_and_wait(&g_dec, g_dec_job.count, payload, 2000);
+        if (!ok) {
+            c.dec_ready = false;
+            say("  video decoder channel disabled after a failed job (%u done before)\n", c.jobs_dec);
+        } else {
+            c.jobs_dec++;
+        }
+    }
+    unlock();
+    return ok;
+}
+
+void nv_rm_dec_disable(void) { c.dec_ready = false; }
+
 /* ----------------------------------------------------------------- init */
 
 bool nv_rm_chan_ready(gpu_adapter_t* a) { return c.ready && c.a == a; }
@@ -865,6 +936,12 @@ bool nv_rm_chan_init(gpu_adapter_t* a, void (*print)(const char* text)) {
     if (!c.gr_ready && !c.gr_tried) {
         c.gr_tried = true;
         if (!make_3d()) say("  3D engine not available; clears stay on the copy engine\n");
+        nv_bar1_keep_physical(a);
+    }
+    if (!c.dec_ready && !c.dec_tried) {
+        c.dec_tried = true;
+        c.dec_ready = make_nvdec();
+        if (!c.dec_ready) say("  video decoder not available; H.264 is decoded on the CPU\n");
         nv_bar1_keep_physical(a);
     }
     return true;

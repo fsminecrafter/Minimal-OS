@@ -150,6 +150,45 @@ bool fgpu_video_convert(const uint8_t* y, const uint8_t* cb, const uint8_t* cr, 
     return fake_gpu && fake_convert(y, cb, cr, w, h, cw, ch, out, width, height);
 }
 
+static int h264_calls, h264_mismatches;
+bool fgpu_video_h264(const syscall_media_h264_t* pic, uint32_t* out, uint32_t width, uint32_t height) {
+    (void)pic; (void)out; (void)width; (void)height;
+    h264_calls++;
+    return false;       // no hardware decoder here: the syscall must answer "not now"
+}
+void fgpu_video_h264_mismatch(void) { h264_mismatches++; }
+
+static uint64_t h264_call(syscall_media_h264_t* pic, uint32_t width, uint32_t height, uint32_t* out, uint32_t op) {
+    syscall_media_request_t request = {
+        .size = sizeof(request), .version = SYS_MEDIA_ABI_VERSION, .op = op,
+        .width = width, .height = height, .frame_bytes = op == SYS_MEDIA_DECODE_H264 ? sizeof(*pic) : 0,
+        .frame = op == SYS_MEDIA_DECODE_H264 ? (const uint8_t*)pic : NULL, .pixels = out
+    };
+    return media_syscall(&request);
+}
+
+static void test_h264_syscall(void) {
+    static syscall_media_h264_t pic;
+    static uint8_t data[64] = { 0, 0, 1, 0x65, 0x88 };
+    static uint32_t out[160 * 96];
+    memset(&pic, 0, sizeof(pic));
+    pic.mb_w = 10; pic.mb_h = 6; pic.slice_count = 1; pic.data = data; pic.data_bytes = sizeof(data);
+    pic.cur_index = 2; pic.max_refs = 2;
+    CHECK(h264_call(&pic, 160, 90, out, SYS_MEDIA_DECODE_H264) == SYS_ERR_AGAIN && h264_calls == 1,
+          "a sound H.264 picture reaches the GPU hook");
+    pic.cur_index = SYS_MEDIA_H264_SURFACES;
+    CHECK(h264_call(&pic, 160, 90, out, SYS_MEDIA_DECODE_H264) == SYS_ERR_INVAL, "bad picture buffer refused");
+    pic.cur_index = 2; pic.ref_count = 1; pic.refs[0].index = 2;
+    CHECK(h264_call(&pic, 160, 90, out, SYS_MEDIA_DECODE_H264) == SYS_ERR_INVAL, "a picture referring to itself refused");
+    pic.ref_count = 0; pic.slice_offset[0] = sizeof(data);
+    CHECK(h264_call(&pic, 160, 90, out, SYS_MEDIA_DECODE_H264) == SYS_ERR_INVAL, "a slice outside the data refused");
+    pic.slice_offset[0] = 0;
+    CHECK(h264_call(&pic, 161, 90, out, SYS_MEDIA_DECODE_H264) == SYS_ERR_INVAL, "a picture larger than its macroblocks refused");
+    CHECK(h264_call(&pic, 160, 90, out, SYS_MEDIA_DECODE_H264) == SYS_ERR_AGAIN && h264_calls == 2, "and then accepted again");
+    CHECK(h264_call(NULL, 0, 0, NULL, SYS_MEDIA_H264_MISMATCH) == SYS_SUCCESS && h264_mismatches == 1,
+          "a mismatch report reaches the backend");
+}
+
 static uint64_t convert_call(syscall_media_planes_t* planes, uint32_t width, uint32_t height, uint32_t* out) {
     syscall_media_request_t request = {
         .size = sizeof(request), .version = SYS_MEDIA_ABI_VERSION, .op = SYS_MEDIA_CONVERT_YCBCR,
@@ -183,6 +222,7 @@ static void test_convert(void) {
 
 int main(void) {
     test_convert();
+    test_h264_syscall();
     const uint32_t width = 256, height = 192, frame_count = 4;
     size_t pixel_count = (size_t)width * height;
     uint32_t* source = (uint32_t*)malloc(pixel_count * frame_count * sizeof(uint32_t));

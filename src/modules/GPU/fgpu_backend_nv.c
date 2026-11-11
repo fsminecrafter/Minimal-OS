@@ -4,6 +4,7 @@
 #include "x86_64/nv_gpu.h"
 #include "x86_64/nv_sass.h"
 #include "x86_64/nv_3d.h"
+#include "x86_64/nv_nvdec.h"
 #include "x86_64/nv_builtin_fgsl.h"
 #include "x86_64/minimafs.h"
 #include "x86_64/allocator.h"
@@ -362,7 +363,7 @@ static bool nv_draw(const fgpu_hw_draw_t* d, uint32_t* triangles) {
             mem->cpu == d->target->color.cpu)       // sampling the target it draws to
             return false;
         uint32_t words[8];
-        nv3d_texture_header(words, nv_rm_vram_va(mem->vram_offset), pitch, tex->width, tex->height, false);
+        nv3d_texture_header(words, nv_rm_vram_va(mem->vram_offset), pitch, tex->width, tex->height, NV3D_TEX_ARGB, 0);
         vram_write(g.pools + POOL_TIC + (u + 1u) * 32u, words, 32);
         nv3d_sampler(words, tex->flags);
         vram_write(g.pools + POOL_TSC + (u + 1u) * 32u, words, 32);
@@ -510,7 +511,7 @@ static bool nv_video_convert(const uint8_t* y, const uint8_t* cb, const uint8_t*
         for (uint32_t row = 0; row < ph; row++)
             memcpy((void*)(g.a->aperture + v.plane[p] + (uint64_t)row * v.pitch[p]), src[p] + (size_t)row * pw, pw);
         uint32_t words[8], slot = TEX_FIRST_VIDEO + (uint32_t)p;
-        nv3d_texture_header(words, nv_rm_vram_va(v.plane[p]), v.pitch[p], pw, ph, true);
+        nv3d_texture_header(words, nv_rm_vram_va(v.plane[p]), v.pitch[p], pw, ph, NV3D_TEX_R8, 0);
         vram_write(g.pools + POOL_TIC + slot * 32u, words, 32);
         nv3d_sampler(words, FGPU_TEXTURE_CLAMP);                // nearest texel
         vram_write(g.pools + POOL_TSC + slot * 32u, words, 32);
@@ -546,6 +547,246 @@ static bool nv_video_convert(const uint8_t* y, const uint8_t* cb, const uint8_t*
     if (ok) v.frames++;
 out:
     __atomic_store_n(&v.busy, 0, __ATOMIC_RELEASE);
+    return ok;
+}
+
+/* ---------------------------------------------------- H.264 on NVDEC */
+
+/* A whole H.264 picture on the card: NVDEC decodes the slices into an
+ * NV12 picture in VRAM, the 3D engine converts that to RGB (the same
+ * arithmetic as above, NV_VIDEO_NV12_FS), the copy engine brings it back.
+ * The caller (mosmedia.h) parsed the headers and keeps the list of
+ * reference pictures; it also decodes the first pictures of a file on the
+ * CPU and compares, so a decoder that is wrong here is switched off
+ * (nv_h264_mismatch) before anyone sees its pictures. */
+
+#define TEX_H264_LUMA   8u
+#define TEX_H264_CHROMA 9u
+
+static struct {
+    volatile int busy;
+    bool init, bad;
+    nv_program_t* program;
+    bool tried;
+    int32_t reg_inv, reg_cmax;
+    uint32_t unit[2];
+    uint32_t mb_w, mb_h, max_refs, width, height;   // what the memory below is for
+    nvdec_layout_t l;
+    uint64_t luma[SYS_MEDIA_H264_SURFACES], chroma[SYS_MEDIA_H264_SURFACES];
+    uint64_t coloc, mbhist, history, pages, stream, target, vbo, cb;
+    uint32_t stream_cap, target_pitch;
+    float uniforms[FGPU_SHADER_MAX_UNIFORMS * 4];
+    uint32_t pictures;
+} hd;
+
+#define H264_PAGE_SETUP  0u
+#define H264_PAGE_SLICES 4096u
+#define H264_PAGE_STATUS 8192u
+#define H264_PAGES       12288u
+
+static void h264_release(uint64_t* off) {
+    if (*off != GPU_VRAM_INVALID) gpu_vram_free(g.a, *off);
+    *off = GPU_VRAM_INVALID;
+}
+
+static void h264_free_all(void) {
+    for (uint32_t i = 0; i < SYS_MEDIA_H264_SURFACES; i++) {
+        if (hd.init) { h264_release(&hd.luma[i]); h264_release(&hd.chroma[i]); }
+        hd.luma[i] = hd.chroma[i] = GPU_VRAM_INVALID;
+    }
+    uint64_t* all[8] = { &hd.coloc, &hd.mbhist, &hd.history, &hd.pages, &hd.stream, &hd.target, &hd.vbo, &hd.cb };
+    for (int i = 0; i < 8; i++) {
+        if (hd.init) h264_release(all[i]);
+        *all[i] = GPU_VRAM_INVALID;
+    }
+    hd.init = true;
+    hd.mb_w = 0;
+    hd.stream_cap = 0;
+}
+
+static bool h264_alloc(uint64_t* off, uint64_t bytes) {
+    if (*off != GPU_VRAM_INVALID) return true;
+    uint64_t o = gpu_vram_alloc(g.a, bytes, 4096, 0);
+    if (o == GPU_VRAM_INVALID) return false;
+    if (o + bytes > nv_rm_vram_mapped(g.a)) { gpu_vram_free(g.a, o); return false; }
+    *off = o;
+    return true;
+}
+
+static bool h264_program(void) {
+    if (hd.tried) return hd.program != NULL;
+    hd.tried = true;
+    fglsl_program_t* c = (fglsl_program_t*)alloc_unzeroed(sizeof(fglsl_program_t));
+    if (!c) return false;
+    fgpu_program_t prog;
+    const char* why = "";
+    if (fglsl_compile(c, NV_VIDEO_VS, NV_VIDEO_NV12_FS) == 0 && fgpu_program_check(c->words, c->size, &prog, &why))
+        hd.program = (nv_program_t*)nv_program_create(&prog);
+    if (hd.program) {
+        int inv = fglsl_find_uniform(c, "u_inv"), cmax = fglsl_find_uniform(c, "u_cmax");
+        int ty = fglsl_find_uniform(c, "ty"), tc = fglsl_find_uniform(c, "tc");
+        bool ok = inv >= 0 && cmax >= 0 && ty >= 0 && tc >= 0 && c->uniforms[ty].reg < FGPU_MAX_TEXTURE_UNITS &&
+                  c->uniforms[tc].reg < FGPU_MAX_TEXTURE_UNITS;
+        if (ok) {
+            hd.reg_inv = (int32_t)c->uniforms[inv].reg;
+            hd.reg_cmax = (int32_t)c->uniforms[cmax].reg;
+            hd.unit[0] = c->uniforms[ty].reg;
+            hd.unit[1] = c->uniforms[tc].reg;
+        } else {
+            nv_program_destroy(hd.program);
+            hd.program = NULL;
+        }
+    }
+    free_mem(c);
+    return hd.program != NULL;
+}
+
+// The stream's buffers; picture buffers come as pictures name them.
+static bool h264_memory(const syscall_media_h264_t* pic, uint32_t width, uint32_t height) {
+    if (!hd.init) h264_free_all();
+    if (hd.mb_w != pic->mb_w || hd.mb_h != pic->mb_h || hd.max_refs != pic->max_refs || hd.width != width ||
+        hd.height != height) {
+        h264_free_all();
+        nvdec_layout(pic->mb_w, pic->mb_h, &hd.l);
+        uint32_t coloc, mbhist, history;
+        nvdec_buffer_sizes(pic->mb_w, pic->mb_h, pic->max_refs, &coloc, &mbhist, &history);
+        hd.target_pitch = ((width + 31u) & ~31u) * 4u;
+        if (!h264_alloc(&hd.coloc, coloc) || !h264_alloc(&hd.mbhist, mbhist) || !h264_alloc(&hd.history, history) ||
+            !h264_alloc(&hd.pages, H264_PAGES) || !h264_alloc(&hd.target, (uint64_t)hd.target_pitch * height) ||
+            !h264_alloc(&hd.vbo, 4096) || !h264_alloc(&hd.cb, 4096)) {
+            h264_free_all();
+            return false;
+        }
+        float fw = (float)width, fh = (float)height;
+        float tri[3][4] = { { -1, 1, 0, 0 }, { -1, -3, 0, 2 * fh }, { 3, 1, 2 * fw, 0 } };
+        vram_write(hd.vbo, tri, sizeof(tri));
+        hd.mb_w = pic->mb_w; hd.mb_h = pic->mb_h; hd.max_refs = pic->max_refs;
+        hd.width = width; hd.height = height;
+    }
+    uint32_t need = (pic->data_bytes + (uint32_t)sizeof(nvdec_h264_eos) + 0xFFFFFu) & ~0xFFFFFu;
+    if (need > hd.stream_cap) {
+        h264_release(&hd.stream);
+        hd.stream_cap = 0;
+        if (!h264_alloc(&hd.stream, need)) return false;
+        hd.stream_cap = need;
+    }
+    return true;
+}
+
+static void nv_h264_mismatch(void) {
+    hd.bad = true;
+    serial_write_str("nv: NVDEC pictures differ from the CPU decoder's; H.264 stays on the CPU\n");
+}
+
+static bool nv_h264_decode(const syscall_media_h264_t* pic, uint32_t* out, uint32_t width, uint32_t height) {
+    if (!g.hw3d || hd.bad || !nv_rm_dec_ready(g.a)) return false;
+    if (!pic->mb_w || !pic->mb_h || pic->mb_w > 256u || pic->mb_h > 256u || !width || !height ||
+        width > (uint32_t)pic->mb_w * 16u || height > (uint32_t)pic->mb_h * 16u || pic->max_refs > 16u ||
+        pic->cur_index >= SYS_MEDIA_H264_SURFACES || pic->ref_count > 16u || !pic->slice_count ||
+        pic->slice_count > SYS_MEDIA_H264_MAX_SLICES || !pic->data_bytes || pic->data_bytes > (32u << 20))
+        return false;
+    if (__atomic_exchange_n(&hd.busy, 1, __ATOMIC_ACQUIRE)) return false;
+    bool ok = false;
+    if (!h264_program() || !h264_memory(pic, width, height)) goto out;
+
+    // Picture buffers: the references must be pictures decoded here before.
+    nvdec_job_t job;
+    memset(&job, 0, sizeof(job));
+    for (uint32_t i = 0; i < pic->ref_count; i++) {
+        uint32_t idx = pic->refs[i].index;
+        if (idx >= SYS_MEDIA_H264_SURFACES || idx == pic->cur_index || hd.luma[idx] == GPU_VRAM_INVALID) goto out;
+    }
+    if (!h264_alloc(&hd.luma[pic->cur_index], hd.l.luma_bytes) ||
+        !h264_alloc(&hd.chroma[pic->cur_index], hd.l.chroma_bytes))
+        goto out;
+    for (uint32_t i = 0; i < SYS_MEDIA_H264_SURFACES; i++) {
+        if (hd.luma[i] == GPU_VRAM_INVALID) continue;
+        job.luma[i] = nv_rm_vram_va(hd.luma[i]);
+        job.chroma[i] = nv_rm_vram_va(hd.chroma[i]);
+    }
+
+    // The slices and the end-of-stream marker, the slice table, the setup.
+    memcpy((void*)(g.a->aperture + hd.stream), pic->data, pic->data_bytes);
+    memcpy((void*)(g.a->aperture + hd.stream + pic->data_bytes), nvdec_h264_eos, sizeof(nvdec_h264_eos));
+    static uint32_t offsets[256];
+    memset(offsets, 0, sizeof(offsets));
+    for (uint32_t i = 0; i < pic->slice_count; i++) {
+        if (pic->slice_offset[i] >= pic->data_bytes) goto out;
+        offsets[i] = pic->slice_offset[i];
+    }
+    offsets[pic->slice_count] = pic->data_bytes;
+    vram_write(hd.pages + H264_PAGE_SLICES, offsets, sizeof(offsets));
+    static nvdec_h264_pic_s setup;
+    static uint32_t setup_words[(sizeof(nvdec_h264_pic_s) + 3) / 4];
+    nvdec_h264_setup(&setup, pic, &hd.l, pic->data_bytes);
+    memcpy(setup_words, &setup, sizeof(setup));
+    vram_write(hd.pages + H264_PAGE_SETUP, setup_words, sizeof(setup_words));
+
+    job.setup = nv_rm_vram_va(hd.pages + H264_PAGE_SETUP);
+    job.slice_offsets = nv_rm_vram_va(hd.pages + H264_PAGE_SLICES);
+    job.status = nv_rm_vram_va(hd.pages + H264_PAGE_STATUS);
+    job.stream = nv_rm_vram_va(hd.stream);
+    job.coloc = nv_rm_vram_va(hd.coloc);
+    job.history = nv_rm_vram_va(hd.history);
+    job.mbhist = nv_rm_vram_va(hd.mbhist);
+    job.picture_number = hd.pictures;
+    job.max_refs = pic->max_refs;
+    nv_push_t* p = NULL;
+    for (uint32_t tries = 0; tries < 2000000u && !p && nv_rm_dec_ready(g.a); tries++) {
+        p = nv_rm_dec_begin(g.a);
+        if (!p) __asm__ volatile("pause");
+    }
+    if (!p) goto out;
+    nvdec_push_h264(p, &job);
+    if (!nv_rm_dec_submit()) {
+        serial_write_str("nv: a video decoder job failed; H.264 goes back to the CPU\n");
+        goto out;
+    }
+    hd.pictures++;
+
+    // NV12 to RGB on the 3D engine.
+    nv3d_draw_t d;
+    memset(&d, 0, sizeof(d));
+    uint32_t words[8];
+    nv3d_texture_header(words, nv_rm_vram_va(hd.luma[pic->cur_index]), hd.l.pitch, hd.l.width, hd.l.height,
+                        NV3D_TEX_R8_BL, hd.l.block_log2);
+    vram_write(g.pools + POOL_TIC + TEX_H264_LUMA * 32u, words, 32);
+    nv3d_texture_header(words, nv_rm_vram_va(hd.chroma[pic->cur_index]), hd.l.pitch, hd.l.width / 2u,
+                        hd.l.height / 2u, NV3D_TEX_RG8_BL, hd.l.block_log2);
+    vram_write(g.pools + POOL_TIC + TEX_H264_CHROMA * 32u, words, 32);
+    nv3d_sampler(words, FGPU_TEXTURE_CLAMP);
+    vram_write(g.pools + POOL_TSC + TEX_H264_LUMA * 32u, words, 32);
+    d.tex_handle[hd.unit[0]] = TEX_H264_LUMA | (TEX_H264_LUMA << 20);
+    d.tex_handle[hd.unit[1]] = TEX_H264_CHROMA | (TEX_H264_LUMA << 20);
+    memset(hd.uniforms, 0, sizeof(hd.uniforms));
+    float inv[4] = { 1.0f / (float)hd.l.width, 1.0f / (float)hd.l.height, 2.0f / (float)hd.l.width,
+                     2.0f / (float)hd.l.height };
+    memcpy(&hd.uniforms[hd.reg_inv * 4], inv, sizeof(inv));
+    hd.uniforms[hd.reg_cmax * 4] = (float)(hd.l.width / 2u - 1u);
+    hd.uniforms[hd.reg_cmax * 4 + 1] = (float)(hd.l.height / 2u - 1u);
+    static const uint32_t attrib[2] = { FGPU_ATTRIB(0, 2), FGPU_ATTRIB(2, 2) };
+    d.color = (nv3d_color_t){ nv_rm_vram_va(hd.target), hd.target_pitch, width, height };
+    d.vp_w = (int32_t)width;
+    d.vp_h = (int32_t)height;
+    d.front_ccw = g.front_ccw;
+    d.vs = (nv3d_stage_t){ nv_rm_vram_va(hd.program->vs.vram), hd.program->vs.regs };
+    d.fs = (nv3d_stage_t){ nv_rm_vram_va(hd.program->fs.vram), hd.program->fs.regs };
+    d.cb_va = nv_rm_vram_va(hd.cb);
+    d.uniforms = hd.uniforms;
+    d.textures_changed = true;
+    d.stride_bytes = 16;
+    d.attrib_count = 2;
+    d.attrib = attrib;
+    d.vb_va = nv_rm_vram_va(hd.vbo);
+    d.vb_bytes = 48;
+    d.count = 3;
+    p = begin_job();
+    if (!p) goto out;
+    nv3d_push_draw(p, &d);
+    if (!end_job(p)) goto out;
+    ok = nv_rm_ce_read(g.a, hd.target, width * 4u, height, hd.target_pitch, out, width * 4u);
+out:
+    __atomic_store_n(&hd.busy, 0, __ATOMIC_RELEASE);
     return ok;
 }
 
@@ -688,6 +929,8 @@ fgpu_backend_t fgpu_backend_nvidia = {
     .read = nv_read,
     .surface_destroy = nv_surface_destroy,
     .video_convert = nv_video_convert,
+    .h264_decode = nv_h264_decode,
+    .h264_mismatch = nv_h264_mismatch,
 };
 
 /* ------------------------------------------------------- bring-up report */
@@ -892,10 +1135,22 @@ void nv_bringup_report(gpu_adapter_t* a, void (*print)(const char* text)) {
         snprintf(line, sizeof(line), "        video: colour conversion of motion .vid frames on the GPU (%u frames so far)\n",
                  (unsigned)v.frames);
         print(line);
+    }
+    if (g.hw3d) {
+        /* reported above */
     } else if (nv_rm_3d_ready(a)) {
         print("Step 4  3D channel is up, but the draw self-test failed (run 'gpu nvidia boot' to see it)\n");
     } else {
         print("Step 4  draws on the 3D engine: wait for the 3D channel (step 4a, 'gpu nvidia boot')\n");
+    }
+    if (hd.bad) {
+        print("Step 5  H.264 on NVDEC: switched off, its pictures differed from the CPU decoder's\n");
+    } else if (nv_rm_dec_ready(a)) {
+        snprintf(line, sizeof(line), "Step 5  H.264 .vid on the video decoder (NVDEC): channel up, %u pictures decoded%s\n",
+                 (unsigned)hd.pictures, g.hw3d ? "" : " (needs step 4 for the colour conversion)");
+        print(line);
+    } else {
+        print("Step 5  H.264 on NVDEC: no decoder channel (step 5a, 'gpu nvidia boot')\n");
     }
     const char* why = "";
     const fgpu_backend_t* hw = fgpu_hw_backend(&why);

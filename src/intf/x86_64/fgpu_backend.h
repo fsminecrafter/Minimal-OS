@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include "x86_64/fgpu_raster.h"
 #include "x86_64/gpucore.h"
+#include "x86_64/media_abi.h"
 
 /*
  * FGPU hardware backends.
@@ -77,6 +78,11 @@ typedef struct {
     // False = not now; the caller converts on the CPU.
     bool (*video_convert)(const uint8_t* y, const uint8_t* cb, const uint8_t* cr, uint32_t w, uint32_t h,
                           uint32_t cw, uint32_t ch, uint32_t* out, uint32_t width, uint32_t height);
+    // Optional. One H.264 picture on the card's video decoder, as
+    // 0xFFRRGGBB pixels (rows of `width`). False = decode on the CPU.
+    bool (*h264_decode)(const syscall_media_h264_t* pic, uint32_t* out, uint32_t width, uint32_t height);
+    // Optional. The caller found the card's pictures wrong: stop offering them.
+    void (*h264_mismatch)(void);
 } fgpu_backend_t;
 
 // NVIDIA Turing (fgpu_backend_nv.c). init() fails until GSP-RM and the

@@ -9,6 +9,10 @@
 #include <string.h>
 
 extern bool syscall_user_range_ok(const void* ptr, size_t len, bool write);
+// fgpu.c: one H.264 picture on the card's video decoder, and the report
+// that its pictures were wrong.
+extern bool fgpu_video_h264(const syscall_media_h264_t* pic, uint32_t* out, uint32_t width, uint32_t height);
+extern void fgpu_video_h264_mismatch(void);
 // fgpu.c: the GPU backend's colour conversion; false = none, or not now.
 extern bool fgpu_video_convert(const uint8_t* y, const uint8_t* cb, const uint8_t* cr, uint32_t w, uint32_t h,
                                uint32_t cw, uint32_t ch, uint32_t* out, uint32_t width, uint32_t height);
@@ -66,11 +70,43 @@ static uint64_t convert_ycbcr(syscall_media_request_t* request) {
                               request->pixels, width, height) ? SYS_SUCCESS : SYS_ERR_AGAIN;
 }
 
+// One H.264 picture on the graphics card's video decoder. The caller's
+// decoder parsed the stream; everything is checked again here.
+static uint64_t decode_h264(syscall_media_request_t* request) {
+    static syscall_media_h264_t pic;        // large: not on the kernel stack
+    static volatile int busy;
+    if (request->flags || request->frame_bytes != sizeof(pic) || !request->frame ||
+        !syscall_user_range_ok(request->frame, sizeof(pic), false))
+        return SYS_ERR_INVAL;
+    if (__atomic_exchange_n(&busy, 1, __ATOMIC_ACQUIRE)) return SYS_ERR_AGAIN;
+    memcpy(&pic, request->frame, sizeof(pic));
+    uint32_t width = request->width, height = request->height;
+    uint64_t result = SYS_ERR_INVAL;
+    bool ok = pic.mb_w && pic.mb_h && pic.mb_w <= 256u && pic.mb_h <= 256u && width && height &&
+              width <= (uint32_t)pic.mb_w * 16u && height <= (uint32_t)pic.mb_h * 16u && pic.max_refs <= 16u &&
+              pic.cur_index < SYS_MEDIA_H264_SURFACES && pic.ref_count <= 16u && pic.slice_count &&
+              pic.slice_count <= SYS_MEDIA_H264_MAX_SLICES && pic.data && pic.data_bytes &&
+              pic.data_bytes <= SYS_MEDIA_MAX_FRAME_BYTES / 2u && pic.poc_type <= 2u &&
+              pic.log2_max_frame_num_minus4 <= 12u && pic.log2_max_poc_lsb_minus4 <= 12u &&
+              syscall_user_range_ok(pic.data, pic.data_bytes, false) && request->pixels &&
+              ((uintptr_t)request->pixels & (sizeof(uint32_t) - 1u)) == 0 &&
+              syscall_user_range_ok(request->pixels, (size_t)width * height * sizeof(uint32_t), true);
+    for (uint32_t i = 0; ok && i < pic.ref_count; i++)
+        ok = pic.refs[i].index < SYS_MEDIA_H264_SURFACES && pic.refs[i].index != pic.cur_index;
+    for (uint32_t i = 0; ok && i < pic.slice_count; i++) ok = pic.slice_offset[i] < pic.data_bytes;
+    if (ok) result = fgpu_video_h264(&pic, request->pixels, width, height) ? SYS_SUCCESS : SYS_ERR_AGAIN;
+    __atomic_store_n(&busy, 0, __ATOMIC_RELEASE);
+    return result;
+}
+
 uint64_t media_syscall(syscall_media_request_t* request) {
     if (request && syscall_user_range_ok(request, sizeof(*request), true) &&
         request->size == sizeof(*request) && request->version == SYS_MEDIA_ABI_VERSION &&
-        request->op == SYS_MEDIA_CONVERT_YCBCR && !request->reserved[0] && !request->reserved[1])
-        return convert_ycbcr(request);
+        !request->reserved[0] && !request->reserved[1]) {
+        if (request->op == SYS_MEDIA_CONVERT_YCBCR) return convert_ycbcr(request);
+        if (request->op == SYS_MEDIA_DECODE_H264) return decode_h264(request);
+        if (request->op == SYS_MEDIA_H264_MISMATCH) { fgpu_video_h264_mismatch(); return SYS_SUCCESS; }
+    }
     if (!request || !syscall_user_range_ok(request, sizeof(*request), true) ||
         request->size != sizeof(*request) ||
         request->version != SYS_MEDIA_ABI_VERSION ||

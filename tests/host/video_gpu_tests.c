@@ -84,6 +84,33 @@ static void run(uint32_t width, uint32_t height, int kind) {
             bad++;
         }
     CHECK(bad == 0, "the shader gives exactly the CPU decoder's pixels");
+
+    // The same picture as a hardware decoder writes it (NV12: Cb, Cr pairs).
+    static fglsl_program_t nv12;
+    CHECK(fglsl_compile(&nv12, NV_VIDEO_VS, NV_VIDEO_NV12_FS) == 0, "NV12 shader compiles");
+    fgpu_program_t prog12;
+    CHECK(fgpu_program_check(nv12.words, nv12.size, &prog12, &why), "NV12 shader accepted");
+    uint32_t* pairs = malloc(cw * ch * 4);
+    for (uint32_t i = 0; i < cw * ch; i++)
+        pairs[i] = 0xFF000000u | ((uint32_t)planes[1][i] << 16) | ((uint32_t)planes[2][i] << 8);   // r = Cb, g = Cr
+    memset(uniforms, 0, sizeof uniforms);
+    ui = fglsl_find_uniform(&nv12, "u_inv"); uc = fglsl_find_uniform(&nv12, "u_cmax");
+    memcpy(uniforms[nv12.uniforms[ui].reg], inv, sizeof inv);
+    uniforms[nv12.uniforms[uc].reg][0] = (float)(cw - 1);
+    uniforms[nv12.uniforms[uc].reg][1] = (float)(ch - 1);
+    memset(&p, 0, sizeof p);
+    p.vp_w = (int32_t)width; p.vp_h = (int32_t)height;
+    p.shader = &prog12;
+    p.constants = uniforms;
+    int ty = fglsl_find_uniform(&nv12, "ty"), tc = fglsl_find_uniform(&nv12, "tc");
+    p.textures[nv12.uniforms[ty].reg] = (fgpu_texture_t){ tex[0], w, h, w, FGPU_TEXTURE_CLAMP };
+    p.textures[nv12.uniforms[tc].reg] = (fgpu_texture_t){ pairs, cw, ch, cw, FGPU_TEXTURE_CLAMP };
+    memset(got, 0, width * height * 4);
+    fgpu_raster_draw_layout(&t, &p, &layout, &tri[0][0], 3, NULL, 3);
+    bad = 0;
+    for (uint32_t i = 0; i < width * height; i++) bad += (got[i] | 0xFF000000u) != want[i];
+    CHECK(bad == 0, "the NV12 shader gives exactly the CPU decoder's pixels");
+    free(pairs);
     for (int k = 0; k < 3; k++) { free(planes[k]); free(tex[k]); }
     free(want); free(got);
 }

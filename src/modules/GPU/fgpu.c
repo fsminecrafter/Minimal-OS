@@ -112,6 +112,17 @@ bool fgpu_video_convert(const uint8_t* y, const uint8_t* cb, const uint8_t* cr, 
     return hw && hw->video_convert && hw->video_convert(y, cb, cr, w, h, cw, ch, out, width, height);
 }
 
+// One H.264 picture on the card's video decoder (SYS_MEDIA).
+bool fgpu_video_h264(const syscall_media_h264_t* pic, uint32_t* out, uint32_t width, uint32_t height) {
+    const fgpu_backend_t* hw = g_hw;
+    return hw && hw->h264_decode && hw->h264_decode(pic, out, width, height);
+}
+
+void fgpu_video_h264_mismatch(void) {
+    const fgpu_backend_t* hw = g_hw;
+    if (hw && hw->h264_mismatch) hw->h264_mismatch();
+}
+
 // Waits for queued GPU work before the CPU reads or writes GPU memory.
 static void hw_sync(void) {
     if (g_hw && g_hw_pending) g_hw->finish();

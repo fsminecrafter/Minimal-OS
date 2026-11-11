@@ -526,7 +526,7 @@ build/tests/host/fgpu_ir_tests: tests/host/fgpu_ir_tests.c src/modules/GPU/fgpu_
 
 # Shader machine code for Turing + 3D pushbuffers, checked against the
 # CPU shader machine with a small simulator.
-build/tests/host/nv_sass_tests: tests/host/nv_sass_tests.c src/modules/GPU/nv_sass.c src/modules/GPU/nv_3d.c src/modules/GPU/nv_fw.c src/modules/GPU/fgpu_ir.c src/modules/GPU/fgpu_shader.c Minimal-OS-SDK/include/fglsl.h $(header_files)
+build/tests/host/nv_sass_tests: tests/host/nv_sass_tests.c src/modules/GPU/nv_sass.c src/modules/GPU/nv_3d.c src/modules/GPU/nv_nvdec.c src/modules/GPU/nv_fw.c src/modules/GPU/fgpu_ir.c src/modules/GPU/fgpu_shader.c Minimal-OS-SDK/include/fglsl.h $(header_files)
 	mkdir -p $(dir $@)
 	$(HOSTCC) $(HOST_CFLAGS) -idirafter Minimal-OS-SDK/include $(filter %.c,$^) -lm -o $@
 

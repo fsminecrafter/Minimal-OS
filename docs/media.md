@@ -411,7 +411,7 @@ What runs where:
 
 | Step | tiles | motion | h264 |
 | --- | --- | --- | --- |
-| Entropy decoding, prediction, transform, deblocking | CPU, changed tiles in parallel on the kernel's SMP workers | CPU, one core | CPU, one core |
+| Entropy decoding, prediction, transform, deblocking | CPU, changed tiles in parallel on the kernel's SMP workers | CPU, one core | **GPU** (NVDEC) once it has proven itself on the file, else CPU |
 | Colour conversion (4:2:0 YCbCr to RGB) | - | **GPU** when FarcadeGL runs on the card (`hw-3d`), else CPU | the same, for full-range BT.601 streams (what the converter writes) |
 
 `.vid` uses its own codecs, so the card's fixed-function video decoder
@@ -441,12 +441,47 @@ rasterizer cannot run them, and hardware decoders do them in dedicated
 circuits for the standard codecs only. Decoding has no motion search, so
 this part is cheap.
 
-**H.264 and the card's video decoder.** H.264 is one of the formats
-NVDEC decodes completely in hardware, so `h264` videos are the ones that
-could one day be decoded on the card from the first bit to the last.
-That needs an NVDEC channel through GSP-RM and its picture-parameter
-interface, which the driver does not have yet; today the H.264 decoder
-is the CPU one above.
+**H.264 on the card's video decoder (NVDEC).** H.264 is one of the
+formats NVIDIA's NVDEC decodes completely in hardware. On an RTX 20 /
+GTX 16 card where `gpu nvidia boot` brought up the video decoder's
+channel (step 5a) and the 3D engine (step 4), `h264` videos are decoded
+like this:
+
+1. `mosmedia_h264.h` still reads every frame's headers: the parameter
+   sets, the picture order count, the reference picture list. It
+   describes the picture to the kernel (`SYS_MEDIA_DECODE_H264`,
+   `syscall_media_h264_t`): parameter sets, the picture's numbers, its
+   reference pictures, and the slice data as it is in the file.
+2. The NVIDIA backend fills NVIDIA's picture setup structure
+   (`nvdec_h264_pic_s`, from `nvdec_drv.h` in open-gpu-doc) and sends one
+   decode job to NVDEC (`nv_nvdec.c`). NVDEC writes an NV12 picture into
+   VRAM. The 17 picture buffers stay in VRAM, so reference pictures never
+   travel.
+3. The 3D engine converts NV12 to RGB with a shader doing the CPU
+   decoder's arithmetic (`NV_VIDEO_NV12_FS`), and the copy engine brings
+   the RGB picture back.
+
+**It has to prove itself first.** H.264 output is exact, so the first
+pictures of every file are decoded on both: from the first keyframe, the
+CPU decoder and NVDEC each decode every picture and the two are compared
+pixel for pixel. After 12 equal pictures NVDEC takes over alone at the
+next keyframe, and the CPU only reads headers (cheap). One different
+pixel and the file stays on the CPU, and the kernel is told
+(`SYS_MEDIA_H264_MISMATCH`): it stops offering NVDEC for every file and
+`gpu nvidia` says so. If NVDEC fails later (a job that does not finish),
+the CPU decoder starts again from the last keyframe and the video goes
+on. Streams NVDEC is not used for: anything not full-range BT.601 or
+with cropping at the top or left (the converter never writes those), and
+anything the CPU decoder refuses.
+
+Only full pictures from the CPU decoder are ever shown before NVDEC has
+passed the comparison, so a mistake in this path costs speed, never a
+wrong picture. **It has not run on a card yet.** The NVDEC interface is
+taken from NVIDIA's published `nvdec_drv.h` / `clc5b0.h` and from Mesa's
+NVK, which decodes H.264 on NVDEC the same way; the host tests check the
+setup structure, the methods, the hand-over and fallback logic (with a
+stand-in decoder), and that the NV12 shader gives exactly the CPU's
+pixels.
 
 **Tiles codec.** Each changed tile is independent, so the kernel decodes
 the tiles of a frame in parallel on its CPU cores

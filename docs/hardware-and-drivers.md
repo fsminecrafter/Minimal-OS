@@ -92,6 +92,11 @@ cannot play a file's rate.
 The `kernelaudio` process decodes `.adi` files ahead of the card. Playback is
 controlled by the terminal's `play`, `pause`, `stop`, `volume` and `seek`
 commands, and by programs through `SYS_AUDIO` ([Playing audio](audio.md)).
+Programs that make their own sound (games) use `SYS_AUDIO_STREAM`: up to 8
+streams, each with its own rate and channel count, are resampled to the
+card's rate and mixed on top of the file player in the mixer
+(`audio_streams.c`). A stream's queue is filled by its program and drained
+by the driver's refill without a lock, and is closed when its program exits.
 `make run QEMU_SOUND=hda` boots QEMU with an HD Audio card instead of AC'97.
 
 If no compatible audio controller is present, initialization reports that state

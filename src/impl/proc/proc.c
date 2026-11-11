@@ -1,3 +1,4 @@
+#include "x86_64/audio_streams.h"
 #include "x86_64/fgpu.h"
 #include "mmu_tables.h"
 // src/impl/proc/proc.c
@@ -666,6 +667,7 @@ void kill(process_t* proc) {
 	if (!proc) return;
 	window_manager_process_exit(proc->pid);
 	fgpu_process_exit(proc->pid);
+	audio_streams_on_process_exit(proc->pid);
 	graphics_release_screen_for_pid(proc->pid);
 	proc->state = PROCESS_ZOMBIE;
 	// Pull it out of whatever per-CPU run queue it's sitting in so it

@@ -56,6 +56,20 @@ void nv_push_clear_xrgb(nv_push_t* p, uint64_t gpu_va, uint32_t width, uint32_t 
     nv_push_1(p, 0, NV_3D_RT_CONTROL, (076543210u << 4) | 1u);   // one target, identity map
     uint32_t scissor[2] = { width << 16, height << 16 };
     nv_push_method(p, 0, NV_3D_SCREEN_SCISSOR_HORIZ, scissor, 2);
+    // State a clear depends on. None of it can be left to the context's
+    // starting values: with a zero write mask (SET_CT_WRITE) the clear
+    // runs, finishes and changes nothing - what the RTX 2060 showed.
+    nv_push_1(p, 0, NV_3D_RENDER_ENABLE_C, 1);           // always render
+    nv_push_1(p, 0, NV_3D_CT_WRITE(0), 0x1111);          // write r, g, b, a
+    nv_push_1(p, 0, NV_3D_CT_MRT_ENABLE, 1);
+    nv_push_1(p, 0, NV_3D_SINGLE_CT_WRITE_CONTROL, 1);
+    nv_push_1(p, 0, NV_3D_COLOR_COMPRESSION(0), 0);      // no compression tags
+    nv_push_1(p, 0, NV_3D_CLEAR_SURFACE_CONTROL, 0);     // the whole surface clip
+    nv_push_1(p, 0, NV_3D_SCISSOR_ENABLE(0), 0);
+    nv_push_1(p, 0, NV_3D_ANTI_ALIAS, 0);
+    uint32_t offset[2] = { 0, 0 };
+    nv_push_method(p, 0, NV_3D_WINDOW_OFFSET_X, offset, 2);
+    nv_push_1(p, 0, NV_3D_ZT_SELECT, 0);                 // no depth target
     const float k = 1.0f / 255.0f;
     uint32_t color[4] = {
         float_bits((float)((xrgb >> 16) & 255u) * k), float_bits((float)((xrgb >> 8) & 255u) * k),
@@ -63,6 +77,7 @@ void nv_push_clear_xrgb(nv_push_t* p, uint64_t gpu_va, uint32_t width, uint32_t 
     };
     nv_push_method(p, 0, NV_3D_CLEAR_COLOR(0), color, 4);
     nv_push_1(p, 0, NV_3D_CLEAR_BUFFERS, NV_3D_CLEAR_BUFFERS_RGBA | (0u << 6));
+    nv_push_1(p, 0, NV_3D_WAIT_FOR_IDLE, 0);             // the clear is in memory before what follows
 }
 
 /* ------------------------------------------------------------ firmware */

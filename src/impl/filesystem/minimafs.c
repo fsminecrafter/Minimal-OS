@@ -1675,7 +1675,10 @@ minimafs_file_handle_t* minimafs_open(const char* path, bool read_only) {
     first_block = NULL;
     first_block_locked = false;
 
-    if (data_length > MINIMAFS_STREAMING_THRESHOLD) {
+    /* Only read-only handles stream: a writable one keeps the whole file
+     * in memory, because minimafs_write edits handle->data in place and
+     * minimafs_close writes it back. */
+    if (read_only && data_length > MINIMAFS_STREAMING_THRESHOLD) {
         handle->use_streaming = true;
         handle->data          = NULL;
         handle->stream_cache  = (uint8_t*)alloc_unzeroed(MINIMAFS_BLOCK_SIZE);
@@ -1870,6 +1873,13 @@ uint32_t minimafs_write(minimafs_file_handle_t* handle, const void* buffer, uint
         serial_write_str(", buffer=");
         serial_write_hex((uintptr_t)buffer);
         serial_write_str(")\n");
+        return 0;
+    }
+
+    /* A streamed handle has no data buffer to edit (open only falls back
+     * to streaming a writable file when it cannot allocate the buffer). */
+    if (handle->use_streaming) {
+        serial_write_str("MinimaFS: write rejected, file too large to load\n");
         return 0;
     }
 

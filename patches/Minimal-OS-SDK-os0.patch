@@ -1,0 +1,2794 @@
+From 2e82237589087ab693de903c6f03a762ad044a3e Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 12 Nov 2026 23:47:54 +0000
+Subject: [PATCH] OS-0: futex, TLS, clocks, stat/rename/chdir, spawn/wait,
+ environment
+
+syscall.h gains the kernel's new calls (SYS_FUTEX, SYS_CLOCK, SYS_STAT,
+SYS_RENAME, SYS_CHDIR, SYS_SPAWN, SYS_WAIT, the SYS_THREAD FS-base and
+CREATE_EX operations, SYS_ERR_TIMEDOUT). thread.h adds futex wait/wake,
+the FS base and mos_thread_create_ex with a futex join. process.h is new:
+spawn, wait, getenv and small file/time helpers. crt0 keeps the
+environment in environ and passes it to main as a third argument.
+
+programs/os0test is the self-test the kernel's make ci-os0 runs in QEMU;
+it passes there (252 checks).
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0112xJofPtaNLntSK14Rcenm
+---
+ crt0.c                       |   15 +-
+ docs/README.md               |    7 +-
+ docs/conventions.md          |   19 +-
+ docs/files.md                |    6 +-
+ docs/process.md              |  143 ++-
+ docs/spawn.md                |  174 ++++
+ docs/threads.md              |  120 ++-
+ include/minimalos.h          |   55 ++
+ include/process.h            |  152 ++++
+ include/syscall.h            |  129 +++
+ include/thread.h             |   96 ++-
+ include/x86_64/user_common.h |   14 +
+ programs/os0test/main.c      | 1576 ++++++++++++++++++++++++++++++++++
+ 13 files changed, 2487 insertions(+), 19 deletions(-)
+ create mode 100644 docs/spawn.md
+ create mode 100644 include/process.h
+ create mode 100644 programs/os0test/main.c
+
+diff --git a/crt0.c b/crt0.c
+index e24eed7..3fd583a 100644
+--- a/crt0.c
++++ b/crt0.c
+@@ -1,6 +1,14 @@
+ #include "minimalos.h"
+ 
+-extern int main(int argc, char** argv);
++/* The entry point gets RDI = argc, RSI = argv, RDX = envp. main is called
++ * with all three: a program defined as main(int, char**) ignores the
++ * third (SysV: extra register arguments are harmless). */
++extern int main(int argc, char** argv, char** envp);
++
++/* The environment ("NAME=value" strings, NULL-terminated); see process.h.
++ * Never NULL: an empty array when the kernel passed none. */
++static char* g_empty_environ[1] = { 0 };
++char** environ = g_empty_environ;
+ 
+ /*
+  * Compiler-emitted memory primitives.
+@@ -78,8 +86,9 @@ static void run_init_array(void) {
+     }
+ }
+ 
+-void _start(long argc, char** argv) {
++void _start(long argc, char** argv, char** envp) {
++    if (envp) environ = envp;
+     run_init_array();
+-    int rc = main((int)argc, argv);
++    int rc = main((int)argc, argv, environ);
+     mos_exit(rc);
+ }
+diff --git a/docs/README.md b/docs/README.md
+index 967777a..68a30d6 100644
+--- a/docs/README.md
++++ b/docs/README.md
+@@ -9,9 +9,10 @@ truth; these pages describe them as of SDK v1.1 and the kernel's
+ | Page | Header | What is in it |
+ | --- | --- | --- |
+ | [Conventions and errors](conventions.md) | `syscall.h` | Calling convention, result codes, privilege rules, which header to include |
+-| [Process and terminal](process.md) | `minimalos.h` | Output to the terminal, exit, sleep, time, PIDs, launching programs, cleanup on Ctrl+C |
++| [Process and terminal](process.md) | `minimalos.h` | Output to the terminal, exit, sleep, time, clocks, PIDs, launching programs, working directory, `stat`, `rename`, cleanup on Ctrl+C |
+ | [Files](files.md) | `minimalos.h` | MinimaFS: open, create, read, write, seek, list, delete, metadata |
+-| [Threads](threads.md) | `thread.h` | Threads in one program, `mos_mutex_t` locks |
++| [Spawning and waiting](spawn.md) | `process.h` | Start programs with arguments, environment, working directory and redirected output; wait for them; `getenv`; clock helpers |
++| [Threads](threads.md) | `thread.h` | Threads in one program, `mos_mutex_t` locks, futexes, thread-local storage base |
+ | [Memory and randomness](memory.md) | `stdlib.h` | `malloc`, `calloc`, `realloc`, `free`, random bytes, `atoi` |
+ | [Strings and memory](strings.md) | `string.h` | `strlen`, `strcmp`, `strstr`, `memcpy`, constant-time compare … |
+ | [Formatted output](output.md) | `stdio.h`, `iostream` | `printf` and `std::cout` |
+@@ -49,7 +50,7 @@ Each function has the same parts:
+ #include "minimalos.h"
+ #include "stdio.h"
+ 
+-int main(int argc, char** argv) {
++int main(int argc, char** argv) {   /* or main(argc, argv, envp) */
+     printf("hello from pid %ld, %d argument(s)\n", mos_getpid(), argc);
+     for (int i = 0; i < argc; i++) printf("argv[%d] = %s\n", i, argv[i]);
+     mos_exit(0);
+diff --git a/docs/conventions.md b/docs/conventions.md
+index c547ec6..721fac3 100644
+--- a/docs/conventions.md
++++ b/docs/conventions.md
+@@ -13,6 +13,7 @@ Every wrapper ends in one `int 0x80`:
+ | `rdi` | first argument | |
+ | `rsi` | second argument | |
+ | `rdx` | third argument | |
++| `r10` | fourth argument (only `SYS_FUTEX_WAIT`'s timeout; see [`mos_syscall4`](process.md#mos_syscall4)) | |
+ 
+ Calls with more data than three registers (graphics, windows, network,
+ packages, input) pass one pointer to a request structure in `rdi`. Keep
+@@ -36,7 +37,9 @@ numbers, which as unsigned values sit at the very top of the range:
+ | `SYS_ERR_INVAL` | `-4` | Invalid argument: NULL pointer, out-of-range value, bad structure size or version |
+ | `SYS_ERR_PERM` | `-5` | The calling process may not do this (see [privilege](#privilege)) |
+ | `SYS_ERR_BUSY` | `-6` | A shared subsystem (the network stack, a full event queue) is in use: retry |
+-| `SYS_ERR_AGAIN` | `-7` | Non-blocking call with nothing to report yet: call again later |
++| `SYS_ERR_AGAIN` | `-7` | Non-blocking call with nothing to report yet: call again later. `SYS_FUTEX_WAIT` returns it when the word no longer has the expected value |
++| `SYS_ERR_NOMEM` | `-8` | Out of kernel memory (heap or video memory) |
++| `SYS_ERR_TIMEDOUT` | `-9` | A timed wait ran out (`SYS_FUTEX_WAIT` with a timeout) |
+ 
+ The constants are defined as `((uint64_t)-N)`. Compare against them
+ directly, or cast to `long` and test for a negative value:
+@@ -76,6 +79,8 @@ reconfiguring shared hardware through the syscall gate.
+ | Include | You get |
+ | --- | --- |
+ | `minimalos.h` | Core calls: terminal output, exit, time, files, packages, exec, process list, framebuffer ownership and blit |
++| `process.h` | `mos_spawn`, `mos_waitpid`, `mos_getenv`, `environ`, clock helpers (includes `minimalos.h`; see [Spawning](spawn.md)) |
++| `thread.h` | Threads, mutexes, futexes, thread-local storage base (see [Threads](threads.md)) |
+ | `stdio.h` | `printf` (includes `minimalos.h`) |
+ | `stdlib.h` | `malloc` and friends, random bytes, `atoi` (includes `minimalos.h`) |
+ | `string.h` | String and memory helpers (no syscalls) |
+@@ -95,20 +100,24 @@ together.
+ ## Units
+ 
+ - Time: milliseconds. `mos_uptime()` and `mos_sleep()` both use
+-  milliseconds; so do every `timeout_ms` argument.
++  milliseconds; so do every `timeout_ms` argument. The exceptions are the
++  `mos_clock_*` functions (nanoseconds) and the futex timeout
++  (nanoseconds, rounded up to whole milliseconds).
+ - Colours: `window.h` and `mos_graphics_blit_surface` take ARGB8888
+   pixels, `0xAARRGGBB`. Use `0xFF` alpha for opaque pixels. The
+   `mos_graphics_*` primitives take separate `r`, `g`, `b` bytes.
+ - IPv4 addresses and ports in `net.h` are host order: `192.168.1.10` is
+   `0xC0A8010A`.
+-- Paths are MinimaFS paths such as `0:/programs/app.run`. Relative paths
+-  are resolved against the terminal's current directory.
++- Paths are MinimaFS paths such as `0:/programs/app.run`. `/dir/file` is
++  the root of the working directory's drive; any other path is relative to
++  the program's working directory (the terminal's until the program calls
++  [`mos_chdir`](process.md#mos_chdir)).
+ 
+ ## Memory
+ 
+ There is no libc and no dynamic linker. Everything a program uses is
+ either an inline wrapper from these headers or code compiled into the
+ program. `crt0.c` supplies `_start`, runs global constructors
+-(`.init_array`), calls `main(argc, argv)` and then `mos_exit()` with its
++(`.init_array`), calls `main(argc, argv, envp)` (programs declared `main(int, char**)` just ignore the third argument), keeps `envp` in `environ` and then `mos_exit()` with its
+ return value. It also defines out-of-line `memcpy`, `memmove`, `memset`
+ and `memcmp`, which the compiler may call on its own.
+diff --git a/docs/files.md b/docs/files.md
+index c47fde8..e398588 100644
+--- a/docs/files.md
++++ b/docs/files.md
+@@ -4,7 +4,11 @@ MinimaFS file and directory calls. Include `minimalos.h`.
+ 
+ Paths look like `0:/etc/System.conf`: a drive number, a colon, then an
+ absolute path. A path without a drive prefix is resolved against the
+-terminal's current directory (see [`mos_getcwd`](process.md#mos_getcwd)).
++program's working directory (see [`mos_getcwd`](process.md#mos_getcwd) and
++[`mos_chdir`](process.md#mos_chdir)); `/dir/file` is the root of that
++directory's drive. [`mos_stat`](process.md#mos_stat) and
++[`mos_rename`](process.md#mos_rename) are documented with the process
++calls.
+ 
+ A file handle is a `long`. Keep it in a `long`: it is a 64-bit value, and
+ truncating it to `int` can corrupt it. Valid handles are positive;
+diff --git a/docs/process.md b/docs/process.md
+index 1865895..81f9e81 100644
+--- a/docs/process.md
++++ b/docs/process.md
+@@ -1,8 +1,10 @@
+ # Process and terminal
+ 
+ Terminal output, ending the program, time, sleeping, process IDs,
+-launching other programs and the Ctrl+C cleanup hook. Include
+-`minimalos.h`.
++launching other programs, clocks, the working directory, `stat` and
++`rename`, and the Ctrl+C cleanup hook. Include `minimalos.h`. Starting a
++program and waiting for it with arguments, environment and redirected
++output is in [Spawning and waiting](spawn.md) (`process.h`).
+ 
+ ## `mos_write`
+ 
+@@ -328,8 +330,9 @@ for (long i = 0; i < n; i++)
+ long mos_getcwd(char* path, size_t path_size);
+ ```
+ 
+-Copies the terminal's current directory, which relative paths are resolved
+-against.
++Copies the program's working directory, which relative paths are resolved
++against. It is the terminal's current directory until the program calls
++[`mos_chdir`](#mos_chdir); programs started by this one inherit it.
+ 
+ | Parameter | Description |
+ | --- | --- |
+@@ -346,6 +349,128 @@ char cwd[256];
+ if (mos_getcwd(cwd, sizeof cwd) == 0) printf("in %s\n", cwd);
+ ```
+ 
++## `mos_chdir`
++
++```c
++long mos_chdir(const char* path);
++```
++
++Sets the program's working directory, which relative paths are resolved
++against. The setting belongs to the program and is shared by all its
++threads; it does not change the terminal's directory. Programs started
++with [`mos_spawn`](spawn.md#mos_spawn) or `mos_exec` inherit it.
++
++| Parameter | Description |
++| --- | --- |
++| `path` | A directory: `0:/dir`, `/dir` (the working directory's drive), or relative. `.` and `..` are allowed; `..` at the root stays at the root |
++
++**Returns** `SYS_SUCCESS`, `SYS_ERR_NOTFOUND` if `path` is not an existing
++directory, `SYS_ERR_INVAL` for a NULL, invalid or over-long path.
++
++**Notes**
++
++- [`mos_getcwd`](#mos_getcwd) then returns the normalized form:
++  `0:/dir/sub`, no trailing slash except for a drive root (`0:/`).
++
++**Example**
++
++```c
++mos_chdir("0:/data");
++mos_create("notes.txt", "text", "txt");     /* 0:/data/notes.txt */
++```
++
++## `mos_stat`
++
++```c
++long mos_stat(const char* path, syscall_stat_t* out);
++```
++
++Size, type and times of a file or directory, without opening it.
++
++| Parameter | Description |
++| --- | --- |
++| `path` | File or directory |
++| `out` | Filled in on success |
++
++`syscall_stat_t`:
++
++| Field | Meaning |
++| --- | --- |
++| `size` | Data bytes; 0 for a directory |
++| `type` | `SYS_STAT_FILE` or `SYS_STAT_DIR` |
++| `flags` | `SYS_STAT_HIDDEN`, `SYS_STAT_RUNNABLE` (bit mask) |
++| `created`, `modified` | Seconds since 1970-01-01. MinimaFS keeps only the day. 0 when unknown, and always 0 for a directory |
++
++**Returns** `SYS_SUCCESS`, `SYS_ERR_NOTFOUND` when nothing is at `path`,
++`SYS_ERR_INVAL` for a NULL argument or an invalid path.
++
++**Example**
++
++```c
++syscall_stat_t st;
++if (mos_stat("0:/etc/motd.txt", &st) == 0 && st.type == SYS_STAT_FILE)
++    printf("%lu bytes\n", (unsigned long)st.size);
++```
++
++## `mos_rename`
++
++```c
++long mos_rename(const char* from, const char* to);
++```
++
++Renames or moves a file or directory on one drive, also into another
++directory.
++
++| Parameter | Description |
++| --- | --- |
++| `from` | Existing file or directory |
++| `to` | New path. Its directory must exist |
++
++**Returns** `SYS_SUCCESS`; `SYS_ERR_NOTFOUND` when `from` does not exist;
++`SYS_ERR_INVAL` for a NULL or invalid path; `SYS_ERR_GENERIC` for any
++other refusal.
++
++**Notes**
++
++- A file already at `to` is replaced. A directory at `to` is an error
++  (`SYS_ERR_GENERIC`), whatever `from` is; so is moving a directory into
++  itself or its own subtree, a missing target directory, a different drive,
++  and the drive root.
++- Renaming a path to itself succeeds and changes nothing.
++- Close files before renaming them: a handle opened earlier still writes
++  back to the old name.
++
++**Example**
++
++```c
++mos_rename("0:/data/new.tmp", "0:/data/state.bin");   /* replaces state.bin */
++```
++
++## Clocks
++
++```c
++uint64_t mos_clock_monotonic_ns(void);
++uint64_t mos_clock_realtime_ns(void);
++uint64_t mos_clock_tsc_hz(void);
++```
++
++| Function | Returns |
++| --- | --- |
++| `mos_clock_monotonic_ns` | Nanoseconds since boot. Never goes backwards. Read from the CPU's time-stamp counter when it has a usable one, else it has millisecond steps |
++| `mos_clock_realtime_ns` | Nanoseconds since 1970-01-01 UTC by the system clock (UTC when internet time sync is on). Millisecond steps; jumps when the clock is set, so use the monotonic clock for durations |
++| `mos_clock_tsc_hz` | Time-stamp counter ticks per second when `RDTSC` is a usable clock in a program (invariant TSC), else 0 |
++
++[`process.h`](spawn.md#clocks-and-files) adds `mos_monotonic_ms()` and
++`mos_time_unix()`.
++
++**Example**
++
++```c
++uint64_t t0 = mos_clock_monotonic_ns();
++do_work();
++printf("took %lu us\n", (unsigned long)((mos_clock_monotonic_ns() - t0) / 1000));
++```
++
+ ## `mos_syscall`
+ 
+ ```c
+@@ -363,6 +488,16 @@ wrapper yet.
+ 
+ **Returns** the raw `rax` value.
+ 
++## `mos_syscall4`
++
++```c
++long mos_syscall4(long num, long a1, long a2, long a3, long a4);
++```
++
++[`mos_syscall`](#mos_syscall) with a fourth argument in `r10`. Only
++`SYS_FUTEX_WAIT` uses it (its timeout); [`mos_futex_wait`](threads.md#futexes)
++wraps that.
++
+ ## `mos_syscall3`
+ 
+ ```c
+diff --git a/docs/spawn.md b/docs/spawn.md
+new file mode 100644
+index 0000000..46c5d54
+--- /dev/null
++++ b/docs/spawn.md
+@@ -0,0 +1,174 @@
++# Spawning and waiting
++
++Starting other programs with their own arguments, environment, working
++directory and redirected output, waiting for them, and reading the
++environment. Include `process.h` (it includes `minimalos.h`). The raw calls
++it builds on (`mos_spawn_raw`, `mos_wait_raw`, `mos_stat`, `mos_rename`,
++`mos_chdir`, `mos_clock_*`) are in [Process and terminal](process.md).
++
++```c
++#include "process.h"
++#include "stdio.h"
++
++int main(void) {
++    const char* const argv[] = { "0:/programs/tool.run", "--fast", NULL };
++    mos_spawn_opts_t o = { "0:/programs/tool.run", argv, NULL, "0:/work",
++                           "0:/work/out.txt", "0:/work/out.txt" };
++    long pid = mos_spawn_ex(&o);
++    if (pid < 0) { printf("spawn failed (%ld)\n", pid); return 1; }
++
++    mos_wait_result_t r;
++    mos_waitpid(pid, 0, &r);                       /* sleeps until it ends */
++    printf("exit %d%s\n", r.exit_code, r.crashed ? " (crashed)" : "");
++    /* 0:/work/out.txt now holds everything it printed */
++    return 0;
++}
++```
++
++A program started this way is a *child* of the caller. A child is waited for
++once; programs started with `mos_exec` count as children too.
++
++## `environ`
++
++```c
++extern char** environ;
++```
++
++The environment the program started with: a NULL-terminated array of
++`"NAME=value"` strings. `crt0.c` sets it from the entry point's third
++argument (`main` also receives it as an optional third parameter,
++`int main(int argc, char** argv, char** envp)`). It is never NULL; it is an
++empty array when the program started with no environment, which is the case
++for programs run from the terminal. A spawned program gets the environment
++its parent passes (see [`mos_spawn_ex`](#mos_spawn_ex)).
++
++## `mos_getenv`
++
++```c
++char* mos_getenv(const char* name);
++```
++
++**Returns** the value of `name` (an empty string for `NAME=`), or NULL when
++it is not set. `name` must match whole: `OS` does not find `OSNAME=x`. The
++string belongs to `environ`; do not modify it.
++
++## `mos_spawn_ex`
++
++```c
++typedef struct {
++    const char* path;                 /* the program (a .run bundle or ELF) */
++    const char* const* argv;          /* NULL-terminated; NULL: just { path } */
++    const char* const* envp;          /* NULL-terminated "NAME=value"; NULL: inherit */
++    const char* cwd;                  /* NULL: the caller's working directory */
++    const char* stdout_path;          /* NULL: the caller's output; else a file */
++    const char* stderr_path;          /* (replaced) receiving it; may be the same */
++} mos_spawn_opts_t;
++
++long mos_spawn_ex(const mos_spawn_opts_t* o);
++```
++
++Starts a program as a child of the caller and returns at once.
++
++| Field | Description |
++| --- | --- |
++| `path` | The program |
++| `argv` | What the child sees as `argv[0..argc-1]`; `argv[0]` is normally the path. The array must end with NULL. NULL means `{ path }`. An empty string is a valid argument |
++| `envp` | The child's environment. NULL: a copy of the environment the caller started with |
++| `cwd` | The child's working directory; it must be an existing directory. NULL: the caller's current one |
++| `stdout_path` | NULL: the child writes where the caller's output goes (the terminal, or the caller's own redirection). Otherwise a file that is created, replacing an existing one, and receives everything the child writes to stdout |
++| `stderr_path` | The same for stderr. May name the same file as `stdout_path`; the two streams are then one, in order |
++
++**Returns** the child's pid (greater than 0), or `SYS_ERR_NOTFOUND` (no such
++program or it is a directory; `cwd` is not a directory), `SYS_ERR_INVAL` (a
++NULL or unreadable pointer, a path that is too long, too many or too long
++arguments or environment strings), `SYS_ERR_GENERIC` (an output file could
++not be created, or the program could not be loaded), `SYS_ERR_NOMEM`.
++
++**Notes**
++
++- Output redirected to a file is buffered by the kernel and written when the
++  buffer fills and when the child ends. The file is complete once
++  [`mos_waitpid`](#mos_waitpid) has returned for that child, also after a
++  crash. Read it only after that.
++- Everything the child's own children print without a redirection of their
++  own goes to the same file.
++
++## `mos_spawn`
++
++```c
++long mos_spawn(const char* path, const char* const* argv);
++```
++
++`mos_spawn_ex` with only a path and an argv (NULL-terminated, or NULL).
++Environment, working directory and output are inherited.
++
++## `mos_waitpid`
++
++```c
++typedef struct {
++    long pid;                 /* the child that ended */
++    int exit_code;            /* mos_exit()'s value (0-255); 255 after a crash */
++    int crashed;              /* nonzero: it died of a CPU exception */
++    int killed;               /* nonzero: it was ended from outside */
++    unsigned crash_vector;    /* the exception number when crashed */
++} mos_wait_result_t;
++
++long mos_waitpid(long pid, int options, mos_wait_result_t* out);
++long mos_wait(mos_wait_result_t* out);               /* any child */
++```
++
++Waits for a child to end.
++
++| Parameter | Description |
++| --- | --- |
++| `pid` | A child's pid, or `MOS_WAIT_ANY` (0) for whichever ends first |
++| `options` | `0` to sleep until it ends, or `MOS_WAIT_NOHANG` to return at once |
++| `out` | Filled in on success; may be NULL |
++
++**Returns** the pid of the child that ended (also in `out->pid`);
++`SYS_ERR_NOTFOUND` when there is no such child: it was never started, was
++already waited for, or (with `MOS_WAIT_ANY`) no child is left;
++`SYS_ERR_AGAIN` with `MOS_WAIT_NOHANG` while the child still runs;
++`SYS_ERR_INVAL` for other `options` or an invalid `out`.
++
++**Notes**
++
++- A child can be waited for once. Waiting again gives `SYS_ERR_NOTFOUND`.
++- The exit status of a child nobody waits for is kept for a limited time (64
++  children); after that waiting for an old child gives `SYS_ERR_NOTFOUND`.
++- A program that ends does not wait for its children.
++
++**Example**
++
++```c
++/* run four at once, collect them as they finish */
++for (int i = 0; i < 4; i++) mos_spawn(worker, args[i]);
++mos_wait_result_t r;
++while (mos_wait(&r) > 0)
++    printf("pid %ld: exit %d\n", r.pid, r.exit_code);
++```
++
++## Clocks and files
++
++```c
++long     mos_file_size(const char* path);
++uint64_t mos_monotonic_ms(void);
++int64_t  mos_time_unix(void);
++```
++
++| Function | Returns |
++| --- | --- |
++| `mos_file_size` | Size in bytes of a file; `SYS_ERR_NOTFOUND` if it does not exist, `SYS_ERR_INVAL` for a directory (built on [`mos_stat`](process.md#mos_stat)) |
++| `mos_monotonic_ms` | Milliseconds on the monotonic clock (`mos_clock_monotonic_ns() / 1000000`) |
++| `mos_time_unix` | Seconds since 1970-01-01 UTC by the system clock |
++
++## System calls
++
++`SYS_SPAWN` (53): `rdi` = a `syscall_spawn_t*` (`size`, `path`, `argv`,
++`argc`, `envp`, `cwd`, `stdout_path`, `stderr_path`, `flags` which must be
++0). `SYS_WAIT` (54): `rdi` = pid (`SYS_WAIT_ANY` = 0), `rsi` = flags
++(`SYS_WAIT_NOHANG`), `rdx` = a `syscall_wait_t*` or NULL
++(`exit_code`, `flags` with `SYS_WAIT_CRASHED` / `SYS_WAIT_KILLED`,
++`crash_vector`). `SYS_CHDIR` (52), `SYS_STAT` (50), `SYS_RENAME` (51) and
++`SYS_CLOCK` (49) are described with their wrappers in
++[Process and terminal](process.md).
+diff --git a/docs/threads.md b/docs/threads.md
+index 6702653..98cc373 100644
+--- a/docs/threads.md
++++ b/docs/threads.md
+@@ -70,6 +70,35 @@ kernel refused.
+ 
+ - `main` has a fixed 64 KiB stack; a thread gets the stack you ask for.
+ 
++## `mos_thread_create_ex`
++
++```c
++int mos_thread_create_ex(mos_thread_t* t, void (*fn)(void*), void* arg,
++                         size_t stack_size, void* tls);
++```
++
++[`mos_thread_create`](#mos_thread_create) plus two things: the thread
++starts with FS base `tls` (see [Thread-local storage](#thread-local-storage)),
++and it has an *exit futex*, so [`mos_thread_join`](#mos_thread_join) sleeps
++until the kernel reports the end of the thread instead of polling every
++millisecond.
++
++| Parameter | Description |
++| --- | --- |
++| `t`, `fn`, `arg`, `stack_size` | As for `mos_thread_create`. `t` must not move until joined |
++| `tls` | The thread's FS base: a block below `0x0000800000000000`, or NULL for none |
++
++**Returns** `0`, or `-1`.
++
++**Notes**
++
++- `mos_thread_t` has two more fields since this call exists
++  (`exit_word`, `futex_join`). Code that declares a `mos_thread_t` and
++  calls `mos_thread_create` keeps working unchanged.
++- The kernel sets `t->exit_word` to 0 and wakes every
++  [`mos_futex_wait`](#futexes) on it when the thread has ended. It is 1
++  while the thread runs, so you can also wait on it yourself.
++
+ ## `mos_thread_join`
+ 
+ ```c
+@@ -77,7 +106,9 @@ void mos_thread_join(mos_thread_t* t);
+ ```
+ 
+ Waits until the thread has ended, then frees its stack. Returns at once
+-for a thread that never started.
++for a thread that never started. A thread made by
++[`mos_thread_create_ex`](#mos_thread_create_ex) is waited for with a
++futex; one made by `mos_thread_create` by polling every millisecond.
+ 
+ ## `mos_thread_running`
+ 
+@@ -120,6 +151,83 @@ a thread that locks a mutex it already holds waits forever. Keep what
+ happens under a lock short. A thread waiting for a lock sleeps in 1 ms
+ steps, so the holder can run.
+ 
++## Futexes
++
++```c
++long mos_futex_wait(volatile uint32_t* addr, uint32_t expected, uint64_t timeout_ns);
++long mos_futex_wake(volatile uint32_t* addr, uint32_t count);
++```
++
++The building block for locks, condition variables and joins: sleep until
++another thread says a 32-bit word may have changed.
++
++`mos_futex_wait` sleeps only while `*addr == expected`; the check and the
++sleep are atomic against `mos_futex_wake`, so a wake-up cannot be lost
++between them.
++
++| Parameter | Description |
++| --- | --- |
++| `addr` | A 4-byte-aligned `uint32_t` in the program's memory (globals, heap, stack) |
++| `expected` | Sleep only if `*addr` still has this value |
++| `timeout_ns` | `0` waits without limit; otherwise rounded up to whole milliseconds. A timed wait never returns early |
++| `count` | Wake at most this many sleepers (`UINT32_MAX` for all) |
++
++**Returns (wait)** `SYS_SUCCESS` once woken; `SYS_ERR_AGAIN` at once when
++`*addr != expected`; `SYS_ERR_TIMEDOUT` when the time ran out;
++`SYS_ERR_INVAL` for an unaligned address or one outside the program.
++
++**Returns (wake)** how many sleepers it woke (0 when nobody waited), or a
++negative `SYS_ERR_*`.
++
++**Notes**
++
++- A wait can return `SYS_SUCCESS` without a matching wake-up. Always look at
++  the word again and wait again if the condition does not hold.
++- Waiters and wakers are threads of one program; a futex cannot signal
++  another program.
++
++**Example**
++
++```c
++static volatile uint32_t ready;
++
++static void producer(void* arg) {
++    __atomic_store_n(&ready, 1, __ATOMIC_RELEASE);
++    mos_futex_wake(&ready, 1);
++}
++
++/* in the consumer */
++while (__atomic_load_n(&ready, __ATOMIC_ACQUIRE) == 0)
++    mos_futex_wait(&ready, 0, 0);
++```
++
++## Thread-local storage
++
++```c
++long  mos_thread_set_fs(const void* base);
++void* mos_thread_get_fs(void);
++```
++
++Every thread has its own FS base, the register compilers use for
++thread-local variables (`%fs:offset`). `mos_thread_set_fs` sets the calling
++thread's; `mos_thread_get_fs` reads it. The kernel keeps it across context
++switches. A new thread starts with the `tls` of
++[`mos_thread_create_ex`](#mos_thread_create_ex), or 0 for
++`mos_thread_create`; the main thread starts with 0.
++
++| Parameter | Description |
++| --- | --- |
++| `base` | Address of the thread's TLS block, below `0x0000800000000000`; NULL clears it |
++
++**Returns (set)** `SYS_SUCCESS`, or `SYS_ERR_INVAL` for an address in the
++upper half (the CPU would fault on it). The value is unchanged then.
++
++**Notes**
++
++- Reading through `%fs` with a base of 0 faults and ends the program. The
++  convention used by C runtimes is a block whose first word points at the
++  block itself, so `%fs:0` yields the thread pointer.
++
+ ## System call
+ 
+ `SYS_THREAD` (47): `rdi` = `SYS_THREAD_CREATE` with `rsi` = a
+@@ -128,3 +236,13 @@ id; or `SYS_THREAD_ALIVE` with `rsi` = a thread id, returning
+ `SYS_SUCCESS` while that thread of the calling program runs and
+ `SYS_ERR_NOTFOUND` after. `entry` must be in the program and `stack_top`
+ in memory it owns. `thread.h` wraps this; programs should use that.
++
++More operations of `SYS_THREAD`: `SYS_THREAD_SET_FS` (`rsi` = FS base) and
++`SYS_THREAD_GET_FS` (returns it); `SYS_THREAD_CREATE_EX` with `rsi` = a
++`syscall_thread_ex_t*` (`syscall_thread_t` plus `fs_base` and
++`exit_futex`, the address of a `uint32_t` the kernel zeroes and wakes when
++the thread has ended).
++
++`SYS_FUTEX` (48): `rdi` = `SYS_FUTEX_WAIT` with `rsi` = address, `rdx` =
++expected value, `r10` = timeout in nanoseconds; or `SYS_FUTEX_WAKE` with
++`rsi` = address, `rdx` = count.
+diff --git a/include/minimalos.h b/include/minimalos.h
+index 701c9d8..7ce4d16 100644
+--- a/include/minimalos.h
++++ b/include/minimalos.h
+@@ -63,6 +63,61 @@ static inline long mos_exec(const char* path, const char** argv, long argc) {
+     return mos_syscall(SYS_EXEC, (long)(uintptr_t)path, (long)(uintptr_t)argv, argc);
+ }
+ 
++// --- Clocks, stat, rename, working directory, spawn/wait (OS-0 calls) ---
++// process.h builds a friendlier API on these. All of them take a plain
++// path ("0:/dir/file", "/dir/file", or relative to the working directory)
++// and return SYS_SUCCESS (0) or a negative SYS_ERR_* value, except where
++// noted.
++
++// Nanoseconds since boot; never goes backwards.
++static inline uint64_t mos_clock_monotonic_ns(void) {
++    return (uint64_t)mos_syscall(SYS_CLOCK, SYS_CLOCK_MONOTONIC, 0, 0);
++}
++
++// Nanoseconds since 1970-01-01 UTC by the system clock (millisecond steps;
++// jumps when the clock is set).
++static inline uint64_t mos_clock_realtime_ns(void) {
++    return (uint64_t)mos_syscall(SYS_CLOCK, SYS_CLOCK_REALTIME, 0, 0);
++}
++
++// RDTSC ticks per second when the TSC is a usable clock in user code
++// (invariant TSC), else 0.
++static inline uint64_t mos_clock_tsc_hz(void) {
++    return (uint64_t)mos_syscall(SYS_CLOCK, SYS_CLOCK_TSC_HZ, 0, 0);
++}
++
++// Size, type and times of a file or directory. SYS_ERR_NOTFOUND when
++// nothing is at `path`.
++static inline long mos_stat(const char* path, syscall_stat_t* out) {
++    return mos_syscall(SYS_STAT, (long)(uintptr_t)path, (long)(uintptr_t)out, 0);
++}
++
++// Moves/renames a file or directory on one drive. Replaces an existing
++// file at `to`; a directory there is an error. SYS_ERR_NOTFOUND when
++// `from` does not exist, SYS_ERR_GENERIC for any other refusal.
++static inline long mos_rename(const char* from, const char* to) {
++    return mos_syscall(SYS_RENAME, (long)(uintptr_t)from, (long)(uintptr_t)to, 0);
++}
++
++// Sets the program's working directory (shared by its threads, inherited
++// by programs it starts). SYS_ERR_NOTFOUND if `path` is not a directory.
++static inline long mos_chdir(const char* path) {
++    return mos_syscall(SYS_CHDIR, (long)(uintptr_t)path, 0, 0);
++}
++
++// Starts a program as a child of the caller. `request->size` must be
++// sizeof(syscall_spawn_t) (process.h's mos_spawn_ex() fills it in).
++// Returns the child's pid (> 0) or a negative SYS_ERR_* value.
++static inline long mos_spawn_raw(const syscall_spawn_t* request) {
++    return mos_syscall(SYS_SPAWN, (long)(uintptr_t)request, 0, 0);
++}
++
++// Waits for a child (pid, or SYS_WAIT_ANY) to end; returns its pid.
++// `flags` is 0 or SYS_WAIT_NOHANG. `out` may be NULL.
++static inline long mos_wait_raw(long pid, long flags, syscall_wait_t* out) {
++    return mos_syscall(SYS_WAIT, pid, flags, (long)(uintptr_t)out);
++}
++
+ static inline long mos_mouse_call(uint64_t operation, uint64_t arg1,
+                                   uint64_t arg2) {
+     return mos_syscall(SYS_MOUSE, (long)operation, (long)arg1, (long)arg2);
+diff --git a/include/process.h b/include/process.h
+new file mode 100644
+index 0000000..9c9c1e8
+--- /dev/null
++++ b/include/process.h
+@@ -0,0 +1,152 @@
++#ifndef MINIMALOS_PROCESS_H
++#define MINIMALOS_PROCESS_H
++
++/*
++ * Processes, working directory, stat/rename, clocks and the environment
++ * (SYS_SPAWN, SYS_WAIT, SYS_CHDIR, SYS_STAT, SYS_RENAME, SYS_CLOCK).
++ *
++ *   const char* const argv[] = { "0:/programs/tool.run", "--fast", NULL };
++ *   long pid = mos_spawn("0:/programs/tool.run", argv);
++ *   if (pid > 0) {
++ *       mos_wait_result_t r;
++ *       mos_waitpid(pid, 0, &r);              // sleeps until it ends
++ *       printf("exit %d%s\n", r.exit_code, r.crashed ? " (crashed)" : "");
++ *   }
++ *
++ * Paths are MinimaFS paths. "0:/dir/file" names a drive; "/dir/file" is the
++ * root of the working directory's drive; anything else is relative to the
++ * program's working directory (mos_chdir(); mos_getcwd() reads it).
++ *
++ * Errors are the kernel's negative SYS_ERR_* values (compare with
++ * `r == (long)SYS_ERR_NOTFOUND`, or just test `r < 0`). The raw calls
++ * (mos_stat, mos_rename, mos_chdir, mos_spawn_raw, mos_wait_raw and the
++ * mos_clock_* functions) live in minimalos.h; this header adds the
++ * friendlier layer on top and the environment.
++ */
++
++#include <stddef.h>
++#include <stdint.h>
++#include "minimalos.h"
++
++/* ------------------------------------------------------- environment */
++
++/* The environment the program started with: a NULL-terminated array of
++ * "NAME=value" strings, set by crt0.c from the entry point's third
++ * argument. Never NULL (an empty array when the kernel gave none). */
++extern char** environ;
++
++/* The value of NAME ("" is a valid value), or NULL when it is not set. */
++static inline char* mos_getenv(const char* name) {
++    if (!name || !*name || !environ) return NULL;
++    size_t n = 0;
++    while (name[n]) n++;
++    for (char** e = environ; *e; e++) {
++        const char* s = *e;
++        size_t i = 0;
++        while (i < n && s[i] == name[i]) i++;
++        if (i == n && s[n] == '=') return (char*)(s + n + 1);
++    }
++    return NULL;
++}
++
++/* ------------------------------------------------------------ spawn */
++
++typedef struct {
++    const char* path;                 /* the program (a .run bundle or ELF) */
++    const char* const* argv;          /* NULL-terminated; NULL: just { path } */
++    const char* const* envp;          /* NULL-terminated "NAME=value"; NULL: inherit */
++    const char* cwd;                  /* NULL: the caller's working directory */
++    const char* stdout_path;          /* NULL: the caller's output; else a file */
++    const char* stderr_path;          /* (replaced) receiving it; may be the same */
++} mos_spawn_opts_t;
++
++/* Starts a program as a child of the caller. argv[0] is what the child
++ * sees as its own name (normally the path). Output redirected with
++ * stdout_path/stderr_path goes into those files, which are complete once
++ * mos_waitpid() has returned for the child. Returns the child's pid (> 0)
++ * or a negative SYS_ERR_*: SYS_ERR_NOTFOUND (no such program, or `cwd` is
++ * not a directory), SYS_ERR_INVAL (a bad pointer, too long or too many
++ * arguments), SYS_ERR_GENERIC (could not create an output file / launch). */
++static inline long mos_spawn_ex(const mos_spawn_opts_t* o) {
++    if (!o) return (long)SYS_ERR_INVAL;
++    syscall_spawn_t r;
++    r.size = sizeof(r);
++    r.path = o->path;
++    r.argv = o->argv;
++    r.argc = 0;
++    if (o->argv) while (o->argv[r.argc]) r.argc++;
++    r.envp = o->envp;
++    r.cwd = o->cwd;
++    r.stdout_path = o->stdout_path;
++    r.stderr_path = o->stderr_path;
++    r.flags = 0;
++    return mos_spawn_raw(&r);
++}
++
++/* mos_spawn_ex() with only a path and argv (NULL-terminated, or NULL). */
++static inline long mos_spawn(const char* path, const char* const* argv) {
++    mos_spawn_opts_t o = { path, argv, NULL, NULL, NULL, NULL };
++    return mos_spawn_ex(&o);
++}
++
++/* ------------------------------------------------------------- wait */
++
++#define MOS_WAIT_ANY    SYS_WAIT_ANY      /* pid: any child */
++#define MOS_WAIT_NOHANG SYS_WAIT_NOHANG   /* options: do not sleep */
++
++typedef struct {
++    long pid;                 /* the child that ended */
++    int exit_code;            /* mos_exit()'s value (0-255); 0xFF after a crash */
++    int crashed;              /* nonzero: it died of a CPU exception */
++    int killed;               /* nonzero: it was ended from outside */
++    unsigned crash_vector;    /* the exception number when crashed */
++} mos_wait_result_t;
++
++/* Waits for the child `pid` (MOS_WAIT_ANY for any child of this program)
++ * to end and fills *out (may be NULL). options: 0, or MOS_WAIT_NOHANG.
++ * Returns the child's pid; SYS_ERR_NOTFOUND when there is no such child
++ * (never started, or already waited for: a child can be waited for once);
++ * SYS_ERR_AGAIN with MOS_WAIT_NOHANG while it still runs. Programs started
++ * with mos_exec() are children too. */
++static inline long mos_waitpid(long pid, int options, mos_wait_result_t* out) {
++    syscall_wait_t w;
++    w.exit_code = 0; w.flags = 0; w.crash_vector = 0; w.reserved = 0;
++    long r = mos_wait_raw(pid, options, &w);
++    if (out) {
++        out->pid = r > 0 ? r : 0;
++        out->exit_code = (int)w.exit_code;
++        out->crashed = (w.flags & SYS_WAIT_CRASHED) != 0;
++        out->killed = (w.flags & SYS_WAIT_KILLED) != 0;
++        out->crash_vector = w.crash_vector;
++    }
++    return r;
++}
++
++/* Waits for any child. */
++static inline long mos_wait(mos_wait_result_t* out) {
++    return mos_waitpid(MOS_WAIT_ANY, 0, out);
++}
++
++/* ------------------------------------------------- files and clocks */
++
++/* Size in bytes of the file at `path`; a negative SYS_ERR_* value when it
++ * does not exist (SYS_ERR_NOTFOUND) or is a directory (SYS_ERR_INVAL). */
++static inline long mos_file_size(const char* path) {
++    syscall_stat_t st;
++    long r = mos_stat(path, &st);
++    if (r < 0) return r;
++    if (st.type != SYS_STAT_FILE) return (long)SYS_ERR_INVAL;
++    return (long)st.size;
++}
++
++/* Milliseconds on the monotonic clock (mos_clock_monotonic_ns() / 1e6). */
++static inline uint64_t mos_monotonic_ms(void) {
++    return mos_clock_monotonic_ns() / 1000000u;
++}
++
++/* Seconds since 1970-01-01 UTC by the system clock. */
++static inline int64_t mos_time_unix(void) {
++    return (int64_t)(mos_clock_realtime_ns() / 1000000000u);
++}
++
++#endif
+diff --git a/include/syscall.h b/include/syscall.h
+index 31735f9..8ebc8a3 100644
+--- a/include/syscall.h
++++ b/include/syscall.h
+@@ -107,6 +107,8 @@
+ #define SYS_ERR_AGAIN    ((uint64_t)-7)
+ // Out of memory (kernel heap or video memory).
+ #define SYS_ERR_NOMEM    ((uint64_t)-8)
++// A timed wait ran out (SYS_FUTEX_WAIT with a timeout).
++#define SYS_ERR_TIMEDOUT ((uint64_t)-9)
+ 
+ typedef enum {
+     SYS_GRAPHICS_GET_WIDTH = 1,
+@@ -935,4 +937,131 @@ typedef struct {
+     uint64_t arg;              // passed to entry in RDI
+ } syscall_thread_t;
+ 
++#define SYS_THREAD_SET_FS    3u   // rsi = FS base of the calling thread (its TLS
++                                  // block, below 0x0000800000000000); 0 clears it
++#define SYS_THREAD_GET_FS    4u   // returns the calling thread's FS base
++#define SYS_THREAD_CREATE_EX 5u   // rsi = syscall_thread_ex_t*: CREATE plus an FS
++                                  // base and an exit futex; returns the thread id
++
++typedef struct {
++    uint64_t entry;            // void entry(uint64_t arg), in the program
++    uint64_t stack_top;        // end of the thread's stack (program memory)
++    uint64_t arg;              // passed to entry in RDI
++    uint64_t fs_base;          // the thread's FS base (TLS); 0 for none
++    uint64_t exit_futex;       // 0, or the address of a uint32_t that the kernel
++                               // sets to 0 and wakes (all SYS_FUTEX waiters) once
++                               // the thread has ended and left its stack
++} syscall_thread_ex_t;
++
++// ---------------------------------------------------------------------------
++// WHAT A C LIBRARY NEEDS: futex, clocks, stat/rename, working directory,
++// spawn/wait, environment
++// ---------------------------------------------------------------------------
++// Paths are MinimaFS paths ("0:/dir/file"). "/dir/file" is the root of the
++// working directory's drive; anything else is relative to the program's
++// working directory (SYS_CHDIR). The SDK wraps these in minimalos.h /
++// x86_64/user_common.h (raw calls) and process.h (the friendlier API).
++//
++// The futex takes a fourth argument, in r10: see mos_syscall4().
++
++// FUTEX: rdi = operation. Waits on / wakes a 32-bit word in the program's
++// memory; waiters and wakers are threads of one program.
++//   SYS_FUTEX_WAIT: rsi = uint32_t* (4-byte aligned), rdx = expected value,
++//                   r10 = timeout in nanoseconds (0 = none; rounded up to
++//                   whole milliseconds). Sleeps only while *rsi == rdx,
++//                   checked atomically against SYS_FUTEX_WAKE. Returns
++//                   SYS_SUCCESS once woken (wake-ups can be spurious: look at
++//                   the word again), SYS_ERR_AGAIN when *rsi != rdx, or
++//                   SYS_ERR_TIMEDOUT.
++//   SYS_FUTEX_WAKE: rsi = uint32_t*, rdx = most waiters to wake. Returns how
++//                   many it woke.
++#define SYS_FUTEX 48
++#define SYS_FUTEX_WAIT 1u
++#define SYS_FUTEX_WAKE 2u
++
++// CLOCK: rdi = which clock; returns its value.
++//   SYS_CLOCK_MONOTONIC: nanoseconds since boot. Never goes backwards; read
++//                        from the CPU's time-stamp counter when it has one.
++//   SYS_CLOCK_REALTIME:  nanoseconds since 1970-01-01 by the system clock (UTC
++//                        with internet time sync on); millisecond steps, and
++//                        it jumps when the clock is set.
++//   SYS_CLOCK_TSC_HZ:    time-stamp counter ticks per second when RDTSC is a
++//                        usable clock in user code (invariant TSC), else 0.
++#define SYS_CLOCK 49
++#define SYS_CLOCK_MONOTONIC 1u
++#define SYS_CLOCK_REALTIME  2u
++#define SYS_CLOCK_TSC_HZ    3u
++
++// STAT: rdi = path, rsi = syscall_stat_t*. SYS_ERR_NOTFOUND when nothing is
++// there. A directory reports size 0 and no times.
++#define SYS_STAT 50
++#define SYS_STAT_FILE 1u
++#define SYS_STAT_DIR  2u
++#define SYS_STAT_HIDDEN   (1u << 0)
++#define SYS_STAT_RUNNABLE (1u << 1)
++
++typedef struct {
++    uint64_t size;             // data bytes (0 for a directory)
++    uint32_t type;             // SYS_STAT_FILE or SYS_STAT_DIR
++    uint32_t flags;            // SYS_STAT_HIDDEN, SYS_STAT_RUNNABLE
++    int64_t created;           // seconds since 1970; MinimaFS keeps only the day
++    int64_t modified;          // the same; 0 when unknown
++} syscall_stat_t;
++
++// RENAME: rdi = old path, rsi = new path, on the same drive. Moves a file or
++// a directory, also into another directory. A file already at the new path
++// is replaced; a directory there is an error, and so is moving a directory
++// into itself. (Errors: SYS_ERR_NOTFOUND when the old path does not exist,
++// SYS_ERR_INVAL for an unusable path, SYS_ERR_GENERIC for every other
++// refusal.)
++#define SYS_RENAME 51
++
++// CHDIR: rdi = directory. Sets the program's working directory (shared by
++// its threads, inherited by programs it starts). SYS_GETCWD returns it; a
++// program that never set one uses the terminal's.
++#define SYS_CHDIR 52
++
++// SPAWN: rdi = syscall_spawn_t*. Starts a program (a .run bundle or a plain
++// ELF executable) as a child of the caller and returns its pid. Wait for it
++// with SYS_WAIT.
++#define SYS_SPAWN 53
++
++typedef struct {
++    uint64_t size;                  // sizeof(syscall_spawn_t)
++    const char* path;               // the program
++    const char* const* argv;        // argv[0..argc-1] as the child sees them (argv[0]
++                                    // is normally the path); NULL: { path }
++    uint64_t argc;
++    const char* const* envp;        // NULL-terminated "NAME=value" strings; NULL:
++                                    // the environment the caller started with
++    const char* cwd;                // working directory; NULL: the caller's
++    const char* stdout_path;        // NULL: wherever the caller's output goes; else a
++                                    // file (replaced) that receives the child's output
++    const char* stderr_path;        // the same for stderr; may name the same file
++    uint64_t flags;                 // 0
++} syscall_spawn_t;
++
++// WAIT: rdi = child pid (SYS_WAIT_ANY for any child), rsi = flags, rdx =
++// syscall_wait_t* or NULL. Waits for that child to end and returns its pid;
++// its output files are complete by then. SYS_ERR_NOTFOUND when there is no
++// such child, SYS_ERR_AGAIN with SYS_WAIT_NOHANG while it still runs. A child
++// can be waited for once. Programs started with SYS_EXEC count as children.
++#define SYS_WAIT 54
++#define SYS_WAIT_ANY     0u
++#define SYS_WAIT_NOHANG  (1u << 0)
++#define SYS_WAIT_CRASHED (1u << 0)   // syscall_wait_t.flags: it crashed
++#define SYS_WAIT_KILLED  (1u << 1)   // it was ended from outside
++
++typedef struct {
++    uint32_t exit_code;        // mos_exit()'s value (0-255)
++    uint32_t flags;            // SYS_WAIT_CRASHED, SYS_WAIT_KILLED
++    uint32_t crash_vector;     // the CPU exception, when it crashed
++    uint32_t reserved;
++} syscall_wait_t;
++
++// The environment: a program's entry point gets it as its third argument
++// (RDI = argc, RSI = argv, RDX = envp), a NULL-terminated array of
++// "NAME=value" strings at the bottom of its stack. The SDK's crt0 keeps it
++// in `environ` (process.h declares it).
++
+ #endif // SYSCALL_H
+diff --git a/include/thread.h b/include/thread.h
+index 82184b8..2d339d7 100644
+--- a/include/thread.h
++++ b/include/thread.h
+@@ -24,6 +24,16 @@
+  *
+  * malloc()/free() are system calls and safe from any thread. Anything
+  * else two threads use at once needs a mos_mutex_t.
++ *
++ * Futexes and TLS (SYS_FUTEX, SYS_THREAD_SET_FS/GET_FS/CREATE_EX):
++ *
++ *   mos_futex_wait()/mos_futex_wake()   sleep on / wake a 32-bit word
++ *   mos_thread_create_ex()              a thread with its own FS base (TLS
++ *                                       block) that mos_thread_join() waits
++ *                                       for with a futex instead of polling
++ *   mos_thread_set_fs()/get_fs()        the calling thread's FS base
++ *
++ * mos_thread_create() is unchanged and joins by polling every 1 ms.
+  */
+ 
+ #include <stddef.h>
+@@ -38,8 +48,50 @@ typedef struct {
+     void* stack;
+     void (*fn)(void*);
+     void* arg;
++    /* Exit futex, used by mos_thread_create_ex(): 1 while the thread
++     * runs, set to 0 (and its waiters woken) by the kernel when it ends.
++     * Unused (0) for mos_thread_create(); joining then polls. */
++    volatile uint32_t exit_word;
++    uint32_t futex_join;        /* nonzero: created by mos_thread_create_ex() */
+ } mos_thread_t;
+ 
++/* ------------------------------------------------------------- futex */
++
++/* Sleeps while *addr == expected (checked atomically against a wake).
++ * `addr` is 4-byte aligned memory of the program. timeout_ns 0 waits
++ * without limit; otherwise the wait is rounded up to whole milliseconds.
++ * Returns SYS_SUCCESS once woken (possibly spuriously: look at the word
++ * again), SYS_ERR_AGAIN when *addr != expected at once, SYS_ERR_TIMEDOUT
++ * when the time ran out, SYS_ERR_INVAL for a bad address. */
++static inline long mos_futex_wait(volatile uint32_t* addr, uint32_t expected,
++                                  uint64_t timeout_ns) {
++    return mos_syscall4(SYS_FUTEX, SYS_FUTEX_WAIT, (long)(uintptr_t)addr,
++                        (long)expected, (long)timeout_ns);
++}
++
++/* Wakes at most `count` threads sleeping on `addr` (all of them for
++ * UINT32_MAX). Returns how many it woke, or a negative SYS_ERR_* value. */
++static inline long mos_futex_wake(volatile uint32_t* addr, uint32_t count) {
++    return mos_syscall(SYS_FUTEX, SYS_FUTEX_WAKE, (long)(uintptr_t)addr, (long)count);
++}
++
++/* --------------------------------------------------------- FS base (TLS) */
++
++/* Sets the calling thread's FS base: the address of its thread-local
++ * block, below 0x0000800000000000 (0 clears it). Every thread has its own;
++ * the kernel keeps it across switches. A new thread starts with the value
++ * given to mos_thread_create_ex() (0 for mos_thread_create()). Reading
++ * through it is up to the program (e.g. `mov %fs:0, %rax` when the block's
++ * first word points to itself). Returns SYS_SUCCESS or SYS_ERR_INVAL. */
++static inline long mos_thread_set_fs(const void* base) {
++    return mos_syscall(SYS_THREAD, SYS_THREAD_SET_FS, (long)(uintptr_t)base, 0);
++}
++
++/* The calling thread's FS base. */
++static inline void* mos_thread_get_fs(void) {
++    return (void*)(uintptr_t)mos_syscall(SYS_THREAD, SYS_THREAD_GET_FS, 0, 0);
++}
++
+ __attribute__((noreturn)) static inline void mos_thread_exit(void) {
+     mos_syscall(SYS_EXIT, 0, 0, 0);
+     for (;;) { }
+@@ -62,6 +114,8 @@ static inline int mos_thread_create(mos_thread_t* t, void (*fn)(void*), void* ar
+     t->id = 0;
+     t->fn = fn;
+     t->arg = arg;
++    t->exit_word = 0;
++    t->futex_join = 0;
+     t->stack = malloc(stack_size);
+     if (!t->stack) return -1;
+     syscall_thread_t request;
+@@ -78,16 +132,54 @@ static inline int mos_thread_create(mos_thread_t* t, void (*fn)(void*), void* ar
+     return 0;
+ }
+ 
++/* Like mos_thread_create(), plus the thread's FS base `tls` (NULL for none;
++ * see mos_thread_set_fs()) and a futex join: mos_thread_join() then sleeps
++ * until the kernel reports the thread's end instead of polling. `t` must
++ * stay valid (and not move) until mos_thread_join(). Returns 0, or -1. */
++static inline int mos_thread_create_ex(mos_thread_t* t, void (*fn)(void*), void* arg,
++                                       size_t stack_size, void* tls) {
++    if (!t || !fn) return -1;
++    if (!stack_size) stack_size = MOS_THREAD_STACK_DEFAULT;
++    t->id = 0;
++    t->fn = fn;
++    t->arg = arg;
++    t->futex_join = 1;
++    t->exit_word = 1;
++    t->stack = malloc(stack_size);
++    if (!t->stack) return -1;
++    syscall_thread_ex_t request;
++    request.entry = (uint64_t)(uintptr_t)mos_thread_start_;
++    request.stack_top = ((uint64_t)(uintptr_t)t->stack + stack_size) & ~(uint64_t)15;
++    request.arg = (uint64_t)(uintptr_t)t;
++    request.fs_base = (uint64_t)(uintptr_t)tls;
++    request.exit_futex = (uint64_t)(uintptr_t)&t->exit_word;
++    long id = mos_syscall(SYS_THREAD, SYS_THREAD_CREATE_EX, (long)(uintptr_t)&request, 0);
++    if (id <= 0) {
++        free(t->stack);
++        t->stack = NULL;
++        return -1;
++    }
++    t->id = id;
++    return 0;
++}
++
+ /* Nonzero while the thread runs. */
+ static inline int mos_thread_running(const mos_thread_t* t) {
+     return t && t->id &&
+            (uint64_t)mos_syscall(SYS_THREAD, SYS_THREAD_ALIVE, t->id, 0) == SYS_SUCCESS;
+ }
+ 
+-/* Waits for the thread to end, then frees its stack. */
++/* Waits for the thread to end, then frees its stack. A thread made by
++ * mos_thread_create_ex() is waited for with a futex, any other by polling. */
+ static inline void mos_thread_join(mos_thread_t* t) {
+     if (!t || !t->id) return;
+-    while (mos_thread_running(t)) mos_sleep(1);
++    if (t->futex_join) {
++        uint32_t word;
++        while ((word = __atomic_load_n(&t->exit_word, __ATOMIC_ACQUIRE)) != 0)
++            mos_futex_wait(&t->exit_word, word, 0);
++    } else {
++        while (mos_thread_running(t)) mos_sleep(1);
++    }
+     free(t->stack);
+     t->stack = NULL;
+     t->id = 0;
+diff --git a/include/x86_64/user_common.h b/include/x86_64/user_common.h
+index d41e36d..50a24ee 100644
+--- a/include/x86_64/user_common.h
++++ b/include/x86_64/user_common.h
+@@ -32,6 +32,20 @@ static inline long mos_syscall(long num, long a1, long a2, long a3) {
+     return ret;
+ }
+ 
++// Four-argument form: a4 goes in r10 (SYS_FUTEX_WAIT's timeout). The
++// kernel restores every register but rax, so r10 needs no clobber.
++static inline long mos_syscall4(long num, long a1, long a2, long a3, long a4) {
++    register long r10 __asm__("r10") = a4;
++    long ret;
++    __asm__ volatile(
++        "int $0x80"
++        : "=a"(ret)
++        : "a"(num), "D"(a1), "S"(a2), "d"(a3), "r"(r10)
++        : "rcx", "r11", "memory", "cc"
++    );
++    return ret;
++}
++
+ // --- Terminal output and process control ---
+ 
+ static inline long mos_write_fd(int fd, const void* buf, size_t len) {
+diff --git a/programs/os0test/main.c b/programs/os0test/main.c
+new file mode 100644
+index 0000000..0ab1bc6
+--- /dev/null
++++ b/programs/os0test/main.c
+@@ -0,0 +1,1576 @@
++/*
++ * os0test - self-test for the OS-0 system calls.
++ *
++ *     ./build.sh programs/os0test        -> os0test.run
++ *     run 0:/programs/os0test.run        (from the terminal)
++ *
++ * Covers SYS_CLOCK, SYS_THREAD (FS base / TLS, exit futex), SYS_FUTEX,
++ * SYS_STAT, SYS_RENAME, SYS_CHDIR/SYS_GETCWD, the environment (envp ->
++ * environ), SYS_SPAWN and SYS_WAIT.
++ *
++ * Output: one line per check,
++ *
++ *     OS0TEST ok <name>
++ *     OS0TEST FAIL <name>: <detail>
++ *
++ * and a last line, OS0TEST PASS (every check passed) or OS0TEST FAIL.
++ * Program output (fd 1) is written to the screen and, by the kernel, to
++ * the serial log as "[run] <line>". The verdict is also written to fd 3
++ * (mos_log), the kernel-log-only descriptor, so the serial log has it
++ * even if another CPU interleaves its own serial output with a "[run]"
++ * line. Exit code: 0 for PASS, 1 for FAIL.
++ *
++ * The test starts itself as a child (spawn + wait are among the things
++ * under test): `os0test.run --child <mode> [arg]` is the child side; see
++ * child_main(). Scratch files live in 0:/os0test_tmp and are removed.
++ *
++ * A watchdog thread turns a hang (a wait that is never woken) into an
++ * `OS0TEST FAIL watchdog` verdict instead of a silent stall.
++ */
++#include <stdarg.h>
++#include <stddef.h>
++#include <stdint.h>
++#include "minimalos.h"
++#include "stdlib.h"
++#include "thread.h"
++#include "process.h"
++#include "string.h"
++
++#define TMP        "0:/os0test_tmp"
++#define ERR(x)     ((long)(x))
++#define PTR(p)     ((unsigned long long)(uintptr_t)(p))
++
++/* =============================================================== output */
++
++/* Tiny formatter: %s %c %d %ld %lld %lu %llu %x %%. */
++static size_t kfmtv(char* out, size_t cap, const char* fmt, va_list ap) {
++    size_t n = 0;
++#define PUT(ch) do { if (n + 1 < cap) out[n] = (ch); n++; } while (0)
++    for (; *fmt; fmt++) {
++        if (*fmt != '%') { PUT(*fmt); continue; }
++        fmt++;
++        int longs = 0;
++        while (*fmt == 'l') { longs++; fmt++; }
++        if (*fmt == 's') {
++            const char* s = va_arg(ap, const char*);
++            if (!s) s = "(null)";
++            while (*s) { PUT(*s); s++; }
++        } else if (*fmt == 'c') {
++            PUT((char)va_arg(ap, int));
++        } else if (*fmt == '%') {
++            PUT('%');
++        } else if (*fmt == 'd' || *fmt == 'u' || *fmt == 'x') {
++            uint64_t v;
++            int neg = 0;
++            if (*fmt == 'd') {
++                int64_t sv = longs ? va_arg(ap, long long) : va_arg(ap, int);
++                if (longs == 1) sv = (long)sv;
++                if (sv < 0) { neg = 1; v = (uint64_t)0 - (uint64_t)sv; } else v = (uint64_t)sv;
++            } else {
++                v = longs ? va_arg(ap, unsigned long long) : va_arg(ap, unsigned int);
++            }
++            unsigned base = *fmt == 'x' ? 16u : 10u;
++            char tmp[24];
++            int len = 0;
++            do { unsigned d = (unsigned)(v % base); tmp[len++] = (char)(d < 10 ? '0' + d : 'a' + d - 10); v /= base; } while (v);
++            if (neg) PUT('-');
++            while (len) PUT(tmp[--len]);
++        } else {
++            PUT('%');
++            if (*fmt) PUT(*fmt);
++        }
++    }
++#undef PUT
++    if (cap) out[n < cap ? n : cap - 1] = '\0';
++    return n < cap ? n : (cap ? cap - 1 : 0);
++}
++
++static size_t kfmt(char* out, size_t cap, const char* fmt, ...) {
++    va_list ap;
++    va_start(ap, fmt);
++    size_t n = kfmtv(out, cap, fmt, ap);
++    va_end(ap);
++    return n;
++}
++
++/* One line, one write (the kernel logs a write to serial as one piece). */
++static void emit_fd(int fd, const char* fmt, ...) {
++    char line[384];
++    va_list ap;
++    va_start(ap, fmt);
++    size_t n = kfmtv(line, sizeof(line) - 1, fmt, ap);
++    va_end(ap);
++    line[n++] = '\n';
++    mos_write_fd(fd, line, n);
++}
++
++static int g_checks;
++static int g_failed;
++static const char* volatile g_stage = "start";
++static volatile uint64_t g_stage_start_ms;
++
++static void stage(const char* name) {
++    g_stage = name;
++    g_stage_start_ms = (uint64_t)mos_uptime();
++}
++
++static void check_pass(const char* name) {
++    g_checks++;
++    emit_fd(1, "OS0TEST ok %s", name);
++}
++
++static void check_fail(const char* name, const char* fmt, ...) {
++    char detail[256];
++    va_list ap;
++    va_start(ap, fmt);
++    kfmtv(detail, sizeof(detail), fmt, ap);
++    va_end(ap);
++    g_checks++;
++    g_failed++;
++    emit_fd(1, "OS0TEST FAIL %s: %s", name, detail);
++}
++
++/* EXPECT(cond, name, detail format, args...): the detail is only built on failure. */
++#define EXPECT(cond, name, ...) \
++    do { if (cond) check_pass(name); else check_fail(name, __VA_ARGS__); } while (0)
++
++static const char* ename(long r) {
++    switch (r) {
++        case 0: return "SUCCESS";
++        case -1: return "ERR_GENERIC";
++        case -2: return "ERR_BADFD";
++        case -3: return "ERR_NOTFOUND";
++        case -4: return "ERR_INVAL";
++        case -5: return "ERR_PERM";
++        case -6: return "ERR_BUSY";
++        case -7: return "ERR_AGAIN";
++        case -8: return "ERR_NOMEM";
++        case -9: return "ERR_TIMEDOUT";
++        default: return "(other)";
++    }
++}
++
++/* EXPECT_ERR(call, wanted SYS_ERR_* or SYS_SUCCESS, name) */
++#define EXPECT_RET(expr, want, name) \
++    do { long r_ = (expr); long w_ = (long)(want); \
++         if (r_ == w_) check_pass(name); \
++         else check_fail(name, "got %ld (%s), expected %ld (%s)", r_, ename(r_), w_, ename(w_)); \
++    } while (0)
++
++/* ============================================================ utilities */
++
++static char g_self[512];          /* absolute path of this program */
++static char g_start_cwd[512];
++
++static int streq(const char* a, const char* b) {
++    while (*a && *a == *b) { a++; b++; }
++    return *a == *b;
++}
++
++static size_t slen(const char* s) { size_t n = 0; while (s[n]) n++; return n; }
++
++static int sstarts(const char* s, const char* p) {
++    while (*p) { if (*s++ != *p++) return 0; }
++    return 1;
++}
++
++static void scopy(char* dst, size_t cap, const char* src) {
++    size_t i = 0;
++    for (; src[i] && i + 1 < cap; i++) dst[i] = src[i];
++    dst[i] = '\0';
++}
++
++static long parse_long(const char* s) {
++    long v = 0;
++    while (*s >= '0' && *s <= '9') v = v * 10 + (*s++ - '0');
++    return v;
++}
++
++static int has_line(const char* text, const char* line) {
++    size_t n = slen(line);
++    const char* p = text;
++    while (*p) {
++        const char* e = p;
++        while (*e && *e != '\n') e++;
++        if ((size_t)(e - p) == n) {
++            size_t i = 0;
++            while (i < n && p[i] == line[i]) i++;
++            if (i == n) return 1;
++        }
++        p = *e ? e + 1 : e;
++    }
++    return 0;
++}
++
++/* Position of a line in the text, or -1. */
++static long line_index(const char* text, const char* line) {
++    size_t n = slen(line);
++    const char* p = text;
++    while (*p) {
++        const char* e = p;
++        while (*e && *e != '\n') e++;
++        if ((size_t)(e - p) == n) {
++            size_t i = 0;
++            while (i < n && p[i] == line[i]) i++;
++            if (i == n) return (long)(p - text);
++        }
++        p = *e ? e + 1 : e;
++    }
++    return -1;
++}
++
++/* Value of a "key=value" line (the number after `key`), or -1. */
++static long line_number(const char* text, const char* key) {
++    size_t n = slen(key);
++    const char* p = text;
++    while (*p) {
++        if (sstarts(p, key)) return parse_long(p + n);
++        while (*p && *p != '\n') p++;
++        if (*p) p++;
++    }
++    return -1;
++}
++
++static int exists(const char* path) { return mos_exists(path) == 1; }
++static int is_dir(const char* path) { return mos_is_dir(path) == 1; }
++
++/* Creates (replacing) a file holding `len` bytes of pattern (seed + i*31+7). */
++static uint8_t pattern_byte(size_t i, uint8_t seed) { return (uint8_t)(seed + i * 31u + 7u); }
++
++static int write_pattern(const char* path, size_t len, uint8_t seed) {
++    if (exists(path) && mos_delete(path) != 0) return -1;
++    if (mos_create(path, NULL, NULL) != 0) return -2;
++    long fd = mos_open(path, SYS_O_RDWR);
++    if (fd < 0) return -3;
++    uint8_t chunk[2048];
++    size_t done = 0;
++    while (done < len) {
++        size_t n = len - done < sizeof(chunk) ? len - done : sizeof(chunk);
++        for (size_t i = 0; i < n; i++) chunk[i] = pattern_byte(done + i, seed);
++        long w = mos_fwrite(fd, chunk, n);
++        if (w != (long)n) { mos_close(fd); return -4; }
++        done += n;
++    }
++    mos_close(fd);
++    return 0;
++}
++
++static int write_text(const char* path, const char* text) {
++    size_t len = slen(text);
++    if (exists(path) && mos_delete(path) != 0) return -1;
++    if (mos_create(path, "text", "txt") != 0) return -2;
++    if (!len) return 0;
++    long fd = mos_open(path, SYS_O_RDWR);
++    if (fd < 0) return -3;
++    long w = mos_fwrite(fd, text, len);
++    mos_close(fd);
++    return w == (long)len ? 0 : -4;
++}
++
++/* Reads up to cap-1 bytes into buf (NUL-terminated); returns the count or <0. */
++static long read_text(const char* path, char* buf, size_t cap) {
++    long fd = mos_open(path, SYS_O_RDONLY);
++    if (fd < 0) { buf[0] = '\0'; return fd; }
++    size_t got = 0;
++    for (;;) {
++        if (got + 1 >= cap) break;
++        long n = mos_read(fd, buf + got, cap - 1 - got);
++        if (n <= 0) break;
++        got += (size_t)n;
++    }
++    mos_close(fd);
++    buf[got] = '\0';
++    return (long)got;
++}
++
++/* Offset of the first line that starts with `prefix`, or -1. */
++static long line_prefix_index(const char* text, const char* prefix) {
++    const char* p = text;
++    while (*p) {
++        if (sstarts(p, prefix)) return (long)(p - text);
++        while (*p && *p != '\n') p++;
++        if (*p) p++;
++    }
++    return -1;
++}
++
++/* 1 when the file holds exactly `len` bytes of that pattern. */
++static int verify_pattern(const char* path, size_t len, uint8_t seed) {
++    long fd = mos_open(path, SYS_O_RDONLY);
++    if (fd < 0) return 0;
++    int good = mos_size(fd) == (long)len;
++    uint8_t chunk[2048];
++    size_t at = 0;
++    while (good) {
++        long n = mos_read(fd, chunk, sizeof(chunk));
++        if (n < 0) { good = 0; break; }
++        if (n == 0) break;
++        for (long i = 0; i < n; i++)
++            if (chunk[i] != pattern_byte(at + (size_t)i, seed)) { good = 0; break; }
++        at += (size_t)n;
++    }
++    if (at != len) good = 0;
++    mos_close(fd);
++    return good;
++}
++
++static void join_path(char* out, size_t cap, const char* a, const char* b) {
++    kfmt(out, cap, "%s/%s", a, b);
++}
++
++/* Removes a file or a directory tree. */
++static void rm_rf(const char* path) {
++    if (!exists(path)) return;
++    if (!is_dir(path)) { mos_delete(path); return; }
++    syscall_dirent_t* ents = (syscall_dirent_t*)malloc(sizeof(syscall_dirent_t) * 64);
++    if (ents) {
++        long n = mos_listdir(path, ents, 64);
++        for (long i = 0; i < n; i++) {
++            if (streq(ents[i].name, ".") || streq(ents[i].name, "..")) continue;
++            char child[512];
++            join_path(child, sizeof(child), path, ents[i].name);
++            rm_rf(child);
++        }
++        free(ents);
++    }
++    mos_rmdir(path);
++}
++
++/* True when a listing of `dir` has an entry called `name`. */
++static int dir_has(const char* dir, const char* name) {
++    syscall_dirent_t* ents = (syscall_dirent_t*)malloc(sizeof(syscall_dirent_t) * 64);
++    if (!ents) return 0;
++    long n = mos_listdir(dir, ents, 64);
++    int found = 0;
++    for (long i = 0; i < n; i++) if (streq(ents[i].name, name)) found = 1;
++    free(ents);
++    return found;
++}
++
++/* ============================================================ child side */
++
++static uint64_t read_fs0(void) {
++    uint64_t v;
++    __asm__ volatile("movq %%fs:0, %0" : "=r"(v) :: "memory");
++    return v;
++}
++
++/* Thread-local block for the hardware TLS check: word 0 points at itself. */
++typedef struct {
++    uint64_t self;
++    long index;
++    volatile int errors;
++    volatile int finished;
++    uint8_t pad[32];
++} tls_block_t;
++
++static tls_block_t g_hw_tls[4] __attribute__((aligned(64)));
++
++static void hw_tls_thread(void* arg) {
++    tls_block_t* b = (tls_block_t*)arg;
++    for (int i = 0; i < 40; i++) {
++        if (read_fs0() != (uint64_t)(uintptr_t)b) b->errors++;
++        if (mos_thread_get_fs() != (void*)b) b->errors++;
++        if (i % 3 == 0) mos_thread_yield();
++        else if (i % 3 == 1) mos_sleep(1 + b->index);
++        else for (volatile int spin = 0; spin < 20000; spin++) { }
++    }
++    __atomic_store_n(&b->finished, 1, __ATOMIC_RELEASE);
++}
++
++static int child_tls_hw(void) {
++    int errors = 0;
++    tls_block_t* main_block = &g_hw_tls[3];
++    main_block->self = (uint64_t)(uintptr_t)main_block;
++    if (mos_thread_set_fs(main_block) != 0) { emit_fd(1, "tls_hw: set_fs failed"); return 1; }
++    mos_thread_t t[3];
++    for (int i = 0; i < 3; i++) {
++        g_hw_tls[i].self = (uint64_t)(uintptr_t)&g_hw_tls[i];
++        g_hw_tls[i].index = i;
++        g_hw_tls[i].errors = 0;
++        g_hw_tls[i].finished = 0;
++        if (mos_thread_create_ex(&t[i], hw_tls_thread, &g_hw_tls[i], 0, &g_hw_tls[i]) != 0) {
++            emit_fd(1, "tls_hw: thread %d not created", i);
++            return 1;
++        }
++    }
++    for (int i = 0; i < 30; i++) {
++        if (read_fs0() != (uint64_t)(uintptr_t)main_block) errors++;
++        if (i & 1) mos_sleep(1); else mos_thread_yield();
++    }
++    for (int i = 0; i < 3; i++) {
++        mos_thread_join(&t[i]);
++        if (g_hw_tls[i].errors || !g_hw_tls[i].finished) {
++            emit_fd(1, "tls_hw: thread %d errors=%d finished=%d", i, g_hw_tls[i].errors, g_hw_tls[i].finished);
++            errors++;
++        }
++    }
++    if (read_fs0() != (uint64_t)(uintptr_t)main_block) errors++;
++    emit_fd(1, errors ? "tls_hw: FAILED" : "tls_hw: all ok");
++    return errors ? 1 : 0;
++}
++
++static int child_tsc(void) {
++    uint64_t hz = mos_clock_tsc_hz();
++    emit_fd(1, "tsc_hz=%llu", (unsigned long long)hz);
++    if (!hz) return 0;
++    uint32_t lo, hi;
++    uint64_t m0 = mos_clock_monotonic_ns();
++    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
++    uint64_t t0 = ((uint64_t)hi << 32) | lo;
++    mos_sleep(100);
++    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
++    uint64_t t1 = ((uint64_t)hi << 32) | lo;
++    uint64_t m1 = mos_clock_monotonic_ns();
++    uint64_t dms = (m1 - m0) / 1000000u;
++    uint64_t expected = (hz / 1000u) * dms;          /* ticks the reported rate predicts */
++    emit_fd(1, "tsc_ticks=%llu", (unsigned long long)(t1 - t0));
++    emit_fd(1, "tsc_pct=%llu", (unsigned long long)(expected ? (t1 - t0) * 100u / expected : 0));
++    return 0;
++}
++
++static int child_info(int argc, char** argv, char** envp) {
++    emit_fd(1, "argc=%d", argc);
++    for (int i = 0; i < argc; i++) emit_fd(1, "argv[%d]=%s", i, argv[i]);
++    emit_fd(1, "argv_null=%d", argv[argc] == NULL);
++    emit_fd(1, "envp_is_environ=%d", envp == environ);
++    int count = 0;
++    for (char** e = environ; *e; e++) count++;
++    emit_fd(1, "environ_count=%d", count);
++    const char* names[] = { "OS0_A", "OS0_B", "OS0_C", "OS0_INH", "OS0_NOPE", "OS0_", "OS0" };
++    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
++        char* v = mos_getenv(names[i]);
++        if (v) emit_fd(1, "getenv.%s=[%s]", names[i], v);
++        else emit_fd(1, "getenv.%s=(null)", names[i]);
++    }
++    char cwd[512];
++    long r = mos_getcwd(cwd, sizeof(cwd));
++    emit_fd(1, "cwd=%s", r == 0 ? cwd : "(error)");
++    emit_fd(2, "stderr-line-from-child");
++    return 7;
++}
++
++static int child_relay(char** argv) {
++    /* Starts the program again with no cwd/envp/output given: all of them
++     * must be inherited from this process. */
++    const char* const child_argv[] = { argv[0], "--child", "info", "inherit", NULL };
++    long pid = mos_spawn(argv[0], child_argv);
++    if (pid <= 0) { emit_fd(1, "relay: spawn failed %ld", pid); return 1; }
++    mos_wait_result_t r;
++    long w = mos_waitpid(pid, 0, &r);
++    emit_fd(1, "relay-done wait=%ld exit=%d crashed=%d", w, r.exit_code, r.crashed);
++    return (w == pid && r.exit_code == 7 && !r.crashed) ? 0 : 1;
++}
++
++/* os0test.run --child <mode> [arg] */
++static int child_main(int argc, char** argv, char** envp) {
++    const char* mode = argc > 2 ? argv[2] : "";
++    long arg = argc > 3 ? parse_long(argv[3]) : 0;
++    if (streq(mode, "exit")) return (int)arg;                 /* returns from main */
++    if (streq(mode, "exitcall")) mos_exit((int)arg);          /* SYS_EXIT directly */
++    if (streq(mode, "sleep")) { mos_sleep(arg); return 3; }
++    if (streq(mode, "info")) return child_info(argc, argv, envp);
++    if (streq(mode, "relay")) return child_relay(argv);
++    if (streq(mode, "tls_hw")) return child_tls_hw();
++    if (streq(mode, "tsc")) return child_tsc();
++    if (streq(mode, "streams")) {
++        emit_fd(1, "out1");
++        emit_fd(2, "err1");
++        emit_fd(1, "out2");
++        return 0;
++    }
++    if (streq(mode, "crash")) {
++        emit_fd(1, "before-crash");
++        __asm__ volatile("ud2");            /* #UD, CPU exception 6 */
++        return 0;
++    }
++    emit_fd(1, "unknown child mode %s", mode);
++    return 99;
++}
++
++/* ============================================================== watchdog */
++
++#define STAGE_LIMIT_MS 60000u
++
++static volatile int g_finished;
++
++static void watchdog(void* arg) {
++    (void)arg;
++    for (;;) {
++        mos_sleep(100);
++        if (g_finished) return;
++        uint64_t now = (uint64_t)mos_uptime();
++        if (now - g_stage_start_ms > STAGE_LIMIT_MS) {
++            emit_fd(1, "OS0TEST FAIL watchdog: stuck for %lu ms in stage '%s'",
++                    (unsigned long)(now - g_stage_start_ms), g_stage);
++            emit_fd(1, "OS0TEST FAIL");
++            mos_log("OS0TEST FAIL");
++            mos_exit(1);
++        }
++    }
++}
++
++/* ================================================================ clocks */
++
++static void test_clocks(void) {
++    stage("clocks");
++    uint64_t prev = mos_clock_monotonic_ns();
++    int back = 0;
++    uint64_t first = prev;
++    for (int i = 0; i < 2000; i++) {
++        uint64_t now = mos_clock_monotonic_ns();
++        if (now < prev) back++;
++        prev = now;
++    }
++    EXPECT(back == 0, "clock_monotonic_nondecreasing", "went backwards %d times", back);
++    EXPECT(prev > 0, "clock_monotonic_nonzero", "value is 0");
++    EXPECT(prev >= first, "clock_monotonic_advances", "last %llu < first %llu",
++           (unsigned long long)prev, (unsigned long long)first);
++
++    uint64_t m0 = mos_clock_monotonic_ns();
++    long u0 = mos_uptime();
++    uint64_t r0 = mos_clock_realtime_ns();
++    mos_sleep(100);
++    uint64_t m1 = mos_clock_monotonic_ns();
++    long u1 = mos_uptime();
++    uint64_t r1 = mos_clock_realtime_ns();
++    uint64_t dm = (m1 - m0) / 1000000u;
++    EXPECT(m1 >= m0 && dm >= 95 && dm <= 400, "clock_monotonic_sleep_100ms",
++           "slept %llu ms by the monotonic clock", (unsigned long long)dm);
++    long du = u1 - u0;
++    long diff = (long)dm - du;
++    if (diff < 0) diff = -diff;
++    EXPECT(diff <= 30, "clock_monotonic_vs_uptime",
++           "monotonic says %llu ms, uptime says %ld ms", (unsigned long long)dm, du);
++
++    const uint64_t y2020 = 1577836800ull, y2100 = 4102444800ull;
++    EXPECT(r0 / 1000000000ull > y2020 && r0 / 1000000000ull < y2100, "clock_realtime_sane",
++           "unix time %llu s", (unsigned long long)(r0 / 1000000000ull));
++    uint64_t dr = r1 >= r0 ? (r1 - r0) / 1000000u : 0;
++    EXPECT(r1 >= r0 && dr >= 50 && dr <= 1500, "clock_realtime_advances",
++           "advanced %llu ms over a 100 ms sleep", (unsigned long long)dr);
++    EXPECT(r0 % 1000000ull == 0 && r1 % 1000000ull == 0, "clock_realtime_ms_steps",
++           "not whole milliseconds: %llu", (unsigned long long)r0);
++    EXPECT(mos_time_unix() > (int64_t)y2020, "clock_time_unix", "process.h mos_time_unix() wrong");
++
++    EXPECT_RET((long)mos_syscall(SYS_CLOCK, 99, 0, 0), ERR(SYS_ERR_INVAL), "clock_bad_which");
++
++    uint64_t hz = mos_clock_tsc_hz();
++    if (hz == 0) {
++        check_pass("clock_tsc_hz (0: no invariant TSC, RDTSC not offered)");
++    } else {
++        EXPECT(hz >= 100000000ull && hz <= 10000000000ull, "clock_tsc_hz_range",
++               "%llu Hz", (unsigned long long)hz);
++    }
++}
++
++/* Runs RDTSC in a child: if the kernel promised it usable and it is not,
++ * only the child dies. */
++static long spawn_wait(const char* mode, const char* arg, const char* out_path,
++                       const char* err_path, const char* const* envp, const char* cwd,
++                       mos_wait_result_t* res);
++
++static void test_tsc(void) {
++    stage("tsc");
++    char out[512];
++    mos_wait_result_t r;
++    long pid = spawn_wait("tsc", NULL, TMP "/tsc.txt", NULL, NULL, NULL, &r);
++    read_text(TMP "/tsc.txt", out, sizeof(out));
++    EXPECT(pid > 0 && !r.crashed && r.exit_code == 0, "tsc_child_runs",
++           "pid=%ld crashed=%d exit=%d vector=%u", pid, r.crashed, r.exit_code, r.crash_vector);
++    long hz = line_number(out, "tsc_hz=");
++    uint64_t want = mos_clock_tsc_hz();
++    EXPECT(hz >= 0 && (uint64_t)hz == want, "tsc_hz_consistent", "child %ld, parent %llu",
++           hz, (unsigned long long)want);
++    if (want) {
++        long pct = line_number(out, "tsc_pct=");
++        EXPECT(pct >= 90 && pct <= 110, "tsc_rdtsc_matches_hz",
++               "RDTSC over 100 ms implies %ld%% of the reported rate", pct);
++    }
++}
++
++/* ================================================================== TLS */
++
++static tls_block_t g_tls[4] __attribute__((aligned(64)));
++static volatile int g_tls_thread_fs_ok;
++static volatile int g_tls_plain_fs_seen = -1;
++static uint64_t g_alt_block[8] __attribute__((aligned(64)));
++
++static void tls_worker(void* arg) {
++    tls_block_t* b = (tls_block_t*)arg;
++    int errors = 0;
++    for (int i = 0; i < 30; i++) {
++        if (mos_thread_get_fs() != (void*)b) errors++;
++        switch (i % 3) {
++            case 0: mos_thread_yield(); break;
++            case 1: mos_sleep(1 + b->index); break;
++            default: for (volatile int s = 0; s < 30000; s++) { } break;
++        }
++    }
++    b->errors = errors;
++    __atomic_store_n(&b->finished, 1, __ATOMIC_RELEASE);
++}
++
++static void tls_plain_worker(void* arg) {
++    (void)arg;
++    g_tls_plain_fs_seen = mos_thread_get_fs() == NULL ? 0 : 1;
++}
++
++static void tls_setter(void* arg) {
++    (void)arg;
++    /* Changing this thread's FS base must not touch the main thread's. */
++    long r = mos_thread_set_fs(g_alt_block);
++    g_tls_thread_fs_ok = (r == 0 && mos_thread_get_fs() == (void*)g_alt_block);
++    mos_sleep(5);
++    if (mos_thread_get_fs() != (void*)g_alt_block) g_tls_thread_fs_ok = 0;
++}
++
++static void test_tls(void) {
++    stage("tls");
++    EXPECT(mos_thread_get_fs() == NULL, "tls_main_initial_zero", "FS base is 0x%llx", PTR(mos_thread_get_fs()));
++    EXPECT_RET(mos_thread_set_fs(&g_tls[3]), SYS_SUCCESS, "tls_main_set");
++    EXPECT(mos_thread_get_fs() == (void*)&g_tls[3], "tls_main_get", "got 0x%llx want 0x%llx",
++           PTR(mos_thread_get_fs()), PTR(&g_tls[3]));
++    mos_thread_yield();
++    mos_sleep(3);
++    EXPECT(mos_thread_get_fs() == (void*)&g_tls[3], "tls_main_survives_yield_sleep", "got 0x%llx",
++           PTR(mos_thread_get_fs()));
++    EXPECT_RET(mos_syscall(SYS_THREAD, SYS_THREAD_SET_FS, (long)0x8000000000000000ull, 0),
++               ERR(SYS_ERR_INVAL), "tls_set_noncanonical_rejected");
++    EXPECT_RET(mos_syscall(SYS_THREAD, SYS_THREAD_SET_FS, (long)0x0000800000000000ull, 0),
++               ERR(SYS_ERR_INVAL), "tls_set_upper_half_rejected");
++    EXPECT(mos_thread_get_fs() == (void*)&g_tls[3], "tls_rejected_set_keeps_value", "got 0x%llx",
++           PTR(mos_thread_get_fs()));
++
++    /* A thread made with mos_thread_create() starts with FS base 0, even
++     * though this thread has one. */
++    mos_thread_t plain;
++    int pc = mos_thread_create(&plain, tls_plain_worker, NULL, 0);
++    if (pc == 0) mos_thread_join(&plain);
++    EXPECT(pc == 0 && g_tls_plain_fs_seen == 0, "tls_plain_thread_starts_at_zero",
++           "create=%d seen=%d", pc, g_tls_plain_fs_seen);
++
++    /* Several threads, each with its own block, running at once. */
++    mos_thread_t t[3];
++    int created = 0;
++    for (int i = 0; i < 3; i++) {
++        g_tls[i].self = (uint64_t)(uintptr_t)&g_tls[i];
++        g_tls[i].index = i;
++        g_tls[i].errors = -1;
++        g_tls[i].finished = 0;
++        if (mos_thread_create_ex(&t[i], tls_worker, &g_tls[i], 0, &g_tls[i]) == 0) created++;
++    }
++    EXPECT(created == 3, "tls_threads_created", "created %d of 3", created);
++    int main_errors = 0;
++    for (int i = 0; i < 20; i++) {
++        if (mos_thread_get_fs() != (void*)&g_tls[3]) main_errors++;
++        if (i & 1) mos_sleep(1); else mos_thread_yield();
++    }
++    EXPECT(main_errors == 0, "tls_main_unchanged_while_threads_run", "%d mismatches", main_errors);
++    for (int i = 0; i < created; i++) {
++        mos_thread_join(&t[i]);
++        char name[48];
++        kfmt(name, sizeof(name), "tls_thread_%d_own_fs_base", i);
++        EXPECT(g_tls[i].finished && g_tls[i].errors == 0, name, "finished=%d errors=%d",
++               g_tls[i].finished, g_tls[i].errors);
++    }
++
++    /* A thread changing its own FS base. */
++    mos_thread_t st;
++    g_tls_thread_fs_ok = 0;
++    int sc = mos_thread_create_ex(&st, tls_setter, NULL, 0, NULL);
++    if (sc == 0) mos_thread_join(&st);
++    EXPECT(sc == 0 && g_tls_thread_fs_ok, "tls_thread_set_fs", "create=%d ok=%d", sc, g_tls_thread_fs_ok);
++    EXPECT(mos_thread_get_fs() == (void*)&g_tls[3], "tls_main_unchanged_by_thread_set_fs",
++           "got 0x%llx", PTR(mos_thread_get_fs()));
++
++    EXPECT_RET(mos_thread_set_fs(NULL), SYS_SUCCESS, "tls_main_clear");
++    EXPECT(mos_thread_get_fs() == NULL, "tls_main_cleared", "got 0x%llx", PTR(mos_thread_get_fs()));
++
++    /* The real thing: %fs:0 reads through the base. In a child process,
++     * where a wrong base only kills the child. */
++    char out[1024];
++    mos_wait_result_t r;
++    long pid = spawn_wait("tls_hw", NULL, TMP "/tls_hw.txt", NULL, NULL, NULL, &r);
++    read_text(TMP "/tls_hw.txt", out, sizeof(out));
++    EXPECT(pid > 0 && !r.crashed && r.exit_code == 0 && has_line(out, "tls_hw: all ok"),
++           "tls_hardware_fs_reads",
++           "pid=%ld exit=%d crashed=%d vector=%u output: %s", pid, r.exit_code, r.crashed,
++           r.crash_vector, out);
++
++    /* CREATE_EX validation. */
++    syscall_thread_ex_t bad;
++    bad.entry = 0; bad.stack_top = 0; bad.arg = 0; bad.fs_base = 0; bad.exit_futex = 0;
++    long id = mos_syscall(SYS_THREAD, SYS_THREAD_CREATE_EX, (long)(uintptr_t)&bad, 0);
++    EXPECT(id < 0, "thread_create_ex_bad_entry_rejected", "returned %ld", id);
++}
++
++/* ================================================================ futex */
++
++static volatile uint32_t g_fx_word;
++static volatile uint32_t g_fx_ready;
++static volatile long g_fx_result[4];
++static volatile uint32_t g_fx_woke_flag;
++
++static void fx_waiter(void* arg) {
++    long idx = (long)(uintptr_t)arg;
++    __atomic_add_fetch(&g_fx_ready, 1, __ATOMIC_SEQ_CST);
++    g_fx_result[idx] = mos_futex_wait(&g_fx_word, 0, 5ull * 1000000000ull);
++    __atomic_store_n(&g_fx_woke_flag, 1, __ATOMIC_SEQ_CST);
++}
++
++static void fx_sleeper(void* arg) {
++    mos_sleep((long)(uintptr_t)arg);
++}
++
++static void fx_quick(void* arg) { (void)arg; }
++
++static void wait_ready(uint32_t want) {
++    for (int i = 0; i < 2000 && __atomic_load_n(&g_fx_ready, __ATOMIC_SEQ_CST) < want; i++)
++        mos_sleep(1);
++    mos_sleep(40);               /* let them get into the kernel's wait */
++}
++
++static void test_futex(void) {
++    stage("futex");
++    static volatile uint32_t word;
++    word = 5;
++    EXPECT_RET(mos_futex_wait(&word, 4, 0), ERR(SYS_ERR_AGAIN), "futex_wait_mismatch_again");
++    EXPECT_RET(mos_futex_wait(&word, 6, 1000000000ull), ERR(SYS_ERR_AGAIN),
++               "futex_wait_mismatch_again_with_timeout");
++    word = 0;
++    EXPECT_RET(mos_futex_wake(&word, 1), 0, "futex_wake_nobody_returns_0");
++
++    static const uint64_t waits_ms[] = { 20, 100, 250 };
++    for (size_t i = 0; i < 3; i++) {
++        uint64_t t0 = mos_clock_monotonic_ns();
++        long r = mos_futex_wait(&word, 0, waits_ms[i] * 1000000ull);
++        uint64_t el = (mos_clock_monotonic_ns() - t0) / 1000u;       /* us */
++        char name[48];
++        kfmt(name, sizeof(name), "futex_timeout_%lums", (unsigned long)waits_ms[i]);
++        /* never early (allow 1 ms of clock-source slop), not much late */
++        EXPECT(r == ERR(SYS_ERR_TIMEDOUT) && el >= waits_ms[i] * 1000u - 1000u &&
++               el <= waits_ms[i] * 1000u + 150000u,
++               name, "returned %ld (%s) after %llu us", r, ename(r), (unsigned long long)el);
++    }
++    {
++        uint64_t t0 = mos_clock_monotonic_ns();
++        long r = mos_futex_wait(&word, 0, 1);              /* 1 ns: rounds up to a millisecond */
++        uint64_t el = (mos_clock_monotonic_ns() - t0) / 1000u;
++        EXPECT(r == ERR(SYS_ERR_TIMEDOUT) && el < 100000u, "futex_timeout_1ns_rounds_up",
++               "returned %ld (%s) after %llu us", r, ename(r), (unsigned long long)el);
++    }
++
++    /* Argument checks. */
++    EXPECT_RET(mos_futex_wait(NULL, 0, 1000000), ERR(SYS_ERR_INVAL), "futex_wait_null_inval");
++    EXPECT_RET(mos_futex_wait((volatile uint32_t*)((uintptr_t)&word + 1), 0, 1000000),
++               ERR(SYS_ERR_INVAL), "futex_wait_unaligned_inval");
++    EXPECT_RET(mos_futex_wake((volatile uint32_t*)((uintptr_t)&word + 2), 1), ERR(SYS_ERR_INVAL),
++               "futex_wake_unaligned_inval");
++    EXPECT_RET(mos_futex_wake(NULL, 1), ERR(SYS_ERR_INVAL), "futex_wake_null_inval");
++    EXPECT_RET(mos_syscall4(SYS_FUTEX, 99, (long)(uintptr_t)&word, 0, 0), ERR(SYS_ERR_INVAL),
++               "futex_bad_op_inval");
++    EXPECT_RET(mos_futex_wait((volatile uint32_t*)0x1000, 0, 1000000), ERR(SYS_ERR_INVAL),
++               "futex_wait_foreign_address_inval");
++
++    /* wake wakes a waiting thread */
++    g_fx_word = 0; g_fx_ready = 0; g_fx_woke_flag = 0; g_fx_result[0] = 12345;
++    mos_thread_t w1;
++    int c = mos_thread_create_ex(&w1, fx_waiter, (void*)0, 0, NULL);
++    EXPECT(c == 0, "futex_waiter_created", "create returned %d", c);
++    if (c == 0) {
++        wait_ready(1);
++        EXPECT(__atomic_load_n(&g_fx_woke_flag, __ATOMIC_SEQ_CST) == 0, "futex_waiter_sleeps",
++               "the waiter returned (%ld) before any wake", (long)g_fx_result[0]);
++        g_fx_word = 1;
++        long woke = mos_futex_wake(&g_fx_word, 1);
++        EXPECT(woke == 1, "futex_wake_returns_1", "returned %ld", woke);
++        mos_thread_join(&w1);
++        EXPECT(g_fx_result[0] == 0 && g_fx_woke_flag, "futex_wake_wakes_waiter",
++               "waiter result %ld (%s)", (long)g_fx_result[0], ename(g_fx_result[0]));
++    }
++
++    /* wake count: 4 waiters, wake 2, then the rest */
++    g_fx_word = 0; g_fx_ready = 0; g_fx_woke_flag = 0;
++    mos_thread_t w[4];
++    int made = 0;
++    for (long i = 0; i < 4; i++) {
++        g_fx_result[i] = 12345;
++        if (mos_thread_create_ex(&w[i], fx_waiter, (void*)(uintptr_t)i, 0, NULL) == 0) made++;
++    }
++    EXPECT(made == 4, "futex_4_waiters_created", "created %d", made);
++    wait_ready(4);
++    long first = mos_futex_wake(&g_fx_word, 2);
++    EXPECT(first == 2, "futex_wake_count_2", "returned %ld", first);
++    mos_sleep(40);
++    int returned = 0;
++    for (int i = 0; i < 4; i++) if (g_fx_result[i] != 12345) returned++;
++    EXPECT(returned == 2, "futex_wake_count_only_2_woke", "%d waiters returned", returned);
++    long second = mos_futex_wake(&g_fx_word, 100);
++    EXPECT(second == 2, "futex_wake_rest_returns_2", "returned %ld", second);
++    long third = mos_futex_wake(&g_fx_word, 100);
++    EXPECT(third == 0, "futex_wake_after_all_woken_returns_0", "returned %ld", third);
++    int good = 0;
++    for (int i = 0; i < made; i++) {
++        mos_thread_join(&w[i]);
++        if (g_fx_result[i] == 0) good++;
++    }
++    EXPECT(good == 4, "futex_all_waiters_woke_success", "%d of 4 returned SUCCESS (results %ld %ld %ld %ld)",
++           good, (long)g_fx_result[0], (long)g_fx_result[1], (long)g_fx_result[2], (long)g_fx_result[3]);
++
++    /* thread join through the exit futex */
++    mos_thread_t j;
++    uint64_t t0 = mos_clock_monotonic_ns();
++    int jc = mos_thread_create_ex(&j, fx_sleeper, (void*)(uintptr_t)60, 0, NULL);
++    if (jc == 0) mos_thread_join(&j);
++    uint64_t ms = (mos_clock_monotonic_ns() - t0) / 1000000u;
++    EXPECT(jc == 0 && ms >= 55 && ms <= 400, "thread_join_exit_futex_waits", "create=%d joined after %llu ms", jc,
++           (unsigned long long)ms);
++    EXPECT(j.exit_word == 0 && j.id == 0 && j.stack == NULL, "thread_join_exit_futex_cleans_up",
++           "exit_word=%u id=%ld stack=0x%llx", (unsigned)j.exit_word, j.id, PTR(j.stack));
++
++    jc = mos_thread_create_ex(&j, fx_quick, NULL, 0, NULL);
++    mos_sleep(50);
++    t0 = mos_clock_monotonic_ns();
++    if (jc == 0) mos_thread_join(&j);
++    ms = (mos_clock_monotonic_ns() - t0) / 1000000u;
++    EXPECT(jc == 0 && ms < 30, "thread_join_already_ended_returns_at_once", "create=%d took %llu ms", jc,
++           (unsigned long long)ms);
++
++    /* waiting on the exit word by hand: the kernel zeroes it and wakes the waiter */
++    static mos_thread_t jm;
++    jc = mos_thread_create_ex(&jm, fx_sleeper, (void*)(uintptr_t)50, 0, NULL);
++    if (jc == 0) {
++        long wr = ERR(SYS_ERR_AGAIN);
++        uint32_t cur = __atomic_load_n(&jm.exit_word, __ATOMIC_SEQ_CST);
++        if (cur != 0) wr = mos_futex_wait(&jm.exit_word, cur, 3ull * 1000000000ull);
++        uint32_t after = __atomic_load_n(&jm.exit_word, __ATOMIC_SEQ_CST);
++        EXPECT(cur == 1 && wr == 0 && after == 0, "thread_exit_futex_zeroed_and_waiter_woken",
++               "word before=%u wait=%ld (%s) word after=%u", (unsigned)cur, wr, ename(wr), (unsigned)after);
++        mos_thread_join(&jm);
++    } else {
++        check_fail("thread_exit_futex_zeroed_and_waiter_woken", "thread not created (%d)", jc);
++    }
++
++    /* the old polling join still works */
++    jc = mos_thread_create(&j, fx_sleeper, (void*)(uintptr_t)30, 0);
++    t0 = mos_clock_monotonic_ns();
++    if (jc == 0) mos_thread_join(&j);
++    ms = (mos_clock_monotonic_ns() - t0) / 1000000u;
++    EXPECT(jc == 0 && ms >= 25 && ms <= 400 && j.id == 0, "thread_join_polling_still_works",
++           "create=%d joined after %llu ms id=%ld", jc, (unsigned long long)ms, j.id);
++}
++
++/* ================================================================== stat */
++
++static void test_stat(void) {
++    stage("stat");
++    static const size_t sizes[] = { 0, 1, 511, 512, 513, 4096, 5000, 70000 };
++    syscall_stat_t st;
++    int all_ok = 1;
++    for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++) {
++        char path[128], name[64];
++        kfmt(path, sizeof(path), TMP "/size_%lu.bin", (unsigned long)sizes[i]);
++        kfmt(name, sizeof(name), "stat_file_size_%lu", (unsigned long)sizes[i]);
++        int w = write_pattern(path, sizes[i], (uint8_t)i);
++        memset(&st, 0xAB, sizeof(st));
++        long r = mos_stat(path, &st);
++        long fd = mos_open(path, SYS_O_RDONLY);
++        long fsz = fd >= 0 ? mos_size(fd) : -1;
++        if (fd >= 0) mos_close(fd);
++        int good = w == 0 && r == 0 && st.type == SYS_STAT_FILE && st.size == sizes[i] &&
++                   fsz == (long)sizes[i];
++        if (!good) all_ok = 0;
++        EXPECT(good, name, "write=%d stat=%ld (%s) type=%u size=%llu mos_size=%ld",
++               w, r, ename(r), (unsigned)st.type, (unsigned long long)st.size, fsz);
++    }
++    (void)all_ok;
++    EXPECT(verify_pattern(TMP "/size_70000.bin", 70000, 7), "stat_file_content_roundtrip", "70000-byte file differs");
++
++    /* grown by a second write */
++    {
++        long fd = mos_open(TMP "/size_1.bin", SYS_O_RDWR);
++        mos_seek(fd, mos_size(fd));
++        mos_fwrite(fd, "xyz", 3);
++        mos_close(fd);
++        long r = mos_stat(TMP "/size_1.bin", &st);
++        EXPECT(r == 0 && st.size == 4, "stat_size_after_append", "stat=%ld size=%llu", r, (unsigned long long)st.size);
++    }
++
++    /* file attributes and times */
++    write_pattern(TMP "/attr.bin", 10, 1);
++    long r = mos_stat(TMP "/attr.bin", &st);
++    EXPECT(r == 0 && !(st.flags & SYS_STAT_HIDDEN) && !(st.flags & SYS_STAT_RUNNABLE),
++           "stat_plain_file_flags", "stat=%ld flags=%x", r, (unsigned)st.flags);
++    {
++        int64_t now = mos_time_unix();
++        const int64_t slack = 2 * 86400;      /* MinimaFS keeps the day only */
++        EXPECT(r == 0 && st.created > 1577836800 && st.created <= now + slack && st.created >= now - slack,
++               "stat_file_created_time", "created=%lld now=%lld", (long long)st.created, (long long)now);
++        EXPECT(r == 0 && st.modified > 1577836800 && st.modified <= now + slack && st.modified >= now - slack,
++               "stat_file_modified_time", "modified=%lld now=%lld", (long long)st.modified, (long long)now);
++    }
++
++    /* directories */
++    mos_mkdir(TMP "/statdir");
++    memset(&st, 0xAB, sizeof(st));
++    r = mos_stat(TMP "/statdir", &st);
++    EXPECT(r == 0 && st.type == SYS_STAT_DIR && st.size == 0, "stat_directory",
++           "stat=%ld type=%u size=%llu", r, (unsigned)st.type, (unsigned long long)st.size);
++    EXPECT(r == 0 && st.created == 0 && st.modified == 0, "stat_directory_has_no_times",
++           "created=%lld modified=%lld", (long long)st.created, (long long)st.modified);
++    memset(&st, 0xAB, sizeof(st));
++    r = mos_stat(TMP "/statdir/", &st);
++    EXPECT(r == 0 && st.type == SYS_STAT_DIR, "stat_directory_trailing_slash", "stat=%ld (%s) type=%u",
++           r, ename(r), (unsigned)st.type);
++    memset(&st, 0xAB, sizeof(st));
++    r = mos_stat("0:/", &st);
++    EXPECT(r == 0 && st.type == SYS_STAT_DIR, "stat_drive_root", "stat=%ld (%s) type=%u", r, ename(r),
++           (unsigned)st.type);
++    memset(&st, 0xAB, sizeof(st));
++    r = mos_stat("/os0test_tmp", &st);
++    EXPECT(r == 0 && st.type == SYS_STAT_DIR, "stat_slash_path_is_drive_root_relative", "stat=%ld (%s)", r, ename(r));
++
++    /* errors */
++    EXPECT_RET(mos_stat(TMP "/no_such_file", &st), ERR(SYS_ERR_NOTFOUND), "stat_missing_notfound");
++    EXPECT_RET(mos_stat(TMP "/no_such_dir/file", &st), ERR(SYS_ERR_NOTFOUND), "stat_missing_parent_notfound");
++    EXPECT_RET(mos_stat(TMP "/attr.bin/inside", &st), ERR(SYS_ERR_NOTFOUND), "stat_path_through_file_notfound");
++    EXPECT_RET(mos_stat(NULL, &st), ERR(SYS_ERR_INVAL), "stat_null_path_inval");
++    EXPECT_RET(mos_stat(TMP "/attr.bin", NULL), ERR(SYS_ERR_INVAL), "stat_null_out_inval");
++    EXPECT(mos_file_size(TMP "/size_513.bin") == 513 && mos_file_size(TMP "/statdir") < 0 &&
++           mos_file_size(TMP "/nope") == ERR(SYS_ERR_NOTFOUND),
++           "stat_process_h_file_size", "sizes %ld %ld %ld", mos_file_size(TMP "/size_513.bin"),
++           mos_file_size(TMP "/statdir"), mos_file_size(TMP "/nope"));
++
++    /* this program's own file: a runnable bundle */
++    memset(&st, 0, sizeof(st));
++    r = mos_stat(g_self, &st);
++    EXPECT(r == 0 && st.type == SYS_STAT_FILE && st.size > 1000, "stat_own_executable",
++           "stat(%s)=%ld (%s) type=%u size=%llu", g_self, r, ename(r), (unsigned)st.type,
++           (unsigned long long)st.size);
++    emit_fd(1, "OS0TEST info own executable: size=%llu flags=%x (RUNNABLE=%d)",
++            (unsigned long long)st.size, (unsigned)st.flags, (st.flags & SYS_STAT_RUNNABLE) != 0);
++}
++
++/* ================================================================ rename */
++
++static void test_rename(void) {
++    stage("rename");
++    const char* d = TMP "/ren";
++    mos_mkdir(d);
++    char a[160], b[160], c[160];
++    char buf[256];
++    syscall_stat_t st;
++
++    /* file, same directory */
++    kfmt(a, sizeof(a), "%s/a.txt", d);
++    kfmt(b, sizeof(b), "%s/b.txt", d);
++    kfmt(c, sizeof(c), "%s/c.txt", d);
++    write_text(a, "AAA");
++    EXPECT_RET(mos_rename(a, b), SYS_SUCCESS, "rename_file");
++    long n = read_text(b, buf, sizeof(buf));
++    EXPECT(!exists(a) && exists(b) && n == 3 && streq(buf, "AAA"), "rename_file_old_gone_new_has_data",
++           "old exists=%d new exists=%d read=%ld '%s'", exists(a), exists(b), n, buf);
++    EXPECT(mos_stat(b, &st) == 0 && st.size == 3 && st.type == SYS_STAT_FILE, "rename_file_stat_new",
++           "size=%llu", (unsigned long long)st.size);
++    EXPECT_RET(mos_stat(a, &st), ERR(SYS_ERR_NOTFOUND), "rename_file_stat_old_notfound");
++    EXPECT(dir_has(d, "b.txt") && !dir_has(d, "a.txt"), "rename_file_listing",
++           "listing has b.txt=%d a.txt=%d", dir_has(d, "b.txt"), dir_has(d, "a.txt"));
++
++    /* replace an existing file */
++    write_text(c, "CCCCC");
++    EXPECT_RET(mos_rename(c, b), SYS_SUCCESS, "rename_replaces_existing_file");
++    n = read_text(b, buf, sizeof(buf));
++    EXPECT(!exists(c) && n == 5 && streq(buf, "CCCCC"), "rename_replace_data", "c exists=%d read=%ld '%s'",
++           exists(c), n, buf);
++    EXPECT(mos_stat(b, &st) == 0 && st.size == 5, "rename_replace_stat", "size=%llu", (unsigned long long)st.size);
++
++    /* a bigger file replaces a smaller one and the data is intact */
++    char big[160];
++    kfmt(big, sizeof(big), "%s/big.bin", d);
++    write_pattern(big, 9000, 3);
++    EXPECT_RET(mos_rename(big, b), SYS_SUCCESS, "rename_big_over_small");
++    EXPECT(verify_pattern(b, 9000, 3) && !exists(big), "rename_big_over_small_data", "content wrong or old name left");
++
++    /* into a directory */
++    char d1[160], d1b[160];
++    kfmt(d1, sizeof(d1), "%s/d1", d);
++    kfmt(d1b, sizeof(d1b), "%s/d1/b.txt", d);
++    mos_mkdir(d1);
++    write_text(b, "BBBB");
++    EXPECT_RET(mos_rename(b, d1b), SYS_SUCCESS, "rename_file_into_directory");
++    n = read_text(d1b, buf, sizeof(buf));
++    EXPECT(!exists(b) && n == 4 && streq(buf, "BBBB"), "rename_into_directory_data", "old exists=%d read=%ld '%s'",
++           exists(b), n, buf);
++    EXPECT(dir_has(d1, "b.txt") && !dir_has(d, "b.txt"), "rename_into_directory_listing", "d1 has=%d ren has=%d",
++           dir_has(d1, "b.txt"), dir_has(d, "b.txt"));
++
++    /* out of a directory, with a new name, replacing */
++    write_text(a, "old");
++    EXPECT_RET(mos_rename(d1b, a), SYS_SUCCESS, "rename_file_out_of_directory_replacing");
++    n = read_text(a, buf, sizeof(buf));
++    EXPECT(!exists(d1b) && n == 4 && streq(buf, "BBBB"), "rename_out_of_directory_data", "read=%ld '%s'", n, buf);
++
++    /* directory, same parent; it keeps its contents */
++    char d2[160], d2f[160];
++    kfmt(d2, sizeof(d2), "%s/d2", d);
++    kfmt(d2f, sizeof(d2f), "%s/d2/in.txt", d);
++    write_text(d1b, "inside");
++    EXPECT_RET(mos_rename(d1, d2), SYS_SUCCESS, "rename_directory");
++    EXPECT(is_dir(d2) && !exists(d1) && dir_has(d, "d2") && !dir_has(d, "d1"), "rename_directory_listing",
++           "d2 is dir=%d d1 exists=%d", is_dir(d2), exists(d1));
++    char moved[160];
++    kfmt(moved, sizeof(moved), "%s/d2/b.txt", d);
++    n = read_text(moved, buf, sizeof(buf));
++    EXPECT(n == 6 && streq(buf, "inside"), "rename_directory_keeps_contents", "read=%ld '%s'", n, buf);
++    EXPECT(mos_stat(d2, &st) == 0 && st.type == SYS_STAT_DIR, "rename_directory_stat", "type=%u", (unsigned)st.type);
++    write_text(d2f, "new in renamed dir");
++    EXPECT(exists(d2f), "rename_directory_can_create_inside", "file not created in the renamed directory");
++
++    /* directory into another directory */
++    char d3[160], d3d2[160], d3d2f[160];
++    kfmt(d3, sizeof(d3), "%s/d3", d);
++    kfmt(d3d2, sizeof(d3d2), "%s/d3/d2", d);
++    kfmt(d3d2f, sizeof(d3d2f), "%s/d3/d2/in.txt", d);
++    mos_mkdir(d3);
++    EXPECT_RET(mos_rename(d2, d3d2), SYS_SUCCESS, "rename_directory_into_directory");
++    EXPECT(is_dir(d3d2) && exists(d3d2f) && !exists(d2), "rename_directory_into_directory_contents",
++           "dir=%d file=%d old=%d", is_dir(d3d2), exists(d3d2f), exists(d2));
++
++    /* errors */
++    char missing[160], missing2[160];
++    kfmt(missing, sizeof(missing), "%s/missing", d);
++    kfmt(missing2, sizeof(missing2), "%s/missing2", d);
++    EXPECT_RET(mos_rename(missing, missing2), ERR(SYS_ERR_NOTFOUND), "rename_missing_source_notfound");
++    EXPECT_RET(mos_rename(NULL, a), ERR(SYS_ERR_INVAL), "rename_null_from_inval");
++    EXPECT_RET(mos_rename(a, NULL), ERR(SYS_ERR_INVAL), "rename_null_to_inval");
++    EXPECT(exists(a), "rename_errors_leave_source", "source vanished");
++
++    char e1[160], e2[160];
++    kfmt(e1, sizeof(e1), "%s/e1", d);
++    kfmt(e2, sizeof(e2), "%s/e2", d);
++    mos_mkdir(e1);
++    mos_mkdir(e2);
++    EXPECT_RET(mos_rename(a, e1), ERR(SYS_ERR_GENERIC), "rename_file_onto_directory_is_error");
++    EXPECT(exists(a) && is_dir(e1), "rename_file_onto_directory_left_alone", "a=%d e1 dir=%d", exists(a), is_dir(e1));
++    EXPECT_RET(mos_rename(e1, e2), ERR(SYS_ERR_GENERIC), "rename_directory_onto_directory_is_error");
++    EXPECT_RET(mos_rename(e1, a), ERR(SYS_ERR_GENERIC), "rename_directory_onto_file_is_error");
++    EXPECT(is_dir(e1) && is_dir(e2) && exists(a), "rename_dir_errors_left_alone", "e1=%d e2=%d a=%d",
++           is_dir(e1), is_dir(e2), exists(a));
++    char e1in[160], e1deep[160];
++    kfmt(e1in, sizeof(e1in), "%s/e1/in", d);
++    kfmt(e1deep, sizeof(e1deep), "%s/e1/in/deeper", d);
++    mos_mkdir(e1in);
++    EXPECT_RET(mos_rename(e1, e1in), ERR(SYS_ERR_GENERIC), "rename_directory_into_itself_is_error");
++    EXPECT_RET(mos_rename(e1, e1deep), ERR(SYS_ERR_GENERIC), "rename_directory_into_its_subtree_is_error");
++    EXPECT(is_dir(e1) && is_dir(e1in), "rename_into_itself_left_alone", "e1=%d in=%d", is_dir(e1), is_dir(e1in));
++    char nodest[160];
++    kfmt(nodest, sizeof(nodest), "%s/no_such_dir/x.txt", d);
++    EXPECT_RET(mos_rename(a, nodest), ERR(SYS_ERR_GENERIC), "rename_into_missing_directory_is_error");
++    char viafile[160];
++    kfmt(viafile, sizeof(viafile), "%s/a.txt/x", d);
++    EXPECT_RET(mos_rename(e2, viafile), ERR(SYS_ERR_GENERIC), "rename_into_a_file_is_error");
++    { long rr = mos_rename("0:/", TMP "/rootmove");
++      EXPECT(rr < 0 && !exists(TMP "/rootmove"), "rename_drive_root_is_error", "returned %ld (%s)", rr, ename(rr)); }
++
++    /* same path: undocumented in the header; MinimaFS treats it as a no-op */
++    EXPECT_RET(mos_rename(a, a), SYS_SUCCESS, "rename_onto_itself_is_noop");
++    EXPECT(exists(a), "rename_onto_itself_keeps_file", "file gone");
++
++    /* long data survives a rename and a following rewrite */
++    char p1[160], p2[160];
++    kfmt(p1, sizeof(p1), "%s/p1.bin", d);
++    kfmt(p2, sizeof(p2), "%s/p2.bin", d);
++    write_pattern(p1, 20000, 9);
++    mos_rename(p1, p2);
++    long fd = mos_open(p2, SYS_O_RDWR);
++    long w = fd >= 0 ? mos_fwrite(fd, "ZZ", 2) : -1;
++    if (fd >= 0) mos_close(fd);
++    n = read_text(p2, buf, 3);
++    EXPECT(fd >= 0 && w == 2 && n == 2 && buf[0] == 'Z' && mos_file_size(p2) == 20000, "rename_then_write_through_new_name",
++           "open=%ld write=%ld read=%ld size=%ld", fd, w, n, mos_file_size(p2));
++}
++
++/* ======================================================= cwd and paths */
++
++static void getcwd_is(const char* want, const char* name) {
++    char cwd[512];
++    long r = mos_getcwd(cwd, sizeof(cwd));
++    EXPECT(r == 0 && streq(cwd, want), name, "getcwd=%ld '%s', expected '%s'", r, cwd, want);
++}
++
++static void cwd_thread(void* arg) {
++    char* out = (char*)arg;
++    if (mos_getcwd(out, 256) != 0) out[0] = '\0';
++}
++
++static void test_cwd(void) {
++    stage("cwd");
++    char cwd[512];
++    EXPECT(mos_getcwd(g_start_cwd, sizeof(g_start_cwd)) == 0 && g_start_cwd[0], "cwd_initial_is_terminal_cwd",
++           "getcwd failed");
++    emit_fd(1, "OS0TEST info start cwd=%s", g_start_cwd);
++
++    mos_mkdir(TMP "/cw");
++    mos_mkdir(TMP "/cw/sub");
++    EXPECT_RET(mos_chdir(TMP "/cw"), SYS_SUCCESS, "chdir_absolute");
++    getcwd_is(TMP "/cw", "getcwd_after_chdir");
++
++    /* relative paths */
++    EXPECT(write_text("rel.txt", "R") == 0, "relative_create", "could not create rel.txt in the working directory");
++    EXPECT(exists(TMP "/cw/rel.txt"), "relative_create_lands_in_cwd", "0:/os0test_tmp/cw/rel.txt missing");
++    EXPECT(exists("rel.txt") && exists("./rel.txt") && exists("sub/../rel.txt"), "relative_exists_forms",
++           "rel=%d dot=%d dotdot=%d", exists("rel.txt"), exists("./rel.txt"), exists("sub/../rel.txt"));
++    EXPECT(exists("../cw/rel.txt") && exists("../../os0test_tmp/cw/rel.txt"), "relative_dotdot_forms", "..-paths wrong");
++    EXPECT(!exists("sub/rel.txt") && !exists("nope.txt"), "relative_missing", "reports files that are not there");
++    EXPECT_RET(mos_mkdir("made"), SYS_SUCCESS, "relative_mkdir");
++    EXPECT(is_dir(TMP "/cw/made") && is_dir("made") && !is_dir("rel.txt"), "relative_is_dir", "is_dir wrong");
++    syscall_stat_t st;
++    EXPECT(mos_stat("rel.txt", &st) == 0 && st.size == 1 && st.type == SYS_STAT_FILE, "relative_stat",
++           "stat failed or wrong size");
++    EXPECT(mos_stat("sub", &st) == 0 && st.type == SYS_STAT_DIR, "relative_stat_dir", "stat of sub failed");
++    EXPECT_RET(mos_rename("rel.txt", "sub/moved.txt"), SYS_SUCCESS, "relative_rename");
++    EXPECT(exists(TMP "/cw/sub/moved.txt") && !exists("rel.txt"), "relative_rename_result", "rename went elsewhere");
++    long fd = mos_open("sub/moved.txt", SYS_O_RDONLY);
++    char c = 0;
++    long n = fd >= 0 ? mos_read(fd, &c, 1) : -1;
++    if (fd >= 0) mos_close(fd);
++    EXPECT(fd >= 0 && n == 1 && c == 'R', "relative_open_read", "open=%ld read=%ld", fd, n);
++    EXPECT_RET(mos_delete("sub/moved.txt"), SYS_SUCCESS, "relative_delete");
++    EXPECT_RET(mos_rmdir("made"), SYS_SUCCESS, "relative_rmdir");
++    EXPECT(dir_has(".", "sub") && dir_has("", "sub"), "relative_listdir_dot_and_empty", "listing of '.' or '' lacks sub");
++
++    /* chdir with relative paths, and the drive-root forms */
++    EXPECT_RET(mos_chdir("sub"), SYS_SUCCESS, "chdir_relative");
++    getcwd_is(TMP "/cw/sub", "getcwd_after_relative_chdir");
++    EXPECT_RET(mos_chdir(".."), SYS_SUCCESS, "chdir_dotdot");
++    getcwd_is(TMP "/cw", "getcwd_after_dotdot");
++    EXPECT_RET(mos_chdir("../.."), SYS_SUCCESS, "chdir_dotdot_twice");
++    getcwd_is("0:/", "getcwd_is_drive_root");
++    EXPECT_RET(mos_chdir("../../.."), SYS_SUCCESS, "chdir_dotdot_above_root_stays_at_root");
++    getcwd_is("0:/", "getcwd_dotdot_above_root");
++    EXPECT_RET(mos_chdir("os0test_tmp/cw"), SYS_SUCCESS, "chdir_relative_from_root");
++    getcwd_is(TMP "/cw", "getcwd_after_relative_from_root");
++
++    /* "/" is the root of the working directory's drive, "0:/" names it */
++    EXPECT_RET(mos_chdir("/"), SYS_SUCCESS, "chdir_slash");
++    getcwd_is("0:/", "getcwd_after_chdir_slash");
++    EXPECT_RET(mos_chdir("/os0test_tmp/cw/sub"), SYS_SUCCESS, "chdir_slash_absolute");
++    getcwd_is(TMP "/cw/sub", "getcwd_after_chdir_slash_absolute");
++    EXPECT(exists("/os0test_tmp/cw") && exists("0:/os0test_tmp/cw") && exists("../../cw") ,
++           "slash_vs_drive_forms_agree", "forms disagree");
++    EXPECT_RET(mos_chdir("0:/"), SYS_SUCCESS, "chdir_drive_root");
++    getcwd_is("0:/", "getcwd_after_chdir_drive_root");
++    EXPECT_RET(mos_chdir(TMP "/cw/"), SYS_SUCCESS, "chdir_trailing_slash");
++    getcwd_is(TMP "/cw", "getcwd_trailing_slash_dropped");
++    EXPECT_RET(mos_chdir("./sub/./"), SYS_SUCCESS, "chdir_dot_components");
++    getcwd_is(TMP "/cw/sub", "getcwd_dot_components_dropped");
++
++    /* failures leave the directory alone */
++    EXPECT_RET(mos_chdir("0:/os0test_tmp/size_1.bin"), ERR(SYS_ERR_NOTFOUND), "chdir_to_file_notfound");
++    EXPECT_RET(mos_chdir("no_such_dir"), ERR(SYS_ERR_NOTFOUND), "chdir_missing_notfound");
++    EXPECT_RET(mos_chdir(NULL), ERR(SYS_ERR_INVAL), "chdir_null_inval");
++    static char longpath[1200];
++    for (int i = 0; i < 1190; i++) longpath[i] = 'x';
++    longpath[0] = '0'; longpath[1] = ':'; longpath[2] = '/';
++    longpath[1190] = '\0';
++    EXPECT_RET(mos_chdir(longpath), ERR(SYS_ERR_INVAL), "chdir_too_long_inval");
++    getcwd_is(TMP "/cw/sub", "cwd_unchanged_after_failed_chdirs");
++
++    /* getcwd buffer rules */
++    char tiny[4];
++    EXPECT_RET(mos_getcwd(tiny, sizeof(tiny)), ERR(SYS_ERR_INVAL), "getcwd_small_buffer_inval");
++    EXPECT_RET(mos_getcwd(NULL, 64), ERR(SYS_ERR_INVAL), "getcwd_null_inval");
++    EXPECT_RET(mos_getcwd(cwd, 0), ERR(SYS_ERR_INVAL), "getcwd_zero_size_inval");
++    n = mos_getcwd(cwd, slen(TMP "/cw/sub") + 1);
++    EXPECT(n == 0 && streq(cwd, TMP "/cw/sub"), "getcwd_exact_fit", "getcwd=%ld '%s'", n, cwd);
++
++    /* the working directory is the program's, shared by its threads */
++    static char thread_cwd[256];
++    thread_cwd[0] = '\0';
++    mos_thread_t t;
++    int tc = mos_thread_create_ex(&t, cwd_thread, thread_cwd, 0, NULL);
++    if (tc == 0) mos_thread_join(&t);
++    EXPECT(tc == 0 && streq(thread_cwd, TMP "/cw/sub"), "cwd_shared_with_threads", "thread saw '%s'", thread_cwd);
++
++    /* back to the start directory */
++    EXPECT_RET(mos_chdir(g_start_cwd), SYS_SUCCESS, "chdir_back_to_start");
++    getcwd_is(g_start_cwd, "getcwd_back_at_start");
++}
++
++/* ============================================================ environment */
++
++static void test_env(void) {
++    stage("env");
++    EXPECT(environ != NULL, "environ_not_null", "environ is NULL");
++    int terminated = 0;
++    if (environ) { for (int i = 0; i < 100000; i++) if (!environ[i]) { terminated = 1; break; } }
++    EXPECT(terminated, "environ_null_terminated", "no NULL terminator found");
++    EXPECT(mos_getenv("OS0_DEFINITELY_NOT_SET") == NULL, "getenv_missing_is_null", "found a value");
++    EXPECT(mos_getenv("") == NULL && mos_getenv(NULL) == NULL, "getenv_empty_and_null_name", "returned a value");
++
++    /* lookups against a made-up environment */
++    static char e0[] = "OS0_AB=1";
++    static char e1[] = "OS0_A=x";
++    static char e2[] = "OS0_EMPTY=";
++    static char e3[] = "OS0_EQ=a=b";
++    static char e4[] = "NOEQUALS";
++    static char* fake[] = { e0, e1, e2, e3, e4, NULL };
++    char** saved = environ;
++    environ = fake;
++    char* v;
++    v = mos_getenv("OS0_A");
++    EXPECT(v && streq(v, "x"), "getenv_exact_name_not_prefix", "got '%s'", v);
++    v = mos_getenv("OS0_AB");
++    EXPECT(v && streq(v, "1"), "getenv_longer_name", "got '%s'", v);
++    v = mos_getenv("OS0_EMPTY");
++    EXPECT(v && v[0] == '\0', "getenv_empty_value", "got %s", v ? "non-empty" : "NULL");
++    v = mos_getenv("OS0_EQ");
++    EXPECT(v && streq(v, "a=b"), "getenv_value_with_equals", "got '%s'", v);
++    EXPECT(mos_getenv("OS0") == NULL && mos_getenv("OS0_") == NULL && mos_getenv("OS0_A=x") == NULL &&
++           mos_getenv("NOEQUALS") == NULL && mos_getenv("OS0_ABC") == NULL,
++           "getenv_no_partial_matches", "a partial name matched");
++    environ = NULL;
++    EXPECT(mos_getenv("OS0_A") == NULL, "getenv_null_environ", "returned a value");
++    environ = saved;
++}
++
++/* =========================================================== spawn / wait */
++
++/* Starts `os0test.run --child <mode> [arg]` and waits for it. Returns the pid
++ * (>0), or the spawn/wait error. */
++static long spawn_child(const char* mode, const char* arg, const char* out_path, const char* err_path,
++                        const char* const* envp, const char* cwd) {
++    const char* argv[6];
++    int n = 0;
++    argv[n++] = g_self;
++    argv[n++] = "--child";
++    argv[n++] = mode;
++    if (arg) argv[n++] = arg;
++    argv[n] = NULL;
++    mos_spawn_opts_t o;
++    o.path = g_self;
++    o.argv = argv;
++    o.envp = envp;
++    o.cwd = cwd;
++    o.stdout_path = out_path;
++    o.stderr_path = err_path;
++    return mos_spawn_ex(&o);
++}
++
++static long spawn_wait(const char* mode, const char* arg, const char* out_path,
++                       const char* err_path, const char* const* envp, const char* cwd,
++                       mos_wait_result_t* res) {
++    memset(res, 0, sizeof(*res));
++    long pid = spawn_child(mode, arg, out_path, err_path, envp, cwd);
++    if (pid <= 0) return pid;
++    long w = mos_waitpid(pid, 0, res);
++    return w == pid ? pid : w - 1000;      /* a wait error shows up as a big negative */
++}
++
++static void test_spawn_basic(void) {
++    stage("spawn_basic");
++    mos_wait_result_t r;
++
++    /* exit codes: returned from main, and via mos_exit() */
++    static const int codes[] = { 0, 42, 255 };
++    for (size_t i = 0; i < 3; i++) {
++        char arg[8], name[48];
++        kfmt(arg, sizeof(arg), "%d", codes[i]);
++        long pid = spawn_child("exit", arg, NULL, NULL, NULL, NULL);
++        long w = pid > 0 ? mos_waitpid(pid, 0, &r) : pid;
++        kfmt(name, sizeof(name), "spawn_wait_exit_code_%d", codes[i]);
++        EXPECT(pid > 0 && w == pid && r.exit_code == codes[i] && !r.crashed && !r.killed && r.pid == pid, name,
++               "spawn=%ld wait=%ld exit=%d crashed=%d killed=%d", pid, w, r.exit_code, r.crashed, r.killed);
++    }
++    {
++        long pid = spawn_child("exitcall", "17", NULL, NULL, NULL, NULL);
++        long w = pid > 0 ? mos_waitpid(pid, 0, &r) : pid;
++        EXPECT(pid > 0 && w == pid && r.exit_code == 17 && !r.crashed, "spawn_wait_mos_exit_code_17",
++               "spawn=%ld wait=%ld exit=%d", pid, w, r.exit_code);
++    }
++
++    /* argv, environment, cwd, redirected stdout and stderr */
++    mos_mkdir(TMP "/work");
++    const char* argv[] = { g_self, "--child", "info", "hello world", "", "--x=1", NULL };
++    const char* envp[] = { "OS0_A=alpha", "OS0_B=", "OS0_C=a=b=c", NULL };
++    mos_spawn_opts_t o = { g_self, argv, envp, TMP "/work", TMP "/out.txt", TMP "/err.txt" };
++    write_text(TMP "/out.txt", "OLD CONTENT THAT MUST BE REPLACED\n");
++    long pid = mos_spawn_ex(&o);
++    EXPECT(pid > 0, "spawn_info_started", "spawn returned %ld (%s)", pid, ename(pid));
++    long w = pid > 0 ? mos_waitpid(pid, 0, &r) : -1;
++    EXPECT(w == pid && r.exit_code == 7 && !r.crashed && !r.killed, "spawn_info_exit_7",
++           "wait=%ld exit=%d crashed=%d killed=%d vector=%u", w, r.exit_code, r.crashed, r.killed, r.crash_vector);
++    static char out[4096], err[512];
++    long on = read_text(TMP "/out.txt", out, sizeof(out));
++    long en = read_text(TMP "/err.txt", err, sizeof(err));
++    EXPECT(on > 0, "spawn_stdout_file_written", "read %ld bytes", on);
++    EXPECT(line_index(out, "OLD CONTENT THAT MUST BE REPLACED") < 0, "spawn_stdout_file_replaced", "old content still there");
++    char want[300];
++    kfmt(want, sizeof(want), "argv[0]=%s", g_self);
++    EXPECT(has_line(out, "argc=6"), "spawn_child_argc", "output:\n%s", out);
++    EXPECT(has_line(out, want), "spawn_child_argv0", "want '%s' in:\n%s", want, out);
++    EXPECT(has_line(out, "argv[1]=--child") && has_line(out, "argv[2]=info"), "spawn_child_argv_1_2", "output:\n%s", out);
++    EXPECT(has_line(out, "argv[3]=hello world"), "spawn_child_argv_with_space", "output:\n%s", out);
++    EXPECT(has_line(out, "argv[4]="), "spawn_child_argv_empty_string", "output:\n%s", out);
++    EXPECT(has_line(out, "argv[5]=--x=1"), "spawn_child_argv_with_equals", "output:\n%s", out);
++    EXPECT(has_line(out, "argv_null=1"), "spawn_child_argv_null_terminated", "output:\n%s", out);
++    EXPECT(has_line(out, "envp_is_environ=1"), "spawn_child_envp_third_arg_equals_environ", "output:\n%s", out);
++    EXPECT(has_line(out, "environ_count=3"), "spawn_child_environ_count", "output:\n%s", out);
++    EXPECT(has_line(out, "getenv.OS0_A=[alpha]") && has_line(out, "getenv.OS0_B=[]") &&
++           has_line(out, "getenv.OS0_C=[a=b=c]"), "spawn_child_getenv_values", "output:\n%s", out);
++    EXPECT(has_line(out, "getenv.OS0_NOPE=(null)") && has_line(out, "getenv.OS0_=(null)") &&
++           has_line(out, "getenv.OS0=(null)") && has_line(out, "getenv.OS0_INH=(null)"),
++           "spawn_child_getenv_missing", "output:\n%s", out);
++    EXPECT(has_line(out, "cwd=" TMP "/work"), "spawn_child_cwd", "output:\n%s", out);
++    EXPECT(en > 0 && has_line(err, "stderr-line-from-child") && line_index(out, "stderr-line") < 0,
++           "spawn_stderr_separate_file", "stderr file (%ld bytes): '%s'", en, err);
++
++    /* same file for stdout and stderr: one stream, in order */
++    long pid2 = spawn_child("streams", NULL, TMP "/both.txt", TMP "/both.txt", NULL, NULL);
++    long w2 = pid2 > 0 ? mos_waitpid(pid2, 0, &r) : -1;
++    static char both[256];
++    read_text(TMP "/both.txt", both, sizeof(both));
++    long i1 = line_index(both, "out1"), i2 = line_index(both, "err1"), i3 = line_index(both, "out2");
++    EXPECT(pid2 > 0 && w2 == pid2 && r.exit_code == 0 && i1 >= 0 && i2 > i1 && i3 > i2, "spawn_stdout_stderr_same_file_in_order",
++           "spawn=%ld wait=%ld exit=%d file: '%s'", pid2, w2, r.exit_code, both);
++
++    /* nothing redirected: the child's output goes where ours goes. We only
++     * check that it runs; the child prints nothing in this mode. */
++    long pid3 = spawn_child("exit", "0", NULL, NULL, NULL, NULL);
++    long w3 = pid3 > 0 ? mos_waitpid(pid3, 0, NULL) : -1;
++    EXPECT(pid3 > 0 && w3 == pid3, "wait_with_null_result", "spawn=%ld wait=%ld", pid3, w3);
++
++    /* a child that starts a child with nothing given: environment, working
++     * directory and output are inherited */
++    const char* renv[] = { "OS0_INH=yes", NULL };
++    long pid4 = spawn_child("relay", NULL, TMP "/relay.txt", NULL, renv, TMP "/work");
++    long w4 = pid4 > 0 ? mos_waitpid(pid4, 0, &r) : -1;
++    static char relay[2048];
++    read_text(TMP "/relay.txt", relay, sizeof(relay));
++    EXPECT(pid4 > 0 && w4 == pid4 && r.exit_code == 0 && !r.crashed, "spawn_nested_relay_ok",
++           "spawn=%ld wait=%ld exit=%d crashed=%d output:\n%s", pid4, w4, r.exit_code, r.crashed, relay);
++    EXPECT(has_line(relay, "getenv.OS0_INH=[yes]") && has_line(relay, "environ_count=1"), "spawn_inherits_environment",
++           "output:\n%s", relay);
++    EXPECT(has_line(relay, "cwd=" TMP "/work"), "spawn_inherits_cwd", "output:\n%s", relay);
++    EXPECT(has_line(relay, "argv[3]=inherit") && line_prefix_index(relay, "relay-done wait=") > line_index(relay, "argc=4"),
++           "spawn_inherits_stdout_sink", "output:\n%s", relay);
++}
++
++static void test_spawn_crash_and_wait(void) {
++    stage("spawn_wait");
++    mos_wait_result_t r;
++    static char out[256];
++
++    /* a crash: CPU exception 6 (#UD) */
++    long pid = spawn_child("crash", NULL, TMP "/crash.txt", NULL, NULL, NULL);
++    long w = pid > 0 ? mos_waitpid(pid, 0, &r) : -1;
++    read_text(TMP "/crash.txt", out, sizeof(out));
++    EXPECT(pid > 0 && w == pid && r.crashed && !r.killed, "wait_reports_crash",
++           "spawn=%ld wait=%ld crashed=%d killed=%d exit=%d", pid, w, r.crashed, r.killed, r.exit_code);
++    EXPECT(r.crashed && r.crash_vector == 6, "wait_crash_vector_is_ud", "vector=%u", r.crash_vector);
++    EXPECT(r.crashed && r.exit_code == 255, "wait_crash_exit_code_255", "exit=%d", r.exit_code);
++    EXPECT(has_line(out, "before-crash"), "wait_crashed_child_output_flushed", "file: '%s'", out);
++
++    /* waiting twice, and for a pid that was never a child */
++    EXPECT_RET(mos_waitpid(pid, 0, NULL), ERR(SYS_ERR_NOTFOUND), "wait_twice_notfound");
++    EXPECT_RET(mos_waitpid(pid, MOS_WAIT_NOHANG, NULL), ERR(SYS_ERR_NOTFOUND), "wait_nohang_after_wait_notfound");
++    EXPECT_RET(mos_waitpid(999999, 0, NULL), ERR(SYS_ERR_NOTFOUND), "wait_unknown_pid_notfound");
++    EXPECT_RET(mos_waitpid(1, 0, NULL), ERR(SYS_ERR_NOTFOUND), "wait_not_our_child_notfound");
++    EXPECT_RET(mos_wait(NULL), ERR(SYS_ERR_NOTFOUND), "wait_any_without_children_notfound");
++    EXPECT_RET(mos_waitpid(MOS_WAIT_ANY, MOS_WAIT_NOHANG, NULL), ERR(SYS_ERR_NOTFOUND),
++               "wait_any_nohang_without_children_notfound");
++    EXPECT_RET(mos_wait_raw(1, 2, NULL), ERR(SYS_ERR_INVAL), "wait_bad_flags_inval");
++    EXPECT_RET(mos_wait_raw(1, 0, (syscall_wait_t*)(uintptr_t)8), ERR(SYS_ERR_INVAL), "wait_bad_result_pointer_inval");
++
++    /* WAIT_NOHANG while the child runs, then a real wait */
++    uint64_t t0 = mos_clock_monotonic_ns();
++    pid = spawn_child("sleep", "400", NULL, NULL, NULL, NULL);
++    long first = pid > 0 ? mos_waitpid(pid, MOS_WAIT_NOHANG, &r) : -1;
++    EXPECT(pid > 0 && first == ERR(SYS_ERR_AGAIN), "wait_nohang_while_running_again", "spawn=%ld wait=%ld (%s)",
++           pid, first, ename(first));
++    long again = pid > 0 ? mos_waitpid(pid, MOS_WAIT_NOHANG, NULL) : -1;
++    EXPECT(again == ERR(SYS_ERR_AGAIN), "wait_nohang_again_still_running", "wait=%ld (%s)", again, ename(again));
++    w = pid > 0 ? mos_waitpid(pid, 0, &r) : -1;
++    uint64_t ms = (mos_clock_monotonic_ns() - t0) / 1000000u;
++    EXPECT(w == pid && r.exit_code == 3 && !r.crashed && ms >= 380, "wait_blocks_until_exit",
++           "wait=%ld exit=%d after %llu ms", w, r.exit_code, (unsigned long long)ms);
++
++    /* polling with NOHANG until it is done */
++    pid = spawn_child("sleep", "60", NULL, NULL, NULL, NULL);
++    long polled = -1;
++    int spins = 0;
++    for (; pid > 0 && spins < 2000; spins++) {
++        polled = mos_waitpid(pid, MOS_WAIT_NOHANG, &r);
++        if (polled != ERR(SYS_ERR_AGAIN)) break;
++        mos_sleep(5);
++    }
++    EXPECT(pid > 0 && polled == pid && r.exit_code == 3 && spins > 2, "wait_nohang_polling_until_done",
++           "pid=%ld polled=%ld exit=%d after %d polls", pid, polled, r.exit_code, spins);
++    EXPECT_RET(mos_waitpid(pid, MOS_WAIT_NOHANG, NULL), ERR(SYS_ERR_NOTFOUND), "wait_nohang_consumed_the_child");
++
++    /* a specific pid while an earlier child is still running */
++    long slow = spawn_child("sleep", "300", NULL, NULL, NULL, NULL);
++    long fast = spawn_child("exit", "21", NULL, NULL, NULL, NULL);
++    long wf = (slow > 0 && fast > 0) ? mos_waitpid(fast, 0, &r) : -1;
++    EXPECT(wf == fast && r.exit_code == 21, "wait_specific_pid_not_the_first_child", "slow=%ld fast=%ld wait=%ld exit=%d",
++           slow, fast, wf, r.exit_code);
++    long still = slow > 0 ? mos_waitpid(slow, MOS_WAIT_NOHANG, NULL) : -1;
++    EXPECT(still == ERR(SYS_ERR_AGAIN) || still == slow, "wait_other_child_unaffected", "wait=%ld (%s)", still, ename(still));
++    long ws = (still == ERR(SYS_ERR_AGAIN)) ? mos_waitpid(slow, 0, &r) : still;
++    EXPECT(ws == slow && r.exit_code == 3, "wait_slow_child_afterwards", "wait=%ld exit=%d", ws, r.exit_code);
++
++    /* SYS_WAIT_ANY with several children */
++    long pids[4];
++    static const char* const args[4] = { "11", "12", "13", "14" };
++    int started = 0;
++    for (int i = 0; i < 4; i++) {
++        pids[i] = spawn_child("exit", args[i], NULL, NULL, NULL, NULL);
++        if (pids[i] > 0) started++;
++    }
++    EXPECT(started == 4, "wait_any_children_started", "started %d of 4", started);
++    int seen[4] = { 0, 0, 0, 0 };
++    int mapping_ok = 1, collected = 0;
++    for (int i = 0; i < started; i++) {
++        mos_wait_result_t ar;
++        long got = mos_wait(&ar);
++        if (got <= 0) { mapping_ok = 0; break; }
++        collected++;
++        int idx = -1;
++        for (int k = 0; k < 4; k++) if (pids[k] == got) idx = k;
++        if (idx < 0 || seen[idx] || ar.exit_code != 11 + idx || ar.pid != got) mapping_ok = 0;
++        else seen[idx] = 1;
++    }
++    EXPECT(collected == 4 && mapping_ok, "wait_any_collects_each_child_once", "collected %d, mapping ok=%d", collected, mapping_ok);
++    EXPECT_RET(mos_wait(NULL), ERR(SYS_ERR_NOTFOUND), "wait_any_after_all_collected_notfound");
++
++    /* any: a blocking wait wakes when a slow child finishes */
++    pid = spawn_child("sleep", "150", NULL, NULL, NULL, NULL);
++    t0 = mos_clock_monotonic_ns();
++    long any = mos_wait(&r);
++    ms = (mos_clock_monotonic_ns() - t0) / 1000000u;
++    EXPECT(pid > 0 && any == pid && r.exit_code == 3 && ms >= 50, "wait_any_blocks_for_a_running_child",
++           "pid=%ld wait=%ld exit=%d after %llu ms", pid, any, r.exit_code, (unsigned long long)ms);
++
++    /* programs started with mos_exec are children too */
++    long ep = mos_exec(g_self, (const char*[]){ "--child", "exit", "5" }, 3);
++    mos_wait_result_t er;
++    long ew = ep > 0 ? mos_waitpid(ep, 0, &er) : ep;
++    EXPECT(ep > 0 && ew == ep && er.exit_code == 5, "wait_for_mos_exec_child", "exec=%ld wait=%ld exit=%d", ep, ew, er.exit_code);
++
++    /* a burst of children */
++    long burst[6];
++    int up = 0;
++    for (int i = 0; i < 6; i++) {
++        char a[8];
++        kfmt(a, sizeof(a), "%d", 30 + i);
++        burst[i] = spawn_child("exit", a, NULL, NULL, NULL, NULL);
++        if (burst[i] > 0) up++;
++    }
++    int sum = 0, got_n = 0;
++    for (int i = 0; i < up; i++) {
++        mos_wait_result_t br;
++        if (mos_wait(&br) > 0) { sum += br.exit_code; got_n++; }
++    }
++    EXPECT(up == 6 && got_n == 6 && sum == 30 + 31 + 32 + 33 + 34 + 35, "spawn_burst_of_six", "up=%d collected=%d sum=%d", up, got_n, sum);
++}
++
++static void test_spawn_errors(void) {
++    stage("spawn_errors");
++    mos_spawn_opts_t o;
++    memset(&o, 0, sizeof(o));
++    EXPECT_RET(mos_spawn(TMP "/no_such_program.run", NULL), ERR(SYS_ERR_NOTFOUND), "spawn_missing_program_notfound");
++    EXPECT_RET(mos_spawn(TMP, NULL), ERR(SYS_ERR_NOTFOUND), "spawn_directory_notfound");
++    EXPECT_RET(mos_spawn(NULL, NULL), ERR(SYS_ERR_INVAL), "spawn_null_path_inval");
++    EXPECT_RET(mos_spawn_raw(NULL), ERR(SYS_ERR_INVAL), "spawn_null_request_inval");
++
++    syscall_spawn_t req;
++    memset(&req, 0, sizeof(req));
++    req.size = sizeof(req);
++    req.path = g_self;
++    req.flags = 1;
++    EXPECT_RET(mos_spawn_raw(&req), ERR(SYS_ERR_INVAL), "spawn_nonzero_flags_inval");
++    req.flags = 0;
++    req.size = 8;
++    EXPECT_RET(mos_spawn_raw(&req), ERR(SYS_ERR_INVAL), "spawn_small_size_inval");
++
++    const char* argv[] = { g_self, "--child", "exit", "0", NULL };
++    o.path = g_self;
++    o.argv = argv;
++    o.cwd = TMP "/no_such_dir";
++    EXPECT_RET(mos_spawn_ex(&o), ERR(SYS_ERR_NOTFOUND), "spawn_cwd_missing_notfound");
++    o.cwd = TMP "/size_1.bin";
++    EXPECT_RET(mos_spawn_ex(&o), ERR(SYS_ERR_NOTFOUND), "spawn_cwd_is_file_notfound");
++    o.cwd = NULL;
++    o.stdout_path = TMP "/no_such_dir/out.txt";
++    long r = mos_spawn_ex(&o);
++    EXPECT(r < 0, "spawn_unwritable_stdout_path_fails", "returned %ld", r);
++    EXPECT_RET(mos_wait(NULL), ERR(SYS_ERR_NOTFOUND), "spawn_failures_leave_no_children");
++
++    /* Spawning a file that is not a program: any error, and nothing to wait for. */
++    write_text(TMP "/notaprogram.run", "this is not a program\n");
++    long np = mos_spawn(TMP "/notaprogram.run", NULL);
++    long leftover = np > 0 ? mos_waitpid(np, 0, NULL) : 0;
++    EXPECT(np < 0 || leftover > 0, "spawn_non_program_file", "returned %ld", np);
++    if (np > 0) emit_fd(1, "OS0TEST info a plain text file was started as pid %ld (wait=%ld)", np, leftover);
++}
++
++/* ================================================================== main */
++
++int main(int argc, char** argv, char** envp) {
++    if (argc >= 3 && streq(argv[1], "--child")) return child_main(argc, argv, envp);
++
++    emit_fd(1, "OS0TEST begin");
++    stage("setup");
++
++    /* Our own absolute path, for spawning ourselves. */
++    if (argc >= 1 && argv[0] && argv[0][0]) {
++        const char* a0 = argv[0];
++        int has_colon = 0;
++        for (const char* p = a0; *p; p++) if (*p == ':') has_colon = 1;
++        if (has_colon || a0[0] == '/') {
++            scopy(g_self, sizeof(g_self), a0);
++        } else {
++            char cwd[400];
++            if (mos_getcwd(cwd, sizeof(cwd)) == 0) kfmt(g_self, sizeof(g_self), "%s/%s", cwd, a0);
++            else scopy(g_self, sizeof(g_self), a0);
++        }
++    } else {
++        scopy(g_self, sizeof(g_self), "0:/programs/os0test.run");
++    }
++    emit_fd(1, "OS0TEST info self=%s argc=%d", g_self, argc);
++
++    mos_thread_t dog;
++    mos_thread_create(&dog, watchdog, NULL, 16 * 1024);
++
++    rm_rf(TMP);
++    EXPECT_RET(mos_mkdir(TMP), SYS_SUCCESS, "setup_scratch_directory");
++
++    test_clocks();
++    test_env();
++    test_futex();
++    test_tls();
++    test_stat();
++    test_rename();
++    test_cwd();
++    test_spawn_basic();
++    test_tsc();
++    test_spawn_crash_and_wait();
++    test_spawn_errors();
++
++    stage("cleanup");
++    mos_chdir(g_start_cwd[0] ? g_start_cwd : "0:/");
++    rm_rf(TMP);
++    EXPECT(!exists(TMP), "cleanup_scratch_directory", "%s is still there", TMP);
++
++    g_finished = 1;
++    emit_fd(1, "OS0TEST summary: %d checks, %d failed", g_checks, g_failed);
++    if (g_failed == 0) {
++        emit_fd(1, "OS0TEST PASS");
++        mos_log("OS0TEST PASS");
++        return 0;
++    }
++    emit_fd(1, "OS0TEST FAIL");
++    mos_log("OS0TEST FAIL");
++    return 1;
++}
+-- 
+2.43.0
+

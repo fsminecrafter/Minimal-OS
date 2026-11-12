@@ -147,21 +147,23 @@ fi
 echo "[ci-os0] Waiting for OS0TEST PASS/FAIL (up to ${TEST_TIMEOUT}s)"
 RESULT=""
 for ((t = 0; t < TEST_TIMEOUT; t++)); do
-    if grep -aqF "OS0TEST PASS" "$SERIAL_OUT" 2>/dev/null; then RESULT=PASS; break; fi
-    if grep -aqF "OS0TEST FAIL" "$SERIAL_OUT" 2>/dev/null; then RESULT=FAIL; break; fi
+    # The verdict is the line that ends right after PASS/FAIL; a failing check
+    # prints "OS0TEST FAIL <name>: ..." and the run goes on to the other checks.
+    if grep -aqE "OS0TEST PASS[[:space:]]*$" "$SERIAL_OUT" 2>/dev/null; then RESULT=PASS; break; fi
+    if grep -aqE "OS0TEST FAIL[[:space:]]*$" "$SERIAL_OUT" 2>/dev/null; then RESULT=FAIL; break; fi
     qemu_alive || { echo "[ci-os0] FAIL: QEMU exited during the test"; fail_tail; exit 2; }
     sleep 1
 done
 
 case "$RESULT" in
     PASS)
-        grep -a "OS0TEST" "$SERIAL_OUT" || true
+        grep -a "OS0TEST" "$SERIAL_OUT" | grep -av "OS0TEST ok" || true
         echo "[ci-os0] PASS"
         exit 0
         ;;
     FAIL)
         echo "[ci-os0] FAIL: the self-test reported a failure"
-        fail_tail
+        grep -a "OS0TEST FAIL" "$SERIAL_OUT" || true
         exit 1
         ;;
     *)

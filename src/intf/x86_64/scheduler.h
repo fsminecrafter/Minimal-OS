@@ -82,6 +82,9 @@ void scheduler_unlock(uint64_t flags);
 // run queue, at the interactive level, and records that assignment in
 // proc->sched_cpu. Called once by proc_create().
 void scheduler_enqueue_new(process_t* proc);
+// Like scheduler_enqueue_new(), on a given CPU (user threads join their
+// owner's CPU).
+void scheduler_enqueue_on_cpu(process_t* proc, uint32_t cpu);
 
 // Re-enqueues a process that was previously removed from its run
 // queue via scheduler_dequeue() (e.g. unpauseProcess()). Keeps it on

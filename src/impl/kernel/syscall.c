@@ -1091,6 +1091,29 @@ static void syscall_dispatch_inner(syscall_regs_t* regs) {
                 : SYS_ERR_INVAL;
             return;
         }
+        case SYS_THREAD: {
+            process_t* self = current_process;
+            if (!self || self->privilege != PROC_PRIVILEGE_USER) {
+                regs->rax = SYS_ERR_PERM;
+                return;
+            }
+            if (regs->rdi == SYS_THREAD_CREATE) {
+                const syscall_thread_t* t = (const syscall_thread_t*)regs->rsi;
+                if (!user_range_ok(t, sizeof(*t), false)) { regs->rax = SYS_ERR_INVAL; return; }
+                process_t* thread = proc_create_thread(self, t->entry, t->stack_top, t->arg);
+                regs->rax = thread ? thread->pid : SYS_ERR_INVAL;
+                return;
+            }
+            if (regs->rdi == SYS_THREAD_ALIVE) {
+                process_t* thread = findProcessByPID(regs->rsi);
+                regs->rax = thread && thread->mem_owner == proc_mem_owner(self) &&
+                            thread->state != PROCESS_ZOMBIE && thread->state != PROCESS_TERMINATED
+                                ? SYS_SUCCESS : SYS_ERR_NOTFOUND;
+                return;
+            }
+            regs->rax = SYS_ERR_INVAL;
+            return;
+        }
         case SYS_POWER: {
             uint64_t op = regs->rdi;
             if (op != SYS_POWER_SHUTDOWN && op != SYS_POWER_REBOOT) {

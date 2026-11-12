@@ -105,7 +105,7 @@ void isr_generic_handler(uint64_t vector, uint64_t error_code,
         // serial port only see the screen.
         uint64_t cr2 = 0;
         if (vector == 14) asm volatile("mov %%cr2, %0" : "=r"(cr2));
-        g_last_crash.pid = current_process->pid;
+        g_last_crash.pid = proc_mem_owner(current_process)->pid;   /* a thread's crash is its program's */
         g_last_crash.vector = (uint8_t)vector;
         g_last_crash.error_code = error_code;
         g_last_crash.rip = saved_rip;

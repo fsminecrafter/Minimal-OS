@@ -169,6 +169,18 @@ void scheduler_enqueue_new(process_t* proc) {
     spinlock_release(&rq->lock, flags);
 }
 
+void scheduler_enqueue_on_cpu(process_t* proc, uint32_t cpu) {
+    if (!proc) return;
+    if (cpu >= MAX_CPUS) { scheduler_enqueue_new(proc); return; }
+    proc->sched_level = SCHED_LEVEL_INTERACTIVE;
+    proc->sched_ticks_used = 0;
+    proc->sched_cpu = cpu;
+    percpu_runqueue_t* rq = &g_runqueues[cpu];
+    uint64_t flags = spinlock_acquire(&rq->lock);
+    rq_push(rq, proc, SCHED_LEVEL_INTERACTIVE);
+    spinlock_release(&rq->lock, flags);
+}
+
 void scheduler_enqueue_existing(process_t* proc) {
     if (!proc) return;
 
@@ -278,6 +290,8 @@ void scheduler_rebalance(void) {
             // then got parked with no wake-up: the desktop froze when an
             // app was opened (the app's load triggered the rebalance).
             if (candidate->privilege != PROC_PRIVILEGE_USER) continue;
+            // A program with threads stays on one CPU (see proc.h).
+            if (candidate->mem_owner || candidate->thread_count) continue;
             if (candidate->cpu_time_ms < migrant_cpu_time) {
                 migrant = candidate;
                 migrant_level = level;
@@ -511,11 +525,15 @@ static void schedule_irqs_off(void) {
             for (uint32_t i = cpu_id + 1; i < MAX_CPUS && !deferred; i++) {
                 deferred = curr == g_deferred_reap[i];
             }
-            if (deferred || process_is_current_on_any_cpu(curr)) {
+            // An owner's address space outlives its threads: reap them first.
+            if (deferred || process_is_current_on_any_cpu(curr) ||
+                (!curr->mem_owner && curr->thread_count)) {
                 prev = curr;
                 curr = curr->next;
                 continue;
             }
+            if (curr->mem_owner && curr->mem_owner->thread_count)
+                curr->mem_owner->thread_count--;
 
             if (SCHED_DEBUG >= 1) {
                 serial_write_str("Cleaning: ");
@@ -913,6 +931,11 @@ void process_exit_with_status(uint8_t exit_code, bool crashed,
         PANIC("process_exit() called with no current process");
     }
 
+    // Threads (SYS_THREAD): the program ending ends its threads, and a
+    // crash in any of them ends the whole program.
+    if (crashed) proc_kill_group(current_process);
+    else if (!current_process->mem_owner) proc_kill_threads(current_process);
+
     current_process->exit_code = exit_code;
     current_process->crashed = crashed;
     current_process->crash_vector = crash_vector;
@@ -927,6 +950,9 @@ void process_exit_with_status(uint8_t exit_code, bool crashed,
 
     command_user_process_exited(current_process->pid, exit_code, crashed,
                                 crash_vector);
+    if (crashed && current_process->mem_owner)     /* the terminal waits on the program */
+        command_user_process_exited(current_process->mem_owner->pid, exit_code, crashed,
+                                    crash_vector);
     current_process->state = PROCESS_TERMINATED;
     schedule();
 

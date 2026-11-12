@@ -941,4 +941,25 @@ typedef struct {
 #define SYS_POWER_SHUTDOWN 1u
 #define SYS_POWER_REBOOT   2u
 
+// ---------------------------------------------------------------------------
+// THREADS (SYS_THREAD)
+// ---------------------------------------------------------------------------
+// rdi = operation, rsi = argument. A thread runs in its program's memory
+// (same heap, same globals) on a stack the program provides, on the same
+// CPU as the program. It ends with SYS_EXIT (that thread only); the
+// program exiting ends all its threads, and a crash in any thread ends
+// the whole program. The SDK's thread.h wraps this.
+#define SYS_THREAD 47
+
+#define SYS_THREAD_CREATE 1u   // rsi = syscall_thread_t*: returns the thread id
+#define SYS_THREAD_ALIVE  2u   // rsi = thread id: SYS_SUCCESS while it runs,
+                               // SYS_ERR_NOTFOUND once it has ended (its
+                               // stack may then be freed)
+
+typedef struct {
+    uint64_t entry;            // void entry(uint64_t arg), in the program
+    uint64_t stack_top;        // end of the thread's stack (program memory)
+    uint64_t arg;              // passed to entry in RDI
+} syscall_thread_t;
+
 #endif // SYSCALL_H

@@ -130,6 +130,7 @@ static int proc_map_user_pages(process_t* proc, uintptr_t address, size_t length
 }
 
 int proc_map_user_heap_range(process_t* proc, void* address, size_t length) {
+	proc = proc_mem_owner(proc);
 	if (!proc || !address || length == 0) return 0;
 	uintptr_t start = (uintptr_t)address & ~0xFFFULL;
 	uintptr_t end = (uintptr_t)address + length;
@@ -177,6 +178,7 @@ int proc_map_user_heap_range(process_t* proc, void* address, size_t length) {
 }
 
 int proc_unmap_user_heap_range(process_t* proc, void* address, size_t length) {
+	proc = proc_mem_owner(proc);
 	if (!proc || !address || length == 0) return 0;
 	uintptr_t start = (uintptr_t)address & ~0xFFFULL;
 	uintptr_t end = (uintptr_t)address + length;
@@ -233,6 +235,7 @@ static void proc_user_heap_unmap_unused_pages(process_t* proc,
 }
 
 int proc_user_heap_contains(process_t* proc, void* address) {
+	proc = proc_mem_owner(proc);
 	if (!proc || !address) return 0;
 	for (struct user_heap_allocation* item = proc->user_heap_allocations;
 	     item; item = item->next) {
@@ -243,6 +246,7 @@ int proc_user_heap_contains(process_t* proc, void* address) {
 
 int proc_user_heap_contains_range(process_t* proc, const void* address,
 				  size_t length) {
+	proc = proc_mem_owner(proc);
 	if (!proc || !address || !length) return 0;
 	uintptr_t start = (uintptr_t)address;
 	if (length > UINTPTR_MAX - start) return 0;
@@ -259,6 +263,7 @@ int proc_user_heap_contains_range(process_t* proc, const void* address,
 
 int proc_user_range_contains(process_t* proc, const void* address,
 			     size_t length) {
+	proc = proc_mem_owner(proc);
 	if (proc_user_heap_contains_range(proc, address, length)) return 1;
 	if (!proc || !address || !length) return 0;
 	uintptr_t start = (uintptr_t)address;
@@ -276,6 +281,7 @@ int proc_user_range_contains(process_t* proc, const void* address,
 }
 
 int proc_user_heap_track(process_t* proc, void* address, size_t size) {
+	proc = proc_mem_owner(proc);
 	if (!proc || !proc_user_heap_valid_range(address, size) ||
 	    proc_user_heap_contains(proc, address)) return 0;
 	struct user_heap_allocation* item = alloc(sizeof(*item));
@@ -288,6 +294,7 @@ int proc_user_heap_track(process_t* proc, void* address, size_t size) {
 }
 
 int proc_user_heap_untrack(process_t* proc, void* address) {
+	proc = proc_mem_owner(proc);
 	if (!proc || !address) return 0;
 	struct user_heap_allocation** link = &proc->user_heap_allocations;
 	while (*link && (*link)->address != address) link = &(*link)->next;
@@ -303,6 +310,7 @@ int proc_user_heap_untrack(process_t* proc, void* address) {
 
 int proc_user_heap_resize(process_t* proc, void* old_address,
 			  void* new_address, size_t new_size) {
+	proc = proc_mem_owner(proc);
 	if (!proc || !proc_user_heap_valid_range(new_address, new_size)) return 0;
 	if (!old_address) return proc_user_heap_track(proc, new_address, new_size);
 	for (struct user_heap_allocation* item = proc->user_heap_allocations;
@@ -321,7 +329,8 @@ int proc_user_heap_resize(process_t* proc, void* old_address,
 }
 
 void proc_user_heap_cleanup(process_t* proc) {
-	if (!proc) return;
+	// A thread's allocations belong to its owner, freed with the owner.
+	if (!proc || proc->mem_owner) return;
 	struct user_heap_allocation* item = proc->user_heap_allocations;
 	uint64_t allocation_count = 0;
 	uint64_t reclaimed_bytes = 0;
@@ -394,6 +403,11 @@ int proc_map_user_range(process_t* proc, void* address, size_t length) {
 
 void proc_destroy_address_space(process_t* proc) {
 	if (!proc || !proc->pml4) return;
+	// A thread runs in its owner's page tables: never free them here.
+	if (proc->mem_owner) {
+		proc->pml4 = 0;
+		return;
+	}
 
 	uint64_t* pml4 = (uint64_t*)(uintptr_t)proc->pml4;
 	uint64_t pml4e = pml4[0];
@@ -665,6 +679,10 @@ process_t* proc_create(const char* file_name, void (*entry_point)()) {
 
 void kill(process_t* proc) {
 	if (!proc) return;
+	if (!proc->mem_owner && proc->thread_count) {
+		proc->state = PROCESS_ZOMBIE;     /* stops proc_kill_threads recursing into it */
+		proc_kill_threads(proc);
+	}
 	window_manager_process_exit(proc->pid);
 	fgpu_process_exit(proc->pid);
 	audio_streams_on_process_exit(proc->pid);
@@ -675,6 +693,76 @@ void kill(process_t* proc) {
 	// schedule() can safely free it later without racing a queue that
 	// still points at it.
 	scheduler_dequeue(proc);
+}
+
+/* ------------------------------------------------------- user threads */
+
+process_t* proc_create_thread(process_t* owner, uint64_t entry,
+			      uint64_t stack_top, uint64_t arg) {
+	owner = proc_mem_owner(owner);
+	if (!owner || owner->privilege != PROC_PRIVILEGE_USER || !owner->pml4 ||
+	    owner->state == PROCESS_ZOMBIE || owner->state == PROCESS_TERMINATED)
+		return NULL;
+	// The code must be in the program's image, the stack (its top 256
+	// bytes at least) in memory the program owns.
+	if (!owner->user_image_size || entry < owner->user_image_address ||
+	    entry >= owner->user_image_address + owner->user_image_size)
+		return NULL;
+	stack_top &= ~0xFULL;
+	if (stack_top < 0x1000 + 256 ||
+	    !proc_user_range_contains(owner, (const void*)(uintptr_t)(stack_top - 256), 256))
+		return NULL;
+
+	char name[MAX_PROCESS_NAME_LEN];
+	size_t n = 0;
+	for (const char* s = owner->name; *s && *s != '@' && n < sizeof(name) - 8; s++) name[n++] = *s;
+	const char* suffix = "#thread";
+	while (*suffix && n < sizeof(name) - 1) name[n++] = *suffix++;
+	name[n] = 0;
+
+	process_t* t = proc_create_ex(name, (void (*)())(uintptr_t)entry, PROC_PRIVILEGE_USER);
+	if (!t) return NULL;
+	// proc_create_ex() gave it page tables of its own; it uses the owner's.
+	proc_destroy_address_space(t);          /* mem_owner not set yet: frees them */
+	t->mem_owner = owner;
+	t->pml4 = owner->pml4;
+	t->parent_pid = owner->pid;
+	// SysV: RSP % 16 == 8 at the entry, as if called.
+	t->user_stack = (uint64_t*)(uintptr_t)(stack_top - 8);
+	t->user_argc = arg;                     /* RDI: the thread's argument */
+	t->user_argv = NULL;
+	// For crash reports (the image is the owner's; nothing to free here).
+	t->user_image_address = owner->user_image_address;
+	t->user_image_size = owner->user_image_size;
+	t->cleanup_entry = NULL;
+
+	uint64_t flags = scheduler_lock();
+	owner->thread_count++;
+	scheduler_unlock(flags);
+	irq_restore(flags, __FILE__, __func__, __LINE__);
+
+	// Same CPU as the owner, and the scheduler never moves a group.
+	t->state = PROCESS_READY;
+	scheduler_enqueue_on_cpu(t, owner->sched_cpu);
+	return t;
+}
+
+void proc_kill_threads(process_t* owner) {
+	if (!owner || owner->mem_owner || !owner->thread_count) return;
+	for (process_t* p = proc_list_head; p; p = p->next) {
+		if (p->mem_owner == owner && p != current_process &&
+		    p->state != PROCESS_ZOMBIE && p->state != PROCESS_TERMINATED)
+			kill(p);
+	}
+}
+
+void proc_kill_group(process_t* p) {
+	process_t* owner = proc_mem_owner(p);
+	if (!owner) return;
+	proc_kill_threads(owner);
+	if (owner != current_process && owner->state != PROCESS_ZOMBIE &&
+	    owner->state != PROCESS_TERMINATED)
+		kill(owner);
 }
 
 process_t* get_proc_by_name(const char* name) {

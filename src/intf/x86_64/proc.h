@@ -134,7 +134,22 @@ typedef struct process {
     // CPU. context_switch() clears it only once it has saved them and left
     // the stack, so another core must not take the process before then.
     volatile uint32_t on_cpu;
+    // User threads (SYS_THREAD). A thread is a process_t of its own that
+    // runs in another user process's address space: mem_owner points at
+    // that process (NULL for an ordinary process). Heap tracking and user
+    // pointer checks always go to the owner (proc_mem_owner()), the page
+    // tables are the owner's, and the owner counts its live threads in
+    // thread_count. A group never migrates between CPUs (its page tables
+    // change without cross-CPU TLB shootdowns), and it lives and dies
+    // together: the owner exiting, or any member crashing, ends them all.
+    struct process* mem_owner;
+    volatile uint32_t thread_count;
 } process_t;
+
+// The process whose address space `p` runs in: its owner for a thread.
+static inline process_t* proc_mem_owner(process_t* p) {
+    return (p && p->mem_owner) ? p->mem_owner : p;
+}
 
 // Global process list head (defined in proc.c)
 extern process_t* proc_list_head;
@@ -186,6 +201,16 @@ int proc_user_heap_resize(process_t* proc, void* old_address,
                           void* new_address, size_t new_size);
 void proc_user_heap_cleanup(process_t* proc);
 void proc_destroy_address_space(process_t* proc);
+
+// A user thread in owner's address space, started at entry(arg) on the
+// stack ending at stack_top (memory the owner already has, e.g. its heap).
+// NULL when owner is not a user process or the arguments are invalid.
+process_t* proc_create_thread(process_t* owner, uint64_t entry,
+                              uint64_t stack_top, uint64_t arg);
+// Ends every thread of `owner` (not owner itself).
+void proc_kill_threads(process_t* owner);
+// Ends p's whole group: its owner and all the owner's threads.
+void proc_kill_group(process_t* p);
 
 // Helper functions (from string.h but needed here)
 void hex_to_str(uint64_t value, char* out);

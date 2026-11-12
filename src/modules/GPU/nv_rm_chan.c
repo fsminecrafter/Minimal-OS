@@ -283,7 +283,12 @@ static uint32_t find_copy_engines(ce_t* out, uint32_t cap) {
             const uint32_t* d = r->entries[i].engineData;
             uint32_t type = d[NV_ENGINE_INFO_RM_ENGINE_TYPE];
             if (type == NV_ENGINE_GR0) gr_runlist = d[NV_ENGINE_INFO_RUNLIST];
-            if (type == NV_ENGINE_NVDEC0) c.dec_runlist = d[NV_ENGINE_INFO_RUNLIST];
+            // The first NVDEC: by its RM engine type, or by name should a
+            // firmware number the types differently.
+            const char* nm = r->entries[i].engineName;
+            if (c.dec_runlist == 0xFFFFFFFFu &&
+                (type == NV_RM_ENGINE_NVDEC0 || (nm[0] == 'N' && nm[1] == 'V' && nm[2] == 'D' && nm[3] == 'E' && nm[4] == 'C')))
+                c.dec_runlist = d[NV_ENGINE_INFO_RUNLIST];
             if (type >= NV_ENGINE_COPY0 && type <= NV_ENGINE_COPY9 && n < 32)
                 all[n++] = (ce_t){ type, d[NV_ENGINE_INFO_RUNLIST] };
         }

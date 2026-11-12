@@ -115,6 +115,7 @@ bool killProcess(uint64_t pid) {
     audio_streams_on_process_exit(proc->pid);
     graphics_release_screen_for_pid(proc->pid);
     proc->state = PROCESS_ZOMBIE;
+    proc_kill_threads(proc);            // a program's threads end with it
     scheduler_dequeue(proc);
     
     serial_write_str("[PROC] Killed process: ");

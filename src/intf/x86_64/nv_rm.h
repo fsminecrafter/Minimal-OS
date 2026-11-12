@@ -525,7 +525,12 @@ _Static_assert(sizeof(nv_fifo_device_info_t) == 3212, "NV2080_CTRL_FIFO_GET_DEVI
 #define NV_ENGINE_GR0    0x01u
 #define NV_ENGINE_COPY0  0x09u
 #define NV_ENGINE_COPY9  0x12u
-#define NV_ENGINE_NVDEC0 0x13u     // the video decoder
+// ...but not on the video decoder. Channel allocation and BIND take
+// NV2080_ENGINE_TYPE (NVDEC0 = 0x13); the FIFO device info table reports
+// RM_ENGINE_TYPE, where 535.113.01 has COPY10..COPY19 at 0x13..0x1C, which
+// moves NVDEC0 to 0x1D (nouveau: nvrm/535.113.01/.../gpu_engine_type.h).
+#define NV_ENGINE_NVDEC0    0x13u  // NV2080_ENGINE_TYPE: for allocating
+#define NV_RM_ENGINE_NVDEC0 0x1Du  // RM_ENGINE_TYPE: in the device info table
 
 typedef struct {                // NV90F1_CTRL_VASPACE_COPY_SERVER_RESERVED_PDES_PARAMS
     uint32_t hSubDevice;

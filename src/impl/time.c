@@ -160,6 +160,11 @@ uint64_t time_get_uptime_sec(void) {
     return system_uptime_ms / 1000;
 }
 
+uint32_t time_get_subsecond_ms(void) {
+    uint64_t d = system_uptime_ms - last_rtc_update_ms;
+    return d > 999 ? 999 : (uint32_t)d;
+}
+
 datetime_t time_get_datetime(void) {
     return current_datetime;
 }

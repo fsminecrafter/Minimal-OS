@@ -116,4 +116,18 @@ void scheduler_priority_boost(void);
 // True for an AP's idle context (see schedule()); it is not a real process.
 bool scheduler_is_idle_process(const process_t* proc);
 
+// Moves a WAITING process to READY and onto its CPU's run queue. Atomic
+// against the timeout wake-up and other wakers: false when it was not
+// waiting (already woken, never asleep, killed). Used by wait queues.
+bool scheduler_wake(process_t* proc);
+
+// After a wait (waitq_wait): makes the calling process RUNNING again,
+// taking it off its run queue if a wake-up queued it while it was still
+// running here. Call with interrupts off.
+void scheduler_resume_self(void);
+
+// Sets a user thread's FS base (TLS pointer) and loads it now when it is
+// the calling thread.
+void scheduler_set_fs_base(process_t* self, uint64_t value);
+
 #endif // SCHEDULER_H

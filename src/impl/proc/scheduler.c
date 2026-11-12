@@ -21,6 +21,8 @@
 #include "x86_64/safeints.h"
 #include "x86_64/spinlock.h"
 #include "x86_64/boot_options.h"
+#include "x86_64/waitq.h"
+#include "x86_64/spawn.h"
 
 #define SCHED_DEBUG 0   // 0 = off, 1 = important, 2 = verbose
 
@@ -33,10 +35,43 @@ extern process_t* proc_list_head;
 extern void context_switch(process_t* current, process_t* next,
                            volatile uint32_t* current_on_cpu);
 
+// FS base each CPU has loaded (IA32_FS_BASE). User threads keep their TLS
+// pointer there; the kernel itself never uses FS, so it is only reloaded
+// when switching to a user process whose value differs.
+#define IA32_FS_BASE_MSR 0xC0000100u
+static uint64_t g_cpu_fs_base[MAX_CPUS];
+
+static inline void write_fs_base(uint64_t value) {
+    asm volatile("wrmsr" :: "c"(IA32_FS_BASE_MSR), "a"((uint32_t)value),
+                 "d"((uint32_t)(value >> 32)) : "memory");
+}
+
+static void load_fs_base_for(const process_t* next) {
+    if (!next || next->privilege != PROC_PRIVILEGE_USER) return;
+    uint32_t cpu = smp_current_cpu_id();
+    if (cpu >= MAX_CPUS || g_cpu_fs_base[cpu] == next->fs_base) return;
+    write_fs_base(next->fs_base);
+    g_cpu_fs_base[cpu] = next->fs_base;
+}
+
+void scheduler_set_fs_base(process_t* self, uint64_t value) {
+    if (!self) return;
+    self->fs_base = value;
+    if (self == current_process) {
+        uint64_t flags;
+        asm volatile("pushfq; pop %0; cli" : "=r"(flags) :: "memory");
+        uint32_t cpu = smp_current_cpu_id();
+        write_fs_base(value);
+        if (cpu < MAX_CPUS) g_cpu_fs_base[cpu] = value;
+        if (flags & 0x200) asm volatile("sti" ::: "memory");
+    }
+}
+
 // Marks `next` as live on this CPU; `current` is released by the assembly
 // once its context is saved and its stack no longer in use.
 static void switch_to(process_t* current, process_t* next) {
     next->on_cpu = 1;
+    load_fs_base_for(next);
     context_switch(current, next, current ? &current->on_cpu : NULL);
 }
 
@@ -231,6 +266,70 @@ void scheduler_dequeue(process_t* proc) {
     spinlock_release(&rq->lock, flags);
 }
 
+// Takes `proc` off `rq` if it is queued there. Caller holds rq->lock.
+static bool rq_remove_locked(percpu_runqueue_t* rq, process_t* proc) {
+    for (uint32_t level = 0; level < SCHED_NUM_LEVELS; level++) {
+        process_t* prev = NULL;
+        for (process_t* curr = rq->head[level]; curr; prev = curr, curr = curr->rq_next) {
+            if (curr != proc) continue;
+            if (prev) prev->rq_next = curr->rq_next;
+            else      rq->head[level] = curr->rq_next;
+            if (rq->tail[level] == curr) rq->tail[level] = prev;
+            rq->count[level]--;
+            curr->rq_next = NULL;
+            return true;
+        }
+    }
+    return false;
+}
+
+// WAITING -> READY and onto the run queue as one step under the queue's
+// lock. The dispatcher and scheduler_resume_self() look at the state under
+// the same lock, so "READY because it was woken" always means "queued":
+// a process can never end up running and queued at once (a second wake
+// would then link it into the queue twice and corrupt the list).
+bool scheduler_wake(process_t* proc) {
+    if (!proc) return false;
+    // A waiting process is on no queue, so nothing moves it between CPUs.
+    uint32_t cpu = proc->sched_cpu < MAX_CPUS ? proc->sched_cpu : 0;
+    percpu_runqueue_t* rq = &g_runqueues[cpu];
+    bool woke = false;
+    uint64_t flags = spinlock_acquire(&rq->lock);
+    process_state_t expected = PROCESS_WAITING;
+    if (__atomic_compare_exchange_n(&proc->state, &expected, PROCESS_READY,
+                                    false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+        proc->wake_time_ms = 0;
+        // Woken from a wait: back to the interactive level, like a sleep.
+        proc->sched_level = SCHED_LEVEL_INTERACTIVE;
+        proc->sched_ticks_used = 0;
+        rq_push(rq, proc, SCHED_LEVEL_INTERACTIVE);
+        woke = true;
+    }
+    spinlock_release(&rq->lock, flags);
+    return woke;
+}
+
+void scheduler_resume_self(void) {
+    process_t* self = current_process;
+    if (!self) return;
+    uint32_t cpu = self->sched_cpu < MAX_CPUS ? self->sched_cpu : smp_current_cpu_id();
+    percpu_runqueue_t* rq = &g_runqueues[cpu];
+    uint64_t flags = spinlock_acquire(&rq->lock);
+    process_state_t state = __atomic_load_n(&self->state, __ATOMIC_SEQ_CST);
+    if (state == PROCESS_WAITING) {
+        // schedule() came straight back and nobody woke it meanwhile.
+        self->wake_time_ms = 0;
+        __atomic_store_n(&self->state, PROCESS_RUNNING, __ATOMIC_SEQ_CST);
+    } else if (state == PROCESS_READY) {
+        // Woken while it was still on this CPU: it sits on the queue.
+        // Take it back off before it runs on.
+        rq_remove_locked(rq, self);
+        __atomic_store_n(&self->state, PROCESS_RUNNING, __ATOMIC_SEQ_CST);
+    }
+    // RUNNING already (it was dispatched), or killed: leave it.
+    spinlock_release(&rq->lock, flags);
+}
+
 void scheduler_rebalance(void) {
     uint32_t online = smp_online_cpu_count();
     if (online < 2 || online > MAX_CPUS) return;
@@ -390,19 +489,13 @@ static void wake_sleeping_processes() {
             if (current_time >= proc->wake_time_ms) {
                 if (proc->sched_cpu != this_cpu) continue;
 
-                proc->state = PROCESS_READY;
-                proc->wake_time_ms = 0;
-
                 // Blocking (sleeping) is the classic I/O-bound signal -
                 // reward it with a return to the interactive level,
                 // same as scheduler_enqueue_existing() does for unpause.
-                proc->sched_level = SCHED_LEVEL_INTERACTIVE;
-                proc->sched_ticks_used = 0;
-
-                percpu_runqueue_t* rq = &g_runqueues[this_cpu];
-                uint64_t flags = spinlock_acquire(&rq->lock);
-                rq_push(rq, proc, SCHED_LEVEL_INTERACTIVE);
-                spinlock_release(&rq->lock, flags);
+                // A wait queue wake-up from another CPU may race with this
+                // timeout: scheduler_wake() lets only one of the two move
+                // it out of WAITING and queue it.
+                if (!scheduler_wake(proc)) continue;
 
                 if (SCHED_DEBUG >= 2) {
                     uint64_t now = time_get_uptime_ms();
@@ -510,6 +603,10 @@ static void schedule_irqs_off(void) {
     percpu_runqueue_t* rq = &g_runqueues[cpu_id];
 
     // ---- Zombie / terminated cleanup (global list, cross-core) ----
+    // Parents waiting in SYS_WAIT for the processes reaped below; woken
+    // once the list lock is released.
+    uint64_t wake_parents[16];
+    uint32_t wake_count = 0;
     uint64_t sched_flags = scheduler_lock();
     process_t* deferred_reap = g_deferred_reap[cpu_id];
     g_deferred_reap[cpu_id] = NULL;
@@ -550,6 +647,10 @@ static void schedule_irqs_off(void) {
                 proc_list_head = curr->next;
             }
 
+            // Killed while sleeping in a wait queue: its queue entry lives on
+            // its kernel stack, so unlink it before that stack is freed.
+            waitq_forget(to_free);
+
             if (to_free->kernel_stack) {
                 void* stack_base = (void*)((uint8_t*)to_free->kernel_stack - STACK_SIZE);
                 if (to_free->kernel_stack_page_backed)
@@ -571,6 +672,12 @@ static void schedule_irqs_off(void) {
                 proc_destroy_address_space(to_free);
             }
 
+            // Record its exit for SYS_WAIT and drop its working directory,
+            // environment and output files (spawn.c; no disk I/O here).
+            uint64_t parent = proc_spawn_reap(to_free);
+            if (parent && wake_count < sizeof(wake_parents) / sizeof(wake_parents[0]))
+                wake_parents[wake_count++] = parent;
+
             free_mem(to_free);
 
             curr = (prev) ? prev->next : proc_list_head;
@@ -580,6 +687,7 @@ static void schedule_irqs_off(void) {
         curr = curr->next;
     }
     scheduler_unlock(sched_flags);
+    for (uint32_t i = 0; i < wake_count; i++) proc_spawn_wake_parent(wake_parents[i]);
 
     // ---- Per-CPU dispatch ----
     process_t* old = current_process;
@@ -612,12 +720,27 @@ static void schedule_irqs_off(void) {
         break;
     }
 
+    if (next && next == old) {
+        // A wait-queue wake-up (scheduler_wake) queued the process that is
+        // still running here, before it switched away. It keeps the CPU.
+        spinlock_release(&rq->lock, rq_flags);
+        old->state = PROCESS_RUNNING;
+        current_process = old;
+        return;
+    }
+
     if (!next) {
-        // Nothing else ready on this core this tick.
+        // Nothing else ready on this core this tick. Whether `old` can go
+        // on is decided before the queue lock is released: once it is, a
+        // wake-up from another CPU may make it READY and queue it, and
+        // treating that as "still runnable here" would leave it running
+        // and queued at once.
+        bool old_runnable = old && (old->state == PROCESS_RUNNING ||
+                                    old->state == PROCESS_READY);
+        if (old_runnable) old->state = PROCESS_RUNNING;
         spinlock_release(&rq->lock, rq_flags);
 
-        if (old && (old->state == PROCESS_RUNNING || old->state == PROCESS_READY)) {
-            old->state = PROCESS_RUNNING;
+        if (old_runnable) {
             current_process = old;
             return;
         }
@@ -939,6 +1062,9 @@ void process_exit_with_status(uint8_t exit_code, bool crashed,
     current_process->exit_code = exit_code;
     current_process->crashed = crashed;
     current_process->crash_vector = crash_vector;
+    // Still in the process's own context, so disk writes are fine: write
+    // out buffered program output, and release a thread's exit futex.
+    proc_spawn_on_exit(current_process);
     window_manager_process_exit(current_process->pid);
     fgpu_process_exit(current_process->pid);
     audio_streams_on_process_exit(current_process->pid);

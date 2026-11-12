@@ -15,6 +15,7 @@
 #include "x86_64/gdt.h"
 #include "x86_64/tss.h"
 #include "time.h"
+#include "x86_64/clock.h"
 #include "x86_64/ac97_driver.h"
 #include "x86_64/exec_trace.h"
 
@@ -91,6 +92,7 @@ void startroutine(uint64_t region_start, uint64_t region_end) {
     allocator_init((void*)heap_start, uintheapsize);
     pmm_init((void*)pmm_start, pmm_end - pmm_start);
     print_str("PIT working!\n");
+    clock_init();
     print_str("Init MMIO subsystem\n");
     extern void mmio_init(void);
     mmio_init();

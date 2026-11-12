@@ -45,6 +45,9 @@ uint64_t time_get_uptime_sec(void);
 // Get current date/time
 datetime_t time_get_datetime(void);
 
+// Milliseconds since the datetime last stepped to a new second (0..999)
+uint32_t time_get_subsecond_ms(void);
+
 // Get individual components
 uint16_t time_get_year(void);
 uint8_t time_get_month(void);

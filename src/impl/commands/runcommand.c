@@ -13,25 +13,17 @@
 #include "x86_64/runcommand.h"
 #include "prochandler.h"
 #include "x86_64/scheduler.h"
+#include "x86_64/loader/argblock.h"
+#include "x86_64/spawn.h"
 
 #define RUN_STACK_SIZE   (64 * 1024)
 #define RUN_USER_IMAGE_BASE 0x20000000ULL
 #define RUN_USER_STACK_BASE 0x30000000ULL
 
-// Bytes carved out of the low end of a launched process's stack
-// allocation to hold its argv pointer array plus the argument string
-// data itself (see run_build_argv_block()). The stack pointer starts
-// at the TOP of the allocation and grows down, so this only collides
-// with real stack usage if the program's own call stack ever grows to
-// within this many bytes of the bottom - the same fixed-size, no-
-// guard-page tradeoff every .run process's stack already accepts.
-#define RUN_ARGV_RESERVED_SIZE (4 * 1024)
-
-// Hard cap on argc (argv[0] plus every extra argument) a launched
-// process can receive. Large enough for any reasonable command line;
-// keeps run_build_argv_block()'s on-stack scratch array a fixed, small
-// size regardless of what a caller passes in.
-#define RUN_MAX_ARGS 64
+// The argument block (argv/envp, see argblock.h) takes at least this much
+// of the low end of the stack allocation, and at most RUN_ARGV_MAX_RESERVED.
+#define RUN_ARGV_MIN_RESERVED (4 * 1024)
+#define RUN_ARGV_MAX_RESERVED (64 * 1024)
 
 static void run_release_buffer(void* buffer, bool page_backed, size_t page_count) {
     if (!buffer) return;
@@ -110,6 +102,37 @@ static bool run_extract_main_elf(const char* path, uint8_t** elf_data,
         serial_write_str("\n");
         minimafs_close(file);
         return false;
+    }
+    if (header[0] == 0x7F && header[1] == 'E' && header[2] == 'L' && header[3] == 'F') {
+        // A plain ELF executable rather than a .run bundle (SYS_SPAWN runs
+        // both, e.g. compiler passes installed as bare binaries).
+        uint8_t* image = (uint8_t*)alloc_unzeroed(archive_size);
+        size_t image_pages = 0;
+        if (!image) {
+            image_pages = (archive_size + 0xFFFu) / 0x1000u;
+            image = (uint8_t*)alloc_pages_zeroed(image_pages);
+            if (!image || !elf_register_page_buffer(image, image_pages)) {
+                if (image) free_pages(image, image_pages);
+                serial_write_str("run: ELF allocation failed bytes=");
+                serial_write_dec(archive_size);
+                serial_write_str("\n");
+                minimafs_close(file);
+                return false;
+            }
+        }
+        memcpy(image, header, sizeof(header));
+        uint32_t rest = archive_size - (uint32_t)sizeof(header);
+        if (rest && minimafs_read(file, image + sizeof(header), rest) != rest) {
+            serial_write_str("run: ELF read short\n");
+            if (image_pages) free_pages(image, image_pages);
+            else free_mem(image);
+            minimafs_close(file);
+            return false;
+        }
+        minimafs_close(file);
+        *elf_data = image;
+        *elf_size = archive_size;
+        return true;
     }
     if (memcmp(header, MINIMALOS_RUN_MAGIC, MINIMALOS_RUN_MAGIC_SIZE) != 0 ||
         run_read_u32(header + 8) != MINIMALOS_RUN_VERSION) {
@@ -229,113 +252,87 @@ static bool run_extract_main_elf(const char* path, uint8_t** elf_data,
     return false;
 }
 
-// Lays out an argv pointer array followed by NUL-terminated string
-// data inside the first RUN_ARGV_RESERVED_SIZE bytes of
-// `stack_base`/`stack_size` (the process's not-yet-mapped kernel stack
-// buffer). argv[0] is always `run_path`; `extra_argc`/`extra_argv`
-// supply everything after that (e.g. "-h", "0:/file" typed after the
-// program name on the command line).
-//
-// The array and strings are written into ordinary kernel heap memory
-// at this point - proc_map_user_range() (called by the caller right
-// after this) copies that memory verbatim into the new process's own
-// physical pages and maps them at this same virtual address, so the
-// pointer values stored in `*out_argv` remain valid once the process's
-// private PML4 is active. See user_stack in proc.h for the identical
-// trick already used for the stack pointer itself.
-//
-// Returns false (leaving *out_argc/*out_argv untouched) if there are
-// too many arguments (see RUN_MAX_ARGS) or the reserved region is too
-// small to hold them all - callers should treat that as a launch
-// failure rather than silently truncating a program's argv.
-static bool run_build_argv_block(void* stack_base, size_t stack_size,
-                                 const char* run_path,
-                                 int extra_argc, const char** extra_argv,
-                                 uintptr_t user_stack_base,
-                                 uint64_t* out_argc, char*** out_argv) {
-    if (!stack_base || !run_path || !out_argc || !out_argv) return false;
-    if (stack_size < RUN_ARGV_RESERVED_SIZE) return false;
-    if (extra_argc < 0) extra_argc = 0;
-
-    uint32_t total_argc = 1u + (uint32_t)extra_argc;
-    if (total_argc == 0 || total_argc > RUN_MAX_ARGS) return false;
-
-    const char* sources[RUN_MAX_ARGS];
-    sources[0] = run_path;
-    for (uint32_t i = 0; i < (uint32_t)extra_argc; i++) {
-        sources[1 + i] = (extra_argv && extra_argv[i]) ? extra_argv[i] : "";
-    }
-
-    uint8_t* region = (uint8_t*)stack_base;
-    size_t region_size = RUN_ARGV_RESERVED_SIZE;
-
-    // Pointer array first (NULL-terminated, matching the conventional
-    // argv[argc] == NULL every C runtime expects), string bytes right
-    // after it.
-    char** argv_array = (char**)region;
-    size_t array_bytes = (size_t)(total_argc + 1) * sizeof(char*);
-    if (array_bytes >= region_size) return false;
-
-    uint8_t* str_cursor = region + array_bytes;
-    size_t str_remaining = region_size - array_bytes;
-
-    for (uint32_t i = 0; i < total_argc; i++) {
-        size_t len = strlen(sources[i]) + 1;
-        if (len > str_remaining) return false;
-        memcpy(str_cursor, sources[i], len);
-        argv_array[i] = (char*)(user_stack_base + (uintptr_t)(str_cursor - region));
-        str_cursor += len;
-        str_remaining -= len;
-    }
-    argv_array[total_argc] = NULL;
-
-    *out_argc = total_argc;
-    *out_argv = (char**)user_stack_base;
-    return true;
+// The argument block (argv, envp and their strings; see argblock.h) sits
+// at the low end of the stack allocation. At least RUN_ARGV_MIN_RESERVED
+// bytes are set aside, and the stack grows by however much more a long
+// command line or a big environment needs, so the program keeps the same
+// amount of stack either way.
+static size_t run_reserved_for(size_t block_bytes) {
+    size_t reserved = (block_bytes + 0xFFFu) & ~(size_t)0xFFFu;
+    return reserved < RUN_ARGV_MIN_RESERVED ? RUN_ARGV_MIN_RESERVED : reserved;
 }
 
-process_t* run_launch_file(const char* run_path, int extra_argc, const char** extra_argv) {
+static void run_drop_sinks(const run_launch_t* launch) {
+    if (launch->out_sink) stdio_sink_put(launch->out_sink);
+    if (launch->err_sink) stdio_sink_put(launch->err_sink);
+}
+
+static char* run_dup_bytes(const char* data, size_t len) {
+    if (!data || !len) return NULL;
+    char* copy = (char*)alloc_unzeroed(len + 1);
+    if (!copy) return NULL;
+    memcpy(copy, data, len);
+    copy[len] = '\0';
+    return copy;
+}
+
+process_t* run_launch_ex(const run_launch_t* launch) {
+    if (!launch || !launch->path) return NULL;
+    const char* run_path = launch->path;
+    const char* default_argv[1] = { run_path };
+    uint32_t argc = launch->argc ? launch->argc : 1;
+    const char* const* argv = launch->argc ? launch->argv : default_argv;
+
+    size_t block_bytes = argblock_size(argc, argv, launch->env, launch->env_len);
+    if (block_bytes == 0 || block_bytes > RUN_ARGV_MAX_RESERVED) {
+        serial_write_str("run: too many/long arguments or environment, not launching\n");
+        run_drop_sinks(launch);
+        return NULL;
+    }
+    size_t reserved = run_reserved_for(block_bytes);
+    size_t stack_size = RUN_STACK_SIZE - RUN_ARGV_MIN_RESERVED + reserved;
+
     elf_loaded_image_t image;
     uint8_t* elf_data = NULL;
     uint32_t elf_size = 0;
     if (!run_extract_main_elf(run_path, &elf_data, &elf_size)) {
         serial_write_str("run: failed to extract main.elf\n");
+        run_drop_sinks(launch);
         return NULL;
     }
     if (!elf_load_buffer_at(elf_data, elf_size, RUN_USER_IMAGE_BASE, &image)) {
         serial_write_str("run: failed to load main.elf\n");
+        run_drop_sinks(launch);
         return NULL;
     }
 
-    void* stack = alloc_unzeroed(RUN_STACK_SIZE);
+    void* stack = alloc_unzeroed(stack_size);
     bool stack_page_backed = false;
     size_t stack_page_count = 0;
     if (!stack) {
-        stack_page_count = (RUN_STACK_SIZE + 0xFFFu) / 0x1000u;
+        stack_page_count = (stack_size + 0xFFFu) / 0x1000u;
         stack = alloc_pages_zeroed(stack_page_count);
         if (!stack) {
             serial_write_str("run: failed to allocate process stack\n");
             elf_unload(&image);
+            run_drop_sinks(launch);
             return NULL;
         }
         stack_page_backed = true;
     }
 
-    // alloc_unzeroed() does not zero memory; run_build_argv_block()
-    // only writes exactly as many bytes as each string needs, so
-    // clear the reserved region first to guarantee no stale heap
-    // bytes ever leak into an unused array slot or padding.
-    memset(stack, 0, RUN_ARGV_RESERVED_SIZE);
+    // alloc_unzeroed() does not zero memory: clear the reserved region so
+    // no stale heap bytes leak into padding the program can see.
+    memset(stack, 0, reserved);
 
-    uint64_t user_argc = 0;
     char** user_argv = NULL;
-    if (!run_build_argv_block(stack, RUN_STACK_SIZE, run_path,
-                              extra_argc, extra_argv, RUN_USER_STACK_BASE,
-                              &user_argc, &user_argv)) {
+    char** user_envp = NULL;
+    if (!argblock_build(stack, reserved, RUN_USER_STACK_BASE, argc, argv,
+                        launch->env, launch->env_len, &user_argv, &user_envp)) {
         serial_write_str("run: failed to build process argv\n");
-        serial_write_str("run: too many/long arguments, not launching\n");
         run_release_buffer(stack, stack_page_backed, stack_page_count);
         elf_unload(&image);
+        run_drop_sinks(launch);
         return NULL;
     }
 
@@ -353,14 +350,26 @@ process_t* run_launch_file(const char* run_path, int extra_argc, const char** ex
         // SysV AMD64 requires RSP % 16 == 8 at a function entry point.
         // proc_enter_ring3 uses iretq directly, so reserve the return-slot
         // word that a normal call would have placed on the stack.
-        proc->user_stack = (uint64_t*)(RUN_USER_STACK_BASE + RUN_STACK_SIZE - sizeof(uint64_t));
-        proc->user_argc  = user_argc;
+        proc->user_stack = (uint64_t*)(RUN_USER_STACK_BASE + stack_size - sizeof(uint64_t));
+        proc->user_argc  = argc;
         proc->user_argv  = user_argv;
+        proc->user_envp  = user_envp;
+        if (launch->parent_pid) proc->parent_pid = launch->parent_pid;
+        proc->wait_record = launch->wait_record;
+        // Reaping frees all of these, also when the launch fails below.
+        proc->out_sink = launch->out_sink;
+        proc->err_sink = launch->err_sink;
+        proc->env = run_dup_bytes(launch->env, launch->env_len);
+        proc->env_len = proc->env ? launch->env_len : 0;
+        proc->cwd = launch->cwd ? run_dup_bytes(launch->cwd, strlen(launch->cwd)) : NULL;
         if (!proc_map_user_range_at(proc, image.base,
                                     (void*)RUN_USER_IMAGE_BASE, image.image_size) ||
             !proc_map_user_range_at(proc, stack,
-                                    (void*)RUN_USER_STACK_BASE, RUN_STACK_SIZE)) {
+                                    (void*)RUN_USER_STACK_BASE, stack_size)) {
             serial_write_str("run: failed to map process image or stack\n");
+            // It never ran and its pid was never handed out: no exit
+            // record, or SYS_WAIT(any) would report a child nobody started.
+            proc->wait_record = false;
             kill(proc);
             proc = NULL;
         } else {
@@ -369,6 +378,8 @@ process_t* run_launch_file(const char* run_path, int extra_argc, const char** ex
             run_release_buffer(stack, stack_page_backed, stack_page_count);
             proc_start(proc);
         }
+    } else {
+        run_drop_sinks(launch);
     }
     if (!proc) {
         serial_write_str("run: failed to create user process after loading image\n");
@@ -377,8 +388,31 @@ process_t* run_launch_file(const char* run_path, int extra_argc, const char** ex
         return NULL;
     }
 
-    command_set_last_user_pid(proc->pid);
+    if (launch->terminal_foreground) command_set_last_user_pid(proc->pid);
 
+    return proc;
+}
+
+process_t* run_launch_file(const char* run_path, int extra_argc, const char** extra_argv) {
+    if (!run_path) return NULL;
+    if (extra_argc < 0) extra_argc = 0;
+    if ((uint32_t)extra_argc + 1u > ARGBLOCK_MAX_ARGS) return NULL;
+
+    // argv[0] is always the path; the extra arguments follow it.
+    const char** argv = (const char**)alloc_unzeroed(((size_t)extra_argc + 1u) * sizeof(char*));
+    if (!argv) return NULL;
+    argv[0] = run_path;
+    for (int i = 0; i < extra_argc; i++)
+        argv[1 + i] = (extra_argv && extra_argv[i]) ? extra_argv[i] : "";
+
+    run_launch_t launch;
+    memset(&launch, 0, sizeof(launch));
+    launch.path = run_path;
+    launch.argc = (uint32_t)extra_argc + 1u;
+    launch.argv = argv;
+    launch.terminal_foreground = true;
+    process_t* proc = run_launch_ex(&launch);
+    free_mem(argv);
     return proc;
 }
 

@@ -432,7 +432,7 @@ void proc_destroy_address_space(process_t* proc) {
 
 static void proc_enter_ring3(process_t* self,
 		void (*entry_point)(), void* user_stack_top,
-		uint64_t user_argc, void* user_argv) {
+		uint64_t user_argc, void* user_argv, void* user_envp) {
 	uint64_t pml4 = self->pml4;
 	__asm__ volatile(
 		"mov %[pml4], %%rax\n\t"
@@ -445,11 +445,12 @@ static void proc_enter_ring3(process_t* self,
 		"pushq %%rax\n\t"
 		"pushq %[cs]\n\t"
 		"pushq %[rip]\n\t"
-		/* SysV integer args to the entry point: RDI=argc, RSI=argv.
-		 * These are ordinary register writes (not popped by iretq),
-		 * so they survive the ring transition below untouched. */
+		/* SysV integer args to the entry point: RDI=argc, RSI=argv,
+		 * RDX=envp. These are ordinary register writes (not popped by
+		 * iretq), so they survive the ring transition below untouched. */
 		"mov %[argc], %%rdi\n\t"
 		"mov %[argv], %%rsi\n\t"
+		"mov %[envp], %%rdx\n\t"
 		"iretq\n\t"
 		:
 		: [pml4] "r"(pml4),
@@ -458,8 +459,9 @@ static void proc_enter_ring3(process_t* self,
 		  [cs] "r"((uint64_t)GDT_SELECTOR_CS_USER),
 		  [rip] "r"((uint64_t)entry_point),
 		  [argc] "r"(user_argc),
-		  [argv] "r"((uint64_t)(uintptr_t)user_argv)
-		: "rax", "rdi", "rsi", "memory");
+		  [argv] "r"((uint64_t)(uintptr_t)user_argv),
+		  [envp] "r"((uint64_t)(uintptr_t)user_envp)
+		: "rax", "rdi", "rsi", "rdx", "memory");
 	for (;;) {
 		asm volatile("cli; hlt" ::: "memory");
 	}
@@ -502,7 +504,7 @@ static void proc_trampoline(void) {
 		if (self->privilege == PROC_PRIVILEGE_USER) {
 			serial_write_str("PROC: entering user process\n");
 			proc_enter_ring3(self, self->entry_point, self->user_stack,
-			                  self->user_argc, self->user_argv);
+			                  self->user_argc, self->user_argv, self->user_envp);
 		}
 		self->entry_point();
 	}
@@ -687,6 +689,8 @@ void kill(process_t* proc) {
 	fgpu_process_exit(proc->pid);
 	audio_streams_on_process_exit(proc->pid);
 	graphics_release_screen_for_pid(proc->pid);
+	if (proc->state != PROCESS_ZOMBIE && proc->state != PROCESS_TERMINATED)
+		proc->killed = true;            /* SYS_WAIT reports it as killed */
 	proc->state = PROCESS_ZOMBIE;
 	// Pull it out of whatever per-CPU run queue it's sitting in so it
 	// can never be dispatched again, and so the zombie-cleanup pass in
@@ -699,9 +703,21 @@ void kill(process_t* proc) {
 
 process_t* proc_create_thread(process_t* owner, uint64_t entry,
 			      uint64_t stack_top, uint64_t arg) {
+	return proc_create_thread_ex(owner, entry, stack_top, arg, 0, 0);
+}
+
+process_t* proc_create_thread_ex(process_t* owner, uint64_t entry,
+				 uint64_t stack_top, uint64_t arg,
+				 uint64_t fs_base, uint64_t exit_futex) {
 	owner = proc_mem_owner(owner);
 	if (!owner || owner->privilege != PROC_PRIVILEGE_USER || !owner->pml4 ||
 	    owner->state == PROCESS_ZOMBIE || owner->state == PROCESS_TERMINATED)
+		return NULL;
+	// FS base must be a canonical lower-half address (WRMSR faults on
+	// anything else); the exit futex an aligned word the program owns.
+	if (fs_base >= 0x0000800000000000ULL) return NULL;
+	if (exit_futex && ((exit_futex & 3u) ||
+	    !proc_user_range_contains(owner, (const void*)(uintptr_t)exit_futex, 4)))
 		return NULL;
 	// The code must be in the program's image, the stack (its top 256
 	// bytes at least) in memory the program owns.
@@ -731,6 +747,9 @@ process_t* proc_create_thread(process_t* owner, uint64_t entry,
 	t->user_stack = (uint64_t*)(uintptr_t)(stack_top - 8);
 	t->user_argc = arg;                     /* RDI: the thread's argument */
 	t->user_argv = NULL;
+	t->user_envp = NULL;
+	t->fs_base = fs_base;                   /* loaded when it is switched to */
+	t->exit_futex = exit_futex;
 	// For crash reports (the image is the owner's; nothing to free here).
 	t->user_image_address = owner->user_image_address;
 	t->user_image_size = owner->user_image_size;

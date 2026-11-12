@@ -29,4 +29,10 @@ bool fs_resolve_path(const char* input, char* resolved);
 // returns NULL - defaults to "0:/".
 const char* fs_get_current_directory(void);
 
+// Like fs_resolve_path(), relative to `base` (an "N:/local/path"
+// directory) instead of the shell's current directory. Reentrant: keeps
+// no state, so any CPU may call it at any time (fspaths.c). A program's
+// own working directory (SYS_CHDIR / SYS_SPAWN) resolves through this.
+bool fs_resolve_path_from(const char* base, const char* input, char* resolved);
+
 #endif // FSPATHS_H

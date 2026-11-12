@@ -108,6 +108,8 @@
 #define SYS_ERR_AGAIN    ((uint64_t)-7)
 // Out of memory (kernel heap or video memory).
 #define SYS_ERR_NOMEM    ((uint64_t)-8)
+// A timed wait ran out (SYS_FUTEX_WAIT with a timeout).
+#define SYS_ERR_TIMEDOUT ((uint64_t)-9)
 
 typedef enum {
     SYS_GRAPHICS_GET_WIDTH = 1,
@@ -961,5 +963,127 @@ typedef struct {
     uint64_t stack_top;        // end of the thread's stack (program memory)
     uint64_t arg;              // passed to entry in RDI
 } syscall_thread_t;
+
+#define SYS_THREAD_SET_FS    3u   // rsi = FS base of the calling thread (its TLS
+                                  // block, below 0x0000800000000000); 0 clears it
+#define SYS_THREAD_GET_FS    4u   // returns the calling thread's FS base
+#define SYS_THREAD_CREATE_EX 5u   // rsi = syscall_thread_ex_t*: CREATE plus an FS
+                                  // base and an exit futex; returns the thread id
+
+typedef struct {
+    uint64_t entry;            // void entry(uint64_t arg), in the program
+    uint64_t stack_top;        // end of the thread's stack (program memory)
+    uint64_t arg;              // passed to entry in RDI
+    uint64_t fs_base;          // the thread's FS base (TLS); 0 for none
+    uint64_t exit_futex;       // 0, or the address of a uint32_t that the kernel
+                               // sets to 0 and wakes (all SYS_FUTEX waiters) once
+                               // the thread has ended and left its stack
+} syscall_thread_ex_t;
+
+// ---------------------------------------------------------------------------
+// WHAT A C LIBRARY NEEDS: futex, clocks, stat/rename, working directory,
+// spawn/wait, environment
+// ---------------------------------------------------------------------------
+// Paths are MinimaFS paths ("0:/dir/file"). "/dir/file" is the root of the
+// working directory's drive; anything else is relative to the program's
+// working directory (SYS_CHDIR).
+
+// FUTEX: rdi = operation. Waits on / wakes a 32-bit word in the program's
+// memory; waiters and wakers are threads of one program.
+//   SYS_FUTEX_WAIT: rsi = uint32_t* (4-byte aligned), rdx = expected value,
+//                   r10 = timeout in nanoseconds (0 = none; rounded up to
+//                   whole milliseconds). Sleeps only while *rsi == rdx,
+//                   checked atomically against SYS_FUTEX_WAKE. Returns
+//                   SYS_SUCCESS once woken (wake-ups can be spurious: look at
+//                   the word again), SYS_ERR_AGAIN when *rsi != rdx, or
+//                   SYS_ERR_TIMEDOUT.
+//   SYS_FUTEX_WAKE: rsi = uint32_t*, rdx = most waiters to wake. Returns how
+//                   many it woke.
+#define SYS_FUTEX 48
+#define SYS_FUTEX_WAIT 1u
+#define SYS_FUTEX_WAKE 2u
+
+// CLOCK: rdi = which clock; returns its value.
+//   SYS_CLOCK_MONOTONIC: nanoseconds since boot. Never goes backwards; read
+//                        from the CPU's time-stamp counter when it has one.
+//   SYS_CLOCK_REALTIME:  nanoseconds since 1970-01-01 by the system clock (UTC
+//                        with internet time sync on); millisecond steps, and
+//                        it jumps when the clock is set.
+//   SYS_CLOCK_TSC_HZ:    time-stamp counter ticks per second when RDTSC is a
+//                        usable clock in user code (invariant TSC), else 0.
+#define SYS_CLOCK 49
+#define SYS_CLOCK_MONOTONIC 1u
+#define SYS_CLOCK_REALTIME  2u
+#define SYS_CLOCK_TSC_HZ    3u
+
+// STAT: rdi = path, rsi = syscall_stat_t*. SYS_ERR_NOTFOUND when nothing is
+// there. A directory reports size 0 and no times.
+#define SYS_STAT 50
+#define SYS_STAT_FILE 1u
+#define SYS_STAT_DIR  2u
+#define SYS_STAT_HIDDEN   (1u << 0)
+#define SYS_STAT_RUNNABLE (1u << 1)
+
+typedef struct {
+    uint64_t size;             // data bytes (0 for a directory)
+    uint32_t type;             // SYS_STAT_FILE or SYS_STAT_DIR
+    uint32_t flags;            // SYS_STAT_HIDDEN, SYS_STAT_RUNNABLE
+    int64_t created;           // seconds since 1970; MinimaFS keeps only the day
+    int64_t modified;          // the same; 0 when unknown
+} syscall_stat_t;
+
+// RENAME: rdi = old path, rsi = new path, on the same drive. Moves a file or
+// a directory, also into another directory. A file already at the new path
+// is replaced; a directory there is an error, and so is moving a directory
+// into itself.
+#define SYS_RENAME 51
+
+// CHDIR: rdi = directory. Sets the program's working directory (shared by
+// its threads, inherited by programs it starts). SYS_GETCWD returns it; a
+// program that never set one uses the terminal's.
+#define SYS_CHDIR 52
+
+// SPAWN: rdi = syscall_spawn_t*. Starts a program (a .run bundle or a plain
+// ELF executable) as a child of the caller and returns its pid. Wait for it
+// with SYS_WAIT.
+#define SYS_SPAWN 53
+
+typedef struct {
+    uint64_t size;                  // sizeof(syscall_spawn_t)
+    const char* path;               // the program
+    const char* const* argv;        // argv[0..argc-1] as the child sees them (argv[0]
+                                    // is normally the path); NULL: { path }
+    uint64_t argc;
+    const char* const* envp;        // NULL-terminated "NAME=value" strings; NULL:
+                                    // the environment the caller started with
+    const char* cwd;                // working directory; NULL: the caller's
+    const char* stdout_path;        // NULL: wherever the caller's output goes; else a
+                                    // file (replaced) that receives the child's output
+    const char* stderr_path;        // the same for stderr; may name the same file
+    uint64_t flags;                 // 0
+} syscall_spawn_t;
+
+// WAIT: rdi = child pid (SYS_WAIT_ANY for any child), rsi = flags, rdx =
+// syscall_wait_t* or NULL. Waits for that child to end and returns its pid;
+// its output files are complete by then. SYS_ERR_NOTFOUND when there is no
+// such child, SYS_ERR_AGAIN with SYS_WAIT_NOHANG while it still runs. A child
+// can be waited for once. Programs started with SYS_EXEC count as children.
+#define SYS_WAIT 54
+#define SYS_WAIT_ANY     0u
+#define SYS_WAIT_NOHANG  (1u << 0)
+#define SYS_WAIT_CRASHED (1u << 0)   // syscall_wait_t.flags: it crashed
+#define SYS_WAIT_KILLED  (1u << 1)   // it was ended from outside
+
+typedef struct {
+    uint32_t exit_code;        // mos_exit()'s value (0-255)
+    uint32_t flags;            // SYS_WAIT_CRASHED, SYS_WAIT_KILLED
+    uint32_t crash_vector;     // the CPU exception, when it crashed
+    uint32_t reserved;
+} syscall_wait_t;
+
+// The environment: a program's entry point gets it as its third argument
+// (RDI = argc, RSI = argv, RDX = envp), a NULL-terminated array of
+// "NAME=value" strings at the bottom of its stack. The SDK's crt0 keeps it
+// in `environ`.
 
 #endif // SYSCALL_H

@@ -34,13 +34,22 @@
 #include "fspaths.h"
 #include "input.h"
 #include "x86_64/window_manager.h"
+#include "x86_64/spawn.h"
+#include "x86_64/waitq.h"
+#include "x86_64/clock.h"
+#include "timeconv.h"
 
 static minimafs_dir_entry_t g_listdir_entries[MINIMAFS_MAX_ROOT_ENTRIES];
 static volatile int     g_listdir_entries_lock;
 
+// Programs resolve relative paths against their own working directory
+// (SYS_CHDIR, inherited through SYS_SPAWN), or the terminal's when they
+// never set one; kernel callers always use the terminal's.
 static const char* syscall_resolve_path(const char* input, char* resolved) {
-    if (!input || !resolved || !fs_resolve_path(input, resolved)) return NULL;
-    return resolved;
+    if (!input || !resolved) return NULL;
+    bool ok = isCurrentProcessUser() ? proc_resolve_path(current_process, input, resolved)
+                                     : fs_resolve_path(input, resolved);
+    return ok ? resolved : NULL;
 }
 
 static bool user_range_ok(const void* ptr, size_t len, bool write) {
@@ -79,6 +88,14 @@ static uint64_t sys_write_impl(int fd, const char* buf, uint64_t len) {
         return len;
     }
     if (fd != 1 && fd != 2) return SYS_ERR_BADFD;
+
+    // Output redirected into a file by SYS_SPAWN (stdout_path/stderr_path).
+    // Anything not redirected goes to the terminal exactly as before.
+    if (isCurrentProcessUser()) {
+        int redirected = proc_stdio_write(current_process, fd, buf, len);
+        if (redirected == 0) return SYS_ERR_INVAL;
+        if (redirected > 0) return len;
+    }
 
     // No memory protection between processes exists yet (every
     // process_t shares the kernel's own PML4 - see proc_create()), so
@@ -877,12 +894,53 @@ static uint64_t sys_exec_impl(const char* path, const char** argv, uint64_t argc
     serial_write_dec(minimafs_is_dir(normalized) ? 1 : 0);
     serial_write_str("\n");
 
+    if (isCurrentProcessUser()) {
+        // From a program: the child inherits its working directory,
+        // environment and output, and the program may SYS_WAIT for it.
+        uint64_t pid = proc_exec_inherit(normalized, (int)argc, argv);
+        if ((int64_t)pid < 0) serial_write_str("SYS_EXEC: launch failed\n");
+        return pid;
+    }
     process_t* proc = run_launch_file(normalized, (int)argc, argv);
     if (!proc) {
         serial_write_str("SYS_EXEC: launch failed\n");
         return SYS_ERR_GENERIC;
     }
     return proc->pid;
+}
+
+static uint64_t sys_stat_impl(const char* path, syscall_stat_t* out) {
+    if (!path || !out) return SYS_ERR_INVAL;
+    if (isCurrentProcessUser() && !user_range_ok(out, sizeof(*out), true)) return SYS_ERR_INVAL;
+    char resolved[MINIMAFS_MAX_PATH];
+    if (!syscall_resolve_path(path, resolved)) return SYS_ERR_INVAL;
+    minimafs_stat_t st;
+    memset(&st, 0, sizeof(st));
+    if (!minimafs_stat(resolved, &st)) return SYS_ERR_NOTFOUND;
+    syscall_stat_t r;
+    memset(&r, 0, sizeof(r));
+    r.type = st.is_dir ? SYS_STAT_DIR : SYS_STAT_FILE;
+    r.size = st.is_dir ? 0 : st.size;
+    r.flags = (st.hidden ? SYS_STAT_HIDDEN : 0u) | (st.runnable ? SYS_STAT_RUNNABLE : 0u);
+    int64_t when = 0;
+    if (timeconv_parse_minimafs_date(st.created_date, &when)) r.created = when;
+    if (timeconv_parse_minimafs_date(st.last_changed, &when)) r.modified = when;
+    *out = r;
+    return SYS_SUCCESS;
+}
+
+static uint64_t sys_rename_impl(const char* from, const char* to) {
+    if (!from || !to) return SYS_ERR_INVAL;
+    char* paths = (char*)alloc_unzeroed(2u * MINIMAFS_MAX_PATH);
+    if (!paths) return SYS_ERR_NOMEM;
+    char* a = paths;
+    char* b = paths + MINIMAFS_MAX_PATH;
+    uint64_t result;
+    if (!syscall_resolve_path(from, a) || !syscall_resolve_path(to, b)) result = SYS_ERR_INVAL;
+    else if (!minimafs_exists(a)) result = SYS_ERR_NOTFOUND;
+    else result = minimafs_rename(a, b) ? SYS_SUCCESS : SYS_ERR_GENERIC;
+    free_mem(paths);
+    return result;
 }
 
 static bool syscall_user_may_call(uint64_t syscall_num, const syscall_regs_t* regs) {
@@ -1111,9 +1169,63 @@ static void syscall_dispatch_inner(syscall_regs_t* regs) {
                                 ? SYS_SUCCESS : SYS_ERR_NOTFOUND;
                 return;
             }
+            if (regs->rdi == SYS_THREAD_SET_FS) {
+                // WRMSR faults on a non-canonical address: lower half only.
+                if (regs->rsi >= 0x0000800000000000ULL) { regs->rax = SYS_ERR_INVAL; return; }
+                scheduler_set_fs_base(self, regs->rsi);
+                regs->rax = SYS_SUCCESS;
+                return;
+            }
+            if (regs->rdi == SYS_THREAD_GET_FS) {
+                regs->rax = self->fs_base;
+                return;
+            }
+            if (regs->rdi == SYS_THREAD_CREATE_EX) {
+                const syscall_thread_ex_t* t = (const syscall_thread_ex_t*)regs->rsi;
+                if (!user_range_ok(t, sizeof(*t), false)) { regs->rax = SYS_ERR_INVAL; return; }
+                syscall_thread_ex_t req = *t;
+                process_t* thread = proc_create_thread_ex(self, req.entry, req.stack_top, req.arg,
+                                                          req.fs_base, req.exit_futex);
+                regs->rax = thread ? thread->pid : SYS_ERR_INVAL;
+                return;
+            }
             regs->rax = SYS_ERR_INVAL;
             return;
         }
+        case SYS_FUTEX: {
+            if (regs->rdi == SYS_FUTEX_WAIT)
+                regs->rax = futex_wait((uint32_t*)regs->rsi, (uint32_t)regs->rdx, regs->r10);
+            else if (regs->rdi == SYS_FUTEX_WAKE)
+                regs->rax = futex_wake((uint32_t*)regs->rsi,
+                                       regs->rdx > UINT32_MAX ? UINT32_MAX : (uint32_t)regs->rdx);
+            else
+                regs->rax = SYS_ERR_INVAL;
+            return;
+        }
+        case SYS_CLOCK: {
+            switch (regs->rdi) {
+                case SYS_CLOCK_MONOTONIC: regs->rax = clock_monotonic_ns(); break;
+                case SYS_CLOCK_REALTIME:  regs->rax = clock_realtime_ns(); break;
+                case SYS_CLOCK_TSC_HZ:    regs->rax = clock_tsc_hz(); break;
+                default:                  regs->rax = SYS_ERR_INVAL; break;
+            }
+            return;
+        }
+        case SYS_STAT:
+            regs->rax = sys_stat_impl((const char*)regs->rdi, (syscall_stat_t*)regs->rsi);
+            return;
+        case SYS_RENAME:
+            regs->rax = sys_rename_impl((const char*)regs->rdi, (const char*)regs->rsi);
+            return;
+        case SYS_CHDIR:
+            regs->rax = proc_chdir((const char*)regs->rdi);
+            return;
+        case SYS_SPAWN:
+            regs->rax = proc_spawn((const syscall_spawn_t*)regs->rdi);
+            return;
+        case SYS_WAIT:
+            regs->rax = proc_wait_child(regs->rdi, regs->rsi, (syscall_wait_t*)regs->rdx);
+            return;
         case SYS_POWER: {
             uint64_t op = regs->rdi;
             if (op != SYS_POWER_SHUTDOWN && op != SYS_POWER_REBOOT) {
@@ -1368,19 +1480,10 @@ static void syscall_dispatch_inner(syscall_regs_t* regs) {
             break;
         }
 
-        case SYS_GETCWD: {
-            char* out = (char*)regs->rdi;
-            uint64_t cap = regs->rsi;
-            const char* cwd = fs_get_current_directory();
-            size_t len = cwd ? strlen(cwd) : 0;
-            if (!out || cap == 0 || !cwd || len + 1 > cap) {
-                regs->rax = SYS_ERR_INVAL;
-                break;
-            }
-            memcpy(out, cwd, len + 1);
-            regs->rax = SYS_SUCCESS;
+        case SYS_GETCWD:
+            // The program's own working directory, or the terminal's.
+            regs->rax = proc_getcwd((char*)regs->rdi, regs->rsi);
             break;
-        }
 
         case SYS_EXEC: {
             const char* path   = (const char*)regs->rdi;

@@ -144,6 +144,32 @@ typedef struct process {
     // together: the owner exiting, or any member crashing, ends them all.
     struct process* mem_owner;
     volatile uint32_t thread_count;
+
+    // ---- C library support (SYS_FUTEX, SYS_SPAWN, ...; see syscall.h) ----
+    // FS base: the thread's TLS pointer, loaded when it is switched to
+    // (scheduler.c). Only user processes have one.
+    uint64_t fs_base;
+    // A thread's exit futex (SYS_THREAD_CREATE_EX): the address of a
+    // uint32_t in its owner's memory, set to 0 and woken once it ends.
+    uint64_t exit_futex;
+    // Its entry in a wait queue while it sleeps in waitq_wait().
+    struct waitq_waiter* waitq;
+    // Owner only (threads use their owner's): the working directory
+    // ("N:/dir" on the kernel heap; NULL = the terminal's) and the
+    // environment it started with (packed "A=1\0B=2\0", kernel heap).
+    char* cwd;
+    char* env;
+    uint32_t env_len;
+    // Owner only: where stdout and stderr go (spawn.c); NULL = terminal.
+    struct stdio_sink* out_sink;
+    struct stdio_sink* err_sink;
+    // envp for the entry point (RDX), next to user_argc/user_argv.
+    char** user_envp;
+    // Started by a program through SYS_SPAWN/SYS_EXEC: its parent may
+    // SYS_WAIT for it, so its exit status is recorded when it is reaped.
+    bool wait_record;
+    // Ended by kill() rather than by exiting or crashing.
+    bool killed;
 } process_t;
 
 // The process whose address space `p` runs in: its owner for a thread.
@@ -207,6 +233,12 @@ void proc_destroy_address_space(process_t* proc);
 // NULL when owner is not a user process or the arguments are invalid.
 process_t* proc_create_thread(process_t* owner, uint64_t entry,
                               uint64_t stack_top, uint64_t arg);
+// The same, with the thread's FS base (TLS pointer; canonical lower half)
+// and an exit futex (0, or an aligned uint32_t in owner's memory that is
+// set to 0 and woken when the thread ends). See SYS_THREAD_CREATE_EX.
+process_t* proc_create_thread_ex(process_t* owner, uint64_t entry,
+                                 uint64_t stack_top, uint64_t arg,
+                                 uint64_t fs_base, uint64_t exit_futex);
 // Ends every thread of `owner` (not owner itself).
 void proc_kill_threads(process_t* owner);
 // Ends p's whole group: its owner and all the owner's threads.

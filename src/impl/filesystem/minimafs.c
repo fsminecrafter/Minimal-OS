@@ -1605,13 +1605,17 @@ minimafs_file_handle_t* minimafs_open(const char* path, bool read_only) {
         goto done;
     }
 
-    /* Read first block for header */
-    first_block = (uint8_t*)alloc_unzeroed(MINIMAFS_BLOCK_SIZE);
+    /* Read first block for header. One byte more than a block, kept 0:
+     * the header parser and the @DATA@ search below treat the block as a
+     * string, and a block without a NUL (binary data, a damaged header)
+     * would send them past the end of the buffer. */
+    first_block = (uint8_t*)alloc_unzeroed(MINIMAFS_BLOCK_SIZE + 1);
     if (!first_block) {
         while (__sync_lock_test_and_set(&g_folder_block_buffer_lock, 1)) { }
         first_block = (uint8_t*)g_folder_block_buffer;
         first_block_locked = true;
     }
+    first_block[MINIMAFS_BLOCK_SIZE] = 0;
 
     if (!minimafs_read_blocks(drive, entry.block_offset, 1, first_block)) {
         serial_write_str("MinimaFS: open failed reading file header block ");
@@ -1635,6 +1639,14 @@ minimafs_file_handle_t* minimafs_open(const char* path, bool read_only) {
     }
 
     minimafs_parse_file_header((const char*)first_block, meta);
+    /* The folder entry is the source of truth for the name and parent: a
+     * rename only edits folder.desc and never rewrites the file header, so
+     * the header's @FILENAME/@PARENTFOLDER can be stale. The next
+     * write-back stores these corrected values. */
+    strncpy(meta->filename, filename, sizeof(meta->filename) - 1);
+    meta->filename[sizeof(meta->filename) - 1] = '\0';
+    strncpy(meta->parent_folder, parent, sizeof(meta->parent_folder) - 1);
+    meta->parent_folder[sizeof(meta->parent_folder) - 1] = '\0';
     meta->block_offset = entry.block_offset;
     meta->block_count  = entry.block_count;
 
@@ -2065,6 +2077,359 @@ bool minimafs_rmdir(const char* path) {
     if (to_free) block_free_run(drive_num, to_free, 1);
     minimafs_refresh_storage_desc(drive);
     return true;
+}
+
+/* ================================================================
+ * STAT / RENAME
+ * ================================================================ */
+
+/* Normalize a local path in place: leading '/', no repeated or trailing
+ * slashes. The root becomes "/". The buffer must have room for one extra
+ * character. */
+static void minimafs_normalize_local(char* p) {
+    if (p[0] != '/') {
+        size_t len = strlen(p);
+        memmove(p + 1, p, len + 1);
+        p[0] = '/';
+    }
+    char* w = p;
+    const char* r = p;
+    while (*r) {
+        while (*r == '/') r++;
+        if (!*r) break;
+        *w++ = '/';
+        while (*r && *r != '/') *w++ = *r++;
+    }
+    if (w == p) *w++ = '/';
+    *w = '\0';
+}
+
+/* Parse "N:/..." into a mounted drive and a normalized local path.
+ * 'local' must hold MINIMAFS_MAX_PATH bytes. Returns NULL on failure. */
+static minimafs_drive_t* minimafs_resolve_path(const char* path, uint8_t* drive_num,
+                                               char* local) {
+    if (!path || !drive_num || !local) return NULL;
+    if (strlen(path) >= MINIMAFS_MAX_PATH) return NULL;
+    if (!minimafs_parse_path(path, drive_num, local)) return NULL;
+    minimafs_drive_t* drive = get_drive(*drive_num);
+    if (!drive || !drive->mounted) return NULL;
+    minimafs_normalize_local(local);
+    return drive;
+}
+
+bool minimafs_stat(const char* path, minimafs_stat_t* out) {
+    if (!path || !out) return false;
+    memset(out, 0, sizeof(*out));
+
+    bool result = false;
+
+    /* HEAP - path buffers are 1KB each. */
+    char* storage = (char*)alloc_unzeroed(3 * MINIMAFS_MAX_PATH);
+    char* local_path = storage;
+    char* parent = storage ? storage + MINIMAFS_MAX_PATH : NULL;
+    char* name = storage ? storage + 2 * MINIMAFS_MAX_PATH : NULL;
+    minimafs_folder_desc_t* pd = NULL;
+    uint8_t* first = NULL;
+    bool first_locked = false;
+    minimafs_file_metadata_t* meta = NULL;
+
+    uint8_t drive_num = 0;
+    minimafs_drive_t* drive = NULL;
+    uint32_t idx = 0;
+    minimafs_dir_entry_t entry;
+    bool header_ok = false;
+    uint32_t data_offset = 0;
+    uint64_t total_bytes = 0;
+    uint64_t size = 0;
+
+    if (!storage) {
+        serial_write_str("MinimaFS: OOM in minimafs_stat\n");
+        goto cleanup;
+    }
+
+    drive = minimafs_resolve_path(path, &drive_num, local_path);
+    if (!drive) goto cleanup;
+
+    /* Root */
+    if (local_path[1] == '\0') {
+        out->is_dir = true;
+        result = true;
+        goto cleanup;
+    }
+
+    minimafs_split_local_path(local_path, parent, name);
+    if (name[0] == '\0' || strlen(name) >= MINIMAFS_MAX_ENTRY_NAME) goto cleanup;
+
+    pd = acquire_folder_desc();
+    if (!pd) goto cleanup;
+    if (!minimafs_read_folder_desc(drive, parent, pd)) goto cleanup;
+    if (!minimafs_find_entry_in_folder(pd, name, &idx)) goto cleanup;
+    entry = pd->entries[idx];
+    release_folder_desc(pd);
+    pd = NULL;
+
+    out->hidden = entry.hidden;
+
+    if (entry.type == MINIMAFS_TYPE_DIR) {
+        out->is_dir = true;
+        result = true;
+        goto cleanup;
+    }
+
+    /* The entry exists. A file with no blocks is empty. */
+    if (entry.block_count == 0) {
+        result = true;
+        goto cleanup;
+    }
+    total_bytes = (uint64_t)entry.block_count * MINIMAFS_BLOCK_SIZE;
+
+    /* A busy pool must not make an existing file look missing: fall back
+     * to the heap (minimafs_release_file_metadata() frees either kind). */
+    meta = minimafs_acquire_file_metadata();
+    if (!meta) meta = (minimafs_file_metadata_t*)alloc(sizeof(*meta));
+    if (!meta) goto cleanup;
+
+    /* Read ONLY the first block of the file. */
+    first = (uint8_t*)alloc_unzeroed(MINIMAFS_BLOCK_SIZE + 1);
+    if (!first) {
+        while (__sync_lock_test_and_set(&g_folder_block_buffer_lock, 1)) { }
+        first = (uint8_t*)g_folder_block_buffer;
+        first_locked = true;
+    }
+    if (!minimafs_read_blocks(drive, entry.block_offset, 1, first)) goto cleanup;
+    first[MINIMAFS_BLOCK_SIZE] = '\0';
+
+    if (minimafs_parse_file_header((const char*)first, meta)) {
+        const char* marker = strstr((const char*)first, "@DATA@\n");
+        if (marker) {
+            data_offset = (uint32_t)(marker - (const char*)first) + 7;
+            header_ok = true;
+        }
+    }
+
+    /* Release the block buffer before any fallback: minimafs_get_metadata()
+     * goes through minimafs_open(), which may take the same lock. */
+    if (first_locked)
+        __sync_lock_release(&g_folder_block_buffer_lock);
+    else
+        free_mem(first);
+    first = NULL;
+    first_locked = false;
+
+    if (!header_ok) {
+        /* Header does not fit in the first block (or is unreadable): let
+         * the regular metadata path deal with it. If that fails too, the
+         * entry still exists, so report it as an empty file. */
+        data_offset = 0;
+        if (!minimafs_get_metadata(path, meta))
+            memset(meta, 0, sizeof(*meta));
+    }
+
+    size = meta->data_length;
+    if (header_ok && size == 0 && meta->file_length > data_offset + 5)
+        size = (uint64_t)meta->file_length - data_offset - 5;
+    if ((uint64_t)data_offset + size > total_bytes)
+        size = (total_bytes > data_offset) ? total_bytes - data_offset : 0;
+
+    out->size     = size;
+    out->runnable = meta->runnable;
+    out->hidden   = out->hidden || meta->hidden;
+    strncpy(out->created_date, meta->created_date, sizeof(out->created_date) - 1);
+    strncpy(out->last_changed, meta->last_changed, sizeof(out->last_changed) - 1);
+    result = true;
+
+    cleanup:
+    if (first) {
+        if (first_locked)
+            __sync_lock_release(&g_folder_block_buffer_lock);
+        else
+            free_mem(first);
+    }
+    if (pd)      release_folder_desc(pd);
+    if (meta)    minimafs_release_file_metadata(meta);
+    if (storage) free_mem(storage);
+    if (!result) memset(out, 0, sizeof(*out));
+    return result;
+}
+
+/*
+ * Rename / move a file or directory entry.
+ *
+ * Only folder.desc entries are edited; file headers are never rewritten
+ * (that would rewrite the whole file). minimafs_open() overrides the
+ * header's filename/parent with the real ones from the path, so readers
+ * see the new name and the next write-back stores it.
+ *
+ * File handles that are already open keep the old path in handle->path
+ * (and use it for write-back), so renaming a file while it is open for
+ * writing makes its close fail to find it. Close files before renaming.
+ *
+ * A renamed directory gets its own folder.desc FOLDER: line updated.
+ * folder.desc files of its descendants keep their old, now stale, FOLDER:
+ * paths. That is cosmetic only: lookups walk entries by name from the
+ * root and never use the stored path.
+ *
+ * Moves between parents add the entry to the new parent first and remove
+ * it from the old one second, so a failure never loses the entry. A
+ * replaced destination file's blocks are freed only after the folder
+ * updates reached disk.
+ */
+bool minimafs_rename(const char* from, const char* to) {
+    if (!from || !to) return false;
+
+    bool result = false;
+
+    /* HEAP - six 1KB path buffers. */
+    char* storage = (char*)alloc_unzeroed(6 * MINIMAFS_MAX_PATH);
+    char* from_local  = storage;
+    char* to_local    = storage ? storage + 1 * MINIMAFS_MAX_PATH : NULL;
+    char* from_parent = storage ? storage + 2 * MINIMAFS_MAX_PATH : NULL;
+    char* to_parent   = storage ? storage + 3 * MINIMAFS_MAX_PATH : NULL;
+    char* from_name   = storage ? storage + 4 * MINIMAFS_MAX_PATH : NULL;
+    char* to_name     = storage ? storage + 5 * MINIMAFS_MAX_PATH : NULL;
+    minimafs_folder_desc_t* sd = NULL;   /* source parent */
+    minimafs_folder_desc_t* dd = NULL;   /* destination parent (== sd if same parent) */
+    minimafs_folder_desc_t* td = NULL;   /* renamed directory's own desc */
+
+    uint8_t from_drive_num = 0, to_drive_num = 0;
+    minimafs_drive_t* drive = NULL;
+    minimafs_drive_t* to_drive = NULL;
+    uint32_t src_idx = 0, dst_idx = 0;
+    minimafs_dir_entry_t src, old_dst;
+    bool src_is_dir = false;
+    bool has_dst = false;
+    bool same_parent = false;
+    size_t from_len = 0, name_len = 0;
+
+    if (!storage) {
+        serial_write_str("MinimaFS: OOM in minimafs_rename\n");
+        goto cleanup;
+    }
+
+    drive    = minimafs_resolve_path(from, &from_drive_num, from_local);
+    to_drive = minimafs_resolve_path(to,   &to_drive_num,   to_local);
+    if (!drive || !to_drive || from_drive_num != to_drive_num) goto cleanup;
+
+    /* The root can be neither moved nor replaced */
+    if (from_local[1] == '\0' || to_local[1] == '\0') goto cleanup;
+
+    /* Not into itself or its own subtree */
+    from_len = strlen(from_local);
+    if (strncmp(to_local, from_local, from_len) == 0 && to_local[from_len] == '/')
+        goto cleanup;
+
+    minimafs_split_local_path(from_local, from_parent, from_name);
+    minimafs_split_local_path(to_local,   to_parent,   to_name);
+
+    /* New name must be storable in a folder.desc entry line */
+    name_len = strlen(to_name);
+    if (name_len == 0 || name_len >= MINIMAFS_MAX_ENTRY_NAME ||
+        strchr(to_name, ',') || strchr(to_name, '\n'))
+        goto cleanup;
+    /* "." and ".." are path components, never names (callers that did not
+     * normalize the path first would otherwise store them as entries). */
+    if (strcmp(to_name, ".") == 0 || strcmp(to_name, "..") == 0) goto cleanup;
+    if (strlen(from_name) >= MINIMAFS_MAX_ENTRY_NAME) goto cleanup;
+
+    same_parent = strcmp(from_parent, to_parent) == 0;
+
+    /* HEAP - descs must never live on the stack */
+    sd = acquire_folder_desc();
+    if (!sd) goto cleanup;
+    if (!minimafs_read_folder_desc(drive, from_parent, sd)) goto cleanup;
+    if (!minimafs_find_entry_in_folder(sd, from_name, &src_idx)) goto cleanup;
+    src = sd->entries[src_idx];
+    src_is_dir = (src.type == MINIMAFS_TYPE_DIR);
+
+    if (same_parent) {
+        dd = sd;
+    } else {
+        dd = acquire_folder_desc();
+        if (!dd) goto cleanup;
+        /* Fails if the destination parent does not exist or is not a
+         * directory (folder walks only follow DIR entries). */
+        if (!minimafs_read_folder_desc(drive, to_parent, dd)) goto cleanup;
+    }
+
+    has_dst = minimafs_find_entry_in_folder(dd, to_name, &dst_idx);
+    if (same_parent && has_dst && dst_idx == src_idx) {
+        result = true;              /* same name: nothing to do */
+        goto cleanup;
+    }
+    if (has_dst) {
+        old_dst = dd->entries[dst_idx];
+        /* Only file over file may replace */
+        if (old_dst.type == MINIMAFS_TYPE_DIR || src_is_dir) goto cleanup;
+    }
+
+    if (same_parent) {
+        if (has_dst) {
+            /* Drop the replaced entry; its blocks are freed after the write */
+            for (uint32_t i = dst_idx; i + 1 < sd->entry_count; i++)
+                sd->entries[i] = sd->entries[i + 1];
+            sd->entry_count--;
+            if (dst_idx < src_idx) src_idx--;
+        }
+        memcpy(sd->entries[src_idx].name, to_name, name_len + 1);
+        if (!minimafs_write_folder_desc(drive, sd)) goto cleanup;
+    } else {
+        minimafs_dir_entry_t moved = src;
+        memcpy(moved.name, to_name, name_len + 1);
+
+        if (has_dst) {
+            dd->entries[dst_idx] = moved;        /* replaces: count unchanged */
+        } else {
+            if (dd->entry_count >= MINIMAFS_MAX_ROOT_ENTRIES) {
+                serial_write_str("MinimaFS: rename failed, destination folder full\n");
+                goto cleanup;
+            }
+            dd->entries[dd->entry_count++] = moved;
+        }
+
+        /* 1. add to the new parent. If this fails (including "folder.desc
+         *    too large") nothing was removed anywhere. */
+        if (!minimafs_write_folder_desc(drive, dd)) goto cleanup;
+
+        /* 2. remove from the old parent */
+        for (uint32_t i = src_idx; i + 1 < sd->entry_count; i++)
+            sd->entries[i] = sd->entries[i + 1];
+        sd->entry_count--;
+
+        if (!minimafs_write_folder_desc(drive, sd)) {
+            /* Undo step 1 so the entry is not left in both parents */
+            if (has_dst) dd->entries[dst_idx] = old_dst;
+            else         dd->entry_count--;
+            if (!minimafs_write_folder_desc(drive, dd))
+                serial_write_str("MinimaFS: WARNING rename rollback failed, entry present in both folders\n");
+            goto cleanup;
+        }
+    }
+
+    /* The folder updates are on disk; now release the replaced file */
+    if (has_dst && old_dst.block_count > 0)
+        block_free_run(from_drive_num, old_dst.block_offset, old_dst.block_count);
+
+    /* Renamed directory: update its own folder.desc path (best effort,
+     * cosmetic - see comment above). */
+    if (src_is_dir) {
+        td = acquire_folder_desc();
+        if (td && minimafs_read_folder_desc(drive, to_local, td)) {
+            strncpy(td->path, to_local, sizeof(td->path) - 1);
+            td->path[sizeof(td->path) - 1] = '\0';
+            if (!minimafs_write_folder_desc(drive, td))
+                serial_write_str("MinimaFS: rename: could not update directory path\n");
+        }
+    }
+
+    minimafs_refresh_storage_desc(drive);
+    result = true;
+
+    cleanup:
+    if (td) release_folder_desc(td);
+    if (dd && dd != sd) release_folder_desc(dd);
+    if (sd) release_folder_desc(sd);
+    if (storage) free_mem(storage);
+    return result;
 }
 
 uint32_t minimafs_list_dir(const char* path, minimafs_dir_entry_t* entries,

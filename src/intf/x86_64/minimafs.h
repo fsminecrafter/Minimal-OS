@@ -307,6 +307,36 @@ bool minimafs_exists(const char* path);
  */
 bool minimafs_is_dir(const char* path);
 
+/**
+ * Cheap metadata snapshot (reads only the folder entry and, for files,
+ * the first block of the file).
+ */
+typedef struct {
+    bool is_dir;
+    uint64_t size;            // data bytes (0 for directories)
+    bool hidden;
+    bool runnable;
+    char created_date[32];    // as stored ("12Nov2026"), "" if unknown
+    char last_changed[32];
+} minimafs_stat_t;
+
+/**
+ * Stat a file or directory.
+ * @param path Full path
+ * @param out Output
+ * @return false if the path does not exist or the drive is not mounted
+ */
+bool minimafs_stat(const char* path, minimafs_stat_t* out);
+
+/**
+ * Rename/move a file or directory within one drive. Both paths must be
+ * fully qualified on the same drive. An existing destination file is
+ * replaced (when the source is a file too); an existing destination
+ * directory makes the call fail.
+ * @return true on success
+ */
+bool minimafs_rename(const char* from, const char* to);
+
 // ===========================================
 // UTILITY FUNCTIONS
 // ===========================================

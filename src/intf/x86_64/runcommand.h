@@ -2,6 +2,8 @@
 #define RUNCOMMAND_H
 
 #include <stddef.h>
+#include <stdint.h>
+#include <stdbool.h>
 #include "x86_64/proc.h"
 
 /*
@@ -34,5 +36,25 @@ const char* run_normalize_path(const char* input, char* normalized, size_t norma
 // Returns the new process, or NULL on failure (bad path, malformed
 // archive/ELF, too many/too-long arguments, or OOM).
 process_t* run_launch_file(const char* run_path, int extra_argc, const char** extra_argv);
+
+typedef struct stdio_sink stdio_sink_t;
+
+// Everything run_launch_ex() can set up for a new program.
+typedef struct {
+    const char* path;             // fully qualified: a .run bundle or an ELF file
+    uint32_t argc;                // argv exactly as the program sees it;
+    const char* const* argv;      // argc 0 means { path }
+    const char* env;              // packed "A=1\0B=2\0" (copied), or NULL
+    uint32_t env_len;
+    const char* cwd;              // working directory (copied); NULL = terminal's
+    stdio_sink_t* out_sink;       // output sinks; the references move to the
+    stdio_sink_t* err_sink;       // program, and are dropped if launching fails
+    uint64_t parent_pid;          // 0 = the calling process
+    bool wait_record;             // its parent may SYS_WAIT for it
+    bool terminal_foreground;     // the terminal treats it as the program it runs
+} run_launch_t;
+
+// The general form of run_launch_file(), used by SYS_SPAWN and SYS_EXEC.
+process_t* run_launch_ex(const run_launch_t* launch);
 
 #endif // RUNCOMMAND_H

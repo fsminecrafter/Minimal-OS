@@ -589,11 +589,12 @@ ci-os0:
 
 .PHONY: test-host
 test-host: build/tests/host/gfx_blit_tests build/tests/host/fgpu_raster_tests build/tests/host/fgsl_tests \
-		build/tests/host/fgpu_ir_tests build/tests/host/nv_hw_tests build/tests/host/nv_sass_tests \
+		build/tests/host/fgpu_bin_tests build/tests/host/fgpu_ir_tests build/tests/host/nv_hw_tests build/tests/host/nv_sass_tests \
 		build/tests/host/video_gpu_tests build/tests/host/audio_stream_tests build/tests/host/hid_mouse_tests \
 		build/tests/host/media_tests build/tests/host/media_parallel_tests build/tests/host/os0_tests
 	./build/tests/host/gfx_blit_tests
 	./build/tests/host/fgpu_raster_tests
+	./build/tests/host/fgpu_bin_tests
 	./build/tests/host/fgsl_tests
 	./build/tests/host/fgpu_ir_tests
 	./build/tests/host/nv_hw_tests
@@ -616,6 +617,20 @@ build/tests/host/hid_mouse_tests: tests/host/hid_mouse_tests.c src/modules/USB/h
 build/tests/host/fgpu_raster_tests: tests/host/fgpu_raster_tests.c src/modules/GPU/fgpu_raster.c src/modules/GPU/fgpu_shader.c
 	mkdir -p $(dir $@)
 	$(HOSTCC) $(HOST_CFLAGS) $(filter %.c,$^) -lm -o $@
+
+# Binned vs immediate rasterizer: differential fuzz, watertightness, budget and failure tests.
+build/tests/host/fgpu_bin_tests: tests/host/fgpu_bin_tests.c src/modules/GPU/fgpu_raster.c src/modules/GPU/fgpu_shader.c Minimal-OS-SDK/include/fglsl.h
+	mkdir -p $(dir $@)
+	$(HOSTCC) $(HOST_CFLAGS) -idirafter Minimal-OS-SDK/include $(filter %.c,$^) -lm -lpthread -o $@
+
+# Rasterizer benchmark (immediate vs binned, 1 and N threads); not part of test-host.
+.PHONY: bench-fgpu
+bench-fgpu: build/tests/host/fgpu_bench
+	./build/tests/host/fgpu_bench
+
+build/tests/host/fgpu_bench: tests/host/fgpu_bench.c src/modules/GPU/fgpu_raster.c src/modules/GPU/fgpu_shader.c Minimal-OS-SDK/include/fglsl.h
+	mkdir -p $(dir $@)
+	$(HOSTCC) $(HOST_CFLAGS) -O2 -idirafter Minimal-OS-SDK/include $(filter %.c,$^) -lm -lpthread -Wl,--wrap=fgpu_shader_run_batch -o $@
 
 # FGSL compiler (SDK) + shader checker/machine + rasterizer, end to end.
 build/tests/host/fgsl_tests: tests/host/fgsl_tests.c src/modules/GPU/fgpu_raster.c src/modules/GPU/fgpu_shader.c Minimal-OS-SDK/include/fglsl.h Minimal-OS-SDK/include/fgpu_abi.h

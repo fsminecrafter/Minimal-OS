@@ -61,6 +61,98 @@ back/front face culling, wireframe, fragment stage and alpha blending.
 The built-in programs (vertex color, Gouraud, per-pixel Phong with
 Blinn-Phong highlights) are hard-wired C code.
 
+#### Binned rasterizer (default)
+
+Draws are not drawn when they are submitted. `fgpu_raster.c` records them in
+a pass (`fgpu_pass_t`: one render target at a time) with a snapshot of
+everything they depend on, and renders the pass at a flush:
+
+1. **Record.** A draw stores its pipeline state, uniforms, shader constants and
+   vertex layout (copied, and deduplicated against the last 8 states), the
+   viewport clipped to the target, and pointers to its vertex and index data.
+   A full clear at the start of a pass is not executed: it is remembered
+   and merged into the tile stage. Lines (`FGPU_STATE_WIREFRAME`) and draws
+   that sample the surface they draw into are not recorded; they flush the
+   pass and run through the immediate path, so submission order holds.
+2. **Geometry** (one parallel phase). Workers take *items* (up to 32
+   triangles of one draw) from an atomic counter. An item shades its vertices
+   with all 8 shader lanes full (built-in programs run a cut-down vertex stage
+   that computes only what the fragment stage reads), clips against the near
+   plane (and, for triangles that reach beyond +-32768 px, against a
+   guard band in screen space), culls, transforms, snaps the vertices to
+   **16.8 fixed point** and sets up integer edge functions (top-left rule, exact
+   and independent of the order the pixels are visited in). The triangle record
+   and its bin entries go into the worker's arena and are added to the bin list
+   of every 64x64 tile the triangle may cover (long thin triangles are tested
+   against each tile). Lists are per worker and per tile.
+3. **Tiles** (one parallel phase). Workers take tiles from an atomic counter.
+   A tile merges the per-worker lists by item number, which restores the
+   submission order exactly (blending and depth-equal results are the same as
+   one core drawing in order), loads color and depth into a local 64x64 copy
+   (or fills it from the pending clear: a tile that only needs the clear is
+   written straight to the target), rasterizes, and stores the copy back.
+   Triangles with a bounding box of at most 400 pixels (this includes the
+   2x2-pixel case) evaluate their edge functions directly at the sample
+   centers. Bigger ones walk 8x8 blocks: a block is rejected, or accepted without
+   per-pixel coverage tests, from the edge functions at its corners, and
+   with depth testing a block is also rejected when the triangle's nearest depth
+   in the block is behind the farthest depth stored there (**hierarchical Z**,
+   min/max per block, kept conservative as pixels are written) or its depth
+   test is skipped when it is entirely in front. A tile entirely inside a
+   triangle skips the coverage tests.
+4. Fragments of consecutive triangles with the same state are shaded in
+   batches of 8 lanes (the shader interface is unchanged); shaders that can
+   `discard` flush per triangle so a later triangle sees the final depth.
+
+**Memory.** Records and bins come from the heap (`fgpu_raster_set_allocator`; the
+kernel passes `alloc_unzeroed`/`free_mem`) in 64 KB chunks that the main thread
+allocates before each phase (nothing allocates inside a parallel phase). Bin
+memory is bounded by a budget (8 MB, `fgpu_raster_set_bin_budget`). The geometry
+stage runs in *rounds*; when a round does not fit, the items that did are
+rasterized and the rest goes to the next round. An allocation failure doubles the
+pool if the budget allows, and as a last resort an item is drawn by the immediate
+path: a draw never fails because bins are full.
+
+**Flush points.** The rasterizer flushes by itself when the target changes
+(`fgpu_pass_clear/draw` with another color or depth buffer), when a clear comes
+after draws, when a draw is a line or reads its own target, when 65536 draws or
+2^24 items are pending, and when memory for the record runs out. The kernel
+(`fgpu.c`) flushes at the end of every `SYS_GPU_SUBMIT` (so the triangle count it
+returns is exact and nothing is pending between system calls), before the hardware
+backend gets a clear or a draw, at the start of every other `SYS_GPU` operation
+(readback, present, buffer upload, surface or buffer or program create and destroy,
+`WRITE_SURFACE`), and `fgpu_process_exit` drops what a dead process left pending.
+Pipeline state, uniforms and constants are snapshotted, so changing them between
+draws needs no flush; vertex buffers, index buffers, textures and shader programs are
+referenced, which is why every operation that writes or frees them flushes first.
+`FGPU_DRAW_COPY` copies vertex and index data at record time for callers whose
+memory does not stay put.
+
+**Results.** Coverage, depth tests, interpolated values and blending order are
+bit-identical to the immediate path whenever the immediate path evaluates its float
+edge functions exactly, which is the case when vertices sit on a coarse grid (the
+differential test generates such scenes). Otherwise they differ at the borders of
+triangles: the immediate path computes edges in float with an accumulating row
+step, and the binned path snaps vertices to 1/256 pixel and computes edges exactly,
+so a sample very close to an edge can fall on the other side, and interpolated depth
+and attributes move by the snapping (a few parts in 1e5; for slivers more). The
+binned path is the more accurate of the two (the shared-edge meshes of the
+watertightness test are covered exactly once; the immediate path has no such
+guarantee). Vertices are clamped as before.
+
+**Mode switch.** `fgpu_raster_set_mode(FGPU_RASTER_IMMEDIATE)` selects the previous
+rasterizer (one barrier per draw, scalar); the kernel does this with the `fgpuold`
+boot flag (GRUB entry "Minimal-OS (RamFS, fgpuold)", two above the last entry).
+The host benchmark (`make bench-fgpu`) and the differential tests use the switch.
+
+**Not done yet (OS-4).** Preemptible kernel worker threads instead of `smp_par`,
+per-process contexts instead of `g_busy`, and asynchronous submit with fences. The
+pass is per target and everything it keeps (workers' scratch, chunk pool, bin lists)
+sits in the pass, not in globals, so a context per process can own one pass; the
+kernel currently has a single pass guarded by `g_busy`. Deferring draws across
+submits only needs the flush points above to stay (they are already called), plus
+an exact triangle count some other way.
+
 ### Shader machine
 
 Shaders are FGPU bytecode (described at the end of `fgpu_abi.h`): vec4

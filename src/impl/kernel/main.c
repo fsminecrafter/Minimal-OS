@@ -16,6 +16,7 @@
 #include "x86_64/idt.h"
 #include "x86_64/gdt.h"
 #include "x86_64/gpu.h"
+#include "x86_64/fgpu.h"
 #include "x86_64/gpu_manager.h"
 #include "x86_64/gpucore.h"
 #include "time.h"
@@ -110,6 +111,7 @@ void kernel_main(uint64_t mb2_info_addr) {
     kernel_boot_no_disk = multiboot2_has_cmdline_token(mb_info, "no-disk");
     kernel_boot_debug = multiboot2_has_cmdline_token(mb_info, "--debug");
     kernel_boot_serial_echo = multiboot2_has_cmdline_token(mb_info, "serial-echo");
+    kernel_boot_fgpuold = multiboot2_has_cmdline_token(mb_info, "fgpuold");
     {
         char mib[12];
         bool sized = multiboot2_get_cmdline_value(mb_info, "ramfs=", mib, sizeof(mib));

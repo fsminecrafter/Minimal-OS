@@ -75,12 +75,40 @@ static const fgpu_backend_t* g_hw;
 static const char* g_hw_why = "not chosen yet";
 static bool g_hw_pending;               // GPU work queued since the last finish()
 
+/* CPU draws are recorded in a pass and rendered at flush (fgpu_raster.h,
+ * docs/gpu.md "Binned rasterizer"). Flush points, all under g_busy: the end of
+ * every SUBMIT (so the reported triangle count is exact and nothing stays
+ * pending between syscalls), before the hardware backend gets a clear or
+ * draw (CPU draws recorded earlier must land first), and at the start of
+ * every other SYS_GPU operation (readback, present, uploads, destroys,
+ * program changes) and process exit, which read, write or free what pending
+ * draws point at. A target switch inside a SUBMIT is a flush point inside
+ * the rasterizer (a pass renders one target at a time). */
+bool kernel_boot_fgpuold;
+static fgpu_pass_t* g_pass;
+static void hw_sync_for_cpu(void);
+
+// Renders the recorded CPU draws; returns the triangles drawn since the last flush.
+static uint32_t pass_flush(void) {
+    if (!g_pass) return 0;
+    if (fgpu_pass_pending(g_pass)) hw_sync_for_cpu();
+    return fgpu_pass_flush(g_pass);
+}
+
+void fgpu_flush_pending(void) {
+    pass_flush();
+}
+
 // The CPU backend draws on every core (smp_par.h).
 _Static_assert(SMP_PAR_MAX_WORKERS <= FGPU_RASTER_MAX_WORKERS, "worker numbers must fit the rasterizer");
 static const fgpu_parallel_t k_parallel = { smp_par_workers, smp_par_run };
 
 void fgpu_backend_select(void) {
     fgpu_raster_set_parallel(&k_parallel);
+    fgpu_raster_set_allocator(alloc_unzeroed, free_mem);
+    fgpu_raster_set_mode(kernel_boot_fgpuold ? FGPU_RASTER_IMMEDIATE : FGPU_RASTER_BINNED);
+    serial_write_str(kernel_boot_fgpuold ? "fgpu: CPU rasterizer: immediate (fgpuold)\n"
+                                         : "fgpu: CPU rasterizer: binned\n");
     g_hw = NULL;
     gpu_adapter_t* a = gpu_primary_adapter();
     if (!a) { g_hw_why = "no GPU adapter"; return; }
@@ -128,6 +156,8 @@ static void hw_sync(void) {
     if (g_hw && g_hw_pending) g_hw->finish();
     g_hw_pending = false;
 }
+
+static void hw_sync_for_cpu(void) { hw_sync(); }
 
 static fgpu_mem_t surface_mem(const fgpu_surface_t* s) {
     fgpu_mem_t m = { 0 };
@@ -288,6 +318,8 @@ void fgpu_process_exit(uint64_t pid) {
         return;
     }
     g_busy_owner = pid;
+    // Draws recorded by a process that died mid-submit are dropped, not drawn.
+    if (g_pass) fgpu_pass_discard(g_pass);
     hw_sync();
     if (g_flipped_owner == pid) release_flip_locked();
     for (int i = 0; i < FGPU_MAX_SURFACES; i++) {
@@ -392,12 +424,15 @@ static uint64_t execute(exec_state_t* st, const uint32_t* cmd, uint32_t words) {
                 memcpy(&depth, &arg[2], sizeof(depth));
                 fgpu_hw_target_t ht;
                 make_hw_target(st, &t, &ht);
-                if (g_hw && g_hw->clear(&ht, arg[0], arg[1], depth)) {
-                    g_hw_pending = true;
-                    break;
+                if (g_hw) {
+                    st->triangles += pass_flush();      // CPU draws recorded earlier come first
+                    if (g_hw->clear(&ht, arg[0], arg[1], depth)) {
+                        g_hw_pending = true;
+                        break;
+                    }
                 }
-                hw_sync();
-                fgpu_raster_clear(&t, arg[0], arg[1], depth);
+                if (g_pass) fgpu_pass_clear(g_pass, &t, arg[0], arg[1], depth);
+                else { hw_sync(); fgpu_raster_clear(&t, arg[0], arg[1], depth); }
                 break;
             }
             case FGPU_OP_SET_STATE:
@@ -491,6 +526,7 @@ static uint64_t execute(exec_state_t* st, const uint32_t* cmd, uint32_t words) {
                 }
                 // A shader the backend could not compile runs on the CPU.
                 if (g_hw && (!st->pipe.shader || st->hw_program)) {
+                    st->triangles += pass_flush();      // CPU draws recorded earlier come first
                     fgpu_hw_target_t ht;
                     make_hw_target(st, &t, &ht);
                     fgpu_hw_draw_t hd = {
@@ -510,15 +546,16 @@ static uint64_t execute(exec_state_t* st, const uint32_t* cmd, uint32_t words) {
                         break;
                     }
                 }
-                hw_sync();
-                if (ib) {
-                    st->triangles += fgpu_raster_draw_layout(&t, &st->pipe, layout, verts, avail,
-                                                             (const uint32_t*)ib->mem + d.first_index,
-                                                             d.index_count);
+                // Recorded now, drawn at the next flush (pipeline state, uniforms and
+                // constants are snapshotted; buffers, textures and programs are
+                // kept alive by the flush points above).
+                const uint32_t* idx = ib ? (const uint32_t*)ib->mem + d.first_index : NULL;
+                uint32_t count = ib ? d.index_count : (d.vertex_count < avail ? d.vertex_count : avail);
+                if (g_pass) {
+                    fgpu_pass_draw_layout(g_pass, &t, &st->pipe, layout, verts, avail, idx, count, 0);
                 } else {
-                    uint32_t count = d.vertex_count < avail ? d.vertex_count : avail;
-                    st->triangles += fgpu_raster_draw_layout(&t, &st->pipe, layout, verts, avail,
-                                                             NULL, count);
+                    hw_sync();
+                    st->triangles += fgpu_raster_draw_layout(&t, &st->pipe, layout, verts, avail, idx, count);
                 }
                 break;
             }
@@ -751,7 +788,9 @@ static uint64_t fgpu_syscall_checked(syscall_gpu_request_t* r) {
     __asm__ volatile("sti");
     lock();
     // Everything but SUBMIT has the CPU read or write GPU memory (or free it).
-    if (r->op != SYS_GPU_SUBMIT) hw_sync();
+    // Nothing is normally pending between syscalls (SUBMIT flushes at its end);
+    // this keeps that true if a later change defers work across submits.
+    if (r->op != SYS_GPU_SUBMIT) { fgpu_flush_pending(); hw_sync(); }
     uint64_t result = SYS_ERR_INVAL;
     switch (r->op) {
         case SYS_GPU_CREATE_SURFACE:
@@ -804,7 +843,9 @@ static uint64_t fgpu_syscall_checked(syscall_gpu_request_t* r) {
             st->pipe.program = FGPU_PROGRAM_COLOR;
             st->pipe.constants = (const float (*)[4])st->constants;
             fgpu_layout_default(&st->layout);
+            if (!g_pass) g_pass = fgpu_pass_create();     // NULL: draws run immediately
             result = execute(st, cmd, (uint32_t)(r->bytes / 4));
+            st->triangles += pass_flush();      // also when the buffer failed half way
             r->handle = st->triangles;
             free_mem(st);
             free_mem(cmd);

@@ -1,7 +1,7 @@
 From 2e82237589087ab693de903c6f03a762ad044a3e Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Thu, 12 Nov 2026 23:47:54 +0000
-Subject: [PATCH 1/5] OS-0: futex, TLS, clocks, stat/rename/chdir, spawn/wait,
+Subject: [PATCH 1/6] OS-0: futex, TLS, clocks, stat/rename/chdir, spawn/wait,
  environment
 
 syscall.h gains the kernel's new calls (SYS_FUTEX, SYS_CLOCK, SYS_STAT,
@@ -2796,7 +2796,7 @@ index 0000000..0ab1bc6
 From e793506e96b03a88fbee6574f7e1c22bed23ce80 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Fri, 13 Nov 2026 07:12:41 +0000
-Subject: [PATCH 2/5] os0test: checks for bad pointers, failed spawns, relative
+Subject: [PATCH 2/6] os0test: checks for bad pointers, failed spawns, relative
  exec, clock reads
 
 Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
@@ -2977,7 +2977,7 @@ index 0ab1bc6..8c7b36f 100644
 From ff1f09af3a14b89df6cb787d107f06d4ea5587a6 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Fri, 13 Nov 2026 07:30:24 +0000
-Subject: [PATCH 3/5] SYS_VM: vm.h, VM-backed thread stacks, spawn stack size,
+Subject: [PATCH 3/6] SYS_VM: vm.h, VM-backed thread stacks, spawn stack size,
  os0test VM checks
 
 vm.h wraps the kernel's SYS_VM (map, unmap, protect, decommit, reserve and
@@ -4623,7 +4623,7 @@ index 8c7b36f..f24dbc2 100644
 From eb1dc7f8a3ca14f9be1502f413346769aa0357d2 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Fri, 13 Nov 2026 12:07:53 +0000
-Subject: [PATCH 4/5] CPU features in SYSINFO; os0test SIMD state checks
+Subject: [PATCH 4/6] CPU features in SYSINFO; os0test SIMD state checks
 
 mos_sysinfo_cpu_features(), mos_sysinfo_xcr0() and mos_cpu_has() report
 what the CPU has and the OS has enabled. os0test loads patterns into the
@@ -5067,7 +5067,7 @@ index f24dbc2..a0dab54 100644
 From cabe10d10c23c0a8c31cb36e3e1c77c8ecaf9754 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Fri, 13 Nov 2026 12:12:35 +0000
-Subject: [PATCH 5/5] os0test: bad-pointer checks across the system calls
+Subject: [PATCH 5/6] os0test: bad-pointer checks across the system calls
 
 Each family of calls is given an unmapped address, a kernel address, a
 no-access mapping, a read-only mapping as output and a buffer that runs
@@ -5616,6 +5616,73 @@ index a0dab54..1a90bd3 100644
      test_spawn_failure_cleanup();
      test_exec_relative();
      test_vm();
+-- 
+2.43.0
+
+
+From 77a1932e99ae63987c8bf692e5cb21d3fc436885 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 13 Nov 2026 17:36:41 +0000
+Subject: [PATCH 6/6] fglcube: --still freezes the animation and prints FGLCUBE
+ READY
+
+For screenshot tests (tools/debug/ci_fglcube.sh in Minimal-OS).
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0112xJofPtaNLntSK14Rcenm
+---
+ programs/fglcube/main.c | 11 ++++++++---
+ 1 file changed, 8 insertions(+), 3 deletions(-)
+
+diff --git a/programs/fglcube/main.c b/programs/fglcube/main.c
+index 2567d1d..05fd546 100644
+--- a/programs/fglcube/main.c
++++ b/programs/fglcube/main.c
+@@ -2,8 +2,11 @@
+  * fglcube - a rotating, lit cube drawn with FarcadeGL.
+  *
+  *     ./build.sh programs/fglcube        -> fglcube.run
+- *     fglcube [seconds] [--gouraud|--flat|--wire|--shader]
++ *     fglcube [seconds] [--gouraud|--flat|--wire|--shader] [--still]
+  *
++ * --still freezes the animation at one fixed time and prints "FGLCUBE READY"
++ * once the first frame is shown (tools/debug/ci_fglcube.sh takes a screenshot
++ * then and compares renderings between CPU rasterizer modes).
+  * --shader draws the scene with FGSL shaders instead of the built-in
+  * programs: a textured cube with per-pixel lighting and a pulsing rim
+  * glow, on a floor with a checker pattern computed per pixel.
+@@ -106,12 +109,13 @@ static void number(char* out, long v) {
+ int main(int argc, char** argv) {
+     long seconds = 0;
+     uint32_t program = FGL_PROGRAM_PHONG;
+-    int wire = 0, shaded = 0;
++    int wire = 0, shaded = 0, still = 0;
+     for (int i = 1; i < argc; i++) {
+         if (strcmp(argv[i], "--gouraud") == 0) program = FGL_PROGRAM_GOURAUD;
+         else if (strcmp(argv[i], "--flat") == 0) program = FGL_PROGRAM_COLOR;
+         else if (strcmp(argv[i], "--wire") == 0) wire = 1;
+         else if (strcmp(argv[i], "--shader") == 0) shaded = 1;
++        else if (strcmp(argv[i], "--still") == 0) still = 1;
+         else seconds = atoi(argv[i]);
+     }
+ 
+@@ -199,7 +203,7 @@ int main(int argc, char** argv) {
+     long frames = 0, fps_frames = 0;
+     while (!g_quit) {
+         long now = mos_uptime();
+-        float t = (float)(now - start) / 1000.0f;
++        float t = still ? 1.2f : (float)(now - start) / 1000.0f;
+ 
+         fglClearColor(gl, 0.06f, 0.08f, 0.13f);
+         fglClear(gl, FGL_COLOR_BUFFER_BIT | FGL_DEPTH_BUFFER_BIT);
+@@ -234,6 +238,7 @@ int main(int argc, char** argv) {
+         }
+         frames++;
+         fps_frames++;
++        if (still && frames == 3) printf("FGLCUBE READY\n");
+ 
+         if (now - last_title >= 1000) {
+             char text[64] = "FarcadeGL cube - ";
 -- 
 2.43.0
 

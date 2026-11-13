@@ -54,6 +54,13 @@ static inline void space_unlock(uvm_space_t* s, uint64_t flags) {
     __asm__ volatile("pushq %0; popfq" :: "r"(flags) : "memory", "cc");
 }
 
+// System calls run with interrupts off. Loops over many pages open a
+// window for them now and then, so that a call working through gigabytes
+// does not starve the timer (and trip the hang watchdog).
+static inline void let_interrupts_in(void) {
+    __asm__ volatile("pushfq; sti; nop; nop; popfq" ::: "memory", "cc");
+}
+
 static uvm_space_t* space_of(process_t* proc) {
     proc = proc_mem_owner(proc);
     return proc ? proc->uvm : NULL;
@@ -368,6 +375,7 @@ uint64_t uvm_map(process_t* proc, uint64_t addr, uint64_t len, uint32_t prot, ui
             irq = space_lock(s);
             bool ok = frame_for(s, page, prot) != NULL;
             space_unlock(s, irq);
+            if (page > start && !(page & (UVM_CHUNK - 1))) let_interrupts_in();
             if (!ok) {
                 uvm_unmap(proc, start, len);
                 return SYS_ERR_NOMEM;
@@ -402,6 +410,7 @@ uint64_t uvm_unmap(process_t* proc, uint64_t addr, uint64_t len) {
         spare = carve(s, at, piece_end, spare);
         for_each_frame(s, at, piece_end, release_frame, 0);
         space_unlock(s, irq);
+        let_interrupts_in();
         at = piece_end;
     }
 
@@ -456,6 +465,7 @@ uint64_t uvm_protect(process_t* proc, uint64_t addr, uint64_t len, uint32_t prot
             for_each_frame(s, lo, hi, reprotect_frame, a->prot);
         }
         space_unlock(s, irq);
+        let_interrupts_in();
         at = piece_end;
     }
     if (spare1) free_mem(spare1);
@@ -477,6 +487,7 @@ uint64_t uvm_decommit(process_t* proc, uint64_t addr, uint64_t len) {
         irq = space_lock(s);
         for_each_frame(s, at, piece_end, release_frame, 0);
         space_unlock(s, irq);
+        let_interrupts_in();
         at = piece_end;
     }
     return SYS_SUCCESS;
@@ -502,6 +513,9 @@ bool uvm_range_ok(process_t* proc, const void* ptr, size_t len, bool write) {
         uvm_area_t* a = area_at(s, page);
         bool ok = a && (a->prot & need) == need && frame_for(s, page, a->prot);
         space_unlock(s, irq);
+        // Only for ranges of 2 MiB and more: a caller with a small buffer may
+        // hold a lock of its own.
+        if (page - start >= UVM_CHUNK && !(page & (UVM_CHUNK - 1))) let_interrupts_in();
         if (!ok) return false;
     }
     return true;

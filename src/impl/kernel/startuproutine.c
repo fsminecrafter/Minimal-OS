@@ -18,6 +18,7 @@
 #include "x86_64/clock.h"
 #include "x86_64/ac97_driver.h"
 #include "x86_64/exec_trace.h"
+#include "x86_64/memlayout.h"
 
 #define HEAP_MIN_START 0x400000  // 4 MiB - fallback if kernel end is lower
 #define PMM_POOL_SIZE  0x4000000ULL
@@ -96,6 +97,7 @@ void startroutine(uint64_t region_start, uint64_t region_end) {
     serial_write_str("\n");
     allocator_init((void*)heap_start, uintheapsize);
     pmm_init((void*)pmm_start, pmm_end - pmm_start);
+    memlayout_add_high_ram(kernel_multiboot_info);
     print_str("PIT working!\n");
     clock_init();
     print_str("Init MMIO subsystem\n");

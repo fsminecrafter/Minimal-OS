@@ -25,6 +25,7 @@ typedef struct {
     fgpu_ir_t* ir;
     const fgpu_program_t* p;
     bool overflow;
+    bool exact;         // FGPU_IR_EXACT
     src_t temp[FGPU_SHADER_MAX_TEMPS][4];
     src_t out[1 + FGPU_SHADER_MAX_VARYINGS][4];
     src_t wait;         // instruction this thread resumes at (as a float)
@@ -113,7 +114,9 @@ static src_t imm(lw_t* w, float v) {
     return append(w, &in);
 }
 
-static bool commutative(uint32_t op) {
+static bool commutative(const lw_t* w, uint32_t op) {
+    // min/max are not symmetric for NaN and signed zeros.
+    if (w->exact && (op == FGPU_IR_MIN || op == FGPU_IR_MAX)) return false;
     return op == FGPU_IR_ADD || op == FGPU_IR_MUL || op == FGPU_IR_MIN || op == FGPU_IR_MAX ||
            op == FGPU_IR_SEQ || op == FGPU_IR_SNE;
 }
@@ -127,6 +130,7 @@ static bool fold(uint32_t op, const float* v, float* r) {
         case FGPU_IR_FMA:   *r = v[0] * v[1] + v[2]; return true;
         case FGPU_IR_MIN:   *r = v[0] < v[1] ? v[0] : v[1]; return true;
         case FGPU_IR_MAX:   *r = v[0] > v[1] ? v[0] : v[1]; return true;
+        case FGPU_IR_SUB:   *r = v[0] - v[1]; return true;
         case FGPU_IR_FLOOR: *r = floor_(v[0]); return true;
         case FGPU_IR_RCP:
             if (v[0] == 0.0f) return false;
@@ -165,6 +169,11 @@ static src_t op3(lw_t* w, uint32_t op, uint32_t n, src_t a, src_t b, src_t c) {
             if (is_imm(w, s[0])) return imm_of(w, s[0]) != 0.0f ? s[1] : s[2];
             if (same(s[1], s[2])) return s[1];
             break;
+        default:
+            break;
+    }
+    if (w->exact) goto canonical;   // the rest changes -0 / NaN results
+    switch (op) {
         case FGPU_IR_ADD:
             if (is_imm(w, s[1]) && imm_of(w, s[1]) == 0.0f) return s[0];
             if (is_imm(w, s[0]) && imm_of(w, s[0]) == 0.0f) return s[1];
@@ -195,8 +204,9 @@ static src_t op3(lw_t* w, uint32_t op, uint32_t n, src_t a, src_t b, src_t c) {
         default:
             break;
     }
+canonical:
     // A canonical order, so a + b and b + a are one value.
-    if (commutative(op) &&
+    if (commutative(w, op) &&
         (s[0].value > s[1].value || (s[0].value == s[1].value && s[0].mods > s[1].mods))) {
         src_t t = s[0]; s[0] = s[1]; s[1] = t;
     }
@@ -232,6 +242,11 @@ static src_t read(lw_t* w, uint32_t word, uint32_t comp) {
     uint32_t m = 0;
     if (word & FGPU_SRC_ABS) m |= FGPU_IR_ABS;
     if (word & FGPU_SRC_NEGATE) m |= FGPU_IR_NEG;
+    // The interpreter's abs is x < 0 ? -x : x and acts on the value the
+    // register holds. |-x| = |x| is false for x = +-0 (the stored -0 stays
+    // -0), so a pending negation is materialized (min(v, v) copies v) first.
+    if (w->exact && (m & FGPU_IR_ABS) && (s.mods & FGPU_IR_NEG) && !is_imm(w, s))
+        s = op3(w, FGPU_IR_MIN, 2, s, s, s);
     s = modify(s, m);
     if (m && is_imm(w, s)) s = imm(w, imm_of(w, s));
     return s;
@@ -252,23 +267,36 @@ static void write(lw_t* w, uint32_t d, uint32_t comp, src_t v) {
 
 // a / b with x / 0 = 0, as the CPU backend defines it.
 static src_t div_(lw_t* w, src_t a, src_t b) {
+    if (w->exact) {
+        src_t nz = op2(w, FGPU_IR_SNE, b, imm(w, 0.0f));
+        src_t q = op2(w, FGPU_IR_DIV, a, op3(w, FGPU_IR_SEL, 3, nz, b, imm(w, 1.0f)));
+        return op3(w, FGPU_IR_SEL, 3, nz, q, imm(w, 0.0f));
+    }
     src_t q = op2(w, FGPU_IR_MUL, a, op1(w, FGPU_IR_RCP, b));
     return op3(w, FGPU_IR_SEL, 3, op2(w, FGPU_IR_SNE, b, imm(w, 0.0f)), q, imm(w, 0.0f));
+}
+
+static src_t sub_(lw_t* w, src_t a, src_t b) {
+    return w->exact ? op2(w, FGPU_IR_SUB, a, b) : op2(w, FGPU_IR_ADD, a, neg(b));
 }
 
 static src_t atan2_(lw_t* w, src_t y, src_t x) {
     // atan(y / x) by range reduction and a polynomial, then the quadrant
     // (the same steps and coefficients as the CPU backend).
-    src_t r = op2(w, FGPU_IR_MUL, y, op1(w, FGPU_IR_RCP, x));
-    src_t ar = modify(r, FGPU_IR_ABS);
+    bool ex = w->exact;
+    src_t r = ex ? op2(w, FGPU_IR_DIV, y, x) : op2(w, FGPU_IR_MUL, y, op1(w, FGPU_IR_RCP, x));
+    // The interpreter negates (x < 0 ? -x : x), which keeps -0.
+    src_t ar = ex ? op3(w, FGPU_IR_SEL, 3, op2(w, FGPU_IR_SLT, r, imm(w, 0.0f)), neg(r), r)
+                  : modify(r, FGPU_IR_ABS);
     src_t inv = op2(w, FGPU_IR_SLT, imm(w, 1.0f), ar);
-    src_t z = op3(w, FGPU_IR_SEL, 3, inv, op1(w, FGPU_IR_RCP, ar), ar);
+    src_t z = op3(w, FGPU_IR_SEL, 3, inv,
+                  ex ? op2(w, FGPU_IR_DIV, imm(w, 1.0f), ar) : op1(w, FGPU_IR_RCP, ar), ar);
     src_t z2 = op2(w, FGPU_IR_MUL, z, z);
     static const float k[] = { 0.05265332f, -0.11643287f, 0.19354346f, -0.33262347f, 0.99997726f };
     src_t p = op3(w, FGPU_IR_FMA, 3, z2, imm(w, -0.01172120f), imm(w, k[0]));
     for (int i = 1; i < 5; i++) p = op3(w, FGPU_IR_FMA, 3, z2, p, imm(w, k[i]));
     p = op2(w, FGPU_IR_MUL, z, p);
-    p = op3(w, FGPU_IR_SEL, 3, inv, op2(w, FGPU_IR_ADD, imm(w, PI_F / 2), neg(p)), p);
+    p = op3(w, FGPU_IR_SEL, 3, inv, sub_(w, imm(w, PI_F / 2), p), p);
     src_t at = op3(w, FGPU_IR_SEL, 3, op2(w, FGPU_IR_SLT, r, imm(w, 0.0f)), neg(p), p);
     src_t zero = imm(w, 0.0f);
     src_t left = op3(w, FGPU_IR_SEL, 3, op2(w, FGPU_IR_SLE, zero, y),
@@ -285,14 +313,14 @@ static src_t lower_comp(lw_t* w, uint32_t op, src_t a, src_t b, src_t c) {
     switch (op) {
         case FGPU_SOP_MOV:   return a;
         case FGPU_SOP_ADD:   return op2(w, FGPU_IR_ADD, a, b);
-        case FGPU_SOP_SUB:   return op2(w, FGPU_IR_ADD, a, neg(b));
+        case FGPU_SOP_SUB:   return sub_(w, a, b);
         case FGPU_SOP_MUL:   return op2(w, FGPU_IR_MUL, a, b);
         case FGPU_SOP_DIV:   return div_(w, a, b);
         case FGPU_SOP_MAD:   return op3(w, FGPU_IR_FMA, 3, a, b, c);
         case FGPU_SOP_MIN:   return op2(w, FGPU_IR_MIN, a, b);
         case FGPU_SOP_MAX:   return op2(w, FGPU_IR_MAX, a, b);
         case FGPU_SOP_FLOOR: return op1(w, FGPU_IR_FLOOR, a);
-        case FGPU_SOP_FRACT: return op2(w, FGPU_IR_ADD, a, neg(op1(w, FGPU_IR_FLOOR, a)));
+        case FGPU_SOP_FRACT: return sub_(w, a, op1(w, FGPU_IR_FLOOR, a));
         case FGPU_SOP_SQRT:  return op1(w, FGPU_IR_SQRT, op2(w, FGPU_IR_MAX, a, zero));
         case FGPU_SOP_RSQ:
             return op3(w, FGPU_IR_SEL, 3, op2(w, FGPU_IR_SLT, zero, a), op1(w, FGPU_IR_RSQ, a), zero);
@@ -307,12 +335,16 @@ static src_t lower_comp(lw_t* w, uint32_t op, src_t a, src_t b, src_t c) {
         }
         case FGPU_SOP_SIN:   return op1(w, FGPU_IR_SIN, a);
         case FGPU_SOP_COS:   return op1(w, FGPU_IR_COS, a);
-        case FGPU_SOP_MIX:   return op3(w, FGPU_IR_FMA, 3, op2(w, FGPU_IR_ADD, b, neg(a)), c, a);
+        case FGPU_SOP_MIX:   return op3(w, FGPU_IR_FMA, 3, sub_(w, b, a), c, a);
         case FGPU_SOP_CLAMP: return op2(w, FGPU_IR_MIN, op2(w, FGPU_IR_MAX, a, b), c);
-        case FGPU_SOP_STEP:  return op2(w, FGPU_IR_SLE, a, b);
+        case FGPU_SOP_STEP:
+            // a < b ? 0 : 1 is 1 for NaN, unlike a <= b.
+            if (w->exact) return op3(w, FGPU_IR_SEL, 3, op2(w, FGPU_IR_SLT, b, a), zero, imm(w, 1.0f));
+            return op2(w, FGPU_IR_SLE, a, b);
         case FGPU_SOP_SSTEP: {
-            src_t d = op2(w, FGPU_IR_ADD, b, neg(a));
-            src_t q = op2(w, FGPU_IR_MUL, op2(w, FGPU_IR_ADD, c, neg(a)), op1(w, FGPU_IR_RCP, d));
+            src_t d = sub_(w, b, a);
+            src_t q = w->exact ? op2(w, FGPU_IR_DIV, sub_(w, c, a), d)
+                               : op2(w, FGPU_IR_MUL, sub_(w, c, a), op1(w, FGPU_IR_RCP, d));
             src_t t = op3(w, FGPU_IR_SEL, 3, op2(w, FGPU_IR_SNE, d, zero), q, op2(w, FGPU_IR_SLE, a, c));
             t = op2(w, FGPU_IR_MIN, op2(w, FGPU_IR_MAX, t, zero), imm(w, 1.0f));
             return op2(w, FGPU_IR_MUL, op2(w, FGPU_IR_MUL, t, t),
@@ -324,6 +356,11 @@ static src_t lower_comp(lw_t* w, uint32_t op, src_t a, src_t b, src_t c) {
         case FGPU_SOP_SNE:   return op2(w, FGPU_IR_SNE, a, b);
         case FGPU_SOP_SEL:   return op3(w, FGPU_IR_SEL, 3, a, b, c);
         case FGPU_SOP_MOD: {
+            if (w->exact) {
+                src_t f = op1(w, FGPU_IR_FLOOR, div_(w, a, b));
+                return op3(w, FGPU_IR_SEL, 3, op2(w, FGPU_IR_SNE, b, zero),
+                           sub_(w, a, op2(w, FGPU_IR_MUL, b, f)), zero);
+            }
             src_t f = op1(w, FGPU_IR_FLOOR, op2(w, FGPU_IR_MUL, a, op1(w, FGPU_IR_RCP, b)));
             return op3(w, FGPU_IR_SEL, 3, op2(w, FGPU_IR_SNE, b, zero),
                        op3(w, FGPU_IR_FMA, 3, neg(b), f, a), zero);
@@ -401,7 +438,8 @@ static void lower_inst(lw_t* w, const uint32_t* in) {
             for (uint32_t k = 0; k < 3; k++) { a[k] = read(w, in[2], k); b[k] = read(w, in[3], k); }
             for (uint32_t c = 0; c < 3; c++) {
                 uint32_t i = (c + 1) % 3, j = (c + 2) % 3;
-                res[c] = op3(w, FGPU_IR_FMA, 3, a[i], b[j], neg(op2(w, FGPU_IR_MUL, a[j], b[i])));
+                res[c] = w->exact ? sub_(w, op2(w, FGPU_IR_MUL, a[i], b[j]), op2(w, FGPU_IR_MUL, a[j], b[i]))
+                                  : op3(w, FGPU_IR_FMA, 3, a[i], b[j], neg(op2(w, FGPU_IR_MUL, a[j], b[i])));
             }
             res[3] = imm(w, 0.0f);
             break;
@@ -450,11 +488,17 @@ static void eliminate(fgpu_ir_t* ir) {
 /* ------------------------------------------------------------- lowering */
 
 bool fgpu_ir_lower(fgpu_ir_t* ir, const fgpu_program_t* p, bool fragment, const char** why) {
+    return fgpu_ir_lower_ex(ir, p, fragment, 0, why);
+}
+
+bool fgpu_ir_lower_ex(fgpu_ir_t* ir, const fgpu_program_t* p, bool fragment, uint32_t flags,
+                      const char** why) {
     const char* dummy;
     if (!why) why = &dummy;
     *why = "";
     if (!ir || !ir->code || !ir->hash || ir->capacity < 16 || !p) { *why = "no storage"; return false; }
     ir->count = 0;
+    ir->flags = flags;
     ir->fragment = fragment;
     ir->reg_count = 0;
     ir->selects_for_jumps = 0;
@@ -464,6 +508,7 @@ bool fgpu_ir_lower(fgpu_ir_t* ir, const fgpu_program_t* p, bool fragment, const 
     __builtin_memset(&w, 0, sizeof(w));
     w.ir = ir;
     w.p = p;
+    w.exact = (flags & FGPU_IR_EXACT) != 0;
     src_t zero = imm(&w, 0.0f), one = imm(&w, 1.0f);
     for (uint32_t t = 0; t < FGPU_SHADER_MAX_TEMPS; t++)
         for (uint32_t c = 0; c < 4; c++) w.temp[t][c] = zero;
@@ -616,7 +661,8 @@ static const char* const k_names[FGPU_IR_OP_COUNT] = {
     [FGPU_IR_SIN] = "MUFU.SIN",     [FGPU_IR_COS] = "MUFU.COS",     [FGPU_IR_SLT] = "FSET.BF.LT",
     [FGPU_IR_SLE] = "FSET.BF.LE",   [FGPU_IR_SEQ] = "FSET.BF.EQ",   [FGPU_IR_SNE] = "FSET.BF.NEU",
     [FGPU_IR_SEL] = "FSEL",         [FGPU_IR_TEX] = "TEX",          [FGPU_IR_TEXC] = "",
-    [FGPU_IR_OUTPUT] = "",          [FGPU_IR_DISCARD] = "KIL",
+    [FGPU_IR_OUTPUT] = "",          [FGPU_IR_DISCARD] = "KIL",      [FGPU_IR_SUB] = "FADD.NEG",
+    [FGPU_IR_DIV] = "FDIV",
 };
 
 void fgpu_ir_print(const fgpu_ir_t* ir, void (*line)(void* ctx, const char* text), void* ctx) {

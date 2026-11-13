@@ -1,5 +1,7 @@
 BITS 64
 
+%include "simd_save.inc"
+
 extern idt_handler_keyboard
 extern idt_handler_pit
 extern idt_handler_doublefault
@@ -38,15 +40,11 @@ global %1_wrapped
     push r14
     push r15
 
-    ; Save the interrupted code's SSE/x87 state (C code here may use
-    ; SSE) and call with a 16-byte aligned stack, as the ABI requires.
-    mov rbp, rsp
-    sub rsp, 512
-    and rsp, -16
-    fxsave64 [rsp]
+    ; Save the interrupted code's x87/SSE/AVX state (C code here may use
+    ; SSE); the area is 64-byte aligned, so the ABI's 16 holds too.
+    SIMD_SAVE
     call %1
-    fxrstor64 [rsp]
-    mov rsp, rbp
+    SIMD_RESTORE
 
     pop r15
     pop r14

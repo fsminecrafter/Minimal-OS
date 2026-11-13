@@ -1,7 +1,7 @@
 From 2e82237589087ab693de903c6f03a762ad044a3e Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Thu, 12 Nov 2026 23:47:54 +0000
-Subject: [PATCH 1/3] OS-0: futex, TLS, clocks, stat/rename/chdir, spawn/wait,
+Subject: [PATCH 1/6] OS-0: futex, TLS, clocks, stat/rename/chdir, spawn/wait,
  environment
 
 syscall.h gains the kernel's new calls (SYS_FUTEX, SYS_CLOCK, SYS_STAT,
@@ -2796,7 +2796,7 @@ index 0000000..0ab1bc6
 From e793506e96b03a88fbee6574f7e1c22bed23ce80 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Fri, 13 Nov 2026 07:12:41 +0000
-Subject: [PATCH 2/3] os0test: checks for bad pointers, failed spawns, relative
+Subject: [PATCH 2/6] os0test: checks for bad pointers, failed spawns, relative
  exec, clock reads
 
 Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
@@ -2977,7 +2977,7 @@ index 0ab1bc6..8c7b36f 100644
 From ff1f09af3a14b89df6cb787d107f06d4ea5587a6 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Fri, 13 Nov 2026 07:30:24 +0000
-Subject: [PATCH 3/3] SYS_VM: vm.h, VM-backed thread stacks, spawn stack size,
+Subject: [PATCH 3/6] SYS_VM: vm.h, VM-backed thread stacks, spawn stack size,
  os0test VM checks
 
 vm.h wraps the kernel's SYS_VM (map, unmap, protect, decommit, reserve and
@@ -4616,6 +4616,1073 @@ index 8c7b36f..f24dbc2 100644
  
      stage("cleanup");
      mos_chdir(g_start_cwd[0] ? g_start_cwd : "0:/");
+-- 
+2.43.0
+
+
+From eb1dc7f8a3ca14f9be1502f413346769aa0357d2 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 13 Nov 2026 12:07:53 +0000
+Subject: [PATCH 4/6] CPU features in SYSINFO; os0test SIMD state checks
+
+mos_sysinfo_cpu_features(), mos_sysinfo_xcr0() and mos_cpu_has() report
+what the CPU has and the OS has enabled. os0test loads patterns into the
+vector, x87 and control registers and checks they survive sleeps, page
+faults and system calls, on several threads and a child process.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0112xJofPtaNLntSK14Rcenm
+---
+ docs/README.md          |   2 +-
+ docs/sysinfo.md         |  46 ++++++++
+ include/syscall.h       |  34 +++++-
+ include/user_sysinfo.h  |  11 ++
+ programs/os0test/main.c | 237 +++++++++++++++++++++++++++++++++++++++-
+ 5 files changed, 327 insertions(+), 3 deletions(-)
+
+diff --git a/docs/README.md b/docs/README.md
+index fe30a3e..918c247 100644
+--- a/docs/README.md
++++ b/docs/README.md
+@@ -22,7 +22,7 @@ truth; these pages describe them as of SDK v1.1 and the kernel's
+ | [Graphics](graphics.md) | `graphics.h`, `x86_64/user_graphics.h` | Full-screen framebuffer: acquire, blit, present, primitives |
+ | [Input](input.md) | `x86_64/user_syscalls.h`, `user_mouse.h`, `user_usb.h` | Raw keyboard and mouse events for full-screen programs |
+ | [Networking](network.md) | `net.h` | DNS, TCP client and server, UDP, the ktls transport |
+-| [System information](sysinfo.md) | `user_sysinfo.h` | CPU, RAM, heap, cores, uptime, processes |
++| [System information](sysinfo.md) | `user_sysinfo.h` | CPU usage and features (AVX), RAM, heap, cores, uptime, processes |
+ | [Packages](packages.md) | `minimalos.h` | `.mpkg` archives: unzip, zip, inspect |
+ | [Device managers](managers.md) | `x86_64/user_managers.h` | GPU, audio, storage and USB manager calls |
+ | [Text in your own pixels](font.md) | `font.h` | `draw_text` / `text_width`: smooth Inter text (bitmap fallback) in any pixel buffer |
+diff --git a/docs/sysinfo.md b/docs/sysinfo.md
+index e1ddd9d..b3bd396 100644
+--- a/docs/sysinfo.md
++++ b/docs/sysinfo.md
+@@ -132,6 +132,52 @@ uint64_t mos_sysinfo_process_count(void);
+ **Returns** the number of processes. To list them use
+ [`mos_pslist`](process.md#mos_pslist).
+ 
++## `mos_cpu_has`
++
++```c
++int mos_cpu_has(uint64_t mask);
++```
++
++**Returns** 1 when every `SYS_CPU_*` feature in `mask` is usable, else 0.
++The AVX-family bits (`SYS_CPU_AVX`, `SYS_CPU_AVX2`, `SYS_CPU_FMA`,
++`SYS_CPU_F16C`, `SYS_CPU_AVX512F` and the other AVX-512 bits) are set only
++when the kernel enabled the register state (`CR4.OSXSAVE` and `XCR0`), so
++"1" means the instructions will not fault. They are 0 on a CPU without
++XSAVE/AVX and when the kernel was booted with the `noavx` flag, even though
++CPUID would still list them. Always test before running VEX or EVEX code;
++without the bit the instruction raises #UD and ends the program.
++
++The other bits are CPUID reports: `SYS_CPU_SSE3`, `SSSE3`, `SSE41`, `SSE42`,
++`POPCNT`, `BMI1`, `BMI2`, `LZCNT`, `AES`, `PCLMUL`, `MOVBE`, `RDRAND`,
++`RDSEED`, `ADX`, `SHA`. SSE2 is always there (x86-64).
++
++**Example** - choosing a code path:
++
++```c
++#include "user_sysinfo.h"
++
++if (mos_cpu_has(SYS_CPU_AVX2 | SYS_CPU_FMA))
++    render_avx2();          /* compiled with __attribute__((target("avx2,fma"))) */
++else
++    render_sse2();
++```
++
++Compile only the functions that use AVX with `__attribute__((target("avx2")))`
++(or `-mavx2` for a separate file); the rest of the program must stay SSE-only
++so it runs everywhere. The kernel saves and restores all YMM/ZMM state around
++every system call, interrupt and context switch, so no extra care is needed
++between threads.
++
++## `mos_sysinfo_cpu_features`, `mos_sysinfo_xcr0`
++
++```c
++uint64_t mos_sysinfo_cpu_features(void);   /* SYS_SYSINFO_CPU_FEATURES, 0x0C */
++uint64_t mos_sysinfo_xcr0(void);           /* SYS_SYSINFO_XCR0, 0x0D */
++```
++
++The raw feature mask (see `mos_cpu_has`) and the `XCR0` value the kernel runs
++with: 0 without XSAVE/AVX, 7 for x87+SSE+AVX, 0xE7 with AVX-512.
++
+ ## `mos_sysinfo`
+ 
+ ```c
+diff --git a/include/syscall.h b/include/syscall.h
+index 2d3b4fb..cafcdee 100644
+--- a/include/syscall.h
++++ b/include/syscall.h
+@@ -677,7 +677,9 @@ typedef enum {
+     SYS_SYSINFO_HEAP_FREE       = 0x09,
+     SYS_SYSINFO_PMM_USED_PAGES  = 0x0A, // 4KB physical pages
+     SYS_SYSINFO_PMM_FREE_PAGES  = 0x0B,
+-    // 0x0C-0x0F reserved for future global stats
++    SYS_SYSINFO_CPU_FEATURES    = 0x0C, // SYS_CPU_* bit mask (usable, not merely present)
++    SYS_SYSINFO_XCR0            = 0x0D, // XCR0 the OS enabled (0 without XSAVE/AVX)
++    // 0x0E-0x0F reserved for future global stats
+ 
+     // Per-core usage: op = SYS_SYSINFO_CORE_USAGE_BASE + core_id.
+     // Deliberately last/open-ended since core count can vary between
+@@ -685,6 +687,36 @@ typedef enum {
+     SYS_SYSINFO_CORE_USAGE_BASE = 0x10,
+ } syscall_sysinfo_op_t;
+ 
++// SYS_SYSINFO_CPU_FEATURES bits. The AVX family (AVX, AVX2, FMA, F16C and the
++// AVX-512 bits) is only set when the OS enabled the register state, so a set
++// bit means a program can run those instructions; with the 'noavx' boot flag
++// or on a CPU without XSAVE/AVX they are clear. The others are plain CPUID
++// reports (they need no OS support).
++#define SYS_CPU_SSE3      (1ull << 0)
++#define SYS_CPU_SSSE3     (1ull << 1)
++#define SYS_CPU_SSE41     (1ull << 2)
++#define SYS_CPU_SSE42     (1ull << 3)
++#define SYS_CPU_POPCNT    (1ull << 4)
++#define SYS_CPU_AVX       (1ull << 5)
++#define SYS_CPU_AVX2      (1ull << 6)
++#define SYS_CPU_FMA       (1ull << 7)
++#define SYS_CPU_BMI1      (1ull << 8)
++#define SYS_CPU_BMI2      (1ull << 9)
++#define SYS_CPU_F16C      (1ull << 10)
++#define SYS_CPU_AVX512F   (1ull << 11)
++#define SYS_CPU_AVX512DQ  (1ull << 12)
++#define SYS_CPU_AVX512BW  (1ull << 13)
++#define SYS_CPU_AVX512VL  (1ull << 14)
++#define SYS_CPU_AVX512CD  (1ull << 15)
++#define SYS_CPU_LZCNT     (1ull << 16)
++#define SYS_CPU_AES       (1ull << 17)
++#define SYS_CPU_PCLMUL    (1ull << 18)
++#define SYS_CPU_MOVBE     (1ull << 19)
++#define SYS_CPU_RDRAND    (1ull << 20)
++#define SYS_CPU_RDSEED    (1ull << 21)
++#define SYS_CPU_ADX       (1ull << 22)
++#define SYS_CPU_SHA       (1ull << 23)
++
+ // Called by isr_syscall_wrapped (syscall_isr.asm) for every `int 0x80`.
+ // regs->rax = syscall number in, return value out. Args in
+ // rdi/rsi/rdx (SysV-ish - matches a future `syscall`-instruction ABI
+diff --git a/include/user_sysinfo.h b/include/user_sysinfo.h
+index d6f3cec..b687e9a 100644
+--- a/include/user_sysinfo.h
++++ b/include/user_sysinfo.h
+@@ -20,6 +20,17 @@ static inline uint64_t mos_sysinfo_heap_free(void)       { return mos_sysinfo(SY
+ static inline uint64_t mos_sysinfo_pmm_used_pages(void)  { return mos_sysinfo(SYS_SYSINFO_PMM_USED_PAGES); }
+ static inline uint64_t mos_sysinfo_pmm_free_pages(void)  { return mos_sysinfo(SYS_SYSINFO_PMM_FREE_PAGES); }
+ 
++/* CPU features (SYS_CPU_* in syscall.h). The AVX family is only reported when
++ * the OS enabled the state, so a set bit means the instructions are usable. */
++static inline uint64_t mos_sysinfo_cpu_features(void) { return mos_sysinfo(SYS_SYSINFO_CPU_FEATURES); }
++static inline uint64_t mos_sysinfo_xcr0(void)         { return mos_sysinfo(SYS_SYSINFO_XCR0); }
++
++/* 1 when every feature in `mask` (SYS_CPU_* bits or'ed together) is usable. */
++static inline int mos_cpu_has(uint64_t mask) {
++    uint64_t f = mos_sysinfo_cpu_features();
++    return f != SYS_ERR_INVAL && (f & mask) == mask;
++}
++
+ static inline uint64_t mos_sysinfo_core_usage(uint32_t core_id) {
+     return mos_sysinfo(SYS_SYSINFO_CORE_USAGE_BASE + core_id);
+ }
+diff --git a/programs/os0test/main.c b/programs/os0test/main.c
+index f24dbc2..a0dab54 100644
+--- a/programs/os0test/main.c
++++ b/programs/os0test/main.c
+@@ -7,7 +7,11 @@
+  * Covers SYS_CLOCK, SYS_THREAD (FS base / TLS, exit futex), SYS_FUTEX,
+  * SYS_STAT, SYS_RENAME, SYS_CHDIR/SYS_GETCWD, the environment (envp ->
+  * environ), SYS_SPAWN and SYS_WAIT, and SYS_VM / the user address-space
+- * layout (vm.h): mappings, protection, guard pages, NX, stack sizes.
++ * layout (vm.h): mappings, protection, guard pages, NX, stack sizes, and
++ * SIMD: the CPU feature report (SYS_SYSINFO) and a torture test that keeps
++ * xmm/ymm/x87/MXCSR state intact across context switches, syscalls and page
++ * faults (the AVX half runs only when the kernel reports AVX usable;
++ * otherwise an AVX instruction must die with #UD).
+  *
+  * Output: one line per check,
+  *
+@@ -614,6 +618,9 @@ static int child_vm(const char* mode, long arg) {
+     return 99;
+ }
+ 
++static int child_torture(int wide, long ms);
++static int child_avx_probe(int wide512);
++
+ /* os0test.run --child <mode> [arg] */
+ static int child_main(int argc, char** argv, char** envp) {
+     const char* mode = argc > 2 ? argv[2] : "";
+@@ -626,6 +633,9 @@ static int child_main(int argc, char** argv, char** envp) {
+     if (streq(mode, "tls_hw")) return child_tls_hw();
+     if (streq(mode, "tsc")) return child_tsc();
+     if (sstarts(mode, "vm_")) return child_vm(mode, arg);
++    if (sstarts(mode, "torture_")) return child_torture(streq(mode, "torture_avx"), arg);
++    if (streq(mode, "avx_probe")) return child_avx_probe(0);
++    if (streq(mode, "avx512_probe")) return child_avx_probe(1);
+     if (streq(mode, "streams")) {
+         emit_fd(1, "out1");
+         emit_fd(2, "err1");
+@@ -2475,6 +2485,230 @@ static void test_vm(void) {
+     test_vm_stacks();
+ }
+ 
++/* ================================================================== SIMD
++ * Register state across context switches. Each worker loads a pattern of its
++ * own into the vector registers (and x87 / MXCSR), lets the kernel do things
++ * to it (a sleep that switches to another thread, a page fault on a fresh
++ * SYS_VM page, a plain syscall) and stores everything back for comparison.
++ * The load, the disturbance and the store are one assembly routine: C code
++ * in between would use xmm registers itself. The AVX routine is assembly
++ * too, so the rest of the program stays SSE-only. */
++
++#define SIMD_BUF 640     /* [0,512) vector regs, [512,576) 8 doubles, 576 mxcsr, 580 fcw */
++
++/* torture_*(in, out, page, mode): mode bit0 = sleep 1 tick (switches), bit1 =
++ * write to `page` (page fault when it is fresh), bit2 = three getpid calls. */
++extern void torture_avx(const uint8_t* in, uint8_t* out, uint8_t* page, uint64_t mode);
++extern void torture_sse(const uint8_t* in, uint8_t* out, uint8_t* page, uint64_t mode);
++
++#define TORTURE_BODY(LOAD, STORE) \
++    "mov r8, rdi\n" "mov r9, rsi\n" "mov r10, rdx\n" "mov r11, rcx\n" \
++    "fldcw word ptr [r8+580]\n" "ldmxcsr dword ptr [r8+576]\n" \
++    ".irp i,0,1,2,3,4,5,6,7\n" "fld qword ptr [r8+512+8*\\i]\n" ".endr\n" \
++    LOAD \
++    "test r11, 1\n" "jz 1f\n" "mov eax, 5\n" "mov edi, 1\n" "int 0x80\n" "1:\n" \
++    "test r11, 2\n" "jz 2f\n" "mov byte ptr [r10], 0x5a\n" "mov al, byte ptr [r10+64]\n" "2:\n" \
++    "test r11, 4\n" "jz 3f\n" "mov eax, 3\n" "int 0x80\n" "mov eax, 3\n" "int 0x80\n" \
++    "mov eax, 3\n" "int 0x80\n" "3:\n" \
++    STORE \
++    ".irp i,7,6,5,4,3,2,1,0\n" "fstp qword ptr [r9+512+8*\\i]\n" ".endr\n" \
++    "stmxcsr dword ptr [r9+576]\n" "fnstcw word ptr [r9+580]\n" \
++    "sub rsp, 8\n" "mov dword ptr [rsp], 0x1f80\n" "ldmxcsr dword ptr [rsp]\n" \
++    "mov word ptr [rsp], 0x37f\n" "fldcw word ptr [rsp]\n" "add rsp, 8\n" "ret\n"
++
++__asm__(".pushsection .text\n.intel_syntax noprefix\n"
++        ".globl torture_avx\n.type torture_avx,@function\ntorture_avx:\n"
++        TORTURE_BODY(".irp i,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15\n" "vmovdqu ymm\\i, ymmword ptr [r8+32*\\i]\n" ".endr\n",
++                     ".irp i,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15\n" "vmovdqu ymmword ptr [r9+32*\\i], ymm\\i\n" ".endr\n")
++        ".size torture_avx,.-torture_avx\n"
++        ".globl torture_sse\n.type torture_sse,@function\ntorture_sse:\n"
++        TORTURE_BODY(".irp i,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15\n" "movdqu xmm\\i, xmmword ptr [r8+16*\\i]\n" ".endr\n",
++                     ".irp i,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15\n" "movdqu xmmword ptr [r9+16*\\i], xmm\\i\n" ".endr\n")
++        ".size torture_sse,.-torture_sse\n"
++        ".att_syntax prefix\n.popsection\n");
++
++typedef struct {
++    int id;                      /* distinct per worker: seeds the patterns */
++    int wide;                    /* 1: ymm0-15 (AVX), 0: xmm0-15 */
++    uint64_t end_ms;
++    unsigned long rounds, errors;
++    char first_error[160];
++} torture_t;
++
++static void torture_fill(uint8_t* in, int id, unsigned long round, int wide) {
++    unsigned n = wide ? 512 : 256;
++    for (unsigned i = 0; i < n; i++)
++        in[i] = (uint8_t)(id * 37 + i * 11 + (i >> 4) * 29 + (unsigned)round * 5 + 1);
++    double v[8];
++    for (int k = 0; k < 8; k++) v[k] = (double)(id * 1000 + (long)(round % 997) + k) + 0.25 * k;
++    memcpy(in + 512, v, sizeof(v));
++    uint32_t mxcsr = 0x1F80u | (uint32_t)((id + round) & 3) << 13 | ((id & 1) ? 0x8000u : 0);
++    uint16_t fcw = (uint16_t)((0x037F & ~0xF00) | ((id + round) % 3 == 0 ? 0x000 : (id + round) % 3 == 1 ? 0x200 : 0x300)
++                              | (((id + round) & 3) << 10));
++    memcpy(in + 576, &mxcsr, 4);
++    memcpy(in + 580, &fcw, 2);
++}
++
++static void torture_one(torture_t* t, unsigned long round, uint8_t* in, uint8_t* out, uint8_t* scratch) {
++    torture_fill(in, t->id, round, t->wide);
++    memset(out, 0, SIMD_BUF);
++    unsigned mode = (unsigned)(round % 8);
++    uint8_t* page = scratch;
++    if (mode & 2) {
++        page = (uint8_t*)mos_vm_map(NULL, VM_PAGE, VM_RW, 0);    /* fresh: the first write faults */
++        if (!page) page = scratch;
++    }
++    if (t->wide) torture_avx(in, out, page, mode);
++    else torture_sse(in, out, page, mode);
++    if (page != scratch) mos_vm_unmap(page, VM_PAGE);
++    unsigned n = t->wide ? 512 : 256;
++    for (unsigned i = 0; i < n + 70; i++) {
++        unsigned off = i < n ? i : 512 + (i - n);
++        if (in[off] == out[off]) continue;
++        t->errors++;
++        if (!t->first_error[0])
++            kfmt(t->first_error, sizeof(t->first_error), "worker %d round %lu mode %u: %s byte %u got %x want %x",
++                 t->id, round, mode, off < 512 ? (t->wide ? "ymm" : "xmm") : "x87/mxcsr/fcw",
++                 off, out[off], in[off]);
++        break;
++    }
++}
++
++static void torture_loop(torture_t* t) {
++    static uint8_t scratch_pages[4][VM_PAGE];
++    uint8_t in[SIMD_BUF] __attribute__((aligned(32)));
++    uint8_t out[SIMD_BUF] __attribute__((aligned(32)));
++    uint8_t* scratch = scratch_pages[t->id & 3];
++    unsigned long round = 0;
++    while ((uint64_t)mos_uptime() < t->end_ms) torture_one(t, round++, in, out, scratch);
++    t->rounds = round;
++}
++
++static void torture_thread(void* arg) { torture_loop((torture_t*)arg); }
++
++#define TORTURE_THREADS 3
++#define TORTURE_MS      3000
++
++/* os0test.run --child torture_avx|torture_sse <ms>: one more process doing the same. */
++static int child_torture(int wide, long ms) {
++    torture_t t;
++    memset(&t, 0, sizeof(t));
++    t.id = 9;
++    t.wide = wide;
++    t.end_ms = (uint64_t)mos_uptime() + (uint64_t)ms;
++    torture_loop(&t);
++    emit_fd(1, "torture child: %lu rounds, %lu errors %s", t.rounds, t.errors, t.first_error);
++    return t.errors ? 1 : (t.rounds ? 0 : 2);
++}
++
++static void run_torture(int wide, const char* name) {
++    char nm[96];
++    torture_t main_t, th[TORTURE_THREADS];
++    mos_thread_t ts[TORTURE_THREADS];
++    uint64_t end = (uint64_t)mos_uptime() + TORTURE_MS;
++    memset(&main_t, 0, sizeof(main_t));
++    main_t.id = 0; main_t.wide = wide; main_t.end_ms = end;
++    int started = 0;
++    for (int i = 0; i < TORTURE_THREADS; i++) {
++        memset(&th[i], 0, sizeof(th[i]));
++        th[i].id = i + 1; th[i].wide = wide; th[i].end_ms = end;
++        if (mos_thread_create_vm(&ts[i], torture_thread, &th[i], 64 * 1024, NULL) == 0) started++;
++        else ts[i].id = 0;
++    }
++    char ms[16];
++    kfmt(ms, sizeof(ms), "%d", TORTURE_MS);
++    mos_wait_result_t r;
++    memset(&r, 0, sizeof(r));
++    long pid = spawn_child(wide ? "torture_avx" : "torture_sse", ms, TMP "/torture.txt", NULL, NULL, NULL);
++    torture_loop(&main_t);
++    for (int i = 0; i < TORTURE_THREADS; i++) if (ts[i].id) mos_thread_join(&ts[i]);
++    long w = pid > 0 ? mos_waitpid(pid, 0, &r) : -1;
++    static char out[256];
++    read_text(TMP "/torture.txt", out, sizeof(out));
++
++    kfmt(nm, sizeof(nm), "%s_torture_threads_started", name);
++    EXPECT(started == TORTURE_THREADS, nm, "started %d of %d", started, TORTURE_THREADS);
++    kfmt(nm, sizeof(nm), "%s_torture_main_thread_state_intact", name);
++    EXPECT(main_t.errors == 0 && main_t.rounds > 0, nm, "%lu rounds, %lu errors: %s", main_t.rounds, main_t.errors, main_t.first_error);
++    unsigned long errs = 0, rounds = 0;
++    const char* first = "";
++    for (int i = 0; i < TORTURE_THREADS; i++) {
++        errs += th[i].errors; rounds += th[i].rounds;
++        if (th[i].errors && !first[0]) first = th[i].first_error;
++    }
++    kfmt(nm, sizeof(nm), "%s_torture_worker_threads_state_intact", name);
++    EXPECT(errs == 0 && rounds > 0, nm, "%lu rounds, %lu errors: %s", rounds, errs, first);
++    kfmt(nm, sizeof(nm), "%s_torture_other_process_state_intact", name);
++    EXPECT(pid > 0 && w == pid && !r.crashed && r.exit_code == 0, nm,
++           "pid=%ld wait=%ld crashed=%d vector=%u exit=%d: %s", pid, w, r.crashed, r.crash_vector, r.exit_code, out);
++    emit_fd(1, "OS0TEST info %s torture: main %lu rounds, threads %lu rounds", name, main_t.rounds, rounds);
++}
++
++/* A child that runs one VEX (or EVEX) instruction and exits 0 if it is allowed. */
++static int child_avx_probe(int wide512) {
++    if (wide512) __asm__ volatile(".intel_syntax noprefix\nvpxord zmm0, zmm0, zmm0\n.att_syntax prefix" ::: "memory");
++    else         __asm__ volatile(".intel_syntax noprefix\nvpxor ymm0, ymm0, ymm0\n.att_syntax prefix" ::: "memory");
++    __asm__ volatile("vzeroupper" ::: "memory");
++    emit_fd(1, "avx probe: instruction ran");
++    return 0;
++}
++
++static void cpuid_leaf(uint32_t leaf, uint32_t sub, uint32_t* a, uint32_t* b, uint32_t* c, uint32_t* d) {
++    __asm__ volatile("cpuid" : "=a"(*a), "=b"(*b), "=c"(*c), "=d"(*d) : "a"(leaf), "c"(sub));
++}
++
++static void test_simd(void) {
++    stage("simd");
++    uint64_t f = mos_sysinfo_cpu_features();
++    uint64_t xcr0 = mos_sysinfo_xcr0();
++    EXPECT(f != SYS_ERR_INVAL && xcr0 != SYS_ERR_INVAL, "simd_sysinfo_cpu_queries_accepted", "features=0x%llx xcr0=0x%llx",
++           (unsigned long long)f, (unsigned long long)xcr0);
++    int avx = mos_cpu_has(SYS_CPU_AVX);
++    emit_fd(1, "OS0TEST info cpu features=0x%llx xcr0=0x%llx avx=%d avx2=%d avx512f=%d", (unsigned long long)f,
++            (unsigned long long)xcr0, avx, mos_cpu_has(SYS_CPU_AVX2), mos_cpu_has(SYS_CPU_AVX512F));
++
++    EXPECT(avx == ((xcr0 & 6) == 6), "simd_avx_bit_matches_enabled_xcr0", "avx=%d xcr0=0x%llx", avx, (unsigned long long)xcr0);
++    EXPECT(!mos_cpu_has(SYS_CPU_AVX2) || avx, "simd_avx2_implies_avx", "features 0x%llx", (unsigned long long)f);
++    EXPECT(!mos_cpu_has(SYS_CPU_FMA | SYS_CPU_F16C) || avx, "simd_fma_f16c_imply_avx", "features 0x%llx", (unsigned long long)f);
++    EXPECT(!mos_cpu_has(SYS_CPU_AVX512F) || (avx && (xcr0 & 0xE0) == 0xE0), "simd_avx512_needs_its_state", "features 0x%llx xcr0 0x%llx",
++           (unsigned long long)f, (unsigned long long)xcr0);
++    EXPECT(mos_cpu_has(0), "simd_cpu_has_empty_mask_is_true", "returned 0");
++
++    uint32_t a, b, c, d;
++    cpuid_leaf(1, 0, &a, &b, &c, &d);
++    int osxsave = (c >> 27) & 1;
++    EXPECT(osxsave == (xcr0 != 0), "simd_osxsave_cpuid_bit_matches_xcr0", "cpuid OSXSAVE=%d xcr0=0x%llx", osxsave, (unsigned long long)xcr0);
++    EXPECT(((c >> 0) & 1) == (mos_cpu_has(SYS_CPU_SSE3) ? 1u : 0u), "simd_sse3_bit_matches_cpuid", "cpuid %u", (c >> 0) & 1);
++    EXPECT(((c >> 23) & 1) == (mos_cpu_has(SYS_CPU_POPCNT) ? 1u : 0u), "simd_popcnt_bit_matches_cpuid", "cpuid %u", (c >> 23) & 1);
++    if (osxsave) {
++        uint32_t lo, hi;
++        __asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
++        EXPECT((((uint64_t)hi << 32) | lo) == xcr0, "simd_xgetbv_matches_sysinfo_xcr0", "xgetbv 0x%x%08x sysinfo 0x%llx", hi, lo, (unsigned long long)xcr0);
++    }
++
++    /* The SSE path always: xmm0-15, x87, MXCSR. */
++    run_torture(0, "sse");
++
++    mos_wait_result_t r;
++    long pid = spawn_wait("avx_probe", NULL, NULL, NULL, NULL, NULL, &r);
++    if (avx) {
++        EXPECT(pid > 0 && !r.crashed && r.exit_code == 0, "simd_avx_instruction_runs_when_reported",
++               "pid=%ld crashed=%d vector=%u exit=%d", pid, r.crashed, r.crash_vector, r.exit_code);
++        run_torture(1, "avx");
++    } else {
++        EXPECT(pid > 0 && r.crashed && r.crash_vector == 6, "simd_avx_instruction_faults_ud_when_not_reported",
++               "pid=%ld crashed=%d vector=%u exit=%d", pid, r.crashed, r.crash_vector, r.exit_code);
++        emit_fd(1, "OS0TEST info AVX not usable here (CPU without AVX, or booted with noavx): YMM torture skipped");
++    }
++    pid = spawn_wait("avx512_probe", NULL, NULL, NULL, NULL, NULL, &r);
++    if (mos_cpu_has(SYS_CPU_AVX512F))
++        EXPECT(pid > 0 && !r.crashed && r.exit_code == 0, "simd_avx512_instruction_runs_when_reported",
++               "pid=%ld crashed=%d vector=%u exit=%d", pid, r.crashed, r.crash_vector, r.exit_code);
++    else
++        EXPECT(pid > 0 && r.crashed && r.crash_vector == 6, "simd_avx512_instruction_faults_ud_when_not_reported",
++               "pid=%ld crashed=%d vector=%u exit=%d", pid, r.crashed, r.crash_vector, r.exit_code);
++}
++
+ /* ================================================================== main */
+ 
+ int main(int argc, char** argv, char** envp) {
+@@ -2523,6 +2757,7 @@ int main(int argc, char** argv, char** envp) {
+     test_spawn_failure_cleanup();
+     test_exec_relative();
+     test_vm();
++    test_simd();
+ 
+     stage("cleanup");
+     mos_chdir(g_start_cwd[0] ? g_start_cwd : "0:/");
+-- 
+2.43.0
+
+
+From cabe10d10c23c0a8c31cb36e3e1c77c8ecaf9754 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 13 Nov 2026 12:12:35 +0000
+Subject: [PATCH 5/6] os0test: bad-pointer checks across the system calls
+
+Each family of calls is given an unmapped address, a kernel address, a
+no-access mapping, a read-only mapping as output and a buffer that runs
+past its mapping, and must fail without effect; the same calls are checked
+to still work with heap, stack, image and SYS_VM buffers.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0112xJofPtaNLntSK14Rcenm
+---
+ programs/os0test/main.c | 518 ++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 518 insertions(+)
+
+diff --git a/programs/os0test/main.c b/programs/os0test/main.c
+index a0dab54..1a90bd3 100644
+--- a/programs/os0test/main.c
++++ b/programs/os0test/main.c
+@@ -1729,6 +1729,523 @@ static void test_bad_pointers(void) {
+     EXPECT_RET(mos_exec(g_self, NULL, 2), ERR(SYS_ERR_INVAL), "exec_argc_without_argv_inval");
+ }
+ 
++/* ================================ user pointer checks: the whole surface */
++
++/* Buffers used as call arguments. Bad pointers (input = the kernel only
++ * reads it, output = it writes): an address nothing maps (above 4 GiB), a
++ * kernel address below 4 GiB, a PROT_NONE mapping, a read-only mapping (output
++ * only), and one byte before the end of a mapping (the next page is a
++ * guard). Good ones: heap, stack, image (.data, .rodata, .bss), SYS_VM. */
++static uint8_t* g_pb_rw;                 /* 1 page, read-write */
++static uint8_t* g_pb_ro;                 /* 1 page, read-only, holds a file path */
++static uint8_t* g_pb_none;               /* 1 page, PROT_NONE */
++static void* g_bad_out[5];
++static void* g_bad_in[4];
++static const char* const g_tag_out[5] = { "unmapped", "kernel", "prot_none", "readonly", "overrun" };
++static const char* const g_tag_in[4]  = { "unmapped", "kernel", "prot_none", "overrun" };
++static char g_bss_buf[256];
++static char g_data_buf[256] = { 'd' };
++static const char g_rodata_path[] = TMP "/ptr_data.bin";
++static const char g_rodata_text[] = "RODATA-TEXT-0123456789";
++
++/* The call is made with P set to each bad pointer; `want` is the result. */
++#define BAD_OUT_RET(base, want, expr) do { \
++    for (int bi_ = 0; bi_ < 5; bi_++) { void* P = g_bad_out[bi_]; char nm_[96]; \
++        kfmt(nm_, sizeof(nm_), "%s_%s", base, g_tag_out[bi_]); \
++        EXPECT_RET(expr, want, nm_); } } while (0)
++#define BAD_IN_RET(base, want, expr) do { \
++    for (int bi_ = 0; bi_ < 4; bi_++) { void* P = g_bad_in[bi_]; char nm_[96]; \
++        kfmt(nm_, sizeof(nm_), "%s_%s", base, g_tag_in[bi_]); \
++        EXPECT_RET(expr, want, nm_); } } while (0)
++/* Same, for calls whose gate may answer PERM or INVAL: any error. */
++#define BAD_OUT_NEG(base, expr) do { \
++    for (int bi_ = 0; bi_ < 5; bi_++) { void* P = g_bad_out[bi_]; char nm_[96]; \
++        kfmt(nm_, sizeof(nm_), "%s_%s", base, g_tag_out[bi_]); \
++        long r_ = (expr); EXPECT(r_ < 0, nm_, "got %ld", r_); } } while (0)
++
++static int pb_pattern_ok(const uint8_t* buf, size_t n, uint8_t seed, size_t from) {
++    for (size_t i = 0; i < n; i++) if (buf[i] != pattern_byte(from + i, seed)) return 0;
++    return 1;
++}
++
++static void test_bad_pointers_2(void) {
++    stage("bad_pointers_2");
++    g_pb_rw = (uint8_t*)mos_vm_map(NULL, 4096, MOS_VM_PROT_RW, 0);
++    g_pb_ro = (uint8_t*)mos_vm_map(NULL, 4096, MOS_VM_PROT_RW, 0);
++    g_pb_none = (uint8_t*)mos_vm_map(NULL, 4096, MOS_VM_PROT_NONE, 0);
++    if (!g_pb_rw || !g_pb_ro || !g_pb_none) {
++        check_fail("bad_pointers_2_setup", "vm map failed: %ld", mos_vm_last_error());
++        return;
++    }
++    scopy((char*)g_pb_ro, 4096, g_rodata_path);
++    EXPECT_RET(mos_vm_protect_raw(g_pb_ro, 4096, MOS_VM_PROT_READ), SYS_SUCCESS, "bp2_make_readonly");
++    g_pb_rw[4095] = 'a';                 /* an unterminated "string" at the very end */
++    g_bad_out[0] = g_bad_in[0] = (void*)0x300000000000ULL;
++    g_bad_out[1] = g_bad_in[1] = (void*)0x200000ULL;
++    g_bad_out[2] = g_bad_in[2] = g_pb_none;
++    g_bad_out[3] = g_pb_ro;
++    g_bad_out[4] = g_bad_in[3] = g_pb_rw + 4095;
++
++    uint8_t* heap = (uint8_t*)malloc(8192);
++    EXPECT(heap != NULL, "bp2_heap_alloc", "malloc failed");
++    if (!heap) return;
++    uint8_t stackbuf[256];
++
++    /* ---- files: SYS_READ, SYS_FWRITE */
++    EXPECT_RET(write_pattern(TMP "/ptr_data.bin", 256, 7), 0, "bp2_make_data_file");
++    long fd = mos_open(TMP "/ptr_data.bin", SYS_O_RDWR);
++    EXPECT(fd > 0, "bp2_open_data_file", "got %ld", fd);
++    if (fd <= 0) return;
++
++    EXPECT_RET(mos_seek(fd, 0), 0, "bp2_seek_start");
++    BAD_OUT_RET("read_bad_buffer", ERR(SYS_ERR_INVAL), mos_read(fd, P, 64));
++    EXPECT_RET(mos_tell(fd), 0, "read_bad_buffer_position_unchanged");
++    BAD_OUT_RET("read_bad_buffer_big", ERR(SYS_ERR_INVAL), mos_read(fd, P, 200));
++    EXPECT_RET(mos_tell(fd), 0, "read_bad_buffer_big_position_unchanged");
++    /* A read-only buffer must stay untouched. */
++    EXPECT(g_pb_ro[0] == g_rodata_path[0], "read_readonly_buffer_untouched", "changed");
++
++    memset(heap, 0, 64);
++    EXPECT_RET(mos_read(fd, heap, 16), 16, "read_into_heap");
++    EXPECT(pb_pattern_ok(heap, 16, 7, 0), "read_into_heap_content", "wrong data");
++    memset(stackbuf, 0, sizeof(stackbuf));
++    EXPECT_RET(mos_read(fd, stackbuf, 16), 16, "read_into_stack");
++    EXPECT(pb_pattern_ok(stackbuf, 16, 7, 16), "read_into_stack_content", "wrong data");
++    EXPECT_RET(mos_read(fd, g_bss_buf, 16), 16, "read_into_bss");
++    EXPECT(pb_pattern_ok((uint8_t*)g_bss_buf, 16, 7, 32), "read_into_bss_content", "wrong data");
++    EXPECT_RET(mos_read(fd, g_data_buf, 16), 16, "read_into_data");
++    EXPECT(pb_pattern_ok((uint8_t*)g_data_buf, 16, 7, 48), "read_into_data_content", "wrong data");
++    EXPECT_RET(mos_read(fd, g_pb_rw, 16), 16, "read_into_vm");
++    EXPECT(pb_pattern_ok(g_pb_rw, 16, 7, 64), "read_into_vm_content", "wrong data");
++    EXPECT_RET(mos_tell(fd), 80, "read_positive_position");
++    /* A capacity bigger than what is left is fine when the bytes written fit. */
++    EXPECT_RET(mos_seek(fd, 0), 0, "bp2_seek_start_again");
++    EXPECT_RET(mos_read(fd, g_pb_rw, 1u << 20), 256, "read_oversize_capacity_ok");
++    EXPECT_RET(mos_read(fd, g_pb_rw, 1u << 20), 0, "read_at_eof_returns_zero");
++    g_pb_rw[4095] = 'a';
++
++    /* SYS_FWRITE: reading from a bad buffer. */
++    EXPECT_RET(mos_seek(fd, 256), 0, "bp2_seek_end");
++    BAD_IN_RET("fwrite_bad_buffer", ERR(SYS_ERR_INVAL), mos_fwrite(fd, P, 16));
++    EXPECT_RET(mos_size(fd), 256, "fwrite_bad_buffer_file_unchanged");
++    EXPECT_RET(mos_fwrite(fd, g_rodata_text, 8), 8, "fwrite_from_rodata");
++    EXPECT_RET(mos_fwrite(fd, g_data_buf, 8), 8, "fwrite_from_data");
++    EXPECT_RET(mos_fwrite(fd, heap, 8), 8, "fwrite_from_heap");
++    EXPECT_RET(mos_fwrite(fd, stackbuf, 8), 8, "fwrite_from_stack");
++    EXPECT_RET(mos_fwrite(fd, g_pb_rw, 8), 8, "fwrite_from_vm");
++    EXPECT_RET(mos_fwrite(fd, g_pb_ro, 8), 8, "fwrite_from_readonly_vm");
++    EXPECT_RET(mos_size(fd), 256 + 48, "fwrite_positive_size");
++    mos_close(fd);
++
++    /* ---- paths: SYS_EXISTS, SYS_OPEN, SYS_MKDIR, SYS_CREATE, SYS_CHDIR, SYS_GET_METADATA */
++    BAD_IN_RET("exists_bad_path", ERR(SYS_ERR_INVAL), mos_exists((const char*)P));
++    BAD_IN_RET("open_bad_path", ERR(SYS_ERR_INVAL), mos_open((const char*)P, SYS_O_RDONLY));
++    BAD_IN_RET("mkdir_bad_path", ERR(SYS_ERR_INVAL), mos_mkdir((const char*)P));
++    BAD_IN_RET("create_bad_path", ERR(SYS_ERR_INVAL), mos_create((const char*)P, NULL, NULL));
++    BAD_IN_RET("chdir_bad_path", ERR(SYS_ERR_INVAL), mos_chdir((const char*)P));
++    BAD_IN_RET("delete_bad_path", ERR(SYS_ERR_INVAL), mos_delete((const char*)P));
++    BAD_IN_RET("create_bad_type", ERR(SYS_ERR_INVAL), mos_create(TMP "/ptr_never.txt", (const char*)P, NULL));
++    BAD_IN_RET("create_bad_format", ERR(SYS_ERR_INVAL), mos_create(TMP "/ptr_never.txt", "text", (const char*)P));
++    EXPECT(!exists(TMP "/ptr_never.txt"), "create_bad_arguments_created_nothing", "file exists");
++    BAD_IN_RET("stat_bad_path_all", ERR(SYS_ERR_INVAL), mos_stat((const char*)P, (syscall_stat_t*)heap));
++    EXPECT_RET(mos_exists(g_rodata_path), 1, "exists_path_in_rodata");
++    EXPECT_RET(mos_exists((const char*)g_pb_ro), 1, "exists_path_in_readonly_vm");
++    scopy((char*)heap, 256, g_rodata_path);
++    EXPECT_RET(mos_exists((const char*)heap), 1, "exists_path_in_heap");
++    scopy((char*)stackbuf, sizeof(stackbuf), g_rodata_path);
++    EXPECT_RET(mos_exists((const char*)stackbuf), 1, "exists_path_on_stack");
++    scopy((char*)g_pb_rw, 4096, g_rodata_path);
++    EXPECT_RET(mos_exists((const char*)g_pb_rw), 1, "exists_path_in_vm");
++    /* A path that fills its mapping to the last byte with a NUL there is fine. */
++    memset(g_pb_rw, 'a', 4096);
++    g_pb_rw[4095] = '\0';
++    EXPECT_RET(mos_exists((const char*)(g_pb_rw + 4090)), 0, "exists_path_ending_at_mapping_end");
++    g_pb_rw[4095] = 'a';
++    EXPECT_RET(mos_exists((const char*)(g_pb_rw + 4090)), ERR(SYS_ERR_INVAL), "exists_unterminated_path_inval");
++
++    /* ---- output structs: SYS_STAT, SYS_GET_METADATA, SYS_GETTIME, SYS_RANDOM, SYS_GETCWD */
++    BAD_OUT_RET("stat_bad_output", ERR(SYS_ERR_INVAL), mos_stat(g_rodata_path, (syscall_stat_t*)P));
++    EXPECT_RET(mos_stat(g_rodata_path, (syscall_stat_t*)heap), 0, "stat_output_in_heap");
++    EXPECT_RET(mos_stat(g_rodata_path, (syscall_stat_t*)g_pb_rw), 0, "stat_output_in_vm");
++    EXPECT_RET(mos_stat(g_rodata_path, (syscall_stat_t*)g_bss_buf), 0, "stat_output_in_bss");
++    BAD_OUT_RET("get_metadata_bad_output", ERR(SYS_ERR_INVAL), mos_get_metadata(g_rodata_path, (syscall_file_metadata_t*)P));
++    EXPECT_RET(mos_get_metadata(g_rodata_path, (syscall_file_metadata_t*)heap), 0, "get_metadata_output_in_heap");
++    BAD_OUT_RET("gettime_bad_output", ERR(SYS_ERR_INVAL), mos_syscall(SYS_GETTIME, (long)(uintptr_t)P, 0, 0));
++    EXPECT_RET(mos_syscall(SYS_GETTIME, (long)(uintptr_t)heap, 0, 0), 0, "gettime_output_in_heap");
++    EXPECT_RET(mos_syscall(SYS_GETTIME, (long)(uintptr_t)stackbuf, 0, 0), 0, "gettime_output_on_stack");
++    BAD_OUT_RET("random_bad_buffer", ERR(SYS_ERR_INVAL), mos_syscall(SYS_RANDOM, (long)(uintptr_t)P, 16, 0));
++    EXPECT_RET(mos_syscall(SYS_RANDOM, (long)(uintptr_t)heap, 16, 0), 16, "random_buffer_in_heap");
++    EXPECT_RET(mos_syscall(SYS_RANDOM, (long)(uintptr_t)g_pb_rw, 16, 0), 16, "random_buffer_in_vm");
++    BAD_OUT_RET("getcwd_bad_buffer", ERR(SYS_ERR_INVAL), mos_getcwd((char*)P, 256));
++    EXPECT_RET(mos_getcwd((char*)stackbuf, 4096), 0, "getcwd_oversize_capacity_on_stack_ok");
++    EXPECT_RET(mos_getcwd((char*)heap, 4096), 0, "getcwd_buffer_in_heap");
++
++    /* ---- SYS_LISTDIR, SYS_PSLIST: only the entries written have to fit */
++    mos_mkdir(TMP "/ptrdir");
++    write_text(TMP "/ptrdir/a.txt", "A");
++    write_text(TMP "/ptrdir/b.txt", "B");
++    BAD_OUT_RET("listdir_bad_output", ERR(SYS_ERR_INVAL), mos_listdir(TMP "/ptrdir", (syscall_dirent_t*)P, 8));
++    BAD_IN_RET("listdir_bad_path", ERR(SYS_ERR_INVAL), mos_listdir((const char*)P, (syscall_dirent_t*)heap, 8));
++    long n = mos_listdir(TMP "/ptrdir", (syscall_dirent_t*)heap, 8);
++    EXPECT(n == 2, "listdir_output_in_heap", "got %ld", n);
++    n = mos_listdir(TMP "/ptrdir", (syscall_dirent_t*)heap, 100);   /* capacity 100, buffer for 8+ */
++    EXPECT(n == 2, "listdir_oversize_capacity_ok", "got %ld", n);
++    n = mos_listdir(TMP "/ptrdir", (syscall_dirent_t*)g_pb_rw, 8);
++    EXPECT(n == 2, "listdir_output_in_vm", "got %ld", n);
++    BAD_OUT_RET("pslist_bad_output", ERR(SYS_ERR_INVAL), mos_pslist((syscall_process_info_t*)P, 4));
++    n = mos_pslist((syscall_process_info_t*)heap, 4);
++    EXPECT(n >= 1 && n <= 4, "pslist_output_in_heap", "got %ld", n);
++    n = mos_pslist((syscall_process_info_t*)g_pb_rw, 8);
++    EXPECT(n >= 1, "pslist_output_in_vm", "got %ld", n);
++
++    /* ---- SYS_WRITE (stdout/stderr and the log descriptor) */
++    BAD_IN_RET("write_stdout_bad_buffer", ERR(SYS_ERR_INVAL), mos_write_fd(1, (const char*)P, 16));
++    BAD_IN_RET("write_log_bad_buffer", ERR(SYS_ERR_INVAL), mos_write_fd(3, (const char*)P, 16));
++    EXPECT_RET(mos_write_fd(3, g_rodata_text, 8), 8, "write_log_from_rodata");
++    EXPECT_RET(mos_write_fd(3, g_pb_ro, 8), 8, "write_log_from_readonly_vm");
++
++    /* ---- SYS_WAIT, SYS_FUTEX, SYS_THREAD, SYS_VM, SYS_REGISTER_CLEANUP */
++    BAD_OUT_RET("wait_bad_output", ERR(SYS_ERR_INVAL), mos_wait_raw(SYS_WAIT_ANY, SYS_WAIT_NOHANG, (syscall_wait_t*)P));
++    BAD_IN_RET("futex_wake_bad_address", ERR(SYS_ERR_INVAL), mos_syscall(SYS_FUTEX, SYS_FUTEX_WAKE, (long)(uintptr_t)P, 1));
++    BAD_IN_RET("thread_create_bad_struct", ERR(SYS_ERR_INVAL), mos_syscall(SYS_THREAD, SYS_THREAD_CREATE, (long)(uintptr_t)P, 0));
++    BAD_IN_RET("thread_create_ex_bad_struct", ERR(SYS_ERR_INVAL), mos_syscall(SYS_THREAD, SYS_THREAD_CREATE_EX, (long)(uintptr_t)P, 0));
++    BAD_IN_RET("vm_map_bad_struct", ERR(SYS_ERR_INVAL), mos_vm_map_raw((const syscall_vm_map_t*)P));
++    EXPECT_RET(mos_syscall(SYS_REGISTER_CLEANUP, 0x300000000000LL, 0, 0), ERR(SYS_ERR_INVAL), "register_cleanup_unmapped_inval");
++    EXPECT_RET(mos_syscall(SYS_REGISTER_CLEANUP, 0x200000, 0, 0), ERR(SYS_ERR_INVAL), "register_cleanup_kernel_inval");
++    EXPECT_RET(mos_syscall(SYS_REGISTER_CLEANUP, (long)(uintptr_t)g_pb_rw, 0, 0), ERR(SYS_ERR_INVAL), "register_cleanup_not_executable_inval");
++
++    /* ---- SYS_PKG: the request's own pointers */
++    {
++        syscall_pkg_request_t pk;
++        memset(&pk, 0, sizeof(pk));
++        pk.op = SYS_PKG_INFO;
++        pk.path = g_rodata_path;
++        pk.out_count = (uint32_t*)g_pb_ro;
++        EXPECT_RET(mos_syscall(SYS_PKG, (long)(uintptr_t)&pk, 0, 0), ERR(SYS_ERR_INVAL), "pkg_info_readonly_out_count");
++        pk.out_count = NULL;
++        for (int i = 0; i < 4; i++) {
++            pk.path = (const char*)g_bad_in[i];
++            char nm[96]; kfmt(nm, sizeof(nm), "pkg_info_bad_path_%s", g_tag_in[i]);
++            EXPECT_RET(mos_syscall(SYS_PKG, (long)(uintptr_t)&pk, 0, 0), ERR(SYS_ERR_INVAL), nm);
++        }
++        BAD_IN_RET("pkg_bad_request", ERR(SYS_ERR_INVAL), mos_syscall(SYS_PKG, (long)(uintptr_t)P, 0, 0));
++    }
++
++    /* ---- SYS_USB keyboard info */
++    BAD_OUT_RET("usb_keyboard_info_bad_output", ERR(SYS_ERR_INVAL), mos_syscall(SYS_USB, SYS_USB_KEYBOARD_INFO, (long)(uintptr_t)P, 0));
++
++    /* ---- SYS_GRAPHICS */
++    {
++        syscall_graphics_request_t gr;
++        memset(&gr, 0, sizeof(gr));
++        gr.op = SYS_GRAPHICS_INFO;
++        for (int i = 0; i < 5; i++) {
++            gr.info = (syscall_graphics_info_t*)g_bad_out[i];
++            char nm[96]; kfmt(nm, sizeof(nm), "graphics_info_bad_output_%s", g_tag_out[i]);
++            EXPECT_RET(mos_syscall(SYS_GRAPHICS, (long)(uintptr_t)&gr, 0, 0), ERR(SYS_ERR_INVAL), nm);
++        }
++        BAD_OUT_NEG("graphics_bad_request", mos_syscall(SYS_GRAPHICS, (long)(uintptr_t)P, 0, 0));
++        gr.op = SYS_GRAPHICS_GET_WIDTH;
++        long w = mos_syscall(SYS_GRAPHICS, (long)(uintptr_t)&gr, 0, 0);
++        EXPECT(w >= 0, "graphics_get_width_still_works", "got %ld", w);
++    }
++
++    /* ---- SYS_WINDOW */
++    {
++        syscall_window_request_t wr;
++        memset(&wr, 0, sizeof(wr));
++        wr.size = sizeof(wr);
++        wr.version = SYS_WINDOW_ABI_VERSION;
++        BAD_IN_RET("window_bad_request", ERR(SYS_ERR_INVAL), mos_syscall(SYS_WINDOW, (long)(uintptr_t)P, 0, 0));
++        wr.op = SYS_WINDOW_GET_INFO; wr.id = 1;
++        for (int i = 0; i < 5; i++) {
++            wr.info = (syscall_window_info_t*)g_bad_out[i];
++            char nm[96]; kfmt(nm, sizeof(nm), "window_get_info_bad_output_%s", g_tag_out[i]);
++            EXPECT_RET(mos_syscall(SYS_WINDOW, (long)(uintptr_t)&wr, 0, 0), ERR(SYS_ERR_INVAL), nm);
++        }
++        wr.info = NULL;
++        wr.op = SYS_WINDOW_LIST; wr.capacity = 2;
++        for (int i = 0; i < 5; i++) {
++            wr.windows = (syscall_window_info_t*)g_bad_out[i];
++            char nm[96]; kfmt(nm, sizeof(nm), "window_list_bad_output_%s", g_tag_out[i]);
++            EXPECT_RET(mos_syscall(SYS_WINDOW, (long)(uintptr_t)&wr, 0, 0), ERR(SYS_ERR_INVAL), nm);
++        }
++        wr.windows = (syscall_window_info_t*)heap; wr.capacity = 4;
++        long c = mos_syscall(SYS_WINDOW, (long)(uintptr_t)&wr, 0, 0);
++        EXPECT(c >= 0, "window_list_output_in_heap", "got %ld", c);
++        wr.windows = (syscall_window_info_t*)g_pb_rw;
++        c = mos_syscall(SYS_WINDOW, (long)(uintptr_t)&wr, 0, 0);
++        EXPECT(c >= 0, "window_list_output_in_vm", "got %ld", c);
++        wr.windows = NULL; wr.capacity = 0;
++        c = mos_syscall(SYS_WINDOW, (long)(uintptr_t)&wr, 0, 0);
++        EXPECT(c >= 0, "window_list_count_only", "got %ld", c);
++        wr.op = SYS_WINDOW_NEXT_EVENT; wr.capacity = 0; wr.id = 1;
++        for (int i = 0; i < 5; i++) {
++            wr.event = (syscall_window_event_t*)g_bad_out[i];
++            char nm[96]; kfmt(nm, sizeof(nm), "window_next_event_bad_output_%s", g_tag_out[i]);
++            EXPECT_RET(mos_syscall(SYS_WINDOW, (long)(uintptr_t)&wr, 0, 0), ERR(SYS_ERR_INVAL), nm);
++        }
++        wr.event = NULL;
++        wr.op = SYS_WINDOW_PRESENT; wr.id = 1; wr.x = 0; wr.y = 0; wr.width = 8; wr.height = 8; wr.pitch = 32;
++        for (int i = 0; i < 4; i++) {
++            wr.pixels = (const uint32_t*)g_bad_in[i];
++            char nm[96]; kfmt(nm, sizeof(nm), "window_present_bad_pixels_%s", g_tag_in[i]);
++            EXPECT_RET(mos_syscall(SYS_WINDOW, (long)(uintptr_t)&wr, 0, 0), ERR(SYS_ERR_INVAL), nm);
++        }
++    }
++
++    /* ---- SYS_INPUT_READ (events written; a request that is fine gets PERM
++     * when this program does not own the screen, which is checked after) */
++    {
++        syscall_input_read_request_t ir;
++        memset(&ir, 0, sizeof(ir));
++        ir.size = sizeof(ir);
++        ir.version = SYS_INPUT_ABI_VERSION;
++        ir.capacity = 4;
++        BAD_IN_RET("input_read_bad_request", ERR(SYS_ERR_INVAL), mos_syscall(SYS_INPUT_READ, (long)(uintptr_t)P, 0, 0));
++        for (int i = 0; i < 5; i++) {
++            ir.events = (syscall_input_event_t*)g_bad_out[i];
++            char nm[96]; kfmt(nm, sizeof(nm), "input_read_bad_events_%s", g_tag_out[i]);
++            EXPECT_RET(mos_syscall(SYS_INPUT_READ, (long)(uintptr_t)&ir, 0, 0), ERR(SYS_ERR_INVAL), nm);
++        }
++        ir.events = (syscall_input_event_t*)heap;
++        for (int i = 0; i < 5; i++) {
++            ir.dropped_count = (uint64_t*)g_bad_out[i];
++            char nm[96]; kfmt(nm, sizeof(nm), "input_read_bad_dropped_count_%s", g_tag_out[i]);
++            EXPECT_RET(mos_syscall(SYS_INPUT_READ, (long)(uintptr_t)&ir, 0, 0), ERR(SYS_ERR_INVAL), nm);
++        }
++        ir.dropped_count = NULL;
++        long r = mos_syscall(SYS_INPUT_READ, (long)(uintptr_t)&ir, 0, 0);
++        EXPECT(r == ERR(SYS_ERR_PERM) || r >= 0, "input_read_valid_request_reaches_owner_check", "got %ld", r);
++        ir.events = (syscall_input_event_t*)stackbuf;
++        r = mos_syscall(SYS_INPUT_READ, (long)(uintptr_t)&ir, 0, 0);
++        EXPECT(r == ERR(SYS_ERR_PERM) || r >= 0, "input_read_events_on_stack_ok", "got %ld", r);
++    }
++
++    /* ---- SYS_GPU: ops that read or write program memory */
++    {
++        syscall_gpu_request_t g;
++        memset(&g, 0, sizeof(g));
++        g.size = sizeof(g);
++        g.version = SYS_GPU_ABI_VERSION;
++        BAD_OUT_RET("gpu_bad_request", ERR(SYS_ERR_INVAL), mos_syscall(SYS_GPU, (long)(uintptr_t)P, 0, 0));
++        g.op = SYS_GPU_INFO;
++        for (int i = 0; i < 5; i++) {
++            g.out = g_bad_out[i];
++            char nm[96]; kfmt(nm, sizeof(nm), "gpu_info_bad_output_%s", g_tag_out[i]);
++            EXPECT_RET(mos_syscall(SYS_GPU, (long)(uintptr_t)&g, 0, 0), ERR(SYS_ERR_INVAL), nm);
++        }
++        g.op = SYS_GPU_SUBMIT; g.bytes = 16;
++        for (int i = 0; i < 4; i++) {
++            g.data = g_bad_in[i];
++            char nm[96]; kfmt(nm, sizeof(nm), "gpu_submit_bad_commands_%s", g_tag_in[i]);
++            EXPECT_RET(mos_syscall(SYS_GPU, (long)(uintptr_t)&g, 0, 0), ERR(SYS_ERR_INVAL), nm);
++        }
++        g.op = SYS_GPU_CREATE_PROGRAM; g.bytes = 64;
++        for (int i = 0; i < 4; i++) {
++            g.data = g_bad_in[i];
++            char nm[96]; kfmt(nm, sizeof(nm), "gpu_create_program_bad_blob_%s", g_tag_in[i]);
++            EXPECT_RET(mos_syscall(SYS_GPU, (long)(uintptr_t)&g, 0, 0), ERR(SYS_ERR_INVAL), nm);
++        }
++        /* A buffer and a surface to upload to / read back from. */
++        memset(&g, 0, sizeof(g));
++        g.size = sizeof(g); g.version = SYS_GPU_ABI_VERSION;
++        g.op = SYS_GPU_CREATE_BUFFER; g.bytes = 4096;
++        long cb = mos_syscall(SYS_GPU, (long)(uintptr_t)&g, 0, 0);
++        uint32_t buf_id = g.handle;
++        memset(&g, 0, sizeof(g));
++        g.size = sizeof(g); g.version = SYS_GPU_ABI_VERSION;
++        g.op = SYS_GPU_CREATE_SURFACE; g.width = 16; g.height = 16; g.format = FGPU_FORMAT_XRGB8888;
++        g.flags = FGPU_SURFACE_SYSTEM_MEMORY;
++        long cs = mos_syscall(SYS_GPU, (long)(uintptr_t)&g, 0, 0);
++        uint32_t surf_id = g.handle;
++        if (cb == 0 && buf_id) {
++            g.op = SYS_GPU_UPLOAD_BUFFER; g.handle = buf_id; g.offset = 0; g.bytes = 256;
++            for (int i = 0; i < 4; i++) {
++                g.data = g_bad_in[i];
++                char nm[96]; kfmt(nm, sizeof(nm), "gpu_upload_buffer_bad_data_%s", g_tag_in[i]);
++                EXPECT_RET(mos_syscall(SYS_GPU, (long)(uintptr_t)&g, 0, 0), ERR(SYS_ERR_INVAL), nm);
++            }
++            g.data = heap;
++            EXPECT_RET(mos_syscall(SYS_GPU, (long)(uintptr_t)&g, 0, 0), 0, "gpu_upload_buffer_from_heap");
++            g.data = g_pb_ro;
++            EXPECT_RET(mos_syscall(SYS_GPU, (long)(uintptr_t)&g, 0, 0), 0, "gpu_upload_buffer_from_readonly_vm");
++            g.data = g_rodata_text; g.bytes = 16;
++            EXPECT_RET(mos_syscall(SYS_GPU, (long)(uintptr_t)&g, 0, 0), 0, "gpu_upload_buffer_from_rodata");
++            g.op = SYS_GPU_DESTROY_BUFFER; g.handle = buf_id;
++            EXPECT_RET(mos_syscall(SYS_GPU, (long)(uintptr_t)&g, 0, 0), 0, "gpu_destroy_buffer");
++        } else {
++            check_pass("gpu_buffer_checks (skipped: no buffer could be created)");
++        }
++        if (cs == 0 && surf_id) {
++            memset(&g, 0, sizeof(g));
++            g.size = sizeof(g); g.version = SYS_GPU_ABI_VERSION;
++            g.handle = surf_id; g.pitch = 64;
++            g.op = SYS_GPU_READBACK;
++            for (int i = 0; i < 5; i++) {
++                g.out = g_bad_out[i];
++                char nm[96]; kfmt(nm, sizeof(nm), "gpu_readback_bad_output_%s", g_tag_out[i]);
++                EXPECT_RET(mos_syscall(SYS_GPU, (long)(uintptr_t)&g, 0, 0), ERR(SYS_ERR_INVAL), nm);
++            }
++            g.out = heap;
++            EXPECT_RET(mos_syscall(SYS_GPU, (long)(uintptr_t)&g, 0, 0), 0, "gpu_readback_into_heap");
++            g.out = g_pb_rw;
++            EXPECT_RET(mos_syscall(SYS_GPU, (long)(uintptr_t)&g, 0, 0), 0, "gpu_readback_into_vm");
++            g.op = SYS_GPU_WRITE_SURFACE;
++            for (int i = 0; i < 4; i++) {
++                g.data = g_bad_in[i];
++                char nm[96]; kfmt(nm, sizeof(nm), "gpu_write_surface_bad_pixels_%s", g_tag_in[i]);
++                EXPECT_RET(mos_syscall(SYS_GPU, (long)(uintptr_t)&g, 0, 0), ERR(SYS_ERR_INVAL), nm);
++            }
++            g.data = heap;
++            EXPECT_RET(mos_syscall(SYS_GPU, (long)(uintptr_t)&g, 0, 0), 0, "gpu_write_surface_from_heap");
++            g.data = g_pb_ro;
++            EXPECT_RET(mos_syscall(SYS_GPU, (long)(uintptr_t)&g, 0, 0), 0, "gpu_write_surface_from_readonly_vm");
++            g.op = SYS_GPU_DESTROY_SURFACE;
++            EXPECT_RET(mos_syscall(SYS_GPU, (long)(uintptr_t)&g, 0, 0), 0, "gpu_destroy_surface");
++        } else {
++            check_pass("gpu_surface_checks (skipped: no surface could be created)");
++        }
++    }
++
++    /* ---- SYS_MEDIA: the tile decoder (frame is read, pixels written) */
++    {
++        syscall_media_request_t m;
++        memset(&m, 0, sizeof(m));
++        m.size = sizeof(m); m.version = SYS_MEDIA_ABI_VERSION; m.op = SYS_MEDIA_DECODE_TILES;
++        m.width = 16; m.height = 16; m.frame_bytes = 64;
++        BAD_OUT_RET("media_bad_request", ERR(SYS_ERR_INVAL), mos_syscall(SYS_MEDIA, (long)(uintptr_t)P, 0, 0));
++        m.pixels = (uint32_t*)heap;
++        for (int i = 0; i < 4; i++) {
++            m.frame = (const uint8_t*)g_bad_in[i];
++            char nm[96]; kfmt(nm, sizeof(nm), "media_tiles_bad_frame_%s", g_tag_in[i]);
++            EXPECT_RET(mos_syscall(SYS_MEDIA, (long)(uintptr_t)&m, 0, 0), ERR(SYS_ERR_INVAL), nm);
++        }
++        m.frame = stackbuf;
++        for (int i = 0; i < 5; i++) {
++            m.pixels = (uint32_t*)g_bad_out[i];
++            char nm[96]; kfmt(nm, sizeof(nm), "media_tiles_bad_pixels_%s", g_tag_out[i]);
++            long r = mos_syscall(SYS_MEDIA, (long)(uintptr_t)&m, 0, 0);
++            /* unaligned (overrun) pointers are refused by the alignment rule: still an error */
++            EXPECT(r == ERR(SYS_ERR_INVAL), nm, "got %ld", r);
++        }
++    }
++
++    /* ---- SYS_NET */
++    {
++        syscall_net_request_t nr;
++        memset(&nr, 0, sizeof(nr));
++        BAD_IN_RET("net_bad_request", ERR(SYS_ERR_INVAL), mos_syscall(SYS_NET, (long)(uintptr_t)P, 0, 0));
++        nr.op = SYS_NET_STATUS;
++        for (int i = 0; i < 5; i++) {
++            nr.out_status = (syscall_net_status_t*)g_bad_out[i];
++            char nm[96]; kfmt(nm, sizeof(nm), "net_status_bad_output_%s", g_tag_out[i]);
++            EXPECT_RET(mos_syscall(SYS_NET, (long)(uintptr_t)&nr, 0, 0), ERR(SYS_ERR_INVAL), nm);
++        }
++        nr.out_status = (syscall_net_status_t*)heap;
++        EXPECT_RET(mos_syscall(SYS_NET, (long)(uintptr_t)&nr, 0, 0), 0, "net_status_output_in_heap");
++        nr.out_status = (syscall_net_status_t*)g_pb_rw;
++        EXPECT_RET(mos_syscall(SYS_NET, (long)(uintptr_t)&nr, 0, 0), 0, "net_status_output_in_vm");
++        nr.out_status = NULL;
++        nr.op = SYS_NET_ADAPTERS; nr.len = sizeof(syscall_net_adapters_t);
++        for (int i = 0; i < 5; i++) {
++            nr.buf = g_bad_out[i];
++            char nm[96]; kfmt(nm, sizeof(nm), "net_adapters_bad_buffer_%s", g_tag_out[i]);
++            EXPECT_RET(mos_syscall(SYS_NET, (long)(uintptr_t)&nr, 0, 0), ERR(SYS_ERR_INVAL), nm);
++        }
++        nr.buf = heap;
++        EXPECT_RET(mos_syscall(SYS_NET, (long)(uintptr_t)&nr, 0, 0), 0, "net_adapters_buffer_in_heap");
++        nr.buf = NULL; nr.len = 0;
++        nr.op = SYS_NET_TCP_CONNECT; nr.ip = 0x7F000001u; nr.port = 80;
++        for (int i = 0; i < 5; i++) {
++            nr.out_handle = (uint64_t*)g_bad_out[i];
++            char nm[96]; kfmt(nm, sizeof(nm), "net_tcp_connect_bad_out_handle_%s", g_tag_out[i]);
++            EXPECT_RET(mos_syscall(SYS_NET, (long)(uintptr_t)&nr, 0, 0), ERR(SYS_ERR_INVAL), nm);
++        }
++        nr.out_handle = NULL;
++        nr.op = SYS_NET_RESOLVE; nr.out_ip = (uint32_t*)heap;
++        for (int i = 0; i < 4; i++) {
++            nr.host = (const char*)g_bad_in[i];
++            char nm[96]; kfmt(nm, sizeof(nm), "net_resolve_bad_host_%s", g_tag_in[i]);
++            EXPECT_RET(mos_syscall(SYS_NET, (long)(uintptr_t)&nr, 0, 0), ERR(SYS_ERR_INVAL), nm);
++        }
++        nr.host = "example.invalid";
++        for (int i = 0; i < 5; i++) {
++            nr.out_ip = (uint32_t*)g_bad_out[i];
++            char nm[96]; kfmt(nm, sizeof(nm), "net_resolve_bad_out_ip_%s", g_tag_out[i]);
++            EXPECT_RET(mos_syscall(SYS_NET, (long)(uintptr_t)&nr, 0, 0), ERR(SYS_ERR_INVAL), nm);
++        }
++        nr.out_ip = NULL;
++        nr.op = SYS_NET_UDP_SEND; nr.ip = 0x7F000001u; nr.port = 9; nr.local_port = 4000; nr.len = 16;
++        for (int i = 0; i < 4; i++) {
++            nr.buf = g_bad_in[i];
++            char nm[96]; kfmt(nm, sizeof(nm), "net_udp_send_bad_buffer_%s", g_tag_in[i]);
++            EXPECT_RET(mos_syscall(SYS_NET, (long)(uintptr_t)&nr, 0, 0), ERR(SYS_ERR_INVAL), nm);
++        }
++        nr.op = SYS_NET_UDP_RECV; nr.handle = 1;
++        for (int i = 0; i < 5; i++) {
++            nr.buf = g_bad_out[i];
++            char nm[96]; kfmt(nm, sizeof(nm), "net_udp_recv_bad_buffer_%s", g_tag_out[i]);
++            EXPECT_RET(mos_syscall(SYS_NET, (long)(uintptr_t)&nr, 0, 0), ERR(SYS_ERR_INVAL), nm);
++        }
++    }
++
++    /* ---- SYS_STORAGE, SYS_AUDIO*, SYS_TIMESYNC, SYS_ROOT (request pointers and nested ones) */
++    {
++        syscall_storage_request_t sr;
++        memset(&sr, 0, sizeof(sr));
++        sr.size = sizeof(sr); sr.version = SYS_STORAGE_ABI_VERSION;
++        BAD_OUT_RET("storage_bad_request", ERR(SYS_ERR_INVAL), mos_syscall(SYS_STORAGE, (long)(uintptr_t)P, 0, 0));
++        sr.op = SYS_STORAGE_LIST; sr.capacity = 4;
++        for (int i = 0; i < 5; i++) {
++            sr.devices = (syscall_storage_device_t*)g_bad_out[i];
++            char nm[96]; kfmt(nm, sizeof(nm), "storage_list_bad_devices_%s", g_tag_out[i]);
++            EXPECT_RET(mos_syscall(SYS_STORAGE, (long)(uintptr_t)&sr, 0, 0), ERR(SYS_ERR_INVAL), nm);
++        }
++        sr.devices = (syscall_storage_device_t*)heap;
++        long sl = mos_syscall(SYS_STORAGE, (long)(uintptr_t)&sr, 0, 0);
++        EXPECT(sl >= 0, "storage_list_devices_in_heap", "got %ld", sl);
++        sr.op = SYS_STORAGE_STATUS;
++        EXPECT_RET(mos_syscall(SYS_STORAGE, (long)(uintptr_t)&sr, 0, 0), 0, "storage_status_ok");
++
++        BAD_OUT_RET("audio_bad_request", ERR(SYS_ERR_INVAL), mos_syscall(SYS_AUDIO, (long)(uintptr_t)P, 0, 0));
++        BAD_OUT_RET("audio_mixer_bad_request", ERR(SYS_ERR_INVAL), mos_syscall(SYS_AUDIO_MIXER, (long)(uintptr_t)P, 0, 0));
++        BAD_OUT_RET("audio_stream_bad_request", ERR(SYS_ERR_INVAL), mos_syscall(SYS_AUDIO_STREAM, (long)(uintptr_t)P, 0, 0));
++        syscall_audio_mixer_t* mx = (syscall_audio_mixer_t*)heap;
++        memset(mx, 0, sizeof(*mx));
++        mx->op = SYS_AUDIO_MIXER_GET;
++        EXPECT_RET(mos_syscall(SYS_AUDIO_MIXER, (long)(uintptr_t)mx, 0, 0), 0, "audio_mixer_get_in_heap");
++        syscall_audio_request_t* ar = (syscall_audio_request_t*)heap;
++        memset(ar, 0, sizeof(*ar));
++        ar->size = sizeof(*ar); ar->version = SYS_AUDIO_ABI_VERSION; ar->op = SYS_AUDIO_STATUS;
++        EXPECT_RET(mos_syscall(SYS_AUDIO, (long)(uintptr_t)ar, 0, 0), 0, "audio_status_in_heap");
++        memset(ar, 0, sizeof(*ar));
++        ar->size = sizeof(*ar); ar->version = SYS_AUDIO_ABI_VERSION; ar->op = SYS_AUDIO_STATUS;
++        long ag = mos_syscall(SYS_AUDIO, (long)(uintptr_t)g_pb_rw, 0, 0);   /* garbage contents */
++        EXPECT(ag < 0, "audio_garbage_request_no_crash", "got %ld", ag);
++
++        /* SYS_TIMESYNC (38) and SYS_ROOT: a kernel-sized request in the heap, op STATUS */
++        BAD_OUT_RET("timesync_bad_request", ERR(SYS_ERR_INVAL), mos_syscall(38, (long)(uintptr_t)P, 0, 0));
++        BAD_OUT_RET("root_bad_request", ERR(SYS_ERR_INVAL), mos_syscall(SYS_ROOT, (long)(uintptr_t)P, 0, 0));
++        uint32_t* big = (uint32_t*)malloc(4096);
++        if (big) {
++            memset(big, 0, 4096);
++            big[0] = 2;     /* SYS_TIMESYNC_STATUS */
++            EXPECT_RET(mos_syscall(38, (long)(uintptr_t)big, 0, 0), 0, "timesync_status_in_heap");
++            memset(big, 0, 4096);
++            big[0] = 4;     /* SYS_ROOT_STATUS */
++            EXPECT_RET(mos_syscall(SYS_ROOT, (long)(uintptr_t)big, 0, 0), 0, "root_status_in_heap");
++            free(big);
++        }
++    }
++
++    /* The mappings are ours to give back. */
++    mos_vm_unmap(g_pb_rw, 4096);
++    mos_vm_unmap(g_pb_ro, 4096);
++    mos_vm_unmap(g_pb_none, 4096);
++    free(heap);
++}
++
+ /* ======================================== failed spawn leaves files alone */
+ 
+ static void test_spawn_failure_cleanup(void) {
+@@ -2754,6 +3271,7 @@ int main(int argc, char** argv, char** envp) {
+     test_spawn_crash_and_wait();
+     test_spawn_errors();
+     test_bad_pointers();
++    test_bad_pointers_2();
+     test_spawn_failure_cleanup();
+     test_exec_relative();
+     test_vm();
+-- 
+2.43.0
+
+
+From 77a1932e99ae63987c8bf692e5cb21d3fc436885 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 13 Nov 2026 17:36:41 +0000
+Subject: [PATCH 6/6] fglcube: --still freezes the animation and prints FGLCUBE
+ READY
+
+For screenshot tests (tools/debug/ci_fglcube.sh in Minimal-OS).
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0112xJofPtaNLntSK14Rcenm
+---
+ programs/fglcube/main.c | 11 ++++++++---
+ 1 file changed, 8 insertions(+), 3 deletions(-)
+
+diff --git a/programs/fglcube/main.c b/programs/fglcube/main.c
+index 2567d1d..05fd546 100644
+--- a/programs/fglcube/main.c
++++ b/programs/fglcube/main.c
+@@ -2,8 +2,11 @@
+  * fglcube - a rotating, lit cube drawn with FarcadeGL.
+  *
+  *     ./build.sh programs/fglcube        -> fglcube.run
+- *     fglcube [seconds] [--gouraud|--flat|--wire|--shader]
++ *     fglcube [seconds] [--gouraud|--flat|--wire|--shader] [--still]
+  *
++ * --still freezes the animation at one fixed time and prints "FGLCUBE READY"
++ * once the first frame is shown (tools/debug/ci_fglcube.sh takes a screenshot
++ * then and compares renderings between CPU rasterizer modes).
+  * --shader draws the scene with FGSL shaders instead of the built-in
+  * programs: a textured cube with per-pixel lighting and a pulsing rim
+  * glow, on a floor with a checker pattern computed per pixel.
+@@ -106,12 +109,13 @@ static void number(char* out, long v) {
+ int main(int argc, char** argv) {
+     long seconds = 0;
+     uint32_t program = FGL_PROGRAM_PHONG;
+-    int wire = 0, shaded = 0;
++    int wire = 0, shaded = 0, still = 0;
+     for (int i = 1; i < argc; i++) {
+         if (strcmp(argv[i], "--gouraud") == 0) program = FGL_PROGRAM_GOURAUD;
+         else if (strcmp(argv[i], "--flat") == 0) program = FGL_PROGRAM_COLOR;
+         else if (strcmp(argv[i], "--wire") == 0) wire = 1;
+         else if (strcmp(argv[i], "--shader") == 0) shaded = 1;
++        else if (strcmp(argv[i], "--still") == 0) still = 1;
+         else seconds = atoi(argv[i]);
+     }
+ 
+@@ -199,7 +203,7 @@ int main(int argc, char** argv) {
+     long frames = 0, fps_frames = 0;
+     while (!g_quit) {
+         long now = mos_uptime();
+-        float t = (float)(now - start) / 1000.0f;
++        float t = still ? 1.2f : (float)(now - start) / 1000.0f;
+ 
+         fglClearColor(gl, 0.06f, 0.08f, 0.13f);
+         fglClear(gl, FGL_COLOR_BUFFER_BIT | FGL_DEPTH_BUFFER_BIT);
+@@ -234,6 +238,7 @@ int main(int argc, char** argv) {
+         }
+         frames++;
+         fps_frames++;
++        if (still && frames == 3) printf("FGLCUBE READY\n");
+ 
+         if (now - last_title >= 1000) {
+             char text[64] = "FarcadeGL cube - ";
 -- 
 2.43.0
 

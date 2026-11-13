@@ -5,6 +5,7 @@
 #include "mmu_tables.h"
 #include "serial.h"
 #include "string.h"
+#include "x86_64/pmm.h"
 
 /*
  * Where the kernel heap and the page pool may live.
@@ -228,4 +229,73 @@ void memlayout_apply_cache_policy(multiboot2_info_t* mb) {
     serial_write_str("memlayout: ");
     serial_write_dec(uncached);
     serial_write_str(" identity 2 MiB pages marked uncached (no RAM)\n");
+}
+
+/* ------------------------------------------------------- RAM above 4 GiB */
+
+// The boot page tables identity map the first 4 GiB only. RAM beyond that
+// is mapped here the same way (2 MiB pages, in the kernel's own tables,
+// which every process shares) and handed to the page pool for program
+// memory. One PML4 slot covers 512 GiB; program memory starts right after
+// it (uvm.h), so that is the limit.
+#define HIGH_RAM_LIMIT (512ull << 30)
+#define HIGH_RAM_MIN   (4ull << 20)            // not worth a bitmap below this
+
+typedef struct {
+    uint64_t pages;
+    uint32_t regions;
+} high_ram_t;
+
+static bool map_high_2m(uint64_t start, uint64_t end) {
+    for (uint64_t addr = start; addr < end; addr += 0x200000ull) {
+        uint64_t gib = addr >> 30;
+        if (!(page_table_l3[gib] & 1)) {
+            void* pd = pmm_try_alloc_pages_zeroed(1);
+            if (!pd) return false;
+            page_table_l3[gib] = (uint64_t)(uintptr_t)pd | 0x3;
+        }
+        uint64_t* pd = (uint64_t*)(uintptr_t)(page_table_l3[gib] & 0x000FFFFFFFFFF000ull);
+        // Present, writable, 2 MiB, never executable.
+        pd[(addr >> 21) & 0x1FF] = addr | 0x83 | (1ull << 63);
+    }
+    return true;
+}
+
+static void high_ram_cb(const multiboot2_tag_t* tag, void* ctx) {
+    high_ram_t* h = (high_ram_t*)ctx;
+    const multiboot2_tag_mmap_t* mm = (const multiboot2_tag_mmap_t*)tag;
+    if (mm->entry_size < sizeof(multiboot2_mmap_entry_t)) return;
+    const uint8_t* e = (const uint8_t*)(mm + 1);
+    const uint8_t* end = (const uint8_t*)tag + tag->size;
+    for (; e + mm->entry_size <= end; e += mm->entry_size) {
+        const multiboot2_mmap_entry_t* ent = (const multiboot2_mmap_entry_t*)e;
+        if (ent->type != MB2_MEM_AVAILABLE) continue;
+        uint64_t s = ent->base_addr, x = ent->base_addr + ent->length;
+        if (x < s) continue;
+        if (s < ((uint64_t)IDENTITY_MAP_GIB << 30)) s = (uint64_t)IDENTITY_MAP_GIB << 30;
+        if (x > HIGH_RAM_LIMIT) x = HIGH_RAM_LIMIT;
+        // Whole 2 MiB pages only, so no mapping reaches past the RAM.
+        s = (s + 0x1FFFFFull) & ~0x1FFFFFull;
+        x &= ~0x1FFFFFull;
+        if (x <= s || x - s < HIGH_RAM_MIN) continue;
+        if (!map_high_2m(s, x)) {
+            serial_write_str("memlayout: no memory to map RAM above 4 GiB\n");
+            continue;
+        }
+        if (pmm_add_high_region((uintptr_t)s, (size_t)(x - s))) {
+            h->pages += (x - s) >> 12;
+            h->regions++;
+        }
+    }
+}
+
+void memlayout_add_high_ram(multiboot2_info_t* mb) {
+    high_ram_t h = { 0, 0 };
+    for_each_tag(mb, MB2_TAG_MMAP, high_ram_cb, &h);
+    // The new entries only add mappings; nothing cached needs flushing.
+    serial_write_str("memlayout: ");
+    serial_write_dec(h.pages >> 8);
+    serial_write_str(" MiB of RAM above 4 GiB in ");
+    serial_write_dec(h.regions);
+    serial_write_str(" region(s) for program memory\n");
 }

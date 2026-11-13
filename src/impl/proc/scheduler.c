@@ -1,3 +1,4 @@
+#include "x86_64/uvm.h"
 #include "x86_64/audio_streams.h"
 #include "x86_64/fgpu.h"
 // src/impl/proc/scheduler.c
@@ -652,7 +653,7 @@ static void schedule_irqs_off(void) {
             waitq_forget(to_free);
 
             if (to_free->kernel_stack) {
-                void* stack_base = (void*)((uint8_t*)to_free->kernel_stack - STACK_SIZE);
+                void* stack_base = (void*)((uint8_t*)to_free->kernel_stack - KERNEL_STACK_SIZE);
                 if (to_free->kernel_stack_page_backed)
                     free_pages(stack_base, to_free->kernel_stack_pages);
                 else
@@ -660,13 +661,6 @@ static void schedule_irqs_off(void) {
             }
 
                     proc_user_heap_cleanup(to_free);
-
-            if (to_free->user_image_phys) {
-                free_pages(to_free->user_image_phys, to_free->user_image_pages);
-            }
-            if (to_free->user_stack_phys) {
-                free_pages(to_free->user_stack_phys, to_free->user_stack_pages);
-            }
 
             if (to_free->privilege == PROC_PRIVILEGE_USER) {
                 proc_destroy_address_space(to_free);
@@ -960,8 +954,20 @@ void scheduler_tick() {
 
     if (was_idle || !current_process) return;
     if (scheduler_is_idle_process(current_process)) {
-        // Idle on an AP: pick up anything woken or migrated here.
-        if (rq_total(&g_runqueues[cpu_id]) > 0) schedule();
+        // Idle on an AP: pick up anything woken or migrated here. Also
+        // when the process that last ran here has ended: its cleanup was
+        // put off until this core had left its stack (g_deferred_reap),
+        // and the cleanup pass is part of schedule(). Without this an
+        // idle core never freed it, and its parent waited forever. Two
+        // passes: the first only notes that the stack is free now.
+        static uint8_t reap_passes[MAX_CPUS];
+        if (g_deferred_reap[cpu_id]) reap_passes[cpu_id] = 2;
+        if (rq_total(&g_runqueues[cpu_id]) > 0) {
+            schedule();
+        } else if (reap_passes[cpu_id]) {
+            reap_passes[cpu_id]--;
+            schedule();
+        }
         return;
     }
 
@@ -1086,6 +1092,10 @@ void process_exit_with_status(uint8_t exit_code, bool crashed,
     if (crashed && current_process->mem_owner)     /* the terminal waits on the program */
         command_user_process_exited(current_process->mem_owner->pid, exit_code, crashed,
                                     crash_vector);
+    // Its memory goes back now (never used again: this does not return to
+    // the program). Its threads are off the run queues by this point.
+    if (!current_process->mem_owner && current_process->privilege == PROC_PRIVILEGE_USER)
+        uvm_release_all(current_process);
     current_process->state = PROCESS_TERMINATED;
     schedule();
 

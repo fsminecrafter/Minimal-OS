@@ -1,4 +1,5 @@
 #include "x86_64/syscall.h"
+#include "x86_64/cpu_simd.h"
 #include "x86_64/wm_watchdog.h"
 #include "x86_64/acpi.h"
 #include "graphics.h"
@@ -39,6 +40,11 @@
 #include "x86_64/waitq.h"
 #include "x86_64/clock.h"
 #include "timeconv.h"
+#include "x86_64/user_ptr.h"
+
+// spawn.c: length of a NUL-terminated string entirely inside the calling
+// program's memory (at most `max` bytes, NUL included).
+bool proc_user_strlen(const char* s, size_t max, size_t* out_len);
 
 static minimafs_dir_entry_t g_listdir_entries[MINIMAFS_MAX_ROOT_ENTRIES];
 static volatile int     g_listdir_entries_lock;
@@ -48,6 +54,10 @@ static volatile int     g_listdir_entries_lock;
 // never set one; kernel callers always use the terminal's.
 static const char* syscall_resolve_path(const char* input, char* resolved) {
     if (!input || !resolved) return NULL;
+    // Every path syscall goes through here: the string must be the
+    // program's own and fit a path.
+    if (isCurrentProcessUser() && !proc_user_strlen(input, MINIMAFS_MAX_PATH, NULL))
+        return NULL;
     bool ok = isCurrentProcessUser() ? proc_resolve_path(current_process, input, resolved)
                                      : fs_resolve_path(input, resolved);
     return ok ? resolved : NULL;
@@ -75,11 +85,35 @@ bool syscall_user_range_ok(const void* ptr, size_t len, bool write) {
     return user_range_ok(ptr, len, write);
 }
 
+bool syscall_user_str_ok(const char* s, size_t max) {
+    if (!s) return false;
+    if (!isCurrentProcessUser()) return true;
+    return proc_user_strlen(s, max, NULL);
+}
+
+bool syscall_user_copy_in(void* dst, const void* src, size_t len) {
+    if (!src || !dst) return false;
+    if (len && !user_range_ok(src, len, false)) return false;
+    memcpy(dst, src, len);
+    return true;
+}
+
+bool syscall_user_copy_out(void* dst, const void* src, size_t len) {
+    if (!src || !dst) return false;
+    if (len && !user_range_ok(dst, len, true)) return false;
+    memcpy(dst, src, len);
+    return true;
+}
+
+// Longest string SYS_GRAPHICS_TEXT / MEASURE_TEXT take.
+#define SYS_GRAPHICS_TEXT_MAX (64u * 1024u)
+
 static uint64_t sys_write_impl(int fd, const char* buf, uint64_t len) {
     if (!buf) return SYS_ERR_INVAL;
     // fd 3: the kernel log only (serial and the network log), not the
     // screen - for program diagnostics such as Mxplorer's console.
     if (fd == 3) {
+        if (len && !user_range_ok(buf, len, false)) return SYS_ERR_INVAL;
         serial_write_str("[");
         serial_write_str(current_process ? current_process->name : "app");
         serial_write_str("] ");
@@ -96,6 +130,7 @@ static uint64_t sys_write_impl(int fd, const char* buf, uint64_t len) {
         if (redirected == 0) return SYS_ERR_INVAL;
         if (redirected > 0) return len;
     }
+    if (len && !user_range_ok(buf, len, false)) return SYS_ERR_INVAL;
 
     // No memory protection between processes exists yet (every
     // process_t shares the kernel's own PML4 - see proc_create()), so
@@ -112,12 +147,13 @@ static uint64_t sys_write_impl(int fd, const char* buf, uint64_t len) {
     return len;
 }
 
-static uint64_t sys_graphics_impl(const syscall_graphics_request_t* request) {
-    if (!request ||
-        (isCurrentProcessUser() &&
-         !user_range_ok(request, sizeof(*request), false))) {
+static uint64_t sys_graphics_impl(const syscall_graphics_request_t* user_request) {
+    // One kernel copy: the nested pointers below are checked and used from
+    // it, not re-read from the program's memory.
+    syscall_graphics_request_t request_copy;
+    if (!syscall_user_copy_in(&request_copy, user_request, sizeof(request_copy)))
         return SYS_ERR_INVAL;
-    }
+    const syscall_graphics_request_t* request = &request_copy;
 
     const int64_t* a = request->args;
     const bool requires_screen_owner =
@@ -182,12 +218,12 @@ static uint64_t sys_graphics_impl(const syscall_graphics_request_t* request) {
         case SYS_GRAPHICS_OWNER:
             return graphics_has_screen_owner() ? graphics_screen_owner_pid() : SYS_ERR_NOTFOUND;
         case SYS_GRAPHICS_BLIT: {
-            const syscall_blit_request_t* blit = request->blit;
-            if (isCurrentProcessUser() &&
-                !user_range_ok(blit, sizeof(*blit), false)) {
+            syscall_blit_request_t blit_copy;
+            if (!syscall_user_copy_in(&blit_copy, request->blit, sizeof(blit_copy))) {
                 serial_write_str("SYS_GRAPHICS_BLIT: invalid request pointer\n");
                 return SYS_ERR_INVAL;
             }
+            const syscall_blit_request_t* blit = &blit_copy;
             if (!blit || blit->size != sizeof(*blit) ||
                 blit->version != SYS_GRAPHICS_ABI_VERSION ||
                 (blit->flags != SYS_GRAPHICS_BLIT_OPAQUE &&
@@ -299,12 +335,16 @@ static uint64_t sys_graphics_impl(const syscall_graphics_request_t* request) {
                                    (uint8_t)a[4], (uint8_t)a[5], (uint8_t)a[6]);
             return SYS_SUCCESS;
         case SYS_GRAPHICS_TEXT:
-            if (!request->text) return SYS_ERR_INVAL;
+            if (!syscall_user_str_ok(request->text, SYS_GRAPHICS_TEXT_MAX))
+                return SYS_ERR_INVAL;
             graphics_write_text(request->text, (int32_t)a[0], (int32_t)a[1],
                                  (uint8_t)a[2], (uint8_t)a[3], (uint8_t)a[4]);
             return SYS_SUCCESS;
         case SYS_GRAPHICS_MEASURE_TEXT:
-            if (!request->text || !request->out_width || !request->out_height) {
+            if (!syscall_user_str_ok(request->text, SYS_GRAPHICS_TEXT_MAX) ||
+                !request->out_width || !request->out_height ||
+                !user_range_ok(request->out_width, sizeof(uint32_t), true) ||
+                !user_range_ok(request->out_height, sizeof(uint32_t), true)) {
                 return SYS_ERR_INVAL;
             }
             graphics_measure_text(request->text, request->out_width,
@@ -421,6 +461,12 @@ static uint64_t sys_sysinfo_impl(uint64_t op) {
         case SYS_SYSINFO_PMM_FREE_PAGES:
             return (uint64_t)pmm_free_pages();
 
+        case SYS_SYSINFO_CPU_FEATURES:
+            return cpu_simd_features();
+
+        case SYS_SYSINFO_XCR0:
+            return simd_xcr0;
+
         default:
             return SYS_ERR_INVAL;
     }
@@ -443,7 +489,7 @@ static uint64_t sys_usb_impl(uint64_t operation, uint64_t arg1, uint64_t arg2) {
             syscall_usb_keyboard_info_t* info =
                 (syscall_usb_keyboard_info_t*)arg1;
             usb_device_t* keyboard = usb_get_keyboard();
-            if (!info) return SYS_ERR_INVAL;
+            if (!info || !user_range_ok(info, sizeof(*info), true)) return SYS_ERR_INVAL;
             if (!keyboard) return SYS_ERR_NOTFOUND;
             info->address = keyboard->address;
             info->port = keyboard->port;
@@ -471,7 +517,7 @@ static uint64_t sys_mouse_impl(uint64_t operation, uint64_t arg1, uint64_t arg2)
             return usb_mouse_is_present() ? 1 : 0;
         case SYS_MOUSE_GET_STATE: {
             syscall_mouse_state_t* out = (syscall_mouse_state_t*)arg1;
-            if (!out) return SYS_ERR_INVAL;
+            if (!out || !user_range_ok(out, sizeof(*out), true)) return SYS_ERR_INVAL;
             int32_t dx, dy, wheel;
             uint8_t buttons;
             usb_mouse_consume_delta(&dx, &dy, &wheel, &buttons);
@@ -486,8 +532,10 @@ static uint64_t sys_mouse_impl(uint64_t operation, uint64_t arg1, uint64_t arg2)
     }
 }
 
-static uint64_t sys_input_read_impl(const syscall_input_read_request_t* request) {
-    if (!request || !user_range_ok(request, sizeof(*request), false) ||
+static uint64_t sys_input_read_impl(const syscall_input_read_request_t* user_request) {
+    syscall_input_read_request_t request_copy;
+    const syscall_input_read_request_t* request = &request_copy;
+    if (!syscall_user_copy_in(&request_copy, user_request, sizeof(request_copy)) ||
         request->size != sizeof(*request) ||
         request->version != SYS_INPUT_ABI_VERSION ||
         !request->events || request->capacity == 0 ||
@@ -536,8 +584,15 @@ static uint64_t sys_input_read_impl(const syscall_input_read_request_t* request)
     return count;
 }
 
-static uint64_t sys_window_impl(const syscall_window_request_t* request) {
-    if (!request || !user_range_ok(request, sizeof(*request), false) ||
+static uint64_t sys_window_impl(const syscall_window_request_t* user_request) {
+    // The window manager works on this kernel copy; the frame and event
+    // structs a request points to are copied below as well, so nothing the
+    // checks looked at can change before it is used.
+    syscall_window_request_t request_copy;
+    syscall_window_frame_t frame_copy;
+    syscall_window_event_t event_copy;
+    syscall_window_request_t* request = &request_copy;
+    if (!syscall_user_copy_in(&request_copy, user_request, sizeof(request_copy)) ||
         request->size != sizeof(*request) ||
         request->version != SYS_WINDOW_ABI_VERSION)
         return SYS_ERR_INVAL;
@@ -577,10 +632,10 @@ static uint64_t sys_window_impl(const syscall_window_request_t* request) {
                 return SYS_ERR_INVAL;
             break;
         case SYS_WINDOW_GET_FRAME: {
-            if (!request->frame ||
-                !user_range_ok(request->frame, sizeof(*request->frame), false))
+            if (!syscall_user_copy_in(&frame_copy, request->frame, sizeof(frame_copy)))
                 return SYS_ERR_INVAL;
-            syscall_window_frame_t* frame = request->frame;
+            syscall_window_frame_t* frame = &frame_copy;
+            request->frame = frame;
             if (!frame->pixels || !frame->width || !frame->height ||
                 frame->width > SYSCALL_GFX_MAX_DIMENSION ||
                 frame->height > SYSCALL_GFX_MAX_DIMENSION ||
@@ -599,12 +654,17 @@ static uint64_t sys_window_impl(const syscall_window_request_t* request) {
                 !user_range_ok(request->event, sizeof(*request->event),
                     request->op == SYS_WINDOW_NEXT_EVENT))
                 return SYS_ERR_INVAL;
+            if (request->op == SYS_WINDOW_POST_EVENT) {
+                // Only read: validate and queue the same copy.
+                memcpy(&event_copy, request->event, sizeof(event_copy));
+                request->event = &event_copy;
+            }
             break;
         default:
             break;
     }
 
-    return window_manager_syscall(request, getCurrentPID(),
+    return window_manager_syscall(&request_copy, getCurrentPID(),
         current_process && current_process->is_window_manager);
 }
 
@@ -632,6 +692,12 @@ static uint64_t sys_listdir_impl(const char* path, syscall_dirent_t* out,
     minimafs_dir_entry_t* entries = (minimafs_dir_entry_t*)g_listdir_entries;
 
     uint32_t count = minimafs_list_dir(path, entries, cap);
+    // Only the entries that exist are written: callers may pass a larger
+    // capacity than their buffer needs.
+    if (count && !user_range_ok(out, (size_t)count * sizeof(*out), true)) {
+        __sync_lock_release(&g_listdir_entries_lock);
+        return SYS_ERR_INVAL;
+    }
     for (uint32_t i = 0; i < count; i++) {
         strncpy(out[i].name, entries[i].name, sizeof(out[i].name) - 1);
         out[i].name[sizeof(out[i].name) - 1] = '\0';
@@ -644,7 +710,7 @@ static uint64_t sys_listdir_impl(const char* path, syscall_dirent_t* out,
 }
 
 static uint64_t sys_get_metadata_impl(const char* path, syscall_file_metadata_t* out) {
-    if (!path || !out) return SYS_ERR_INVAL;
+    if (!path || !out || !user_range_ok(out, sizeof(*out), true)) return SYS_ERR_INVAL;
 
     minimafs_file_metadata_t meta;
     if (!minimafs_get_metadata(path, &meta)) return SYS_ERR_NOTFOUND;
@@ -666,9 +732,18 @@ static uint64_t sys_get_metadata_impl(const char* path, syscall_file_metadata_t*
 
 static uint64_t sys_pkg_impl(const syscall_pkg_request_t* request) {
     serial_write_str("SYS_PKG: dispatch\n");
-    if (!request || !request->path) return SYS_ERR_INVAL;
+    syscall_pkg_request_t local;
+    if (!syscall_user_copy_in(&local, request, sizeof(local)) || !local.path)
+        return SYS_ERR_INVAL;
 
-    syscall_pkg_request_t local = *request;
+    // Everything the request points to is checked before anything runs.
+    if (!syscall_user_str_ok(local.path, MINIMAFS_MAX_PATH) ||
+        (local.extra && !syscall_user_str_ok(local.extra, MINIMAFS_MAX_PATH)) ||
+        (local.out_count && !user_range_ok(local.out_count, sizeof(uint32_t), true)) ||
+        (local.out_failed && !user_range_ok(local.out_failed, sizeof(uint32_t), true)) ||
+        (local.out_path && local.out_path_size &&
+         !user_range_ok(local.out_path, local.out_path_size, true)))
+        return SYS_ERR_INVAL;
 
     switch (local.op) {
         case SYS_PKG_UNZIP: {
@@ -712,6 +787,11 @@ static uint64_t sys_pslist_impl(syscall_process_info_t* out, uint32_t max_entrie
 
     uint32_t n = (uint32_t)count;
     if (n > max_entries) n = max_entries;
+    // Only the entries written have to fit (max_entries may be generous).
+    if (n && !user_range_ok(out, (size_t)n * sizeof(*out), true)) {
+        free_mem(procs);
+        return SYS_ERR_INVAL;
+    }
 
     for (uint32_t i = 0; i < n; i++) {
         process_t* p = procs[i];
@@ -865,14 +945,10 @@ static uint64_t sys_heap_impl(uint64_t op, void* ptr, uint64_t size) {
 }
 
 static uint64_t sys_random_impl(void* buf, uint64_t len) {
-    if (!buf || len == 0) return SYS_ERR_INVAL;
+    if (!buf || len == 0 || !user_range_ok(buf, (size_t)len, true)) return SYS_ERR_INVAL;
     random_bytes(buf, (size_t)len);
     return len;
 }
-
-// spawn.c: length of a NUL-terminated string entirely inside the calling
-// program's memory (at most `max` bytes).
-bool proc_user_strlen(const char* s, size_t max, size_t* out_len);
 
 // Biggest single argv string SYS_EXEC accepts from a program.
 #define SYS_EXEC_MAX_ARG_LEN (64u * 1024u)
@@ -883,14 +959,19 @@ static uint64_t sys_exec_impl(const char* path, const char** argv, uint64_t argc
 
     // A program's path, argv array and every argv string must be its own
     // memory (the kernel reads them below and in the launch).
+    // The pointer array is copied once, so the strings checked are the
+    // strings used.
+    const char* argv_copy[16];
     if (isCurrentProcessUser()) {
         if (!proc_user_strlen(path, MINIMAFS_MAX_PATH, NULL)) return SYS_ERR_INVAL;
         if (argc) {
-            if (!argv || !user_range_ok(argv, argc * sizeof(char*), false)) return SYS_ERR_INVAL;
+            if (!argv || !syscall_user_copy_in(argv_copy, argv, argc * sizeof(char*)))
+                return SYS_ERR_INVAL;
             for (uint64_t i = 0; i < argc; i++) {
-                const char* a = argv[i];
+                const char* a = argv_copy[i];
                 if (a && !proc_user_strlen(a, SYS_EXEC_MAX_ARG_LEN, NULL)) return SYS_ERR_INVAL;
             }
+            argv = argv_copy;
         }
     }
 
@@ -946,10 +1027,8 @@ static uint64_t sys_exec_impl(const char* path, const char** argv, uint64_t argc
 
 static uint64_t sys_stat_impl(const char* path, syscall_stat_t* out) {
     if (!path || !out) return SYS_ERR_INVAL;
-    if (isCurrentProcessUser() &&
-        (!user_range_ok(out, sizeof(*out), true) ||
-         !proc_user_strlen(path, MINIMAFS_MAX_PATH, NULL)))
-        return SYS_ERR_INVAL;
+    // (the path string is checked by syscall_resolve_path)
+    if (!user_range_ok(out, sizeof(*out), true)) return SYS_ERR_INVAL;
     char resolved[MINIMAFS_MAX_PATH];
     if (!syscall_resolve_path(path, resolved)) return SYS_ERR_INVAL;
     minimafs_stat_t st;
@@ -969,10 +1048,7 @@ static uint64_t sys_stat_impl(const char* path, syscall_stat_t* out) {
 
 static uint64_t sys_rename_impl(const char* from, const char* to) {
     if (!from || !to) return SYS_ERR_INVAL;
-    if (isCurrentProcessUser() &&
-        (!proc_user_strlen(from, MINIMAFS_MAX_PATH, NULL) ||
-         !proc_user_strlen(to, MINIMAFS_MAX_PATH, NULL)))
-        return SYS_ERR_INVAL;
+    // Both strings are checked by syscall_resolve_path, before anything changes.
     char* paths = (char*)alloc_unzeroed(2u * MINIMAFS_MAX_PATH);
     if (!paths) return SYS_ERR_NOMEM;
     char* a = paths;
@@ -1039,7 +1115,8 @@ static bool syscall_user_may_call(uint64_t syscall_num, const syscall_regs_t* re
             // dispatch like SYS_GRAPHICS/SYS_PKG.
             const syscall_net_request_t* req =
                 (const syscall_net_request_t*)regs->rdi;
-            if (!req) return true;      // sys_net_impl() rejects it anyway
+            // Not readable: sys_net_impl() rejects it.
+            if (!req || !user_range_ok(req, sizeof(*req), false)) return true;
 
             switch (req->op) {
                 case SYS_NET_DHCP:
@@ -1096,35 +1173,20 @@ static bool syscall_user_may_call(uint64_t syscall_num, const syscall_regs_t* re
             }
         }
 
+        // SYS_INPUT_READ, SYS_WINDOW, SYS_GPU, SYS_MEDIA, SYS_STORAGE: the
+        // handler checks (and copies) its own request, once per call.
         case SYS_INPUT_READ:
-            return user_range_ok((const void*)regs->rdi,
-                                 sizeof(syscall_input_read_request_t), false);
-
         case SYS_WINDOW:
-            return user_range_ok((const void*)regs->rdi,
-                                 sizeof(syscall_window_request_t), false);
-
         case SYS_GPU:
-            return user_range_ok((const void*)regs->rdi,
-                                 sizeof(syscall_gpu_request_t), true);
-
         case SYS_MEDIA:
-            return user_range_ok((const void*)regs->rdi,
-                                 sizeof(syscall_media_request_t), true);
-
         case SYS_STORAGE:
-            return user_range_ok((const void*)regs->rdi,
-                                 sizeof(syscall_storage_request_t), true);
+            return true;
 
+        // The audio handlers check (and copy) their request themselves.
         case SYS_AUDIO:
-            return user_range_ok((const void*)regs->rdi,
-                                 sizeof(syscall_audio_request_t), true);
         case SYS_AUDIO_MIXER:
-            return user_range_ok((const void*)regs->rdi,
-                                 sizeof(syscall_audio_mixer_t), true);
         case SYS_AUDIO_STREAM:
-            return user_range_ok((const void*)regs->rdi,
-                                 sizeof(syscall_audio_stream_t), true);
+            return true;
 
         default:
             // Everything else (SYS_WRITE, file I/O, graphics drawing,
@@ -1135,13 +1197,40 @@ static bool syscall_user_may_call(uint64_t syscall_num, const syscall_regs_t* re
     }
 }
 
+// A request struct without nested pointers that the handler reads and
+// writes in place (text buffers it validates and then uses): the handler
+// works on a kernel copy, so a second thread cannot change it between the
+// handler's check and use; the result is copied back. Heap, not stack: the
+// biggest is SYS_ROOT's (2.4 KB) and the kernel stack is small.
+typedef uint64_t (*syscall_struct_fn)(void* request);
+static uint64_t syscall_inout_struct(void* user, size_t size, syscall_struct_fn fn) {
+    if (!isCurrentProcessUser()) return user ? fn(user) : SYS_ERR_INVAL;
+    if (!user_range_ok(user, size, true)) return SYS_ERR_INVAL;
+    void* copy = alloc_unzeroed(size);
+    if (!copy) return SYS_ERR_NOMEM;
+    memcpy(copy, user, size);
+    uint64_t result = fn(copy);
+    // The range was verified (and its pages given frames) above.
+    memcpy(user, copy, size);
+    memset(copy, 0, size);      // SYS_ROOT held a password
+    free_mem(copy);
+    return result;
+}
+
 static void syscall_dispatch_inner(syscall_regs_t* regs);
 
 void syscall_dispatch(syscall_regs_t* regs) {
     if (!regs) return;
+    // The page-fault handler looks at in_syscall: a fault inside a system
+    // call on an address the program passed ends the program, not the
+    // system.
+    process_t* self = current_process;
+    if (self) self->in_syscall++;
     wm_watchdog_syscall_enter(regs->rax);
     syscall_dispatch_inner(regs);
     wm_watchdog_syscall_exit();
+    // The same process comes back here, whatever ran in between.
+    if (self) self->in_syscall--;
 }
 
 static void syscall_dispatch_inner(syscall_regs_t* regs) {
@@ -1177,17 +1266,27 @@ static void syscall_dispatch_inner(syscall_regs_t* regs) {
         }
         case SYS_AUDIO_STREAM: {
             extern uint64_t audio_stream_syscall(syscall_audio_stream_t* r, uint64_t pid) __attribute__((weak));
-            regs->rax = audio_stream_syscall
-                ? audio_stream_syscall((syscall_audio_stream_t*)regs->rdi,
-                                       current_process ? current_process->pid : 0)
-                : SYS_ERR_INVAL;
+            uint64_t pid = current_process ? current_process->pid : 0;
+            if (!audio_stream_syscall) { regs->rax = SYS_ERR_INVAL; return; }
+            if (!isCurrentProcessUser()) {
+                regs->rax = audio_stream_syscall((syscall_audio_stream_t*)regs->rdi, pid);
+                return;
+            }
+            // Hot (a call per audio buffer): one check, the handler works on
+            // a copy so the frame count it validated is the one it uses.
+            syscall_audio_stream_t sc;
+            if (!user_range_ok((void*)regs->rdi, sizeof(sc), true)) { regs->rax = SYS_ERR_INVAL; return; }
+            memcpy(&sc, (void*)regs->rdi, sizeof(sc));
+            regs->rax = audio_stream_syscall(&sc, pid);
+            memcpy((void*)regs->rdi, &sc, sizeof(sc));
             return;
         }
         case SYS_AUDIO: {
             // Weak: a build without the audio module answers "invalid".
             extern uint64_t audio_syscall(syscall_audio_request_t* r) __attribute__((weak));
             regs->rax = audio_syscall
-                ? audio_syscall((syscall_audio_request_t*)regs->rdi)
+                ? syscall_inout_struct((void*)regs->rdi, sizeof(syscall_audio_request_t),
+                                       (syscall_struct_fn)audio_syscall)
                 : SYS_ERR_INVAL;
             return;
         }
@@ -1198,8 +1297,9 @@ static void syscall_dispatch_inner(syscall_regs_t* regs) {
                 return;
             }
             if (regs->rdi == SYS_THREAD_CREATE) {
-                const syscall_thread_t* t = (const syscall_thread_t*)regs->rsi;
-                if (!user_range_ok(t, sizeof(*t), false)) { regs->rax = SYS_ERR_INVAL; return; }
+                syscall_thread_t tc;
+                if (!syscall_user_copy_in(&tc, (const void*)regs->rsi, sizeof(tc))) { regs->rax = SYS_ERR_INVAL; return; }
+                const syscall_thread_t* t = &tc;
                 process_t* thread = proc_create_thread(self, t->entry, t->stack_top, t->arg);
                 regs->rax = thread ? thread->pid : SYS_ERR_INVAL;
                 return;
@@ -1223,9 +1323,8 @@ static void syscall_dispatch_inner(syscall_regs_t* regs) {
                 return;
             }
             if (regs->rdi == SYS_THREAD_CREATE_EX) {
-                const syscall_thread_ex_t* t = (const syscall_thread_ex_t*)regs->rsi;
-                if (!user_range_ok(t, sizeof(*t), false)) { regs->rax = SYS_ERR_INVAL; return; }
-                syscall_thread_ex_t req = *t;
+                syscall_thread_ex_t req;
+                if (!syscall_user_copy_in(&req, (const void*)regs->rsi, sizeof(req))) { regs->rax = SYS_ERR_INVAL; return; }
                 process_t* thread = proc_create_thread_ex(self, req.entry, req.stack_top, req.arg,
                                                           req.fs_base, req.exit_futex);
                 regs->rax = thread ? thread->pid : SYS_ERR_INVAL;
@@ -1258,12 +1357,12 @@ static void syscall_dispatch_inner(syscall_regs_t* regs) {
             if (!self || self->privilege != PROC_PRIVILEGE_USER) { regs->rax = SYS_ERR_PERM; return; }
             switch (regs->rdi) {
                 case SYS_VM_MAP: {
-                    const syscall_vm_map_t* m = (const syscall_vm_map_t*)regs->rsi;
-                    if (!user_range_ok(m, sizeof(*m), false) || m->size < sizeof(*m)) {
+                    syscall_vm_map_t req;
+                    if (!syscall_user_copy_in(&req, (const void*)regs->rsi, sizeof(req)) ||
+                        req.size < sizeof(req)) {
                         regs->rax = SYS_ERR_INVAL;
                         return;
                     }
-                    syscall_vm_map_t req = *m;
                     regs->rax = uvm_map(self, req.address, req.length, req.prot, req.flags);
                     return;
                 }
@@ -1306,7 +1405,8 @@ static void syscall_dispatch_inner(syscall_regs_t* regs) {
         case SYS_AUDIO_MIXER: {
             extern uint64_t audio_mixer_syscall(syscall_audio_mixer_t* m) __attribute__((weak));
             regs->rax = audio_mixer_syscall
-                ? audio_mixer_syscall((syscall_audio_mixer_t*)regs->rdi)
+                ? syscall_inout_struct((void*)regs->rdi, sizeof(syscall_audio_mixer_t),
+                                       (syscall_struct_fn)audio_mixer_syscall)
                 : SYS_ERR_INVAL;
             return;
         }
@@ -1332,7 +1432,9 @@ static void syscall_dispatch_inner(syscall_regs_t* regs) {
         }
 
         case SYS_REGISTER_CLEANUP:
-            if (!isCurrentProcessUser() || !regs->rdi) {
+            // The kernel calls this later: it has to be code of the program.
+            if (!isCurrentProcessUser() || !regs->rdi ||
+                !uvm_is_executable(proc_mem_owner(current_process), regs->rdi)) {
                 regs->rax = SYS_ERR_INVAL;
                 break;
             }
@@ -1380,6 +1482,16 @@ static void syscall_dispatch_inner(syscall_regs_t* regs) {
             minimafs_file_handle_t* handle =
                 (minimafs_file_handle_t*)regs->rdi;
             if (!handle || !regs->rsi) {
+                regs->rax = SYS_ERR_INVAL;
+                break;
+            }
+            // Only the bytes that will be written must fit the buffer: a
+            // program may pass a capacity larger than what is left.
+            uint32_t want = (uint32_t)regs->rdx;
+            uint32_t total = minimafs_size(handle), at = minimafs_tell(handle);
+            uint32_t left = total > at ? total - at : 0;
+            if (want > left) want = left;
+            if (want && !user_range_ok((const void*)regs->rsi, want, true)) {
                 regs->rax = SYS_ERR_INVAL;
                 break;
             }
@@ -1446,6 +1558,10 @@ static void syscall_dispatch_inner(syscall_regs_t* regs) {
             uint64_t len = regs->rdx;
             if (!handle || !buf) {
                 serial_write_str("SYS_FWRITE: invalid handle or buffer\n");
+                regs->rax = SYS_ERR_INVAL;
+                break;
+            }
+            if ((uint32_t)len && !user_range_ok(buf, (uint32_t)len, false)) {
                 regs->rax = SYS_ERR_INVAL;
                 break;
             }
@@ -1530,6 +1646,11 @@ static void syscall_dispatch_inner(syscall_regs_t* regs) {
                 break;
             }
             char resolved[MINIMAFS_MAX_PATH];
+            if ((type && !syscall_user_str_ok(type, MINIMAFS_MAX_PATH)) ||
+                (format && !syscall_user_str_ok(format, MINIMAFS_MAX_PATH))) {
+                regs->rax = SYS_ERR_INVAL;
+                break;
+            }
             path = syscall_resolve_path(path, resolved);
             if (!path) {
                 regs->rax = SYS_ERR_INVAL;
@@ -1606,7 +1727,7 @@ static void syscall_dispatch_inner(syscall_regs_t* regs) {
 
         case SYS_GETTIME: {
             datetime_t* output = (datetime_t*)regs->rdi;
-            if (!output) {
+            if (!output || !user_range_ok(output, sizeof(*output), true)) {
                 regs->rax = SYS_ERR_INVAL;
                 break;
             }
@@ -1618,19 +1739,15 @@ static void syscall_dispatch_inner(syscall_regs_t* regs) {
             regs->rax = sys_sysinfo_impl(regs->rdi);
             break;
 
-        case SYS_ROOT: {
-            syscall_root_t* request = (syscall_root_t*)regs->rdi;
-            regs->rax = user_range_ok(request, sizeof(*request), true)
-                ? root_syscall(request) : SYS_ERR_INVAL;
+        case SYS_ROOT:
+            regs->rax = syscall_inout_struct((void*)regs->rdi, sizeof(syscall_root_t),
+                                             (syscall_struct_fn)root_syscall);
             break;
-        }
 
-        case SYS_TIMESYNC: {
-            syscall_timesync_t* request = (syscall_timesync_t*)regs->rdi;
-            regs->rax = user_range_ok(request, sizeof(*request), true)
-                ? timesync_syscall(request) : SYS_ERR_INVAL;
+        case SYS_TIMESYNC:
+            regs->rax = syscall_inout_struct((void*)regs->rdi, sizeof(syscall_timesync_t),
+                                             (syscall_struct_fn)timesync_syscall);
             break;
-        }
 
         default: {
             regs->rax = SYS_ERR_GENERIC;

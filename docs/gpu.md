@@ -61,6 +61,98 @@ back/front face culling, wireframe, fragment stage and alpha blending.
 The built-in programs (vertex color, Gouraud, per-pixel Phong with
 Blinn-Phong highlights) are hard-wired C code.
 
+#### Binned rasterizer (default)
+
+Draws are not drawn when they are submitted. `fgpu_raster.c` records them in
+a pass (`fgpu_pass_t`: one render target at a time) with a snapshot of
+everything they depend on, and renders the pass at a flush:
+
+1. **Record.** A draw stores its pipeline state, uniforms, shader constants and
+   vertex layout (copied, and deduplicated against the last 8 states), the
+   viewport clipped to the target, and pointers to its vertex and index data.
+   A full clear at the start of a pass is not executed: it is remembered
+   and merged into the tile stage. Lines (`FGPU_STATE_WIREFRAME`) and draws
+   that sample the surface they draw into are not recorded; they flush the
+   pass and run through the immediate path, so submission order holds.
+2. **Geometry** (one parallel phase). Workers take *items* (up to 32
+   triangles of one draw) from an atomic counter. An item shades its vertices
+   with all 8 shader lanes full (built-in programs run a cut-down vertex stage
+   that computes only what the fragment stage reads), clips against the near
+   plane (and, for triangles that reach beyond +-32768 px, against a
+   guard band in screen space), culls, transforms, snaps the vertices to
+   **16.8 fixed point** and sets up integer edge functions (top-left rule, exact
+   and independent of the order the pixels are visited in). The triangle record
+   and its bin entries go into the worker's arena and are added to the bin list
+   of every 64x64 tile the triangle may cover (long thin triangles are tested
+   against each tile). Lists are per worker and per tile.
+3. **Tiles** (one parallel phase). Workers take tiles from an atomic counter.
+   A tile merges the per-worker lists by item number, which restores the
+   submission order exactly (blending and depth-equal results are the same as
+   one core drawing in order), loads color and depth into a local 64x64 copy
+   (or fills it from the pending clear: a tile that only needs the clear is
+   written straight to the target), rasterizes, and stores the copy back.
+   Triangles with a bounding box of at most 400 pixels (this includes the
+   2x2-pixel case) evaluate their edge functions directly at the sample
+   centers. Bigger ones walk 8x8 blocks: a block is rejected, or accepted without
+   per-pixel coverage tests, from the edge functions at its corners, and
+   with depth testing a block is also rejected when the triangle's nearest depth
+   in the block is behind the farthest depth stored there (**hierarchical Z**,
+   min/max per block, kept conservative as pixels are written) or its depth
+   test is skipped when it is entirely in front. A tile entirely inside a
+   triangle skips the coverage tests.
+4. Fragments of consecutive triangles with the same state are shaded in
+   batches of 8 lanes (the shader interface is unchanged); shaders that can
+   `discard` flush per triangle so a later triangle sees the final depth.
+
+**Memory.** Records and bins come from the heap (`fgpu_raster_set_allocator`; the
+kernel passes `alloc_unzeroed`/`free_mem`) in 64 KB chunks that the main thread
+allocates before each phase (nothing allocates inside a parallel phase). Bin
+memory is bounded by a budget (8 MB, `fgpu_raster_set_bin_budget`). The geometry
+stage runs in *rounds*; when a round does not fit, the items that did are
+rasterized and the rest goes to the next round. An allocation failure doubles the
+pool if the budget allows, and as a last resort an item is drawn by the immediate
+path: a draw never fails because bins are full.
+
+**Flush points.** The rasterizer flushes by itself when the target changes
+(`fgpu_pass_clear/draw` with another color or depth buffer), when a clear comes
+after draws, when a draw is a line or reads its own target, when 65536 draws or
+2^24 items are pending, and when memory for the record runs out. The kernel
+(`fgpu.c`) flushes at the end of every `SYS_GPU_SUBMIT` (so the triangle count it
+returns is exact and nothing is pending between system calls), before the hardware
+backend gets a clear or a draw, at the start of every other `SYS_GPU` operation
+(readback, present, buffer upload, surface or buffer or program create and destroy,
+`WRITE_SURFACE`), and `fgpu_process_exit` drops what a dead process left pending.
+Pipeline state, uniforms and constants are snapshotted, so changing them between
+draws needs no flush; vertex buffers, index buffers, textures and shader programs are
+referenced, which is why every operation that writes or frees them flushes first.
+`FGPU_DRAW_COPY` copies vertex and index data at record time for callers whose
+memory does not stay put.
+
+**Results.** Coverage, depth tests, interpolated values and blending order are
+bit-identical to the immediate path whenever the immediate path evaluates its float
+edge functions exactly, which is the case when vertices sit on a coarse grid (the
+differential test generates such scenes). Otherwise they differ at the borders of
+triangles: the immediate path computes edges in float with an accumulating row
+step, and the binned path snaps vertices to 1/256 pixel and computes edges exactly,
+so a sample very close to an edge can fall on the other side, and interpolated depth
+and attributes move by the snapping (a few parts in 1e5; for slivers more). The
+binned path is the more accurate of the two (the shared-edge meshes of the
+watertightness test are covered exactly once; the immediate path has no such
+guarantee). Vertices are clamped as before.
+
+**Mode switch.** `fgpu_raster_set_mode(FGPU_RASTER_IMMEDIATE)` selects the previous
+rasterizer (one barrier per draw, scalar); the kernel does this with the `fgpuold`
+boot flag (GRUB entry "Minimal-OS (RamFS, fgpuold)", two above the last entry).
+The host benchmark (`make bench-fgpu`) and the differential tests use the switch.
+
+**Not done yet (OS-4).** Preemptible kernel worker threads instead of `smp_par`,
+per-process contexts instead of `g_busy`, and asynchronous submit with fences. The
+pass is per target and everything it keeps (workers' scratch, chunk pool, bin lists)
+sits in the pass, not in globals, so a context per process can own one pass; the
+kernel currently has a single pass guarded by `g_busy`. Deferring draws across
+submits only needs the flush points above to stay (they are already called), plus
+an exact triangle count some other way.
+
 ### Shader machine
 
 Shaders are FGPU bytecode (described at the end of `fgpu_abi.h`): vec4
@@ -96,6 +188,165 @@ Speed: the `fglcube` scene at 640 × 480 on one 2.8 GHz core takes about
 11 ms per frame with the built-in Phong program and about 42 ms with
 `fglcube --shader` (a 60-instruction fragment shader over about 180,000
 pixels).
+
+### CPU JIT (OS-4)
+
+`fgpu_jit_x64.c` compiles each shader stage to x86-64 machine code, with an
+SSE4.1 path (4 lanes per XMM register) and an AVX2 path (8 lanes per YMM).
+The interpreter stays the reference and the fallback: a program whose stage
+does not compile, a CPU with only SSE2 (QEMU's default `qemu64` has no
+SSE4.1) and the `nojit` boot flag all keep running on it. Nothing about the
+call interface changed: `fgpu_shader_run_batch`, `run_vertex` and
+`run_fragment` use the compiled code when the program has any.
+
+**Pipeline.** bytecode -> `fgpu_ir_lower_ex(..., FGPU_IR_EXACT)` -> linear
+scan register allocation (`fgpu_ir_allocate`) -> emitter -> code. The IR is
+the branch-free SSA form the NVIDIA backend uses (jumps are if-converted to
+selects, so the code has no branches at all). `FGPU_IR_EXACT` makes the IR
+mean what the interpreter computes instead of what GPU hardware would:
+IEEE division instead of multiply-by-reciprocal, a real subtraction, no
+algebraic simplifications that change `-0`/NaN results (`x*1`, `x+0`,
+`fma(a,0,c)`, `min(a,a)`), no commuting of `min`/`max`, `step` as
+`!(b < a)`, `abs` as the interpreter's `x < 0 ? -x : x` (which keeps `-0`),
+and a pending negation is materialized before an `abs` reads it. The
+transcendental ops (`EX2`, `LG2`, `SIN`, `COS`, `RSQ`) are emitted as the
+interpreter's own polynomial sequences, one vector instruction per vector
+operation, with the same constants; `fma` is multiply, round, add (no FMA
+instruction, so results are bit-identical; the code uses AVX2 but not FMA).
+
+**Results are bit-identical** to the interpreter for every opcode,
+including `-0`, denormals, infinities, float-to-int conversions, `min`/`max`
+operand order and comparisons with NaN. The one allowed difference: the
+sign/payload of a NaN that comes out of arithmetic on two NaNs (operand
+order, which FGPU does not define) -- a NaN is compared as a NaN. Also,
+discarded lanes keep unspecified outputs (the interpreter freezes them at
+the `discard`, the JIT runs on), and temporaries are not preserved (the
+interpreter leaves its last values in `batch->temp`; the JIT uses that area
+as its spill space). Lanes not asked for (`lanes` mask) get the default
+outputs in both.
+
+**Registers.** `xmm0` is the blend mask (SSE `blendvps`), `xmm1`..`xmm8`
+hold IR values (virtual registers 0..7 of the allocator; the allocator
+hands out the lowest free number, so the hot values land there), the other
+virtual registers are spill slots, `xmm9`..`xmm15` are scratch. Spill slots,
+the texture helper's arguments and results, and the registers saved around
+a helper call all live in the batch's `temp` rows (128 slots of 32 bytes;
+a stage that needs more does not compile). General registers: `rbx` = the
+batch (`+16` bytes for the SSE upper half), `rbp` = uniforms, `r12` =
+textures, saved and restored; `rax, rcx, rdx, rsi, rdi, r8, r9` only for
+helper calls.
+
+**One emitter, two ISAs.** A small layer (`v3`, `v2`, `cmp`, `shift`,
+`sel`) takes AVX-style three-operand requests. For AVX2 it emits 3-byte
+VEX with L=1; for SSE4.1 it emits the legacy two-operand form, inserting a
+`movaps` when the destination is not the first source, and `blendvps` with
+the mask in `xmm0` for selects. The IR code generation is shared. The SSE
+path runs the code twice, once per half of the 8-lane batch (base pointer
++16 bytes); empty halves are skipped. The AVX2 path ends with
+`vzeroupper` (and has one before every helper call) so SSE code
+afterwards pays no transition penalty.
+
+**Calling convention.** `uint32_t code(char* batch, const float* uniforms,
+const fgpu_texture_t* textures)` (System V): returns the lanes that were
+not discarded (4 or 8 bits). The wrapper masks that with the `lanes`
+argument, and writes the default outputs for lanes that were not asked for.
+
+**Helper-call ABI.** The only call is texture sampling: `jit_tex_helper`
+(C, in the same file), at a fixed address, called with `rdi` = textures,
+`esi` = unit, `rdx`/`rcx` = rows of u and v, `r8` = result rows, `r9d` =
+lanes. It calls the interpreter's own `fgpu_texture_sample` per lane, so
+the results are identical. Before the call the code stores every live
+value that is in an XMM register to its save slot and reloads it
+afterwards (all vector registers are caller-saved in System V); results
+stay in slots, 4 per sample, until the last use.
+
+**Safety (the JIT output runs in ring 0).**
+
+- It is generated only from IR that was lowered from a program that passed
+  `fgpu_program_check`; the emitter checks again that every register file,
+  input/output/special/uniform slot and texture unit index is in range and
+  fails the compile otherwise.
+- Memory the code can touch, all at offsets fixed when it is generated:
+  the batch's input, special, output and temp rows (inputs are only read),
+  the uniforms (read only), and its own constant pool (read only, 32-byte
+  aligned). Nothing is computed from shader data: there are no
+  indirect jumps or calls, no jumps at all, no data-dependent addresses.
+  The one call goes to a fixed helper that clamps every texel coordinate.
+- The code buffer is a fixed-size scratch area; the emitter checks every
+  byte and the compile fails (the stage stays on the interpreter) on
+  overflow, too many constants, too many texture samples or spill slots,
+  or more than 4096 IR operations. Compile time and code size are
+  therefore bounded (at most 128 KiB of code per stage; real shaders are
+  2-10 KiB). The finished code is copied to an exactly sized block.
+- Compilation allocates, so it happens when the program is created
+  (`op_create_program`, process context), never in a worker. The code is
+  cached in `fgpu_program_t.jit` and freed with the program
+  (`fgpu_program_release`, called from `program_free`).
+- W^X: on the host the code is mapped RW, copied, then `mprotect`ed RX. In
+  the kernel the code comes from the heap, which is in the low identity map
+  and is writable and executable today; there is nothing to flip yet. What
+  should change: allocate whole pages from the page pool, map them RW
+  while writing, then RX (and keep the rest of the heap NX).
+- Vector state: AVX code only exists as JIT output (the kernel is compiled
+  without AVX). Every kernel entry stub (`simd_save.inc`: exceptions,
+  IRQs, `int 0x80`, and the `smp_par` IPI wrapper in `idt_.asm`) saves the
+  full XSAVE area, including the upper YMM halves, before C code runs and
+  restores it on the way out, so JIT code running in a syscall or in a
+  helper core's IPI handler cannot corrupt the interrupted program's
+  state. `vzeroupper` before returning keeps the kernel's SSE code fast.
+  Exceptions the JIT code could raise are masked in MXCSR like everywhere
+  in the kernel; both machines run under the same MXCSR.
+- CPU gating: SSE4.1 from CPUID; AVX2 only when `cpu_simd_features()` says
+  the OS enabled the state (XSAVE, `noavx` flag not given). `nojit` forces
+  the interpreter. All CPUs are assumed to match the boot CPU (as the
+  entry stubs already do).
+
+**Flags and API.** Boot flag `nojit` (GRUB entry "Minimal-OS (RamFS,
+nojit)"); `fgpu_jit_set_mode(OFF|AUTO|SSE41|AVX2)` for tests and benchmarks;
+`gpu jit` in the terminal runs the kernel self-check (below).
+
+**Tests.** `tests/host/fgpu_jit_tests.c` (part of `make test-host`):
+per-opcode tests over all pairs/triples of ~50 special operands with
+modifiers, swizzles and write masks; control flow; texture units; real FGSL
+shaders (including both `fglcube --shader` shaders); a deterministic
+differential fuzzer over random valid programs; safety and negative tests.
+`make fuzz-fgpu-jit FUZZ_SECONDS=300` runs the fuzzer longer. Kernel:
+`gpu jit` compiles FGSL shaders in the kernel and compares interpreter, SSE4.1
+and AVX2 code on random batches, also on the other cores through `smp_par`
+(`tools/debug/ci_fgpu_jit.sh` drives it in QEMU). `tools/debug/ci_fgpu_jit_cube.sh`
+takes screendumps of `fglcube --shader --still` to compare JIT and `nojit`.
+
+**Speed** (`make bench-fgpu-jit`, one thread of a 2.1 GHz Xeon, through the
+rasterizer's batch interface; lane-instructions are FGSL bytecode
+instructions x 8 lanes):
+
+```
+shader (stage)                instr     interp     SSE4.1       AVX2    SSE x   AVX2 x
+                                    G lane-i/s G lane-i/s G lane-i/s
+arith vertex (~25 instr)         28      0.399      4.185      7.098    10.5x    17.8x
+arith fragment                   15      0.508      2.360      3.842     4.6x     7.6x
+fragment + bilinear tex           5      0.116      0.137      0.152     1.2x     1.3x
+fglcube vertex                   20      0.454      3.119      5.615     6.9x    12.4x
+fglcube fragment                 61      0.377      0.940      1.194     2.5x     3.2x
+```
+
+The plan's target (16 G lane-instr/s AVX2, 0.6x of it with SSE4.1) is for a
+4 GHz core on shaders that are mostly arithmetic: the 28-instruction vertex
+shader reaches 7.1 G (AVX2) and 4.2 G (SSE4.1) here, about 44% of the target on AVX2 (the SSE path is 59% of the AVX2 one); the fragment shaders with `pow`/`sin`/`log2`/texture are far from it.
+The interpreter number is this host's (GCC -O3), not the kernel's 0.1-0.2.
+
+Where the time goes: arithmetic is now limited by the number of vector
+instructions (the transcendentals are 25-60 each), not by dispatch. Two
+things cap the next factor, and both are interface/design limits:
+(1) texture sampling runs through a scalar C helper per lane (about 30 ns
+per bilinear sample), so a shader with one sample is dominated by it; an
+inline AVX2 gather sampler for the common ARGB8 path would remove that;
+(2) marshalling: the rasterizer scatters its per-pixel data into the
+8-lane SoA rows and gathers the outputs back, which costs about twice the
+shader for a short fragment shader (see the benchmark line). A call that
+takes the interpolants and writes pixels itself (fused kernels, as in the
+plan) would remove it, as would larger batches (16/32 lanes per call, so
+the 4-6 ns call and per-batch constant loads amortize).
 
 ## FarcadeGL
 

@@ -2,6 +2,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "x86_64/waitq.h"
+#include "x86_64/clock.h"
 #include "x86_64/proc.h"
 #include "x86_64/scheduler.h"
 #include "x86_64/spinlock.h"
@@ -179,11 +180,20 @@ uint64_t futex_wait(uint32_t* addr, uint32_t expected, uint64_t timeout_ns) {
     }
 
     futex_ctx_t ctx = { addr, expected };
-    switch (waitq_wait(owner, (uint64_t)(uintptr_t)addr, futex_should_sleep, &ctx, deadline)) {
-        case WAITQ_NOT_SLEPT: return SYS_ERR_AGAIN;
-        case WAITQ_TIMEOUT:   return SYS_ERR_TIMEDOUT;
-        default:              return SYS_SUCCESS;
+    uint64_t start_ns = timeout_ns ? clock_monotonic_ns() : 0;
+    waitq_result_t result = waitq_wait(owner, (uint64_t)(uintptr_t)addr, futex_should_sleep,
+                                       &ctx, deadline);
+    if (result == WAITQ_NOT_SLEPT) return SYS_ERR_AGAIN;
+    // The deadline counts timer ticks, the program measures with the
+    // monotonic clock, and the two drift (ticks can arrive in bursts in a
+    // virtual machine). Time out only once the monotonic clock agrees.
+    while (result == WAITQ_TIMEOUT && clock_monotonic_ns() - start_ns < timeout_ns) {
+        result = waitq_wait(owner, (uint64_t)(uintptr_t)addr, futex_should_sleep, &ctx,
+                            time_get_uptime_ms() + 1u);
+        // The word changed while we were not queued: as good as a wake-up.
+        if (result == WAITQ_NOT_SLEPT) return SYS_SUCCESS;
     }
+    return result == WAITQ_TIMEOUT ? SYS_ERR_TIMEDOUT : SYS_SUCCESS;
 }
 
 uint64_t futex_wake(uint32_t* addr, uint32_t max) {

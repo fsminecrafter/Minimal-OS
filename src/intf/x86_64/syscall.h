@@ -740,13 +740,45 @@ typedef enum {
     SYS_SYSINFO_HEAP_FREE       = 0x09,
     SYS_SYSINFO_PMM_USED_PAGES  = 0x0A, // 4KB physical pages
     SYS_SYSINFO_PMM_FREE_PAGES  = 0x0B,
-    // 0x0C-0x0F reserved for future global stats
+    SYS_SYSINFO_CPU_FEATURES    = 0x0C, // SYS_CPU_* bit mask (usable, not merely present)
+    SYS_SYSINFO_XCR0            = 0x0D, // XCR0 the OS enabled (0 without XSAVE/AVX)
+    // 0x0E-0x0F reserved for future global stats
 
     // Per-core usage: op = SYS_SYSINFO_CORE_USAGE_BASE + core_id.
     // Deliberately last/open-ended since core count can vary between
     // boots (SMP bring-up may bring up fewer cores than expected).
     SYS_SYSINFO_CORE_USAGE_BASE = 0x10,
 } syscall_sysinfo_op_t;
+
+// SYS_SYSINFO_CPU_FEATURES bits. The AVX family (AVX, AVX2, FMA, F16C and the
+// AVX-512 bits) is only set when the OS enabled the register state, so a set
+// bit means a program can run those instructions; with the 'noavx' boot flag
+// or on a CPU without XSAVE/AVX they are clear. The others are plain CPUID
+// reports (they need no OS support).
+#define SYS_CPU_SSE3      (1ull << 0)
+#define SYS_CPU_SSSE3     (1ull << 1)
+#define SYS_CPU_SSE41     (1ull << 2)
+#define SYS_CPU_SSE42     (1ull << 3)
+#define SYS_CPU_POPCNT    (1ull << 4)
+#define SYS_CPU_AVX       (1ull << 5)
+#define SYS_CPU_AVX2      (1ull << 6)
+#define SYS_CPU_FMA       (1ull << 7)
+#define SYS_CPU_BMI1      (1ull << 8)
+#define SYS_CPU_BMI2      (1ull << 9)
+#define SYS_CPU_F16C      (1ull << 10)
+#define SYS_CPU_AVX512F   (1ull << 11)
+#define SYS_CPU_AVX512DQ  (1ull << 12)
+#define SYS_CPU_AVX512BW  (1ull << 13)
+#define SYS_CPU_AVX512VL  (1ull << 14)
+#define SYS_CPU_AVX512CD  (1ull << 15)
+#define SYS_CPU_LZCNT     (1ull << 16)
+#define SYS_CPU_AES       (1ull << 17)
+#define SYS_CPU_PCLMUL    (1ull << 18)
+#define SYS_CPU_MOVBE     (1ull << 19)
+#define SYS_CPU_RDRAND    (1ull << 20)
+#define SYS_CPU_RDSEED    (1ull << 21)
+#define SYS_CPU_ADX       (1ull << 22)
+#define SYS_CPU_SHA       (1ull << 23)
 
 // Called by isr_syscall_wrapped (syscall_isr.asm) for every `int 0x80`.
 // regs->rax = syscall number in, return value out. Args in

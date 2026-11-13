@@ -22,6 +22,7 @@ static int failures;
 } while (0)
 
 void* alloc(size_t size) { return malloc(size); }
+void* alloc_unzeroed(size_t size) { return malloc(size); }
 void free_mem(void* pointer) { free(pointer); }
 bool syscall_user_range_ok(const void* pointer, size_t length, bool write) {
     (void)write;

@@ -5,7 +5,7 @@
 #include "minimafshandler.h"
 #include "string.h"
 
-extern bool syscall_user_range_ok(const void* ptr, size_t len, bool write);
+#include "x86_64/user_ptr.h"
 
 static bool disk_in_use(blockdev_t* disk) {
     for (uint32_t i = 0; i < BLOCKDEV_MAX; i++) {
@@ -48,23 +48,27 @@ static void fill(syscall_storage_device_t* out, blockdev_t* d) {
 uint64_t storage_syscall(syscall_storage_request_t* r) {
     if (!r || !syscall_user_range_ok(r, sizeof(*r), true) || r->size != sizeof(*r) ||
         r->version != SYS_STORAGE_ABI_VERSION) return SYS_ERR_INVAL;
-    switch (r->op) {
+    // One read of the fields used after the checks.
+    const uint32_t op = r->op;
+    const uint32_t capacity = r->capacity;
+    syscall_storage_device_t* const devices = r->devices;
+    switch (op) {
         case SYS_STORAGE_LIST: {
-            if (r->capacity && (!r->devices ||
-                !syscall_user_range_ok(r->devices,
-                                       (size_t)r->capacity * sizeof(syscall_storage_device_t),
+            if (capacity && (!devices ||
+                !syscall_user_range_ok(devices,
+                                       (size_t)capacity * sizeof(syscall_storage_device_t),
                                        true))) return SYS_ERR_INVAL;
             uint32_t n = 0;
             // Disks first, each followed by its partitions.
             for (uint32_t i = 0; i < BLOCKDEV_MAX; i++) {
                 blockdev_t* disk = blockdev_get(i);
                 if (!disk || disk->kind != BLOCKDEV_KIND_DISK) continue;
-                if (n < r->capacity) fill(&r->devices[n], disk);
+                if (n < capacity) fill(&devices[n], disk);
                 n++;
                 for (uint32_t j = 0; j < BLOCKDEV_MAX; j++) {
                     blockdev_t* p = blockdev_get(j);
                     if (!p || p->parent != disk) continue;
-                    if (n < r->capacity) fill(&r->devices[n], p);
+                    if (n < capacity) fill(&devices[n], p);
                     n++;
                 }
             }

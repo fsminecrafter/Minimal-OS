@@ -98,7 +98,7 @@ void memory_test_run(void) {
     }
 
     memory_test_report("Minimal-OS x64 PMM Memory Tester");
-    size_t page_count = pmm_free_pages();
+    size_t page_count = pmm_low_free_pages();
     if (page_count == 0) {
         memory_test_report("FAIL: no free PMM pages to test");
         memory_test_halt();
@@ -166,7 +166,7 @@ void memory_test_run(void) {
     for (size_t i = 0; i < run_count; i++) {
         free_pages(runs[i].base, runs[i].pages);
     }
-    if (pmm_free_pages() != page_count) {
+    if (pmm_low_free_pages() != page_count) {
         memory_test_report("FAIL: PMM page count did not recover after test");
         memory_test_halt();
     }

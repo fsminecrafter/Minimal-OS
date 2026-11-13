@@ -1,4 +1,5 @@
 #include "x86_64/syscall.h"
+#include "x86_64/user_ptr.h"
 #include "x86_64/network_manager.h"
 #include "x86_64/spinlock.h"
 #include "x86_64/random.h"
@@ -694,8 +695,75 @@ void net_syscall_init(void) {
     g_last_sweep_ms = 0;
 }
 
-uint64_t sys_net_impl(syscall_net_request_t* request) {
-    if (!request) return SYS_ERR_INVAL;
+// Longest host name a request may carry (a DNS name is at most 253).
+#define NET_HOST_MAX 256
+
+// Checks every pointer a request of this op carries, before the op does
+// anything. `r` is the kernel copy. NULL optional pointers are fine;
+// required ones that are NULL are left for the op to reject.
+static bool net_request_pointers_ok(const syscall_net_request_t* r) {
+#define OUT(p, type) ((p) == NULL || syscall_user_range_ok((p), sizeof(type), true))
+    // Buffers: the bytes the op can actually touch.
+    uint32_t send_len = r->len;
+    switch (r->op) {
+        case SYS_NET_STATUS:
+            return OUT(r->out_status, syscall_net_status_t);
+        case SYS_NET_ADAPTERS:
+            // Too small: the op says INVAL itself.
+            return r->len < sizeof(syscall_net_adapters_t) || !r->buf ||
+                   syscall_user_range_ok(r->buf, sizeof(syscall_net_adapters_t), true);
+        case SYS_NET_RESOLVE:
+            return (!r->host || syscall_user_str_ok(r->host, NET_HOST_MAX)) &&
+                   OUT(r->out_ip, uint32_t);
+        case SYS_NET_TCP_CONNECT:
+        case SYS_NET_TCP_LISTEN:
+        case SYS_NET_UDP_BIND:
+        case SYS_NET_TLS_CONNECT:
+        case SYS_NET_TLS_ACCEPT:
+            return OUT(r->out_handle, uint64_t);
+        case SYS_NET_TCP_ACCEPT:
+            return OUT(r->out_handle, uint64_t) && OUT(r->out_from_ip, uint32_t) &&
+                   OUT(r->out_from_port, uint16_t);
+        case SYS_NET_TCP_SEND:
+            if (send_len > NET_TCP_SEND_SLICE) send_len = NET_TCP_SEND_SLICE;
+            return !r->buf || !send_len || syscall_user_range_ok(r->buf, send_len, false);
+        case SYS_NET_TLS_SEND:
+            if (send_len > NET_TLS_SEND_SLICE) send_len = NET_TLS_SEND_SLICE;
+            return !r->buf || !send_len || syscall_user_range_ok(r->buf, send_len, false);
+        case SYS_NET_TLS13_SEND:
+            if (send_len > NET_TLS13_SEND_SLICE) send_len = NET_TLS13_SEND_SLICE;
+            return !r->buf || !send_len || syscall_user_range_ok(r->buf, send_len, false);
+        case SYS_NET_UDP_SEND:
+            // Longer than a datagram: the op rejects it.
+            if (send_len > NET_UDP_DGRAM_MAX) return true;
+            return !r->buf || !send_len || syscall_user_range_ok(r->buf, send_len, false);
+        case SYS_NET_TCP_RECV:
+        case SYS_NET_TLS_RECV:
+        case SYS_NET_TLS13_RECV:
+            return !r->buf || !r->len || syscall_user_range_ok(r->buf, r->len, true);
+        case SYS_NET_UDP_RECV: {
+            // A datagram never holds more than NET_UDP_DGRAM_MAX bytes.
+            uint32_t n = r->len > NET_UDP_DGRAM_MAX ? NET_UDP_DGRAM_MAX : r->len;
+            return (!r->buf || !n || syscall_user_range_ok(r->buf, n, true)) &&
+                   OUT(r->out_from_ip, uint32_t) && OUT(r->out_from_port, uint16_t);
+        }
+        case SYS_NET_TLS13_CONNECT:
+            return (!r->host || syscall_user_str_ok(r->host, NET_HOST_MAX)) &&
+                   OUT(r->out_handle, uint64_t);
+        default:
+            return true;    // no pointers (the op may still be unknown)
+    }
+#undef OUT
+}
+
+uint64_t sys_net_impl(syscall_net_request_t* user_request) {
+    // The request is copied once; everything below uses the copy.
+    syscall_net_request_t request_copy;
+    syscall_net_request_t* request = &request_copy;
+    if (!syscall_user_copy_in(&request_copy, user_request, sizeof(request_copy)))
+        return SYS_ERR_INVAL;
+    if (isCurrentProcessUser() && !net_request_pointers_ok(request))
+        return SYS_ERR_INVAL;
 
     // Ops that touch neither the send path nor the handle tables can
     // run without claiming the stack.

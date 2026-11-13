@@ -8,7 +8,7 @@
 #include <stdint.h>
 #include <string.h>
 
-extern bool syscall_user_range_ok(const void* ptr, size_t len, bool write);
+#include "x86_64/user_ptr.h"
 // fgpu.c: one H.264 picture on the card's video decoder, and the report
 // that its pictures were wrong.
 extern bool fgpu_video_h264(const syscall_media_h264_t* pic, uint32_t* out, uint32_t width, uint32_t height);
@@ -99,16 +99,21 @@ static uint64_t decode_h264(syscall_media_request_t* request) {
     return result;
 }
 
-uint64_t media_syscall(syscall_media_request_t* request) {
-    if (request && syscall_user_range_ok(request, sizeof(*request), true) &&
-        request->size == sizeof(*request) && request->version == SYS_MEDIA_ABI_VERSION &&
+uint64_t media_syscall(syscall_media_request_t* user_request) {
+    // The request is copied once: sizes and pointers are checked and used
+    // from the copy. (Written to nothing: results go through `pixels`.)
+    syscall_media_request_t request_copy;
+    syscall_media_request_t* request = &request_copy;
+    if (!user_request || !syscall_user_range_ok(user_request, sizeof(*request), true))
+        return SYS_ERR_INVAL;
+    memcpy(&request_copy, user_request, sizeof(request_copy));
+    if (request->size == sizeof(*request) && request->version == SYS_MEDIA_ABI_VERSION &&
         !request->reserved[0] && !request->reserved[1]) {
         if (request->op == SYS_MEDIA_CONVERT_YCBCR) return convert_ycbcr(request);
         if (request->op == SYS_MEDIA_DECODE_H264) return decode_h264(request);
         if (request->op == SYS_MEDIA_H264_MISMATCH) { fgpu_video_h264_mismatch(); return SYS_SUCCESS; }
     }
-    if (!request || !syscall_user_range_ok(request, sizeof(*request), true) ||
-        request->size != sizeof(*request) ||
+    if (request->size != sizeof(*request) ||
         request->version != SYS_MEDIA_ABI_VERSION ||
         request->op != SYS_MEDIA_DECODE_TILES ||
         (request->flags & ~SYS_MEDIA_HAS_PREVIOUS_FRAME) ||
@@ -129,29 +134,40 @@ uint64_t media_syscall(syscall_media_request_t* request) {
         !syscall_user_range_ok(request->pixels, (size_t)pixel_bytes, true))
         return SYS_ERR_INVAL;
 
+    // The tiles are decoded on every core (smp_par), and those run on the
+    // kernel's page tables, where a program's memory above 4 GiB does not
+    // exist: decode from a kernel copy of the frame (which also means the
+    // bitmap read below cannot change between the two passes over it).
+    uint8_t* kframe = (uint8_t*)alloc_unzeroed((size_t)request->frame_bytes);
+    if (!kframe) return SYS_ERR_AGAIN;
+    memcpy(kframe, request->frame, (size_t)request->frame_bytes);
+
     uint32_t tile_count = mm_tiles(width, height);
     uint32_t across = mm_tiles_x(width);
     uint32_t bitmap_bytes = (tile_count + 7u) / 8u;
-    if (request->frame_bytes < 4u + (uint64_t)bitmap_bytes)
+    if (request->frame_bytes < 4u + (uint64_t)bitmap_bytes) {
+        free_mem(kframe);
         return SYS_ERR_INVAL;
+    }
 
-    const uint8_t* frame = request->frame;
+    const uint8_t* frame = kframe;
     const uint8_t* bitmap = frame + 4u;
     uint32_t coded = 0;
     for (uint32_t tile = 0; tile < tile_count; tile++)
         coded += (bitmap[tile / 8u] >> (tile % 8u)) & 1u;
 
     bool has_previous = (request->flags & SYS_MEDIA_HAS_PREVIOUS_FRAME) != 0;
-    if (!has_previous && coded != tile_count) return SYS_ERR_INVAL;
-    if (!coded) return SYS_SUCCESS;
+    if (!has_previous && coded != tile_count) { free_mem(kframe); return SYS_ERR_INVAL; }
+    if (!coded) { free_mem(kframe); return SYS_SUCCESS; }
     uint64_t header_bytes = 4u + (uint64_t)bitmap_bytes + (uint64_t)coded * 4u;
-    if (header_bytes > request->frame_bytes) return SYS_ERR_INVAL;
+    if (header_bytes > request->frame_bytes) { free_mem(kframe); return SYS_ERR_INVAL; }
 
     tile_job_t* jobs = (tile_job_t*)alloc((size_t)coded * sizeof(*jobs));
     uint32_t* decoded = (uint32_t*)alloc((size_t)pixel_bytes);
     if (!jobs || !decoded) {
         if (jobs) free_mem(jobs);
         if (decoded) free_mem(decoded);
+        free_mem(kframe);
         return SYS_ERR_AGAIN;
     }
 
@@ -183,6 +199,7 @@ uint64_t media_syscall(syscall_media_request_t* request) {
     if (!valid) {
         free_mem(decoded);
         free_mem(jobs);
+        free_mem(kframe);
         return SYS_ERR_INVAL;
     }
 
@@ -203,6 +220,7 @@ uint64_t media_syscall(syscall_media_request_t* request) {
         if (!jobs[i].ok) {
             free_mem(decoded);
             free_mem(jobs);
+            free_mem(kframe);
             return SYS_ERR_INVAL;
         }
     }
@@ -210,5 +228,6 @@ uint64_t media_syscall(syscall_media_request_t* request) {
     memcpy(request->pixels, decoded, (size_t)pixel_bytes);
     free_mem(decoded);
     free_mem(jobs);
+    free_mem(kframe);
     return SYS_SUCCESS;
 }

@@ -1,5 +1,6 @@
 // src/impl/kernel/smp.c
 #include "x86_64/smp.h"
+#include "x86_64/cpu_simd.h"
 #include "x86_64/acpi.h"
 #include "x86_64/lapic.h"
 #include "x86_64/lapic_timer.h"
@@ -15,6 +16,10 @@
 #include "time.h"
 
 #include "panic.h"
+
+// An AP's boot stack also serves the idle loop's interrupts, each of which
+// saves up to ~2.7 KiB of AVX-512 state on it; 32 KiB leaves ample room.
+#define AP_STACK_PAGES 8
 
 cpu_local_t g_cpus[MAX_CPUS];
 volatile uint32_t g_cpu_count = 1;
@@ -172,13 +177,13 @@ uint32_t smp_start_aps(multiboot2_info_t* mb_info) {
 
         uint32_t cpu_id = started;
 
-        void* stack = alloc_pages_zeroed(4); // 16KB AP kernel stack
+        void* stack = alloc_pages_zeroed(AP_STACK_PAGES); // AP kernel stack (see AP_STACK_PAGES)
         if (!stack) {
             serial_write_str("SMP: OOM allocating AP stack, stopping bring-up\n");
             break;
         }
 
-        mailbox->stack_top = (uint64_t)(uintptr_t)stack + 4 * 0x1000;
+        mailbox->stack_top = (uint64_t)(uintptr_t)stack + AP_STACK_PAGES * 0x1000;
         mailbox->cpu_id    = cpu_id;
 
         g_apic_id_to_cpu[cpu_id] = cpu->apic_id;
@@ -210,7 +215,7 @@ uint32_t smp_start_aps(multiboot2_info_t* mb_info) {
             g_cpu_count = started;
         } else {
             serial_write_str("SMP: AP did not come online (timeout)\n");
-            free_pages(stack, 4);
+            free_pages(stack, AP_STACK_PAGES);
         }
     }
 
@@ -222,6 +227,7 @@ uint32_t smp_start_aps(multiboot2_info_t* mb_info) {
 
 void ap_entry_c(uint32_t cpu_id) __attribute__((__noreturn__));
 void ap_entry_c(uint32_t cpu_id) {
+    cpu_simd_init_ap(cpu_id);   // CR4.OSXSAVE + XCR0 before any interrupt can use xsave
     gdt_load_this_cpu(cpu_id);
     pat_init();           // same memory types as the BSP
     idt_load(&idt_ptr);   // shares the BSP's single IDT - fine, entries only encode handler addr/selector

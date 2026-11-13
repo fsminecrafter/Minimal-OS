@@ -36,6 +36,7 @@ static void help_system_information(void) {
     help_item("info", "Show system, CPU, PCI, and memory information.");
     help_item("cpu", "Show CPU information.");
     help_item("gpu", "Show GPU adapters, VRAM and capabilities.");
+    help_item("gpu jit", "Self-check of the shader JIT: interpreter vs SSE4.1/AVX2 machine code.");
     help_item("gpu nvidia", "NVIDIA hardware rendering status: firmware, microcontrollers.");
     help_item("hyperv", "Hyper-V guest state: VMBus channels and passed-through PCI devices.");
     help_item("fglcube [seconds] [--shader]", "FarcadeGL 3D demo: a rotating, lit cube (--shader: FGSL shaders).");

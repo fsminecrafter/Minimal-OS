@@ -1,5 +1,7 @@
 BITS 64
 
+%include "simd_save.inc"
+
 extern syscall_dispatch
 global isr_syscall_wrapped
 
@@ -23,16 +25,12 @@ isr_syscall_wrapped:
     push rbx
     push rax
 
-    mov rdi, rsp        ; syscall_regs_t*
-    ; User code expects its SSE registers to survive the int 0x80 (the
+    ; User code expects its SSE/AVX registers to survive the int 0x80 (the
     ; SDK's inline asm does not list them as clobbered), so save them.
-    mov rbp, rsp
-    sub rsp, 512
-    and rsp, -16
-    fxsave64 [rsp]
+    SIMD_SAVE
+    mov rdi, rbp        ; syscall_regs_t* (SIMD_SAVE left rbp = the frame)
     call syscall_dispatch
-    fxrstor64 [rsp]
-    mov rsp, rbp
+    SIMD_RESTORE
 
     pop rax
     pop rbx

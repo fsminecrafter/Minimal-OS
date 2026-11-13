@@ -1,6 +1,7 @@
 #pragma once
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include "x86_64/fgpu_abi.h"
 #include "x86_64/fgpu_shader.h"
 
@@ -81,3 +82,65 @@ uint32_t fgpu_raster_draw_layout(const fgpu_target_t* t, const fgpu_pipeline_t* 
                                  const fgpu_layout_t* layout,
                                  const float* vertices, uint32_t vertex_count,
                                  const uint32_t* indices, uint32_t count);
+
+/* ---------------------------------------------------------------- binning
+ *
+ * The default path records draws and renders them at flush time (see
+ * docs/gpu.md, "Binned rasterizer"): a geometry stage (vertex shading,
+ * clipping, culling, 16.8 fixed-point setup) bins triangles into 64x64
+ * tiles, then workers take tiles and rasterize them into a tile-local copy
+ * of color and depth with hierarchical Z.
+ *
+ * fgpu_raster_draw*() and fgpu_raster_clear() keep their meaning (the result
+ * is in the target when they return). A pass keeps draws pending instead,
+ * until fgpu_pass_flush(): the caller must flush before anything reads or
+ * writes the target, a texture bound by a pending draw, or the memory
+ * behind a pending draw's vertices/indices/shader program (unless the draw
+ * was recorded with FGPU_DRAW_COPY). Everything else the draws depend on
+ * (pipeline state, uniforms, shader constants, layout) is snapshotted. */
+
+typedef enum {
+    FGPU_RASTER_BINNED = 0,     // default
+    FGPU_RASTER_IMMEDIATE = 1,  // the previous rasterizer: one barrier per draw, scalar
+} fgpu_raster_mode_t;
+
+// Selects the path for everything that follows (flush pending work first).
+void fgpu_raster_set_mode(fgpu_raster_mode_t mode);
+fgpu_raster_mode_t fgpu_raster_get_mode(void);
+
+// Memory for bins and records. Hosted builds default to malloc/free; the
+// kernel passes its heap. A NULL result is never fatal: the pass flushes
+// early or draws immediately.
+void fgpu_raster_set_allocator(void* (*alloc)(size_t), void (*release)(void*));
+// Upper bound for bin memory in bytes (default 8 MiB, minimum 1 MiB).
+void fgpu_raster_set_bin_budget(size_t bytes);
+
+typedef struct fgpu_pass fgpu_pass_t;
+
+#define FGPU_DRAW_COPY 1u       // copy vertices and indices at record time
+
+fgpu_pass_t* fgpu_pass_create(void);
+// Drops pending work without drawing it.
+void fgpu_pass_destroy(fgpu_pass_t* pass);
+void fgpu_pass_discard(fgpu_pass_t* pass);
+bool fgpu_pass_pending(const fgpu_pass_t* pass);
+
+void fgpu_pass_clear(fgpu_pass_t* pass, const fgpu_target_t* t, uint32_t flags, uint32_t color,
+                     float depth);
+void fgpu_pass_draw_layout(fgpu_pass_t* pass, const fgpu_target_t* t, const fgpu_pipeline_t* p,
+                           const fgpu_layout_t* layout, const float* vertices,
+                           uint32_t vertex_count, const uint32_t* indices, uint32_t count,
+                           uint32_t flags);
+// Renders what is pending. Returns the triangles drawn (the value
+// fgpu_raster_draw_layout() returns) by everything since the last flush.
+uint32_t fgpu_pass_flush(fgpu_pass_t* pass);
+
+// Counters of the last flushes, for tests and the benchmark.
+typedef struct {
+    uint32_t flushes, rounds, fallbacks;   // fallbacks: items drawn by the immediate path
+    uint32_t tris_binned, small_tris, tiles_run;
+    uint64_t bin_bytes_peak;
+    uint64_t geometry_cycles, tile_cycles;      // TSC cycles spent in the two phases (wall clock of the flush)
+} fgpu_raster_stats_t;
+void fgpu_raster_get_stats(fgpu_raster_stats_t* out);
+void fgpu_raster_reset_stats(void);

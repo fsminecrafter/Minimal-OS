@@ -22,6 +22,9 @@
 #define PTE_NX    (1ULL << 63)
 #define PTE_ADDR  0x000FFFFFFFFFF000ULL
 
+// Long operations take the lock for this much address space at a time.
+#define UVM_CHUNK (2ull << 20)
+
 #define SLOT_FIRST ((UVM_MIN >> 39) & 0x1FF)
 #define SLOT_LAST  (((UVM_MAX - 1) >> 39) & 0x1FF)
 
@@ -49,6 +52,13 @@ static inline uint64_t space_lock(uvm_space_t* s) {
 static inline void space_unlock(uvm_space_t* s, uint64_t flags) {
     __sync_lock_release(&s->lock);
     __asm__ volatile("pushq %0; popfq" :: "r"(flags) : "memory", "cc");
+}
+
+// System calls run with interrupts off. Loops over many pages open a
+// window for them now and then, so that a call working through gigabytes
+// does not starve the timer (and trip the hang watchdog).
+static inline void let_interrupts_in(void) {
+    __asm__ volatile("pushfq; sti; nop; nop; popfq" ::: "memory", "cc");
 }
 
 static uvm_space_t* space_of(process_t* proc) {
@@ -86,8 +96,9 @@ static uint64_t* walk(uvm_space_t* s, uint64_t addr, bool create) {
         uint64_t* entry = &table[(addr >> shift) & 0x1FF];
         if (!(*entry & PTE_P)) {
             if (!create) return NULL;
-            void* next = pmm_try_alloc_pages_zeroed(1);
+            void* next = pmm_try_alloc_page();
             if (!next) return NULL;
+            memset(next, 0, PAGE);
             // Access is decided at the leaf.
             *entry = (uint64_t)(uintptr_t)next | PTE_P | PTE_W | PTE_U;
         }
@@ -163,7 +174,7 @@ static void release_frame(uvm_space_t* s, uint64_t addr, uint64_t* pte, uint32_t
     void* frame = (void*)(uintptr_t)(*pte & PTE_ADDR);
     *pte = 0;
     flush_page(s, addr);
-    free_page(frame);
+    pmm_free_page_unscrubbed(frame);
     s->committed_pages--;
 }
 
@@ -186,7 +197,7 @@ static void prune_tables(uint64_t* table, int shift, uint64_t table_base,
             // Everything below is unmapped: page tables only, no frames.
             if (shift > 21) prune_tables(child, shift - 9, lo, lo, hi);
             table[i] = 0;
-            free_page(child);
+            pmm_free_page_unscrubbed(child);
         } else if (shift > 21) {
             prune_tables(child, shift - 9, lo, start, end);
         }
@@ -227,13 +238,13 @@ static void free_tables(uint64_t* table, int level) {
     for (int i = 0; i < 512; i++) {
         uint64_t entry = table[i];
         if (level == 1) {
-            if (pte_has_frame(entry)) free_page((void*)(uintptr_t)(entry & PTE_ADDR));
+            if (pte_has_frame(entry)) pmm_free_page_unscrubbed((void*)(uintptr_t)(entry & PTE_ADDR));
             continue;
         }
         if (!(entry & PTE_P) || (entry & PTE_HUGE)) continue;
         free_tables((uint64_t*)(uintptr_t)(entry & PTE_ADDR), level - 1);
     }
-    free_page(table);
+    pmm_free_page_unscrubbed(table);
 }
 
 void uvm_destroy(process_t* proc) {
@@ -364,6 +375,7 @@ uint64_t uvm_map(process_t* proc, uint64_t addr, uint64_t len, uint32_t prot, ui
             irq = space_lock(s);
             bool ok = frame_for(s, page, prot) != NULL;
             space_unlock(s, irq);
+            if (page > start && !(page & (UVM_CHUNK - 1))) let_interrupts_in();
             if (!ok) {
                 uvm_unmap(proc, start, len);
                 return SYS_ERR_NOMEM;
@@ -380,9 +392,29 @@ uint64_t uvm_unmap(process_t* proc, uint64_t addr, uint64_t len) {
     uvm_area_t* spare = (uvm_area_t*)alloc(sizeof(*spare));
     if (!spare) return SYS_ERR_NOMEM;
 
+    // A piece at a time, so that unmapping gigabytes never keeps
+    // interrupts off for long. Each piece leaves the area list and loses
+    // its frames in one step.
+    for (uint64_t at = addr; at < end;) {
+        uint64_t irq = space_lock(s);
+        // Straight to the next area: there is nothing in between.
+        uvm_area_t* next = s->areas;
+        while (next && next->end <= at) next = next->next;
+        if (!next || next->start >= end) {
+            space_unlock(s, irq);
+            break;
+        }
+        if (next->start > at) at = next->start;
+        uint64_t piece_end = (at & ~(UVM_CHUNK - 1)) + UVM_CHUNK;
+        if (piece_end > end) piece_end = end;
+        spare = carve(s, at, piece_end, spare);
+        for_each_frame(s, at, piece_end, release_frame, 0);
+        space_unlock(s, irq);
+        let_interrupts_in();
+        at = piece_end;
+    }
+
     uint64_t irq = space_lock(s);
-    spare = carve(s, addr, end, spare);
-    for_each_frame(s, addr, end, release_frame, 0);
     for (uint64_t slot = (addr >> 39) & 0x1FF; slot <= ((end - 1) >> 39) & 0x1FF; slot++) {
         uint64_t entry = s->pml4[slot];
         if (entry & PTE_P)
@@ -417,10 +449,25 @@ uint64_t uvm_protect(process_t* proc, uint64_t addr, uint64_t len, uint32_t prot
         split_at(s, addr, &spare1);
         split_at(s, end, &spare2);
         for (uvm_area_t* a = area_at(s, addr); a && a->start < end; a = a->next) a->prot = prot;
-        for_each_frame(s, addr, end, reprotect_frame, prot);
         result = SYS_SUCCESS;
     }
     space_unlock(s, irq);
+    // The pages that already have a frame follow, a piece at a time.
+    for (uint64_t at = addr; result == SYS_SUCCESS && at < end;) {
+        uint64_t piece_end = (at & ~(UVM_CHUNK - 1)) + UVM_CHUNK;
+        if (piece_end > end) piece_end = end;
+        irq = space_lock(s);
+        // Only where the area still says so: it may have changed meanwhile.
+        for (uvm_area_t* a = s->areas; a && a->start < piece_end; a = a->next) {
+            if (a->end <= at) continue;
+            uint64_t lo = a->start > at ? a->start : at;
+            uint64_t hi = a->end < piece_end ? a->end : piece_end;
+            for_each_frame(s, lo, hi, reprotect_frame, a->prot);
+        }
+        space_unlock(s, irq);
+        let_interrupts_in();
+        at = piece_end;
+    }
     if (spare1) free_mem(spare1);
     if (spare2) free_mem(spare2);
     return result;
@@ -431,13 +478,24 @@ uint64_t uvm_decommit(process_t* proc, uint64_t addr, uint64_t len) {
     if (!s || !range_valid(addr, len)) return SYS_ERR_INVAL;
     uint64_t end = addr + round_up(len);
     uint64_t irq = space_lock(s);
-    uint64_t result = SYS_ERR_INVAL;
-    if (covered(s, addr, end, 0)) {
-        for_each_frame(s, addr, end, release_frame, 0);
-        result = SYS_SUCCESS;
-    }
+    bool ok = covered(s, addr, end, 0);
     space_unlock(s, irq);
-    return result;
+    if (!ok) return SYS_ERR_INVAL;
+    for (uint64_t at = addr; at < end;) {
+        uint64_t piece_end = (at & ~(UVM_CHUNK - 1)) + UVM_CHUNK;
+        if (piece_end > end) piece_end = end;
+        irq = space_lock(s);
+        for_each_frame(s, at, piece_end, release_frame, 0);
+        space_unlock(s, irq);
+        let_interrupts_in();
+        at = piece_end;
+    }
+    return SYS_SUCCESS;
+}
+
+void uvm_release_all(process_t* proc) {
+    if (!proc || proc->mem_owner || !proc->uvm) return;
+    uvm_unmap(proc, UVM_MIN, UVM_MAX - UVM_MIN);
 }
 
 // ------------------------------------------------------------------- access
@@ -455,6 +513,9 @@ bool uvm_range_ok(process_t* proc, const void* ptr, size_t len, bool write) {
         uvm_area_t* a = area_at(s, page);
         bool ok = a && (a->prot & need) == need && frame_for(s, page, a->prot);
         space_unlock(s, irq);
+        // Only for ranges of 2 MiB and more: a caller with a small buffer may
+        // hold a lock of its own.
+        if (page - start >= UVM_CHUNK && !(page & (UVM_CHUNK - 1))) let_interrupts_in();
         if (!ok) return false;
     }
     return true;

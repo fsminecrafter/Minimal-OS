@@ -60,6 +60,9 @@ typedef enum {
     FGPU_IR_TEXC,       // component aux (1-3) of the TEX in a: no code of its own
     FGPU_IR_OUTPUT,     // output aux = a (no value)       AST in VS, output registers in FS
     FGPU_IR_DISCARD,    // discard the fragment if a != 0  KIL
+    // Only produced with FGPU_IR_EXACT (the CPU JIT; see below):
+    FGPU_IR_SUB,        // a - b (IEEE subtraction, not a + -b)
+    FGPU_IR_DIV,        // a / b (IEEE division, no zero special case)
     FGPU_IR_OP_COUNT
 } fgpu_ir_op_t;
 
@@ -96,7 +99,17 @@ typedef struct {
     uint32_t selects_for_jumps; // SELs added by if-conversion
     // Lowering scratch: CSE hash table, 2 * capacity entries.
     uint32_t* hash;
+    uint32_t flags;             // set by fgpu_ir_lower_ex()
 } fgpu_ir_t;
+
+/* Lowering flags. FGPU_IR_EXACT makes the IR evaluate bit for bit like the
+ * CPU interpreter (fgpu_shader.c) instead of like GPU hardware: IEEE
+ * division instead of multiplying by a reciprocal, true subtraction, no
+ * algebraic simplifications that change signed zeros or NaNs, no
+ * commuting of min/max operands. Transcendental ops (EX2, LG2, SIN, COS,
+ * RSQ) then mean "the interpreter's polynomial/sequence", and FMA means
+ * "multiply, round, add". The JIT (fgpu_jit_x64.c) needs this. */
+#define FGPU_IR_EXACT 1u
 
 // Words of scratch fgpu_ir_t.hash needs for `capacity` instructions.
 #define FGPU_IR_HASH_WORDS(capacity) (2u * (capacity))
@@ -105,6 +118,8 @@ typedef struct {
 // hash must be set; returns false if the stage needs more than capacity
 // instructions (`why` then says so).
 bool fgpu_ir_lower(fgpu_ir_t* ir, const fgpu_program_t* p, bool fragment, const char** why);
+bool fgpu_ir_lower_ex(fgpu_ir_t* ir, const fgpu_program_t* p, bool fragment, uint32_t flags,
+                      const char** why);
 
 // Assigns registers (linear scan over the straight-line code) and sets
 // reg_count. Immediates get no register: they become instruction operands.

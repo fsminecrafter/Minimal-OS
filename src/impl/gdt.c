@@ -43,7 +43,10 @@ typedef struct __attribute__((packed)) {
 static uint64_t   g_gdt[GDT_TOTAL_QWORDS] __attribute__((aligned(16)));
 static gdt_ptr_t   g_gdt_ptr;
 static tss_entry_t g_tss[MAX_CPUS] __attribute__((aligned(16)));
-static uint8_t     g_tss_stacks[MAX_CPUS][4096] __attribute__((aligned(16)));
+// Boot-time rsp0 and the double-fault IST1 stack. 16 KiB, not a page: a double
+// fault saves up to ~2.7 KiB of AVX-512 state before its handler runs.
+#define TSS_STACK_SIZE 16384
+static uint8_t     g_tss_stacks[MAX_CPUS][TSS_STACK_SIZE] __attribute__((aligned(16)));
 
 static void gdt_set_entry(int index, uint8_t access, uint8_t flags) {
     gdt_entry_t e = {0};
@@ -102,8 +105,8 @@ void gdt_init(void) {
 
     for (int i = 0; i < MAX_CPUS; i++) {
         // GDT setup runs before the heap allocator is initialized.
-        g_tss[i].rsp0 = (uint64_t)&g_tss_stacks[i][4096];
-        g_tss[i].ist[0] = (uint64_t)&g_tss_stacks[i][4096];
+        g_tss[i].rsp0 = (uint64_t)&g_tss_stacks[i][TSS_STACK_SIZE];
+        g_tss[i].ist[0] = (uint64_t)&g_tss_stacks[i][TSS_STACK_SIZE];
         gdt_set_tss(i, &g_tss[i]);
     }
 

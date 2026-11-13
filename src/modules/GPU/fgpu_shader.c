@@ -2,6 +2,12 @@
 #pragma GCC optimize("O3")
 #include "x86_64/fgpu_shader.h"
 #include <stddef.h>
+#if !__STDC_HOSTED__ && !defined(FGPU_ENABLE_JIT)
+#define FGPU_ENABLE_JIT 1       // the kernel always has the JIT (fgpu_jit_x64.c); the host opts in
+#endif
+#ifdef FGPU_ENABLE_JIT
+#include "x86_64/fgpu_jit_x64.h"
+#endif
 
 /*
  * FGPU shader machine (CPU backend).
@@ -274,6 +280,7 @@ bool fgpu_program_check(const void* blob, uint32_t bytes, fgpu_program_t* out, c
         out->vs = base + h->vs_offset;
         out->fs = base + h->fs_offset;
         out->consts = (const float (*)[4])(const void*)(base + h->const_offset);
+        out->jit = NULL;
     }
     return true;
 }
@@ -634,6 +641,13 @@ void fgpu_shader_batch_reset(fgpu_shader_batch_t* b, uint32_t temps) {
 uint32_t fgpu_shader_run_batch(const fgpu_program_t* p, bool fragment, fgpu_shader_batch_t* b,
                                uint32_t lanes, const float (*uniforms)[4],
                                const fgpu_texture_t* textures) {
+#ifdef FGPU_ENABLE_JIT
+    // Compiled code (bit-identical results), if the program has any.
+    if (p->jit) {
+        uint32_t kept;
+        if (fgpu_jit_run_batch(p, fragment, b, lanes, uniforms, textures, &kept)) return kept;
+    }
+#endif
     vm_t vm;
     vm.b = b;
     vm.uniforms = uniforms;

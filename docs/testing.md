@@ -22,6 +22,7 @@ The target builds and runs:
 | `fgpu_bin_tests` | Binned rasterizer against the immediate one (see below) |
 | `fgsl_tests` | FGSL shader compilation and execution path |
 | `fgpu_ir_tests` | FGPU intermediate representation |
+| `fgpu_jit_tests` | Shader JIT (SSE4.1 and AVX2 machine code) against the interpreter, bit for bit: per-opcode edge cases, real FGSL shaders, a differential fuzzer, safety and negative tests. A path the host CPU lacks is skipped with a message |
 | `nv_hw_tests` | NVIDIA firmware, VBIOS, and resource-manager data parsing |
 | `hid_mouse_tests` | HID mouse report decoding |
 | `media_tests` | Host-testable media interfaces |
@@ -29,6 +30,26 @@ The target builds and runs:
 
 These are ordinary host binaries under `build/tests/host`. The Makefile uses
 `HOSTCC` (default `gcc`) and `HOST_CFLAGS` for their compilation.
+
+### Shader JIT checks
+
+```sh
+make test-host                       # includes fgpu_jit_tests (a few seconds)
+make fuzz-fgpu-jit FUZZ_SECONDS=300  # longer differential fuzzing (FUZZ_SEED=n to change the seed)
+make bench-fgpu-jit                  # interpreter vs SSE4.1 vs AVX2, lane-instructions/s (not part of test-host)
+FGPU_JIT_DUMP=1 build/tests/host/fgpu_jit_tests --soak 20   # on a failure: shrunk program + listing
+```
+
+In QEMU (TCG), the JIT needs a CPU with SSE4.1 and AVX2: `-cpu max`; the
+default `qemu64` CPU has neither, so the shader JIT stays off there.
+
+```sh
+QEMU_EXTRA="-cpu max -smp 4" bash tools/debug/ci_fgpu_jit.sh   # `gpu jit`: interpreter vs JIT in the kernel, also on helper cores
+bash tools/debug/ci_fgpu_jit.sh                                 # default CPU: reports SKIP
+GRUB_UP=3 QEMU_EXTRA="-cpu max" bash tools/debug/ci_fgpu_jit.sh # the nojit entry: reports SKIP
+SHOT=/tmp/a.ppm QEMU_EXTRA="-cpu max -smp 4" bash tools/debug/ci_fgpu_jit_cube.sh   # fglcube --shader --still screendump
+SHOT=/tmp/b.ppm GRUB_UP=3 QEMU_EXTRA="-cpu max -smp 4" bash tools/debug/ci_fgpu_jit_cube.sh && cmp /tmp/a.ppm /tmp/b.ppm
+```
 
 ## QEMU boot smoke test
 

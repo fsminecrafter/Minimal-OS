@@ -12,6 +12,7 @@ uint8_t  simd_use_xsave = 0;
 uint64_t simd_xcr0 = 0;
 uint64_t simd_save_size = 512;
 bool kernel_boot_noavx = false;
+bool kernel_boot_nojit = false;
 
 static uint64_t g_cpu_features;
 
@@ -128,6 +129,7 @@ uint64_t cpu_simd_features(void) {
 
 void cpu_simd_init_bsp(multiboot2_info_t* mb_info) {
     kernel_boot_noavx = multiboot2_has_cmdline_token(mb_info, "noavx");
+    kernel_boot_nojit = multiboot2_has_cmdline_token(mb_info, "nojit");
 
     uint64_t want = kernel_boot_noavx ? 0 : wanted_xcr0(supported_xcr0());
     if (want) {

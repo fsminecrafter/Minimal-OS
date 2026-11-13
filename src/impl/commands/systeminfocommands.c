@@ -15,6 +15,7 @@
 #include "x86_64/gpucore.h"
 #include "x86_64/nv_gpu.h"
 #include "x86_64/fgpu.h"
+#include "x86_64/fgpu_jit_x64.h"
 #include "x86_64/fgpu_backend.h"
 #include "x86_64/scheduler.h"
 #include "x86_64/minimafs.h"
@@ -361,6 +362,13 @@ static void gpu_size_text(uint64_t bytes) {
     info_text(buf);
 }
 
+static void jit_say(const char* line) {
+    info_text(line);
+    info_text("\n");
+    serial_write_str(line);
+    serial_write_str("\n");
+}
+
 void cmd_gpu(int argc, const char** argv) {
     uint32_t count = gpu_adapter_count();
     if (argc >= 3 && strcmp(argv[1], "nvidia") == 0 && strcmp(argv[2], "boot") == 0) {
@@ -395,6 +403,11 @@ void cmd_gpu(int argc, const char** argv) {
         if (!any) info_text("No NVIDIA GPU found.\n");
         return;
     }
+    if (argc >= 2 && strcmp(argv[1], "jit") == 0) {
+        // OS-4: shader JIT self-check (interpreter against JIT, also on the other cores).
+        fgpu_jit_selfcheck(jit_say);
+        return;
+    }
     if (argc >= 2 && strcmp(argv[1], "nvidia") == 0) {
         // Hardware rendering bring-up status (read only).
         bool any = false;
@@ -408,7 +421,7 @@ void cmd_gpu(int argc, const char** argv) {
         return;
     }
     if (argc >= 2) {
-        info_text("Usage: gpu [nvidia [boot]]\n");
+        info_text("Usage: gpu [nvidia [boot] | jit]\n");
         return;
     }
     if (count == 0) info_text("No GPU adapter found.\n");

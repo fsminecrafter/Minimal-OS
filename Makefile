@@ -142,6 +142,13 @@ build/modules/GPU/fgpu_backend_nv.o: src/modules/GPU/fgpu_backend_nv.c $(header_
 	$(CC) $(BUILD_DATE_CFLAG) -c -I src/intf -idirafter Minimal-OS-SDK/include \
 		$(KERNEL_CFLAGS) $< -o $@
 
+# The JIT self-check compiles FGSL sources in the kernel too.
+build/modules/GPU/fgpu_jit_selfcheck.o: src/modules/GPU/fgpu_jit_selfcheck.c $(header_files) \
+	Minimal-OS-SDK/include/fglsl.h
+	mkdir -p $(dir $@)
+	$(CC) $(BUILD_DATE_CFLAG) -c -I src/intf -idirafter Minimal-OS-SDK/include \
+		$(KERNEL_CFLAGS) $< -o $@
+
 build/modules/Media/vid_decode.o: src/modules/Media/vid_decode.c $(header_files) \
 	Minimal-OS-SDK/include/mosmedia.h Minimal-OS-SDK/include/mosmedia_motion.h
 	mkdir -p $(dir $@)
@@ -589,7 +596,7 @@ ci-os0:
 
 .PHONY: test-host
 test-host: build/tests/host/gfx_blit_tests build/tests/host/fgpu_raster_tests build/tests/host/fgsl_tests \
-		build/tests/host/fgpu_bin_tests build/tests/host/fgpu_ir_tests build/tests/host/nv_hw_tests build/tests/host/nv_sass_tests \
+		build/tests/host/fgpu_bin_tests build/tests/host/fgpu_ir_tests build/tests/host/fgpu_jit_tests build/tests/host/nv_hw_tests build/tests/host/nv_sass_tests \
 		build/tests/host/video_gpu_tests build/tests/host/audio_stream_tests build/tests/host/hid_mouse_tests \
 		build/tests/host/media_tests build/tests/host/media_parallel_tests build/tests/host/os0_tests
 	./build/tests/host/gfx_blit_tests
@@ -597,6 +604,7 @@ test-host: build/tests/host/gfx_blit_tests build/tests/host/fgpu_raster_tests bu
 	./build/tests/host/fgpu_bin_tests
 	./build/tests/host/fgsl_tests
 	./build/tests/host/fgpu_ir_tests
+	./build/tests/host/fgpu_jit_tests
 	./build/tests/host/nv_hw_tests
 	./build/tests/host/nv_sass_tests
 	./build/tests/host/video_gpu_tests
@@ -640,6 +648,28 @@ build/tests/host/fgsl_tests: tests/host/fgsl_tests.c src/modules/GPU/fgpu_raster
 build/tests/host/fgpu_ir_tests: tests/host/fgpu_ir_tests.c src/modules/GPU/fgpu_ir.c src/modules/GPU/fgpu_shader.c Minimal-OS-SDK/include/fglsl.h Minimal-OS-SDK/include/fgpu_abi.h $(header_files)
 	mkdir -p $(dir $@)
 	$(HOSTCC) $(HOST_CFLAGS) -idirafter Minimal-OS-SDK/include $(filter %.c,$^) -lm -o $@
+
+# The shader JIT (x86-64 SSE4.1 / AVX2) against the interpreter, bit for bit.
+JIT_SRC := src/modules/GPU/fgpu_jit_x64.c src/modules/GPU/fgpu_ir.c src/modules/GPU/fgpu_shader.c
+build/tests/host/fgpu_jit_tests: tests/host/fgpu_jit_tests.c $(JIT_SRC) Minimal-OS-SDK/include/fglsl.h Minimal-OS-SDK/include/fgpu_abi.h $(header_files)
+	mkdir -p $(dir $@)
+	$(HOSTCC) $(HOST_CFLAGS) -O1 -DFGPU_ENABLE_JIT -idirafter Minimal-OS-SDK/include $(filter %.c,$^) -lm -o $@
+
+build/tests/host/fgpu_jit_bench: tests/host/fgpu_jit_bench.c $(JIT_SRC) Minimal-OS-SDK/include/fglsl.h $(header_files)
+	mkdir -p $(dir $@)
+	$(HOSTCC) $(HOST_CFLAGS) -O2 -DFGPU_ENABLE_JIT -idirafter Minimal-OS-SDK/include $(filter %.c,$^) -lm -o $@
+
+# Interpreter vs SSE4.1 vs AVX2 JIT, single thread (not part of test-host).
+.PHONY: bench-fgpu-jit
+bench-fgpu-jit: build/tests/host/fgpu_jit_bench
+	./build/tests/host/fgpu_jit_bench
+
+# Longer differential fuzzing of the JIT: make fuzz-fgpu-jit FUZZ_SECONDS=300 FUZZ_SEED=1
+FUZZ_SECONDS ?= 120
+FUZZ_SEED ?= 1
+.PHONY: fuzz-fgpu-jit
+fuzz-fgpu-jit: build/tests/host/fgpu_jit_tests
+	./build/tests/host/fgpu_jit_tests --soak $(FUZZ_SECONDS) --seed $(FUZZ_SEED)
 
 # Shader machine code for Turing + 3D pushbuffers, checked against the
 # CPU shader machine with a small simulator.

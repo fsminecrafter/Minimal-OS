@@ -22,6 +22,7 @@ typedef struct {
     const uint32_t* vs;
     const uint32_t* fs;
     const float (*consts)[4];
+    void* jit;                  // compiled code (fgpu_jit_x64.h), NULL = interpreter only
 } fgpu_program_t;
 
 // Checks a blob and fills *out. On failure returns false and, if `why`

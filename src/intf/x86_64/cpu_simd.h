@@ -24,6 +24,10 @@ extern uint64_t simd_save_size;
 // with AVX (a fallback for hardware trouble).
 extern bool kernel_boot_noavx;
 
+// The 'nojit' boot flag: FGPU shaders stay on the interpreter (the JIT in
+// fgpu_jit_x64.c checks it).
+extern bool kernel_boot_nojit;
+
 // Boot CPU: reads the 'noavx' flag, decides between fxsave and xsave, turns
 // XSAVE/AVX on for this CPU and works out the feature mask. Must run in
 // kernel_main before the IDT is loaded and interrupts are enabled: the entry

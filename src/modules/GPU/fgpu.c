@@ -1,6 +1,7 @@
 #include "x86_64/fgpu.h"
 #include "x86_64/fgpu_raster.h"
 #include "x86_64/fgpu_shader.h"
+#include "x86_64/fgpu_jit_x64.h"     // OS-4: shader JIT
 #include "x86_64/fgpu_backend.h"
 #include "x86_64/gpucore.h"
 #include "x86_64/gpu.h"
@@ -182,6 +183,7 @@ static fgpu_mem_t buffer_mem(const fgpu_buffer_t* b) {
 static void program_free(fgpu_shader_program_t* sp) {
     if (sp->hw && g_hw && g_hw->program_destroy) g_hw->program_destroy(sp->hw);
     sp->hw = NULL;
+    fgpu_program_release(&sp->program);     // OS-4: frees the compiled shader code
     free_mem(sp->blob);
     sp->used = false;
 }
@@ -734,6 +736,7 @@ static uint64_t op_create_program(syscall_gpu_request_t* r, uint64_t owner) {
         free_mem(blob);
         return SYS_ERR_INVAL;
     }
+    fgpu_program_jit(&sp->program);         // OS-4: compile now (here we may allocate); falls back silently
     sp->used = true;
     sp->id = g_next_id++;
     sp->owner = owner;

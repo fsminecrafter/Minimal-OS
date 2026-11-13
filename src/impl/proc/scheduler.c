@@ -1,3 +1,4 @@
+#include "x86_64/uvm.h"
 #include "x86_64/audio_streams.h"
 #include "x86_64/fgpu.h"
 // src/impl/proc/scheduler.c
@@ -661,13 +662,6 @@ static void schedule_irqs_off(void) {
 
                     proc_user_heap_cleanup(to_free);
 
-            if (to_free->user_image_phys) {
-                free_pages(to_free->user_image_phys, to_free->user_image_pages);
-            }
-            if (to_free->user_stack_phys) {
-                free_pages(to_free->user_stack_phys, to_free->user_stack_pages);
-            }
-
             if (to_free->privilege == PROC_PRIVILEGE_USER) {
                 proc_destroy_address_space(to_free);
             }
@@ -1086,6 +1080,10 @@ void process_exit_with_status(uint8_t exit_code, bool crashed,
     if (crashed && current_process->mem_owner)     /* the terminal waits on the program */
         command_user_process_exited(current_process->mem_owner->pid, exit_code, crashed,
                                     crash_vector);
+    // Its memory goes back now (never used again: this does not return to
+    // the program). Its threads are off the run queues by this point.
+    if (!current_process->mem_owner && current_process->privilege == PROC_PRIVILEGE_USER)
+        uvm_release_all(current_process);
     current_process->state = PROCESS_TERMINATED;
     schedule();
 

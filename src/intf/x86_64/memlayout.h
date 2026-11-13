@@ -21,6 +21,11 @@ bool memlayout_pick_heap_region(multiboot2_info_t* mb, uintptr_t kernel_end,
 // Marks identity-mapped 2 MiB pages without RAM as uncached.
 void memlayout_apply_cache_policy(multiboot2_info_t* mb);
 
+// Identity maps the RAM above 4 GiB and adds it to the page pool as
+// program memory. Call once, after pmm_init() and before any other CPU or
+// user process starts.
+void memlayout_add_high_ram(multiboot2_info_t* mb);
+
 // GRUB "module2 <file> <name>" lookups.
 bool memlayout_find_module(multiboot2_info_t* mb, const char* name,
                            memlayout_module_t* out);

@@ -97,12 +97,8 @@ typedef struct process {
     // without any assembly changes.
     process_privilege_t privilege;
 
-    // Physical storage owned by a user process. These fields are appended
-    // after the context-switch ABI fields and are reclaimed by the scheduler.
-    void* user_image_phys;
-    size_t user_image_pages;
-    void* user_stack_phys;
-    size_t user_stack_pages;
+    // Set when the kernel stack came from the page pool instead of the
+    // heap; the scheduler frees it accordingly.
     bool kernel_stack_page_backed;
     size_t kernel_stack_pages;
     // argv/argc for a user process's entry point, consumed by
@@ -173,6 +169,8 @@ typedef struct process {
     // Owner only: the address space above 4 GiB (uvm.h) - image, main
     // stack, SYS_VM mappings.
     struct uvm_space* uvm;
+    // Nonzero while this process is inside a system call (syscall.c).
+    volatile uint32_t in_syscall;
 } process_t;
 
 // The process whose address space `p` runs in: its owner for a thread.
@@ -214,9 +212,6 @@ uint64_t get_kernel_pml4(void);
 
 // Copy a user range to process-owned physical pages and map only those pages
 // as user-accessible in the process's private page-table hierarchy.
-int proc_map_user_range(process_t* proc, void* address, size_t length);
-int proc_map_user_range_at(process_t* proc, const void* source,
-                           void* user_address, size_t length);
 int proc_map_user_heap_range(process_t* proc, void* address, size_t length);
 int proc_unmap_user_heap_range(process_t* proc, void* address, size_t length);
 int proc_user_heap_track(process_t* proc, void* address, size_t size);

@@ -1139,9 +1139,16 @@ static void syscall_dispatch_inner(syscall_regs_t* regs);
 
 void syscall_dispatch(syscall_regs_t* regs) {
     if (!regs) return;
+    // The page-fault handler looks at in_syscall: a fault inside a system
+    // call on an address the program passed ends the program, not the
+    // system.
+    process_t* self = current_process;
+    if (self) self->in_syscall++;
     wm_watchdog_syscall_enter(regs->rax);
     syscall_dispatch_inner(regs);
     wm_watchdog_syscall_exit();
+    // The same process comes back here, whatever ran in between.
+    if (self) self->in_syscall--;
 }
 
 static void syscall_dispatch_inner(syscall_regs_t* regs) {

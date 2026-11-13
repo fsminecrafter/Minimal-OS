@@ -2,6 +2,7 @@
 #include "serial.h"
 #include "panic.h"
 #include "string.h"
+#include "x86_64/allocator.h"
 
 #define PAGE_SIZE 0x1000  // 4 KiB
 
@@ -22,6 +23,22 @@ static size_t    page_search_hint = 0;
 #define PMM_MAX_PAGES (1u << 20)
 #define BITMAP_WORDS  ((PMM_MAX_PAGES + 63) / 64)
 static uint64_t page_bitmap[BITMAP_WORDS];  // 0 = free, 1 = used
+
+// RAM above 4 GiB (pmm_add_high_region): frames for program memory only.
+// Nothing that needs a 32-bit physical address or a contiguous run comes
+// from here. Each region has a bitmap of its own on the kernel heap.
+#define PMM_HIGH_REGIONS 8
+typedef struct {
+    uintptr_t base;
+    size_t pages;
+    size_t free;
+    size_t hint;                // word index: every word below it is full
+    uint64_t* bitmap;
+} pmm_high_t;
+static pmm_high_t high_regions[PMM_HIGH_REGIONS];
+static size_t high_region_count = 0;
+static size_t high_pages_total = 0;
+static size_t high_pages_free = 0;
 
 // Interrupt-safe spinlock (same pattern as allocator)
 static volatile int pmm_spin = 0;
@@ -176,8 +193,90 @@ void* pmm_try_alloc_pages_zeroed(size_t count) {
     return pmm_take(count, true);
 }
 
+bool pmm_add_high_region(uintptr_t base, size_t size) {
+    size_t pages = size / PAGE_SIZE;
+    if ((base & (PAGE_SIZE - 1)) || !pages || high_region_count >= PMM_HIGH_REGIONS) return false;
+    size_t words = (pages + 63) / 64;
+    uint64_t* bitmap = (uint64_t*)alloc(words * sizeof(uint64_t));   // zeroed: all free
+    if (!bitmap) return false;
+    // Bits past the end of the region count as used.
+    if (pages % 64) bitmap[words - 1] = ~0ULL << (pages % 64);
+
+    uint64_t flags = pmm_lock();
+    pmm_high_t* r = &high_regions[high_region_count];
+    r->base = base;
+    r->pages = pages;
+    r->free = pages;
+    r->hint = 0;
+    r->bitmap = bitmap;
+    high_pages_total += pages;
+    high_pages_free += pages;
+    high_region_count++;            // last: readers without the lock see a complete entry
+    pmm_unlock(flags);
+
+    serial_write_str("PMM high region: ");
+    serial_write_hex(base);
+    serial_write_str(" -> ");
+    serial_write_hex(base + pages * PAGE_SIZE);
+    serial_write_str(", pages: ");
+    serial_write_dec(pages);
+    serial_write_str("\n");
+    return true;
+}
+
+static void* pmm_take_high(void) {
+    if (!high_pages_free) return NULL;
+    uint64_t flags = pmm_lock();
+    for (size_t i = 0; i < high_region_count; i++) {
+        pmm_high_t* r = &high_regions[i];
+        if (!r->free) continue;
+        size_t words = (r->pages + 63) / 64;
+        for (size_t w = r->hint; w < words; w++) {
+            uint64_t free_bits = ~r->bitmap[w];
+            if (!free_bits) continue;
+            size_t bit = (size_t)__builtin_ctzll(free_bits);
+            r->bitmap[w] |= 1ULL << bit;
+            r->hint = w;
+            r->free--;
+            high_pages_free--;
+            pmm_unlock(flags);
+            return (void*)(r->base + (w * 64 + bit) * PAGE_SIZE);
+        }
+    }
+    pmm_unlock(flags);
+    return NULL;
+}
+
+// True (and the page is freed) when `page` belongs to a high region.
+static bool pmm_free_high(void* page) {
+    uintptr_t addr = (uintptr_t)page;
+    for (size_t i = 0; i < high_region_count; i++) {
+        pmm_high_t* r = &high_regions[i];
+        if (addr < r->base || addr >= r->base + r->pages * PAGE_SIZE) continue;
+        size_t idx = (addr - r->base) / PAGE_SIZE;
+        uint64_t flags = pmm_lock();
+        if (!(r->bitmap[idx / 64] & (1ULL << (idx % 64)))) {
+            pmm_unlock(flags);
+            serial_write_str("WARNING: free_page double-free at 0x");
+            serial_write_hex(addr);
+            serial_write_str("\n");
+            return true;
+        }
+        r->bitmap[idx / 64] &= ~(1ULL << (idx % 64));
+        if (idx / 64 < r->hint) r->hint = idx / 64;
+        r->free++;
+        high_pages_free++;
+        pmm_unlock(flags);
+        return true;
+    }
+    return false;
+}
+
 void* pmm_try_alloc_page(void) {
-    return pmm_take(1, false);
+    // Program memory: RAM above 4 GiB first, so the low pool stays free
+    // for what must be low.
+    void* page = pmm_take_high();
+    return page ? page : pmm_take(1, false);
 }
 
 void* alloc_page_zeroed(void) {
@@ -194,8 +293,21 @@ void* alloc_pages_zeroed(size_t count) {
     return pages;
 }
 
+static void pmm_free(void* page, bool scrub);
+
 void free_page(void* page) {
+    pmm_free(page, true);
+}
+
+// For program memory: frames are cleared when they are handed out, and
+// scrubbing gigabytes on the way back would stall whoever unmaps them.
+void pmm_free_page_unscrubbed(void* page) {
+    pmm_free(page, false);
+}
+
+static void pmm_free(void* page, bool scrub) {
     if (!page) return;
+    if (((uintptr_t)page & (PAGE_SIZE - 1)) == 0 && pmm_free_high(page)) return;
 
     size_t idx = pmm_ptr_to_idx(page);
     if (idx == PMM_MAX_PAGES) {
@@ -216,7 +328,7 @@ void free_page(void* page) {
     }
 
     // Scrub page before returning to pool (catch use-after-free bugs)
-    memset(page, 0xCC, PAGE_SIZE);
+    if (scrub) memset(page, 0xCC, PAGE_SIZE);
 
     pmm_mark_free(idx);
     page_pool_free++;
@@ -237,27 +349,35 @@ void free_pages(void* base, size_t count) {
 // ===========================================
 
 size_t pmm_free_pages(void) {
+    return page_pool_free + high_pages_free;
+}
+
+size_t pmm_low_free_pages(void) {
     return page_pool_free;
 }
 
 size_t pmm_total_pages(void) {
-    return page_pool_pages;
+    return page_pool_pages + high_pages_total;
 }
 
 size_t pmm_used_pages(void) {
-    return page_pool_pages - page_pool_free;
+    return pmm_total_pages() - pmm_free_pages();
 }
 
 bool pmm_owns(const void* ptr) {
     uintptr_t addr = (uintptr_t)ptr;
-    return addr >= page_pool_base && addr < page_pool_base + page_pool_pages * PAGE_SIZE;
+    if (addr >= page_pool_base && addr < page_pool_base + page_pool_pages * PAGE_SIZE) return true;
+    for (size_t i = 0; i < high_region_count; i++)
+        if (addr >= high_regions[i].base &&
+            addr < high_regions[i].base + high_regions[i].pages * PAGE_SIZE) return true;
+    return false;
 }
 
 void pmm_stats(void) {
     size_t used = pmm_used_pages();
-    size_t free = page_pool_pages - used;
+    size_t free = pmm_free_pages();
     serial_write_str("=== PMM Stats ===\n");
-    serial_write_str("Total pages: "); serial_write_dec(page_pool_pages); serial_write_str("\n");
+    serial_write_str("Total pages: "); serial_write_dec(pmm_total_pages()); serial_write_str("\n");
     serial_write_str("Used pages:  "); serial_write_dec(used);            serial_write_str("\n");
     serial_write_str("Free pages:  "); serial_write_dec(free);            serial_write_str("\n");
     serial_write_str("Used KB:     "); serial_write_dec(used * 4);        serial_write_str("\n");

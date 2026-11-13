@@ -47,6 +47,10 @@ struct process;
 bool uvm_create(struct process* proc);
 // Frees every frame, page table and area. Owner only; a thread is ignored.
 void uvm_destroy(struct process* proc);
+// Unmaps everything, a piece at a time with interrupts on in between. A
+// program that ends does this itself, so that the scheduler, which calls
+// uvm_destroy() with its lock held, finds little left to free.
+void uvm_release_all(struct process* proc);
 
 // Maps `len` bytes (rounded up to pages). Without UVM_MAP_FIXED the kernel
 // picks the address, at or above `addr` when it is given, and leaves an

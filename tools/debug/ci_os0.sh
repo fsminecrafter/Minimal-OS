@@ -61,7 +61,7 @@ fi
 echo "[ci-os0] Starting QEMU (headless), serial log: $SERIAL_OUT"
 "$QEMU_BIN" \
     "${ACCEL[@]}" \
-    -smp 2 -m 1024M \
+    -smp 2 -m "${QEMU_MEM:-1024M}" \
     -cdrom "$ISO" -boot d \
     -display none \
     -chardev "pipe,id=ser0,path=$TMP/ser,logfile=$SERIAL_OUT" -serial chardev:ser0 \

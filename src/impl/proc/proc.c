@@ -78,58 +78,6 @@ static uint64_t clone_kernel_pml4(void) {
 	return (uint64_t)(uintptr_t)dst;
 }
 
-static int proc_map_user_pages(process_t* proc, uintptr_t address, size_t length,
-					uint64_t phys_base) {
-	if (!proc || length == 0) return 0;
-
-	uintptr_t start = address & ~0xFFFULL;
-	uintptr_t end = address + length;
-	if (end < address) return 0;
-	end = (end + 0xFFFULL) & ~0xFFFULL;
-
-	uint64_t* pml4 = (uint64_t*)(uintptr_t)proc->pml4;
-	uint64_t pml4_index = (start >> 39) & 0x1FF;
-	if ((((end - 1) >> 39) & 0x1FF) != pml4_index || pml4_index != 0) {
-		return 0;
-	}
-
-	uint64_t pml4e = pml4[pml4_index];
-	if (!(pml4e & 1)) return 0;
-	uint64_t* pdpt = (uint64_t*)(uintptr_t)(pml4e & ~0xFFFULL);
-	pml4[pml4_index] |= 0x4;
-
-	for (uintptr_t page = start; page < end; page += 0x1000) {
-		uint64_t pdpt_index = (page >> 30) & 0x1FF;
-		uint64_t pdpte = pdpt[pdpt_index];
-		if (!(pdpte & 1) || (pdpte & (1ULL << 7))) return 0;
-		uint64_t* pd = (uint64_t*)(uintptr_t)(pdpte & ~0xFFFULL);
-		pdpt[pdpt_index] |= 0x4;
-
-		uint64_t pd_index = (page >> 21) & 0x1FF;
-		uint64_t pde = pd[pd_index];
-		if (!(pde & 1)) return 0;
-
-		uint64_t* pt;
-		if (pde & (1ULL << 7)) {
-			pt = (uint64_t*)alloc_page_zeroed();
-			if (!pt) return 0;
-			uint64_t base = pde & 0xFFFFFFE00000ULL;
-			uint64_t flags = pde & 0xFFFULL & ~(1ULL << 7);
-			for (size_t i = 0; i < 512; i++) {
-				pt[i] = (base + i * 0x1000ULL) | flags;
-			}
-			pd[pd_index] = (uint64_t)(uintptr_t)pt | flags;
-		}
-		pt = (uint64_t*)(uintptr_t)(pd[pd_index] & ~0xFFFULL);
-		uint64_t pt_index = (page >> 12) & 0x1FF;
-		uint64_t pte_flags = pt[pt_index] & 0xFFFULL;
-		pt[pt_index] = (phys_base + (page - start)) | pte_flags | 0x4;
-		pd[pd_index] |= 0x4;
-	}
-
-	return 1;
-}
-
 int proc_map_user_heap_range(process_t* proc, void* address, size_t length) {
 	proc = proc_mem_owner(proc);
 	if (!proc || !address || length == 0) return 0;
@@ -367,50 +315,6 @@ void proc_user_heap_cleanup(process_t* proc) {
 		serial_write_dec(allocation_count);
 		serial_write_str(" allocations\n");
 	}
-}
-
-int proc_map_user_range_at(process_t* proc, const void* source,
-			   void* user_address, size_t length) {
-	if (!proc || !source || !user_address || length == 0) return 0;
-	uintptr_t destination = (uintptr_t)user_address;
-	if (destination & 0xFFFULL) return 0;
-	if (length > SIZE_MAX - 0xFFFULL) return 0;
-	size_t pages = (length + 0xFFFULL) / 0x1000ULL;
-
-	void* physical = alloc_pages_zeroed(pages);
-	if (!physical) return 0;
-	memcpy(physical, source, length);
-
-	if (!proc_map_user_pages(proc, destination, length,
-				(uint64_t)(uintptr_t)physical)) {
-		free_pages(physical, pages);
-		return 0;
-	}
-
-	if (!proc->user_image_phys) {
-		proc->user_image_phys = physical;
-		proc->user_image_pages = pages;
-		proc->user_image_address = destination;
-		proc->user_image_size = length;
-	} else if (!proc->user_stack_phys) {
-		proc->user_stack_phys = physical;
-		proc->user_stack_pages = pages;
-		proc->user_stack_address = destination;
-		proc->user_stack_size = length;
-	} else {
-		free_pages(physical, pages);
-		return 0;
-	}
-	return 1;
-}
-
-int proc_map_user_range(process_t* proc, void* address, size_t length) {
-	if (!address || length == 0) return 0;
-	uintptr_t source_start = (uintptr_t)address & ~0xFFFULL;
-	uintptr_t offset = (uintptr_t)address - source_start;
-	if (length > SIZE_MAX - offset) return 0;
-	return proc_map_user_range_at(proc, (void*)source_start,
-				      (void*)source_start, length + offset);
 }
 
 void proc_destroy_address_space(process_t* proc) {
@@ -673,7 +577,8 @@ process_t* proc_create_ex(const char* file_name, void (*entry_point)(),
 	// A user process has no image or stack mapped into its address space
 	// yet. Queueing it now would let another core dispatch it into the
 	// kernel's supervisor-only identity mapping before the caller finishes
-	// proc_map_user_range_at(), so it stays parked until proc_start().
+	// setting up its address space (runcommand.c), so it stays parked
+	// until proc_start().
 	if (privilege == PROC_PRIVILEGE_USER) {
 		proc->state = PROCESS_PAUSED;
 		return proc;

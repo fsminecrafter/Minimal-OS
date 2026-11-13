@@ -61,41 +61,6 @@ typedef struct {
 #define DT_RELAENT          9
 #define R_X86_64_RELATIVE   8
 
-// ===========================================
-// Loader API
-// ===========================================
-
-typedef struct {
-    uint64_t entry_point;   // runtime (relocated) entry address
-    void*    base;          // heap allocation the image lives in
-    uint64_t image_size;    // bytes reserved for the image (== highest vaddr+memsz)
-    bool     page_backed;   // image storage came from PMM pages instead of heap
-    size_t   page_count;    // number of PMM pages owned by the image
-} elf_loaded_image_t;
-
-// Loads a static/PIE ELF64 executable from a MinimaFS path into a
-// fresh heap allocation, applies R_X86_64_RELATIVE relocations if a
-// PT_DYNAMIC segment is present, and fills in `out` on success.
-// The binary MUST be linked with a base address of 0 (see sdk/link.ld) -
-// there is no per-process paging to honor any other link address.
-bool elf_load_file(const char* path, elf_loaded_image_t* out);
-
-/* Takes ownership of file_data and frees it on success or failure. */
-bool elf_load_buffer(uint8_t* file_data, uint32_t file_size,
-                     elf_loaded_image_t* out);
-
-// Loads into temporary storage while rebasing the entry point and
-// R_X86_64_RELATIVE relocations for the requested runtime virtual address.
-bool elf_load_buffer_at(uint8_t* file_data, uint32_t file_size,
-                        uint64_t load_address, elf_loaded_image_t* out);
-
-// Registers a PMM-backed input buffer so elf_load_buffer() can release it.
-bool elf_register_page_buffer(void* buffer, size_t page_count);
-
-// Frees the memory owned by a previously loaded image. Do NOT call
-// this while a process is still executing code from the image.
-void elf_unload(elf_loaded_image_t* image);
-
 // ---- Loading straight into a program's address space (uvm.h) ----
 //
 // The file is read piece by piece through a callback, so neither the file

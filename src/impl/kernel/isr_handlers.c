@@ -102,7 +102,24 @@ void isr_generic_handler(uint64_t vector, uint64_t error_code,
     serial_write_hex(saved_rip);
     serial_write_str("\n");
 
-    if ((saved_cs & 3) == 3 && current_process &&
+    bool from_user = (saved_cs & 3) == 3;
+    // A system call that was handed a bad address above the kernel's own
+    // memory and used it unchecked: the program's fault, not the kernel's.
+    // The program ends like any other crash. (Whatever lock the call held
+    // stays held; the checks in the system calls are what should catch
+    // bad pointers, this only keeps one program from taking the system
+    // down.)
+    bool in_bad_syscall = false;
+    if (!from_user && vector == 14 && current_process &&
+        current_process->privilege == PROC_PRIVILEGE_USER &&
+        current_process->in_syscall) {
+        uint64_t cr2;
+        asm volatile("mov %%cr2, %0" : "=r"(cr2));
+        in_bad_syscall = cr2 >= UVM_MIN;
+        if (in_bad_syscall)
+            serial_write_str("  In a system call, on an address the program passed\n");
+    }
+    if ((from_user || in_bad_syscall) && current_process &&
         current_process->privilege == PROC_PRIVILEGE_USER &&
         vector != 2 && vector != 18) {
         // Kept for the terminal's crash message: machines without a

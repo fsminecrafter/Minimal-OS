@@ -1,7 +1,7 @@
 From 2e82237589087ab693de903c6f03a762ad044a3e Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Thu, 12 Nov 2026 23:47:54 +0000
-Subject: [PATCH 1/2] OS-0: futex, TLS, clocks, stat/rename/chdir, spawn/wait,
+Subject: [PATCH 1/3] OS-0: futex, TLS, clocks, stat/rename/chdir, spawn/wait,
  environment
 
 syscall.h gains the kernel's new calls (SYS_FUTEX, SYS_CLOCK, SYS_STAT,
@@ -2796,7 +2796,7 @@ index 0000000..0ab1bc6
 From e793506e96b03a88fbee6574f7e1c22bed23ce80 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Fri, 13 Nov 2026 07:12:41 +0000
-Subject: [PATCH 2/2] os0test: checks for bad pointers, failed spawns, relative
+Subject: [PATCH 2/3] os0test: checks for bad pointers, failed spawns, relative
  exec, clock reads
 
 Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
@@ -2967,6 +2967,1652 @@ index 0ab1bc6..8c7b36f 100644
 +    test_bad_pointers();
 +    test_spawn_failure_cleanup();
 +    test_exec_relative();
+ 
+     stage("cleanup");
+     mos_chdir(g_start_cwd[0] ? g_start_cwd : "0:/");
+-- 
+2.43.0
+
+
+From ff1f09af3a14b89df6cb787d107f06d4ea5587a6 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 13 Nov 2026 07:30:24 +0000
+Subject: [PATCH 3/3] SYS_VM: vm.h, VM-backed thread stacks, spawn stack size,
+ os0test VM checks
+
+vm.h wraps the kernel's SYS_VM (map, unmap, protect, decommit, reserve and
+commit). mos_thread_create_vm() gives a thread a guarded SYS_VM stack.
+mos_spawn_opts_t gains stack_size. os0test checks demand-zero pages, guard
+pages, NX, protection changes, stack sizes, page accounting and threads in
+mapped memory (469 checks in all, passing in QEMU).
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0112xJofPtaNLntSK14Rcenm
+---
+ docs/README.md          |   1 +
+ docs/conventions.md     |   1 +
+ docs/memory.md          |  23 ++
+ docs/spawn.md           |   9 +-
+ docs/threads.md         |  30 +-
+ docs/vm.md              | 176 +++++++++
+ include/minimalos.h     |  21 +
+ include/process.h       |   8 +-
+ include/syscall.h       |  48 +++
+ include/thread.h        |  51 ++-
+ include/vm.h            | 133 +++++++
+ programs/os0test/main.c | 830 +++++++++++++++++++++++++++++++++++++++-
+ 12 files changed, 1320 insertions(+), 11 deletions(-)
+ create mode 100644 docs/vm.md
+ create mode 100644 include/vm.h
+
+diff --git a/docs/README.md b/docs/README.md
+index 68a30d6..fe30a3e 100644
+--- a/docs/README.md
++++ b/docs/README.md
+@@ -14,6 +14,7 @@ truth; these pages describe them as of SDK v1.1 and the kernel's
+ | [Spawning and waiting](spawn.md) | `process.h` | Start programs with arguments, environment, working directory and redirected output; wait for them; `getenv`; clock helpers |
+ | [Threads](threads.md) | `thread.h` | Threads in one program, `mos_mutex_t` locks, futexes, thread-local storage base |
+ | [Memory and randomness](memory.md) | `stdlib.h` | `malloc`, `calloc`, `realloc`, `free`, random bytes, `atoi` |
++| [Virtual memory](vm.md) | `vm.h` | Pages of your own: map, unmap, protect, decommit, reserve/commit, executable mappings, guard pages, where the image and stack live |
+ | [Strings and memory](strings.md) | `string.h` | `strlen`, `strcmp`, `strstr`, `memcpy`, constant-time compare … |
+ | [Formatted output](output.md) | `stdio.h`, `iostream` | `printf` and `std::cout` |
+ | [Windows](windows.md) | `window.h` | mosWM windows: create, draw, present, events |
+diff --git a/docs/conventions.md b/docs/conventions.md
+index 721fac3..2031c42 100644
+--- a/docs/conventions.md
++++ b/docs/conventions.md
+@@ -80,6 +80,7 @@ reconfiguring shared hardware through the syscall gate.
+ | --- | --- |
+ | `minimalos.h` | Core calls: terminal output, exit, time, files, packages, exec, process list, framebuffer ownership and blit |
+ | `process.h` | `mos_spawn`, `mos_waitpid`, `mos_getenv`, `environ`, clock helpers (includes `minimalos.h`; see [Spawning](spawn.md)) |
++| `vm.h` | `mos_vm_map`, `mos_vm_unmap`, `mos_vm_protect`, `mos_vm_decommit`, `mos_vm_reserve` (includes `minimalos.h`; see [Virtual memory](vm.md)) |
+ | `thread.h` | Threads, mutexes, futexes, thread-local storage base (see [Threads](threads.md)) |
+ | `stdio.h` | `printf` (includes `minimalos.h`) |
+ | `stdlib.h` | `malloc` and friends, random bytes, `atoi` (includes `minimalos.h`) |
+diff --git a/docs/memory.md b/docs/memory.md
+index 59bf9fe..e6ac24c 100644
+--- a/docs/memory.md
++++ b/docs/memory.md
+@@ -3,10 +3,33 @@
+ Heap allocation over `SYS_HEAP`, random bytes over `SYS_RANDOM`, and
+ `atoi`. Include `stdlib.h`.
+ 
++For big blocks, memory that must be given back, reserved address space or
++code you generate, see [Virtual memory](vm.md) (`vm.h`).
++
+ Heap blocks come from the kernel allocator and are tracked per process:
+ `free` and `realloc` only accept blocks this process allocated, and any
+ block still allocated when the process ends is reclaimed.
+ 
++## `malloc` or `SYS_VM`?
++
++| | `malloc` (`SYS_HEAP`) | `mos_vm_map` (`SYS_VM`) |
++| --- | --- | --- |
++| Granularity | Any size | Whole 4 KiB pages |
++| Address | Below 4 GiB | 2 TiB and up |
++| Contents | Not cleared | Reads as zero |
++| Physical memory | Taken when allocated | Taken on first use, can be given back (`mos_vm_decommit`) |
++| Guard pages | None | An unmapped page on each side |
++| Executable | Never | Only with `MOS_VM_PROT_EXEC` |
++| Cost of a call | Cheap, fine for small objects | A system call and a kernel area per mapping |
++
++Use `malloc` for ordinary objects, strings and buffers up to some
++megabytes. Use `mos_vm_map` for large blocks (images, arenas, caches), for a
++buffer that should grow in place (reserve, then commit), for memory you
++want to return to the system while keeping the address range, for stacks
++and anything that benefits from a guard page, and for code you write at run
++time. Do not use it for many small allocations: each mapping takes at least
++one page and two guard pages of address space.
++
+ ## `malloc`
+ 
+ ```c
+diff --git a/docs/spawn.md b/docs/spawn.md
+index 46c5d54..8a55c6a 100644
+--- a/docs/spawn.md
++++ b/docs/spawn.md
+@@ -13,7 +13,8 @@ it builds on (`mos_spawn_raw`, `mos_wait_raw`, `mos_stat`, `mos_rename`,
+ int main(void) {
+     const char* const argv[] = { "0:/programs/tool.run", "--fast", NULL };
+     mos_spawn_opts_t o = { "0:/programs/tool.run", argv, NULL, "0:/work",
+-                           "0:/work/out.txt", "0:/work/out.txt" };
++                           "0:/work/out.txt", "0:/work/out.txt",
++                           0 /* stack_size: the 8 MiB default */ };
+     long pid = mos_spawn_ex(&o);
+     if (pid < 0) { printf("spawn failed (%ld)\n", pid); return 1; }
+ 
+@@ -62,6 +63,7 @@ typedef struct {
+     const char* cwd;                  /* NULL: the caller's working directory */
+     const char* stdout_path;          /* NULL: the caller's output; else a file */
+     const char* stderr_path;          /* (replaced) receiving it; may be the same */
++    size_t stack_size;                /* main stack in bytes; 0: 8 MiB */
+ } mos_spawn_opts_t;
+ 
+ long mos_spawn_ex(const mos_spawn_opts_t* o);
+@@ -77,6 +79,7 @@ Starts a program as a child of the caller and returns at once.
+ | `cwd` | The child's working directory; it must be an existing directory. NULL: the caller's current one |
+ | `stdout_path` | NULL: the child writes where the caller's output goes (the terminal, or the caller's own redirection). Otherwise a file that is created, replacing an existing one, and receives everything the child writes to stdout |
+ | `stderr_path` | The same for stderr. May name the same file as `stdout_path`; the two streams are then one, in order |
++| `stack_size` | Bytes of main stack for the child. 0: the default, 8 MiB. Values outside 64 KiB..1 GiB are clamped to that range (no error); the size is rounded up to whole pages. Stack pages take memory only once they are used, so a large stack is cheap. Running off the end of it is a page fault: the child crashes with `crash_vector == 14` |
+ 
+ **Returns** the child's pid (greater than 0), or `SYS_ERR_NOTFOUND` (no such
+ program or it is a directory; `cwd` is not a directory), `SYS_ERR_INVAL` (a
+@@ -86,6 +89,10 @@ not be created, or the program could not be loaded), `SYS_ERR_NOMEM`.
+ 
+ **Notes**
+ 
++- The struct has grown at the end (`stack_size`). A positional initializer
++  such as `{ path, argv, NULL, NULL, NULL, NULL }` leaves it 0, which is the
++  default. If you fill a `mos_spawn_opts_t` field by field, set `stack_size`
++  too (or `memset` the struct first): it is read by the call.
+ - Output redirected to a file is buffered by the kernel and written when the
+   buffer fills and when the child ends. The file is complete once
+   [`mos_waitpid`](#mos_waitpid) has returned for that child, also after a
+diff --git a/docs/threads.md b/docs/threads.md
+index 98cc373..0f545f1 100644
+--- a/docs/threads.md
++++ b/docs/threads.md
+@@ -68,7 +68,7 @@ kernel refused.
+ 
+ **Notes**
+ 
+-- `main` has a fixed 64 KiB stack; a thread gets the stack you ask for.
++- `main` has an 8 MiB stack by default (a spawning program can choose another size with `stack_size`, see [Spawning](spawn.md#mos_spawn_ex)); a thread gets the stack you ask for, here from `malloc`. See [`mos_thread_create_vm`](#mos_thread_create_vm) for a thread stack that is demand-paged and guarded.
+ 
+ ## `mos_thread_create_ex`
+ 
+@@ -99,13 +99,33 @@ millisecond.
+   [`mos_futex_wait`](#futexes) on it when the thread has ended. It is 1
+   while the thread runs, so you can also wait on it yourself.
+ 
++## `mos_thread_create_vm`
++
++```c
++int mos_thread_create_vm(mos_thread_t* t, void (*fn)(void*), void* arg,
++                         size_t stack_size, void* tls);
++```
++
++[`mos_thread_create_ex`](#mos_thread_create_ex) with a stack that is a
++[`SYS_VM`](vm.md) mapping instead of `malloc` memory. `stack_size` is
++rounded up to whole pages (`0`: `MOS_THREAD_STACK_DEFAULT`). The stack takes
++physical memory only as the thread uses it, so a big one is cheap, and it
++has an unmapped page on each side: running off its low end is a page fault
++(the whole program ends, as for any crash) rather than corruption of other
++memory. [`mos_thread_join`](#mos_thread_join) unmaps it.
++
++**Returns** `0`, or `-1` (no address space or memory, or the kernel refused).
++
++**Notes** `mos_thread_t` has two more fields for this (`stack_size`,
++`stack_vm`); the other creators set them, so existing code is unaffected.
++
+ ## `mos_thread_join`
+ 
+ ```c
+ void mos_thread_join(mos_thread_t* t);
+ ```
+ 
+-Waits until the thread has ended, then frees its stack. Returns at once
++Waits until the thread has ended, then frees its stack (`free`, or unmaps it for a thread made by `mos_thread_create_vm`). Returns at once
+ for a thread that never started. A thread made by
+ [`mos_thread_create_ex`](#mos_thread_create_ex) is waited for with a
+ futex; one made by `mos_thread_create` by polling every millisecond.
+@@ -234,8 +254,10 @@ upper half (the CPU would fault on it). The value is unchanged then.
+ `syscall_thread_t*` (`entry`, `stack_top`, `arg`), returning the thread's
+ id; or `SYS_THREAD_ALIVE` with `rsi` = a thread id, returning
+ `SYS_SUCCESS` while that thread of the calling program runs and
+-`SYS_ERR_NOTFOUND` after. `entry` must be in the program and `stack_top`
+-in memory it owns. `thread.h` wraps this; programs should use that.
++`SYS_ERR_NOTFOUND` after. `entry` must be in executable memory of the
++program (its image, or a [`SYS_VM`](vm.md) mapping with
++`SYS_VM_PROT_EXEC`; not `malloc` memory or a stack) and `stack_top` in
++memory it owns. `thread.h` wraps this; programs should use that.
+ 
+ More operations of `SYS_THREAD`: `SYS_THREAD_SET_FS` (`rsi` = FS base) and
+ `SYS_THREAD_GET_FS` (returns it); `SYS_THREAD_CREATE_EX` with `rsi` = a
+diff --git a/docs/vm.md b/docs/vm.md
+new file mode 100644
+index 0000000..8acf7c7
+--- /dev/null
++++ b/docs/vm.md
+@@ -0,0 +1,176 @@
++# Virtual memory
++
++Memory of your own in whole 4 KiB pages: reserve a large range, run
++generated code, give memory back to the system. Include `vm.h` (it includes
++`minimalos.h`). The raw calls it builds on (`mos_vm_map_raw`,
++`mos_vm_unmap_raw`, `mos_vm_protect_raw`, `mos_vm_decommit_raw`) are in
++`minimalos.h`; the kernel call is `SYS_VM` (55).
++
++```c
++#include "vm.h"
++#include "stdio.h"
++
++int main(void) {
++    uint8_t* big = mos_vm_map(NULL, (size_t)1 << 30, MOS_VM_PROT_RW, 0);   /* 1 GiB */
++    if (!big) { printf("map failed (%ld)\n", mos_vm_last_error()); return 1; }
++
++    big[123456789] = 1;                 /* only this page takes physical memory */
++    mos_vm_decommit(big, (size_t)1 << 30);   /* give every page back, keep the range */
++    mos_vm_unmap(big, (size_t)1 << 30);      /* remove it */
++    return 0;
++}
++```
++
++## What you get
++
++- **Demand-zero pages.** A page reads as zero until it is written and takes
++  physical memory from its first use. A mapping that is never touched costs
++  nothing, so mapping 1 GiB "just in case" is cheap. If memory has run out
++  when a page is first touched, the program is ended with a page fault;
++  `MOS_VM_MAP_POPULATE` takes all the memory at once and fails with
++  `SYS_ERR_NOMEM` instead.
++- **Guard pages.** A mapping the kernel places (no `MOS_VM_MAP_FIXED`) has
++  an unmapped page on each side. Reading or writing just before or after it
++  is a page fault (CPU exception 14, reported to a waiting parent as
++  `crashed` with `crash_vector == 14`), not silent corruption.
++- **No execution by default.** Pages are not executable unless you give
++  `MOS_VM_PROT_EXEC`. Running code from a mapping without it, from the main
++  stack, or from `malloc` memory is a page fault.
++- **Addresses from 2 TiB up** (`0x20000000000`), below the main stack.
++  Your program's image is at 1 TiB, the main stack ends at
++  `0x7FFFF0000000`, and `malloc` memory stays below 4 GiB.
++
++Addresses given to `mos_vm_unmap`, `mos_vm_protect` and `mos_vm_decommit`
++must be page aligned; lengths are rounded up to whole pages.
++
++## Constants
++
++| Name | Value | Meaning |
++| --- | --- | --- |
++| `MOS_VM_PAGE_SIZE` | 4096 | The page size |
++| `MOS_VM_PROT_NONE` | 0 | No access (contents are kept) |
++| `MOS_VM_PROT_READ` | 1 | Readable |
++| `MOS_VM_PROT_WRITE` | 2 | Writable (implies readable) |
++| `MOS_VM_PROT_EXEC` | 4 | Executable (implies readable) |
++| `MOS_VM_PROT_RW` | 3 | Read and write |
++| `MOS_VM_PROT_RX` | 5 | Read and execute |
++| `MOS_VM_MAP_FIXED` | 1 | Map exactly at the given address, or fail |
++| `MOS_VM_MAP_POPULATE` | 2 | Take the physical memory now |
++
++## `mos_vm_map`
++
++```c
++void* mos_vm_map(void* hint, size_t length, int prot, int flags);
++void* mos_vm_map_ex(void* hint, size_t length, int prot, int flags, long* error);
++long  mos_vm_last_error(void);
++```
++
++Maps `length` bytes (rounded up to whole pages) with protection `prot`.
++
++| Parameter | Description |
++| --- | --- |
++| `hint` | NULL: anywhere. Otherwise the lowest address you want: the kernel uses the first free place at or above it (the hint itself when it is free). With `MOS_VM_MAP_FIXED`: the exact address, which must be page aligned and free |
++| `length` | Bytes. Must be greater than 0 |
++| `prot` | `MOS_VM_PROT_*` bits |
++| `flags` | 0, or `MOS_VM_MAP_FIXED` and/or `MOS_VM_MAP_POPULATE` |
++| `error` | `mos_vm_map_ex` only: receives 0 or the error (may be NULL) |
++
++**Returns** the address, or NULL on failure. The reason is in `*error` for
++`mos_vm_map_ex`, and in `mos_vm_last_error()` (the last `mos_vm_map` call,
++0 after a success; one value for the whole program) for `mos_vm_map`.
++Errors: `SYS_ERR_INVAL` (zero or too large length, unknown `prot` or
++`flags` bits, a `FIXED` address that is unaligned, outside user space or
++already (partly) mapped), `SYS_ERR_NOMEM` (no room, or `POPULATE` could not
++get all its pages; nothing stays mapped then).
++
++**Notes**
++
++- `FIXED` never replaces anything and adds no guard pages, so two fixed
++  mappings can touch.
++- With `POPULATE`, a size that cannot be satisfied (for example 64 GiB)
++  fails with `SYS_ERR_NOMEM`. The attempt briefly uses all free memory, so
++  do not use it to probe how much there is.
++
++## `mos_vm_unmap`
++
++```c
++long mos_vm_unmap(void* address, size_t length);
++```
++
++Removes the pages of `[address, address + length)` and frees their memory.
++Pages in the range that are not mapped are skipped, so unmapping part of a
++mapping leaves the two pieces (each keeps its data; the hole faults), and
++unmapping an unmapped range succeeds.
++
++**Returns** `SYS_SUCCESS`, or `SYS_ERR_INVAL` (unaligned address, zero
++length, outside user space).
++
++## `mos_vm_protect`
++
++```c
++long mos_vm_protect(void* address, size_t length, int prot);
++```
++
++Changes the protection of `[address, address + length)`. The whole range
++must be mapped, otherwise nothing changes. Contents are kept, also while
++the protection is `MOS_VM_PROT_NONE`. This is how generated code is made
++runnable: write it while the pages are read/write, then protect them
++`MOS_VM_PROT_RX`.
++
++**Returns** `SYS_SUCCESS`, or `SYS_ERR_INVAL` (part of the range is not
++mapped, unaligned address, zero length, unknown `prot` bits),
++`SYS_ERR_NOMEM`.
++
++## `mos_vm_decommit`
++
++```c
++long mos_vm_decommit(void* address, size_t length);
++```
++
++Gives the physical memory of the range back. The pages stay mapped with
++their protection and read as zero again. The whole range must be mapped.
++
++**Returns** `SYS_SUCCESS` or `SYS_ERR_INVAL`.
++
++## `mos_vm_reserve` and `mos_vm_commit`
++
++```c
++void* mos_vm_reserve(size_t length);
++long  mos_vm_commit(void* address, size_t length);
++```
++
++`mos_vm_reserve` maps `length` bytes with `MOS_VM_PROT_NONE`: address space
++that nothing can touch and that costs no memory. `mos_vm_commit` makes part
++of it read/write (`mos_vm_protect(..., MOS_VM_PROT_RW)`); pages still take
++memory only when first used. A growing buffer can reserve its maximum size
++once and commit as it grows, and never moves.
++
++## Example: running generated code
++
++```c
++static const uint8_t code[] = { 0xB8, 0x2A, 0, 0, 0, 0xC3 };   /* mov eax,42 ; ret */
++
++uint8_t* p = mos_vm_map(NULL, 4096, MOS_VM_PROT_RW, 0);
++for (unsigned i = 0; i < sizeof code; i++) p[i] = code[i];
++mos_vm_protect(p, 4096, MOS_VM_PROT_RX);
++int v = ((int (*)(void))p)();                  /* 42 */
++```
++
++## Threads on mapped stacks
++
++`thread.h` adds
++`int mos_thread_create_vm(mos_thread_t* t, void (*fn)(void*), void* arg, size_t stack_size, void* tls)`:
++like `mos_thread_create_ex`, but the stack is a `SYS_VM` mapping (`0` for
++128 KiB, rounded up to pages). It takes memory only as the thread uses it,
++has an unmapped guard page on both sides, and `mos_thread_join` unmaps it.
++A thread's entry point may be in any executable mapping (the image or a
++`MOS_VM_PROT_EXEC` mapping) when you call `SYS_THREAD` yourself; code in a
++non-executable mapping, in `malloc` memory or on the stack is refused with
++`SYS_ERR_INVAL`.
++
++## The system call
++
++`SYS_VM` (55): `rdi` = operation, `SYS_VM_MAP` (`rsi` = `syscall_vm_map_t*`
++with `size`, `address`, `length`, `prot`, `flags`), `SYS_VM_UNMAP`
++(`rsi` = address, `rdx` = length), `SYS_VM_PROTECT` (also `r10` = prot) or
++`SYS_VM_DECOMMIT` (`rsi` = address, `rdx` = length).
+diff --git a/include/minimalos.h b/include/minimalos.h
+index 7ce4d16..f916086 100644
+--- a/include/minimalos.h
++++ b/include/minimalos.h
+@@ -118,6 +118,27 @@ static inline long mos_wait_raw(long pid, long flags, syscall_wait_t* out) {
+     return mos_syscall(SYS_WAIT, pid, flags, (long)(uintptr_t)out);
+ }
+ 
++// SYS_VM, the raw calls (vm.h has the friendlier layer). Each returns a
++// negative SYS_ERR_* value on failure.
++//   mos_vm_map_raw: the mapping's address (>= 2 TiB unless FIXED).
++//   the others:     SYS_SUCCESS.
++static inline long mos_vm_map_raw(const syscall_vm_map_t* request) {
++    return mos_syscall(SYS_VM, SYS_VM_MAP, (long)(uintptr_t)request, 0);
++}
++
++static inline long mos_vm_unmap_raw(void* address, size_t length) {
++    return mos_syscall(SYS_VM, SYS_VM_UNMAP, (long)(uintptr_t)address, (long)length);
++}
++
++static inline long mos_vm_protect_raw(void* address, size_t length, unsigned prot) {
++    return mos_syscall4(SYS_VM, SYS_VM_PROTECT, (long)(uintptr_t)address,
++                        (long)length, (long)prot);
++}
++
++static inline long mos_vm_decommit_raw(void* address, size_t length) {
++    return mos_syscall(SYS_VM, SYS_VM_DECOMMIT, (long)(uintptr_t)address, (long)length);
++}
++
+ static inline long mos_mouse_call(uint64_t operation, uint64_t arg1,
+                                   uint64_t arg2) {
+     return mos_syscall(SYS_MOUSE, (long)operation, (long)arg1, (long)arg2);
+diff --git a/include/process.h b/include/process.h
+index 9c9c1e8..ca0bf3d 100644
+--- a/include/process.h
++++ b/include/process.h
+@@ -58,6 +58,11 @@ typedef struct {
+     const char* cwd;                  /* NULL: the caller's working directory */
+     const char* stdout_path;          /* NULL: the caller's output; else a file */
+     const char* stderr_path;          /* (replaced) receiving it; may be the same */
++    size_t stack_size;                /* the child's main stack in bytes; 0: 8 MiB.
++                                       * 64 KiB..1 GiB (other values are
++                                       * clamped to that range; there is no error). Pages
++                                       * take memory only once used. Set it to 0 when the
++                                       * struct is not zero-initialised. */
+ } mos_spawn_opts_t;
+ 
+ /* Starts a program as a child of the caller. argv[0] is what the child
+@@ -80,12 +85,13 @@ static inline long mos_spawn_ex(const mos_spawn_opts_t* o) {
+     r.stdout_path = o->stdout_path;
+     r.stderr_path = o->stderr_path;
+     r.flags = 0;
++    r.stack_size = o->stack_size;
+     return mos_spawn_raw(&r);
+ }
+ 
+ /* mos_spawn_ex() with only a path and argv (NULL-terminated, or NULL). */
+ static inline long mos_spawn(const char* path, const char* const* argv) {
+-    mos_spawn_opts_t o = { path, argv, NULL, NULL, NULL, NULL };
++    mos_spawn_opts_t o = { path, argv, NULL, NULL, NULL, NULL, 0 };
+     return mos_spawn_ex(&o);
+ }
+ 
+diff --git a/include/syscall.h b/include/syscall.h
+index 8ebc8a3..2d3b4fb 100644
+--- a/include/syscall.h
++++ b/include/syscall.h
+@@ -1039,6 +1039,9 @@ typedef struct {
+                                     // file (replaced) that receives the child's output
+     const char* stderr_path;        // the same for stderr; may name the same file
+     uint64_t flags;                 // 0
++    uint64_t stack_size;            // bytes of main stack; 0: the default (8 MiB).
++                                    // Between 64 KiB and 1 GiB. Stack pages only
++                                    // take memory once they are used.
+ } syscall_spawn_t;
+ 
+ // WAIT: rdi = child pid (SYS_WAIT_ANY for any child), rsi = flags, rdx =
+@@ -1059,6 +1062,51 @@ typedef struct {
+     uint32_t reserved;
+ } syscall_wait_t;
+ 
++// VM: rdi = operation. Memory of the program's own, in whole 4 KiB pages,
++// above everything else it has (addresses from 2 TiB up). Pages read as
++// zero until written and take physical memory only from their first use,
++// so a large mapping that is never touched costs nothing. Mappings the
++// kernel places have an unmapped page on both sides: running off either
++// end is a crash, not silent corruption. SYS_HEAP stays what malloc uses;
++// SYS_VM is for big blocks, for memory that must be given back, for
++// reserving address space, and for running generated or loaded code.
++//   SYS_VM_MAP:      rsi = const syscall_vm_map_t*. Returns the address, or
++//                    SYS_ERR_NOMEM / SYS_ERR_INVAL.
++//   SYS_VM_UNMAP:    rsi = address (page aligned), rdx = length. Frees the
++//                    pages; ones that are not mapped are skipped, so part
++//                    of a mapping, or several at once, can go.
++//   SYS_VM_PROTECT:  rsi = address, rdx = length, r10 = SYS_VM_PROT_* bits.
++//                    The whole range must be mapped. Contents are kept,
++//                    also while there is no access (SYS_VM_PROT_NONE).
++//   SYS_VM_DECOMMIT: rsi = address, rdx = length. Gives the physical memory
++//                    back; the pages stay mapped and read as zero again.
++// Protection: writable implies readable, and so does executable. Without
++// SYS_VM_PROT_EXEC the CPU refuses to run code from the pages. The main
++// stack and SYS_HEAP memory are never executable.
++#define SYS_VM 55
++#define SYS_VM_MAP      1u
++#define SYS_VM_UNMAP    2u
++#define SYS_VM_PROTECT  3u
++#define SYS_VM_DECOMMIT 4u
++
++#define SYS_VM_PROT_NONE  0u
++#define SYS_VM_PROT_READ  (1u << 0)
++#define SYS_VM_PROT_WRITE (1u << 1)
++#define SYS_VM_PROT_EXEC  (1u << 2)
++
++#define SYS_VM_MAP_FIXED    (1u << 0)  // exactly at `address` (page aligned), which
++                                       // must be free: nothing is ever replaced
++#define SYS_VM_MAP_POPULATE (1u << 1)  // take the physical memory now: fails with
++                                       // SYS_ERR_NOMEM instead of a later crash
++
++typedef struct {
++    uint64_t size;             // sizeof(syscall_vm_map_t)
++    uint64_t address;          // 0: anywhere; else the lowest address wanted
++    uint64_t length;           // bytes, rounded up to whole pages
++    uint32_t prot;             // SYS_VM_PROT_*
++    uint32_t flags;            // SYS_VM_MAP_*
++} syscall_vm_map_t;
++
+ // The environment: a program's entry point gets it as its third argument
+ // (RDI = argc, RSI = argv, RDX = envp), a NULL-terminated array of
+ // "NAME=value" strings at the bottom of its stack. The SDK's crt0 keeps it
+diff --git a/include/thread.h b/include/thread.h
+index 2d339d7..655552f 100644
+--- a/include/thread.h
++++ b/include/thread.h
+@@ -40,6 +40,7 @@
+ #include <stdint.h>
+ #include "stdlib.h"
+ #include "x86_64/user_common.h"
++#include "vm.h"
+ 
+ #define MOS_THREAD_STACK_DEFAULT (128u * 1024u)
+ 
+@@ -53,6 +54,8 @@ typedef struct {
+      * Unused (0) for mos_thread_create(); joining then polls. */
+     volatile uint32_t exit_word;
+     uint32_t futex_join;        /* nonzero: created by mos_thread_create_ex() */
++    size_t stack_size;          /* mos_thread_create_vm(): the mapping's length */
++    uint32_t stack_vm;          /* nonzero: `stack` is a SYS_VM mapping */
+ } mos_thread_t;
+ 
+ /* ------------------------------------------------------------- futex */
+@@ -116,6 +119,7 @@ static inline int mos_thread_create(mos_thread_t* t, void (*fn)(void*), void* ar
+     t->arg = arg;
+     t->exit_word = 0;
+     t->futex_join = 0;
++    t->stack_vm = 0;
+     t->stack = malloc(stack_size);
+     if (!t->stack) return -1;
+     syscall_thread_t request;
+@@ -144,6 +148,7 @@ static inline int mos_thread_create_ex(mos_thread_t* t, void (*fn)(void*), void*
+     t->fn = fn;
+     t->arg = arg;
+     t->futex_join = 1;
++    t->stack_vm = 0;
+     t->exit_word = 1;
+     t->stack = malloc(stack_size);
+     if (!t->stack) return -1;
+@@ -163,14 +168,52 @@ static inline int mos_thread_create_ex(mos_thread_t* t, void (*fn)(void*), void*
+     return 0;
+ }
+ 
++/* Like mos_thread_create_ex() (futex join, optional `tls`), but the stack
++ * is a SYS_VM mapping of stack_size bytes (0: MOS_THREAD_STACK_DEFAULT;
++ * rounded up to pages) instead of malloc memory: it takes physical memory
++ * only as it is used, so a large one is cheap, and it has an unmapped page
++ * on both sides, so running off its low end is a crash (exception 14)
++ * rather than corrupting other memory. mos_thread_join() unmaps it.
++ * Returns 0, or -1. */
++static inline int mos_thread_create_vm(mos_thread_t* t, void (*fn)(void*), void* arg,
++                                       size_t stack_size, void* tls) {
++    if (!t || !fn) return -1;
++    if (!stack_size) stack_size = MOS_THREAD_STACK_DEFAULT;
++    stack_size = mos_vm_round_up(stack_size);
++    t->id = 0;
++    t->fn = fn;
++    t->arg = arg;
++    t->futex_join = 1;
++    t->exit_word = 1;
++    t->stack = mos_vm_map(NULL, stack_size, MOS_VM_PROT_RW, 0);
++    t->stack_size = stack_size;
++    t->stack_vm = 1;
++    if (!t->stack) return -1;
++    syscall_thread_ex_t request;
++    request.entry = (uint64_t)(uintptr_t)mos_thread_start_;
++    request.stack_top = ((uint64_t)(uintptr_t)t->stack + stack_size) & ~(uint64_t)15;
++    request.arg = (uint64_t)(uintptr_t)t;
++    request.fs_base = (uint64_t)(uintptr_t)tls;
++    request.exit_futex = (uint64_t)(uintptr_t)&t->exit_word;
++    long id = mos_syscall(SYS_THREAD, SYS_THREAD_CREATE_EX, (long)(uintptr_t)&request, 0);
++    if (id <= 0) {
++        mos_vm_unmap(t->stack, stack_size);
++        t->stack = NULL;
++        return -1;
++    }
++    t->id = id;
++    return 0;
++}
++
+ /* Nonzero while the thread runs. */
+ static inline int mos_thread_running(const mos_thread_t* t) {
+     return t && t->id &&
+            (uint64_t)mos_syscall(SYS_THREAD, SYS_THREAD_ALIVE, t->id, 0) == SYS_SUCCESS;
+ }
+ 
+-/* Waits for the thread to end, then frees its stack. A thread made by
+- * mos_thread_create_ex() is waited for with a futex, any other by polling. */
++/* Waits for the thread to end, then frees its stack (unmaps it, for
++ * mos_thread_create_vm()). A thread made by mos_thread_create_ex() or
++ * mos_thread_create_vm() is waited for with a futex, any other by polling. */
+ static inline void mos_thread_join(mos_thread_t* t) {
+     if (!t || !t->id) return;
+     if (t->futex_join) {
+@@ -180,8 +223,10 @@ static inline void mos_thread_join(mos_thread_t* t) {
+     } else {
+         while (mos_thread_running(t)) mos_sleep(1);
+     }
+-    free(t->stack);
++    if (t->stack_vm) mos_vm_unmap(t->stack, t->stack_size);
++    else free(t->stack);
+     t->stack = NULL;
++    t->stack_vm = 0;
+     t->id = 0;
+ }
+ 
+diff --git a/include/vm.h b/include/vm.h
+new file mode 100644
+index 0000000..137b326
+--- /dev/null
++++ b/include/vm.h
+@@ -0,0 +1,133 @@
++#ifndef MINIMALOS_VM_H
++#define MINIMALOS_VM_H
++
++/*
++ * Virtual memory of your own (SYS_VM): whole 4 KiB pages that the kernel
++ * places above 2 TiB, with a protection you choose.
++ *
++ *   uint8_t* big = mos_vm_map(NULL, 1u << 30, MOS_VM_PROT_RW, 0);   // 1 GiB
++ *   if (!big) printf("failed: %ld\n", mos_vm_last_error());
++ *   big[12345] = 1;                 // only this page takes physical memory
++ *   mos_vm_decommit(big, 1u << 30); // give it all back, keep the mapping
++ *   mos_vm_unmap(big, 1u << 30);    // remove the mapping
++ *
++ * What you get:
++ *   - Pages read as zero until written and take physical memory only from
++ *     their first use, so a large mapping that is never touched costs
++ *     nothing. (Memory can still run out later: a first touch that finds
++ *     none ends the program with a page fault. MOS_VM_MAP_POPULATE takes it
++ *     all at once, and fails with SYS_ERR_NOMEM instead.)
++ *   - A mapping the kernel places has an unmapped page on both sides:
++ *     running off either end crashes (CPU exception 14) instead of
++ *     silently touching something else.
++ *   - Memory is not executable unless MOS_VM_PROT_EXEC is given, which
++ *     makes a mapping the place for generated or loaded code. Thread entry
++ *     points may be in such a mapping (SYS_THREAD).
++ *
++ * malloc() is separate and unchanged (a system call on the kernel heap
++ * below 4 GiB, never executable); see docs/memory.md for when to use which.
++ *
++ * Addresses and lengths of unmap/protect/decommit are in whole pages:
++ * `address` must be page aligned, `length` is rounded up. Errors are the
++ * kernel's negative SYS_ERR_* values (SYS_ERR_INVAL, SYS_ERR_NOMEM).
++ */
++
++#include <stddef.h>
++#include <stdint.h>
++#include "minimalos.h"
++
++#define MOS_VM_PAGE_SIZE 4096u
++
++/* Protection. Writable implies readable, and so does executable. */
++#define MOS_VM_PROT_NONE  SYS_VM_PROT_NONE
++#define MOS_VM_PROT_READ  SYS_VM_PROT_READ
++#define MOS_VM_PROT_WRITE SYS_VM_PROT_WRITE
++#define MOS_VM_PROT_EXEC  SYS_VM_PROT_EXEC
++#define MOS_VM_PROT_RW    (SYS_VM_PROT_READ | SYS_VM_PROT_WRITE)
++#define MOS_VM_PROT_RX    (SYS_VM_PROT_READ | SYS_VM_PROT_EXEC)
++
++/* Flags of mos_vm_map(). */
++#define MOS_VM_MAP_FIXED    SYS_VM_MAP_FIXED     /* exactly at `hint`, which must be free */
++#define MOS_VM_MAP_POPULATE SYS_VM_MAP_POPULATE  /* take the physical memory now */
++
++/* The error of the last failed mos_vm_map() (0 after a success). One
++ * value for the whole program, not per thread. */
++long mos_vm_errno __attribute__((weak));
++
++static inline long mos_vm_last_error(void) { return mos_vm_errno; }
++
++/* Rounds up to a whole number of pages. */
++static inline size_t mos_vm_round_up(size_t length) {
++    return (length + (MOS_VM_PAGE_SIZE - 1u)) & ~(size_t)(MOS_VM_PAGE_SIZE - 1u);
++}
++
++/* Maps `length` bytes (rounded up to pages) with protection `prot`.
++ * hint == NULL: anywhere. A hint without MOS_VM_MAP_FIXED is the lowest
++ * address wanted (the kernel picks the first free place at or above it).
++ * With MOS_VM_MAP_FIXED the mapping is at `hint` (page aligned) or the call
++ * fails: nothing is ever replaced, and no guard pages are added.
++ * On failure returns NULL and stores the reason in *error (may be NULL):
++ * SYS_ERR_INVAL (zero or huge length, bad prot/flags, unaligned or busy
++ * FIXED address) or SYS_ERR_NOMEM (no room, or POPULATE found too little
++ * memory; nothing stays mapped then). */
++static inline void* mos_vm_map_ex(void* hint, size_t length, int prot, int flags,
++                                  long* error) {
++    syscall_vm_map_t r;
++    r.size = sizeof(r);
++    r.address = (uint64_t)(uintptr_t)hint;
++    r.length = length;
++    r.prot = (uint32_t)prot;
++    r.flags = (uint32_t)flags;
++    long a = mos_vm_map_raw(&r);
++    if (a < 0) {
++        if (error) *error = a;
++        return NULL;
++    }
++    if (error) *error = 0;
++    return (void*)(uintptr_t)a;
++}
++
++/* mos_vm_map_ex() that keeps the error for mos_vm_last_error(). */
++static inline void* mos_vm_map(void* hint, size_t length, int prot, int flags) {
++    long e = 0;
++    void* p = mos_vm_map_ex(hint, length, prot, flags, &e);
++    mos_vm_errno = e;
++    return p;
++}
++
++/* Removes the pages of [address, address+length). Pages that are not mapped
++ * are skipped, so part of a mapping (leaving two pieces) or several
++ * mappings at once can go. Returns 0, or SYS_ERR_INVAL (unaligned address,
++ * zero length). */
++static inline long mos_vm_unmap(void* address, size_t length) {
++    return mos_vm_unmap_raw(address, length);
++}
++
++/* Changes the protection of [address, address+length), all of which must be
++ * mapped (else SYS_ERR_INVAL and nothing changes). Contents are kept, also
++ * while the protection is MOS_VM_PROT_NONE. Returns 0 or a negative error. */
++static inline long mos_vm_protect(void* address, size_t length, int prot) {
++    return mos_vm_protect_raw(address, length, (unsigned)prot);
++}
++
++/* Gives the physical memory of [address, address+length) back. The pages
++ * stay mapped (with their protection) and read as zero again. The whole
++ * range must be mapped. Returns 0 or a negative error. */
++static inline long mos_vm_decommit(void* address, size_t length) {
++    return mos_vm_decommit_raw(address, length);
++}
++
++/* Reserves address space: a PROT_NONE mapping that nothing can touch and
++ * that costs no memory. Grow into it with mos_vm_commit(). NULL on failure. */
++static inline void* mos_vm_reserve(size_t length) {
++    return mos_vm_map(NULL, length, MOS_VM_PROT_NONE, 0);
++}
++
++/* Makes [address, address+length) of a reserved range readable and
++ * writable (pages still take memory only when first used). Returns 0 or a
++ * negative error. */
++static inline long mos_vm_commit(void* address, size_t length) {
++    return mos_vm_protect(address, length, MOS_VM_PROT_RW);
++}
++
++#endif
+diff --git a/programs/os0test/main.c b/programs/os0test/main.c
+index 8c7b36f..f24dbc2 100644
+--- a/programs/os0test/main.c
++++ b/programs/os0test/main.c
+@@ -6,7 +6,8 @@
+  *
+  * Covers SYS_CLOCK, SYS_THREAD (FS base / TLS, exit futex), SYS_FUTEX,
+  * SYS_STAT, SYS_RENAME, SYS_CHDIR/SYS_GETCWD, the environment (envp ->
+- * environ), SYS_SPAWN and SYS_WAIT.
++ * environ), SYS_SPAWN and SYS_WAIT, and SYS_VM / the user address-space
++ * layout (vm.h): mappings, protection, guard pages, NX, stack sizes.
+  *
+  * Output: one line per check,
+  *
+@@ -35,6 +36,8 @@
+ #include "thread.h"
+ #include "process.h"
+ #include "string.h"
++#include "vm.h"
++#include "user_sysinfo.h"
+ 
+ #define TMP        "0:/os0test_tmp"
+ #define ERR(x)     ((long)(x))
+@@ -462,6 +465,155 @@ static int child_relay(char** argv) {
+     return (w == pid && r.exit_code == 7 && !r.crashed) ? 0 : 1;
+ }
+ 
++/* ---------------------------------------------------------------- VM children
++ * Everything that is supposed to crash runs in a child, as
++ * `--child vm_<mode>`. A child that survives its fault prints a line and
++ * exits 77, so the parent's report tells "no crash" from "wrong crash". */
++
++#define VM_PAGE      4096u
++#define VM_RW        MOS_VM_PROT_RW
++
++typedef int (*vm_stub_fn)(void);
++static const uint8_t k_stub42[] = { 0xB8, 0x2A, 0x00, 0x00, 0x00, 0xC3 };   /* mov eax,42 ; ret */
++
++static int vm_survived(const char* mode) {
++    emit_fd(1, "vm child %s: still alive after the access", mode);
++    return 77;
++}
++
++static void vm_copy_stub(volatile uint8_t* dst) {
++    for (size_t i = 0; i < sizeof(k_stub42); i++) dst[i] = k_stub42[i];
++}
++
++/* About 4 KiB of stack per level; volatile so none of it is optimised away. */
++static __attribute__((noinline)) unsigned long vm_burn(unsigned depth) {
++    volatile unsigned char buf[4000];
++    buf[0] = (unsigned char)depth;
++    buf[sizeof(buf) - 1] = (unsigned char)(depth * 3u);
++    unsigned long below = depth ? vm_burn(depth - 1) : 0;
++    return below + buf[0] + buf[sizeof(buf) - 1];
++}
++
++static unsigned long vm_burn_expect(unsigned depth) {
++    unsigned long sum = 0;
++    for (unsigned d = 0; d <= depth; d++) sum += (unsigned char)d + (unsigned char)(d * 3u);
++    return sum;
++}
++
++static void vm_burn_thread(void* arg) { (void)vm_burn((unsigned)(uintptr_t)arg); }
++
++static int child_vm(const char* mode, long arg) {
++    volatile uint8_t* p;
++    if (streq(mode, "vm_hole")) {
++        p = (volatile uint8_t*)mos_vm_map(NULL, 3 * VM_PAGE, VM_RW, 0);
++        if (!p) return 90;
++        p[0] = 1; p[VM_PAGE] = 2; p[2 * VM_PAGE] = 3;
++        if (mos_vm_unmap((void*)(p + VM_PAGE), VM_PAGE) != 0) return 91;
++        if (p[0] != 1 || p[2 * VM_PAGE] != 3) return 92;      /* the pieces are fine */
++        (void)*(volatile uint8_t*)(p + VM_PAGE + 5);          /* the hole is not */
++        return vm_survived(mode);
++    }
++    if (streq(mode, "vm_unmapped")) {
++        p = (volatile uint8_t*)mos_vm_map(NULL, VM_PAGE, VM_RW, 0);
++        if (!p) return 90;
++        p[0] = 1;
++        if (mos_vm_unmap((void*)p, VM_PAGE) != 0) return 91;
++        (void)*p;
++        return vm_survived(mode);
++    }
++    if (streq(mode, "vm_ro_write")) {
++        p = (volatile uint8_t*)mos_vm_map(NULL, VM_PAGE, VM_RW, 0);
++        if (!p) return 90;
++        p[0] = 5;
++        if (mos_vm_protect((void*)p, VM_PAGE, MOS_VM_PROT_READ) != 0) return 91;
++        if (p[0] != 5) return 92;                              /* reading still works */
++        p[0] = 6;                                              /* writing does not */
++        return vm_survived(mode);
++    }
++    if (streq(mode, "vm_none_read") || streq(mode, "vm_none_write")) {
++        p = (volatile uint8_t*)mos_vm_map(NULL, VM_PAGE, VM_RW, 0);
++        if (!p) return 90;
++        p[0] = 5;
++        if (mos_vm_protect((void*)p, VM_PAGE, MOS_VM_PROT_NONE) != 0) return 91;
++        if (streq(mode, "vm_none_read")) (void)*p; else p[0] = 6;
++        return vm_survived(mode);
++    }
++    if (streq(mode, "vm_guard_before") || streq(mode, "vm_guard_after")) {
++        /* 5000 bytes: two pages. The rest of the second page is ours. */
++        p = (volatile uint8_t*)mos_vm_map(NULL, 5000, VM_RW, 0);
++        if (!p) return 90;
++        p[0] = 1; p[5000] = 2; p[2 * VM_PAGE - 1] = 3;
++        if (streq(mode, "vm_guard_before")) (void)*(p - 1);
++        else (void)*(p + 2 * VM_PAGE);
++        return vm_survived(mode);
++    }
++    if (streq(mode, "vm_nx_data")) {
++        p = (volatile uint8_t*)mos_vm_map(NULL, VM_PAGE, VM_RW, 0);
++        if (!p) return 90;
++        vm_copy_stub(p);
++        int v = ((vm_stub_fn)(void*)p)();
++        emit_fd(1, "vm child %s: the stub ran and returned %d", mode, v);
++        return 77;
++    }
++    if (streq(mode, "vm_nx_stack")) {
++        uint8_t code[32] __attribute__((aligned(16)));
++        vm_copy_stub((volatile uint8_t*)code);
++        __asm__ volatile("" ::: "memory");
++        int v = ((vm_stub_fn)(void*)code)();
++        emit_fd(1, "vm child %s: the stub ran and returned %d", mode, v);
++        return 77;
++    }
++    if (streq(mode, "vm_nx_heap")) {
++        uint8_t* h = (uint8_t*)malloc(256);
++        if (!h) return 90;
++        vm_copy_stub(h);
++        int v = ((vm_stub_fn)(void*)h)();
++        emit_fd(1, "vm child %s: the stub ran and returned %d", mode, v);
++        return 77;
++    }
++    if (streq(mode, "vm_exec")) {
++        /* W^X flow: write while RW, run while RX, edit again. */
++        uint8_t* q = (uint8_t*)mos_vm_map(NULL, VM_PAGE, VM_RW, 0);
++        if (!q) return 90;
++        vm_copy_stub(q);
++        if (mos_vm_protect(q, VM_PAGE, MOS_VM_PROT_RX) != 0) return 91;
++        if (((vm_stub_fn)(void*)q)() != 42) return 92;
++        if (mos_vm_protect(q, VM_PAGE, VM_RW) != 0) return 93;
++        q[1] = 43;
++        if (mos_vm_protect(q, VM_PAGE, MOS_VM_PROT_RX) != 0) return 94;
++        if (((vm_stub_fn)(void*)q)() != 43) return 95;
++        /* Writable and executable at once, straight from the map call. */
++        uint8_t* w = (uint8_t*)mos_vm_map(NULL, VM_PAGE, VM_RW | MOS_VM_PROT_EXEC, 0);
++        if (!w) return 96;
++        vm_copy_stub(w);
++        if (((vm_stub_fn)(void*)w)() != 42) return 97;
++        /* PROT_EXEC alone implies readable. */
++        uint8_t* x = (uint8_t*)mos_vm_map(NULL, VM_PAGE, VM_RW, 0);
++        if (!x) return 98;
++        vm_copy_stub(x);
++        if (mos_vm_protect(x, VM_PAGE, MOS_VM_PROT_EXEC) != 0) return 99;
++        if (x[0] != 0xB8) return 100;
++        return 0;
++    }
++    if (streq(mode, "vm_stack_use")) {
++        unsigned depth = (unsigned)(arg / 4);                  /* arg KiB, 4 KiB a level */
++        unsigned long got = vm_burn(depth);
++        if (got != vm_burn_expect(depth)) {
++            emit_fd(1, "vm child %s: sum %lu, expected %lu", mode, got, vm_burn_expect(depth));
++            return 1;
++        }
++        return 0;
++    }
++    if (streq(mode, "vm_thread_overflow")) {
++        mos_thread_t t;
++        if (mos_thread_create_vm(&t, vm_burn_thread, (void*)(uintptr_t)256, 64 * 1024, NULL) != 0) return 90;
++        mos_thread_join(&t);
++        return vm_survived(mode);
++    }
++    emit_fd(1, "unknown vm child mode %s", mode);
++    return 99;
++}
++
+ /* os0test.run --child <mode> [arg] */
+ static int child_main(int argc, char** argv, char** envp) {
+     const char* mode = argc > 2 ? argv[2] : "";
+@@ -473,6 +625,7 @@ static int child_main(int argc, char** argv, char** envp) {
+     if (streq(mode, "relay")) return child_relay(argv);
+     if (streq(mode, "tls_hw")) return child_tls_hw();
+     if (streq(mode, "tsc")) return child_tsc();
++    if (sstarts(mode, "vm_")) return child_vm(mode, arg);
+     if (streq(mode, "streams")) {
+         emit_fd(1, "out1");
+         emit_fd(2, "err1");
+@@ -1275,6 +1428,7 @@ static long spawn_child(const char* mode, const char* arg, const char* out_path,
+     o.cwd = cwd;
+     o.stdout_path = out_path;
+     o.stderr_path = err_path;
++    o.stack_size = 0;
+     return mos_spawn_ex(&o);
+ }
+ 
+@@ -1314,7 +1468,7 @@ static void test_spawn_basic(void) {
+     mos_mkdir(TMP "/work");
+     const char* argv[] = { g_self, "--child", "info", "hello world", "", "--x=1", NULL };
+     const char* envp[] = { "OS0_A=alpha", "OS0_B=", "OS0_C=a=b=c", NULL };
+-    mos_spawn_opts_t o = { g_self, argv, envp, TMP "/work", TMP "/out.txt", TMP "/err.txt" };
++    mos_spawn_opts_t o = { g_self, argv, envp, TMP "/work", TMP "/out.txt", TMP "/err.txt", 0 };
+     write_text(TMP "/out.txt", "OLD CONTENT THAT MUST BE REPLACED\n");
+     long pid = mos_spawn_ex(&o);
+     EXPECT(pid > 0, "spawn_info_started", "spawn returned %ld (%s)", pid, ename(pid));
+@@ -1652,9 +1806,680 @@ static void test_exec_relative(void) {
+     EXPECT_RET(mos_chdir(g_start_cwd), SYS_SUCCESS, "exec_relative_chdir_back");
+ }
+ 
++/* ================================================================== VM */
++
++static char** g_argv;       /* set by main(): the layout checks look at them */
++static char** g_envp;
++int main(int argc, char** argv, char** envp);
++
++#define TIB            0x10000000000ULL
++#define VM_MMAP_BASE   0x20000000000ULL      /* 2 TiB */
++#define VM_STACK_TOP   0x7FFFF0000000ULL
++#define VM_FIX_A       0x30000000000ULL      /* 3 TiB: free unless something leaked */
++#define VM_HINT_A      0x50000000000ULL      /* 5 TiB */
++#define VM_PAGES_SLACK 64                    /* noise allowed in page-pool readings */
++
++static void* vm_new(size_t len, int prot) { return mos_vm_map(NULL, len, prot, 0); }
++
++static int vm_is_zero(const uint8_t* p, size_t n) {
++    for (size_t i = 0; i < n; i++) if (p[i]) return 0;
++    return 1;
++}
++
++static void vm_fill(uint8_t* p, size_t n, uint8_t seed) {
++    for (size_t i = 0; i < n; i++) p[i] = pattern_byte(i, seed);
++}
++
++static int vm_matches(const uint8_t* p, size_t n, uint8_t seed) {
++    for (size_t i = 0; i < n; i++) if (p[i] != pattern_byte(i, seed)) return 0;
++    return 1;
++}
++
++static long vm_free_pages(void) { return (long)mos_sysinfo_pmm_free_pages(); }
++
++/* Maps and (on success) unmaps again. Returns 1 when the map worked, else
++ * the negative error. */
++static long vm_map_result(void* hint, size_t len, int prot, int flags) {
++    long e = 0;
++    void* p = mos_vm_map_ex(hint, len, prot, flags, &e);
++    if (!p) return e;
++    mos_vm_unmap(p, len);
++    return 1;
++}
++
++static long spawn_wait_stack(const char* mode, const char* arg, size_t stack_size,
++                             mos_wait_result_t* res) {
++    const char* argv[6];
++    int n = 0;
++    argv[n++] = g_self;
++    argv[n++] = "--child";
++    argv[n++] = mode;
++    if (arg) argv[n++] = arg;
++    argv[n] = NULL;
++    mos_spawn_opts_t o;
++    memset(&o, 0, sizeof(o));
++    o.path = g_self;
++    o.argv = argv;
++    o.stack_size = stack_size;
++    memset(res, 0, sizeof(*res));
++    long pid = mos_spawn_ex(&o);
++    if (pid <= 0) return pid;
++    long w = mos_waitpid(pid, 0, res);
++    return w == pid ? pid : w - 1000;
++}
++
++/* A child that must die of a page fault (exception 14). */
++static void expect_vm_fault(const char* mode, const char* arg, size_t stack_size, const char* name) {
++    mos_wait_result_t r;
++    long pid = spawn_wait_stack(mode, arg, stack_size, &r);
++    EXPECT(pid > 0 && r.crashed && r.crash_vector == 14, name,
++           "pid=%ld crashed=%d vector=%u exit=%d", pid, r.crashed, r.crash_vector, r.exit_code);
++}
++
++/* A child that must finish normally with exit code 0. */
++static void expect_vm_ok(const char* mode, const char* arg, size_t stack_size, const char* name) {
++    mos_wait_result_t r;
++    long pid = spawn_wait_stack(mode, arg, stack_size, &r);
++    EXPECT(pid > 0 && !r.crashed && r.exit_code == 0, name,
++           "pid=%ld crashed=%d vector=%u exit=%d", pid, r.crashed, r.crash_vector, r.exit_code);
++}
++
++/* ---------------------------------------------------------- map basics */
++
++static void test_vm_map(void) {
++    stage("vm_map");
++    long e = 0;
++    uint8_t* a = (uint8_t*)mos_vm_map_ex(NULL, 3 * VM_PAGE, VM_RW, 0, &e);
++    EXPECT(a != NULL, "vm_map_returns_address", "failed: %ld (%s)", e, ename(e));
++    if (!a) return;
++    EXPECT(((uintptr_t)a & (VM_PAGE - 1)) == 0, "vm_map_page_aligned", "address 0x%llx", PTR(a));
++    EXPECT(PTR(a) >= VM_MMAP_BASE, "vm_map_at_or_above_2tib", "address 0x%llx", PTR(a));
++    EXPECT(vm_is_zero(a, 3 * VM_PAGE), "vm_map_fresh_pages_read_zero", "a byte was not zero");
++    vm_fill(a, 3 * VM_PAGE, 0x11);
++    EXPECT(vm_matches(a, 3 * VM_PAGE, 0x11), "vm_map_writes_stick", "data changed");
++
++    uint8_t* b = (uint8_t*)vm_new(2 * VM_PAGE, VM_RW);
++    EXPECT(b != NULL, "vm_map_second_mapping", "failed: %ld", mos_vm_last_error());
++    if (b) {
++        uint64_t ua = PTR(a), ub = PTR(b);
++        int gap = ub > ua ? ub >= ua + 3 * VM_PAGE + VM_PAGE : ua >= ub + 2 * VM_PAGE + VM_PAGE;
++        EXPECT(gap, "vm_map_mappings_have_a_gap_between", "a=0x%llx b=0x%llx", ua, ub);
++        vm_fill(b, 2 * VM_PAGE, 0x22);
++        EXPECT(vm_matches(a, 3 * VM_PAGE, 0x11) && vm_matches(b, 2 * VM_PAGE, 0x22),
++               "vm_map_mappings_independent", "data of one mapping changed");
++        mos_vm_unmap(b, 2 * VM_PAGE);
++    }
++    mos_vm_unmap(a, 3 * VM_PAGE);
++
++    /* Length rounding: exactly whole pages. */
++    uint8_t* p = (uint8_t*)vm_new(1, VM_RW);
++    EXPECT(p != NULL, "vm_len_1_maps", "failed: %ld", mos_vm_last_error());
++    if (p) {
++        p[VM_PAGE - 1] = 7;
++        EXPECT(p[VM_PAGE - 1] == 7, "vm_len_1_whole_page_usable", "last byte of the page lost");
++        EXPECT_RET(mos_vm_protect(p, 2 * VM_PAGE, VM_RW), ERR(SYS_ERR_INVAL), "vm_len_1_is_not_two_pages");
++        EXPECT_RET(mos_vm_protect(p, VM_PAGE, MOS_VM_PROT_READ), SYS_SUCCESS, "vm_len_1_is_one_page");
++        mos_vm_unmap(p, VM_PAGE);
++    }
++    p = (uint8_t*)vm_new(VM_PAGE + 1, VM_RW);
++    EXPECT(p != NULL, "vm_len_4097_maps", "failed: %ld", mos_vm_last_error());
++    if (p) {
++        EXPECT_RET(mos_vm_protect(p, 3 * VM_PAGE, VM_RW), ERR(SYS_ERR_INVAL), "vm_len_4097_is_not_three_pages");
++        EXPECT_RET(mos_vm_protect(p, 2 * VM_PAGE, VM_RW), SYS_SUCCESS, "vm_len_4097_is_two_pages");
++        mos_vm_unmap(p, 2 * VM_PAGE);
++    }
++
++    /* Bad arguments. */
++    EXPECT_RET(vm_map_result(NULL, 0, VM_RW, 0), ERR(SYS_ERR_INVAL), "vm_map_zero_length_inval");
++    EXPECT_RET(vm_map_result(NULL, VM_PAGE, 8, 0), ERR(SYS_ERR_INVAL), "vm_map_bad_prot_inval");
++    EXPECT_RET(vm_map_result(NULL, VM_PAGE, VM_RW, 4), ERR(SYS_ERR_INVAL), "vm_map_bad_flags_inval");
++    EXPECT_RET(vm_map_result(NULL, (size_t)1 << 47, VM_RW, 0), ERR(SYS_ERR_INVAL), "vm_map_huge_length_inval");
++    EXPECT_RET(vm_map_result(NULL, (size_t)-1, VM_RW, 0), ERR(SYS_ERR_INVAL), "vm_map_max_length_inval");
++    syscall_vm_map_t req;
++    req.size = 8; req.address = 0; req.length = VM_PAGE; req.prot = VM_RW; req.flags = 0;
++    EXPECT_RET(mos_vm_map_raw(&req), ERR(SYS_ERR_INVAL), "vm_map_small_request_size_inval");
++    EXPECT_RET(mos_vm_map_raw(NULL), ERR(SYS_ERR_INVAL), "vm_map_null_request_inval");
++    EXPECT_RET(mos_vm_map_raw((const syscall_vm_map_t*)(uintptr_t)8), ERR(SYS_ERR_INVAL), "vm_map_bad_request_pointer_inval");
++    EXPECT_RET(mos_syscall(SYS_VM, 99, 0, 0), ERR(SYS_ERR_INVAL), "vm_unknown_operation_inval");
++
++    void* none = vm_new(0, VM_RW);
++    EXPECT(none == NULL && mos_vm_last_error() == ERR(SYS_ERR_INVAL), "vm_last_error_after_failure",
++           "ptr=%llx err=%ld", PTR(none), mos_vm_last_error());
++    p = (uint8_t*)vm_new(VM_PAGE, VM_RW);
++    EXPECT(p != NULL && mos_vm_last_error() == 0, "vm_last_error_cleared_by_success", "err=%ld", mos_vm_last_error());
++    if (p) mos_vm_unmap(p, VM_PAGE);
++
++    /* reserve / commit */
++    uint8_t* res = (uint8_t*)mos_vm_reserve(1u << 20);
++    EXPECT(res != NULL, "vm_reserve_maps_none", "failed: %ld", mos_vm_last_error());
++    if (res) {
++        EXPECT_RET(mos_vm_commit(res, 16 * VM_PAGE), SYS_SUCCESS, "vm_commit_prefix");
++        vm_fill(res, 16 * VM_PAGE, 0x33);
++        EXPECT(vm_matches(res, 16 * VM_PAGE, 0x33), "vm_commit_prefix_usable", "data changed");
++        EXPECT_RET(mos_vm_commit(res + 16 * VM_PAGE, 16 * VM_PAGE), SYS_SUCCESS, "vm_commit_next_part");
++        EXPECT(vm_is_zero(res + 16 * VM_PAGE, 16 * VM_PAGE), "vm_commit_next_part_zero", "not zero");
++        mos_vm_unmap(res, 1u << 20);
++    }
++}
++
++static void test_vm_fixed_and_hint(void) {
++    stage("vm_fixed");
++    long e = 0;
++    uint8_t* f = (uint8_t*)mos_vm_map_ex((void*)(uintptr_t)VM_FIX_A, 2 * VM_PAGE, VM_RW, MOS_VM_MAP_FIXED, &e);
++    EXPECT(PTR(f) == VM_FIX_A, "vm_fixed_at_free_address", "got 0x%llx, error %ld (%s)", PTR(f), e, ename(e));
++    if (!f) return;
++    EXPECT(vm_is_zero(f, 2 * VM_PAGE), "vm_fixed_pages_read_zero", "not zero");
++    vm_fill(f, 2 * VM_PAGE, 0x44);
++    uintptr_t fa = (uintptr_t)VM_FIX_A;
++    EXPECT_RET(vm_map_result((void*)fa, 2 * VM_PAGE, VM_RW, MOS_VM_MAP_FIXED), ERR(SYS_ERR_INVAL), "vm_fixed_over_existing_fails");
++    EXPECT_RET(vm_map_result((void*)(fa + VM_PAGE), 2 * VM_PAGE, VM_RW, MOS_VM_MAP_FIXED), ERR(SYS_ERR_INVAL), "vm_fixed_over_tail_fails");
++    EXPECT_RET(vm_map_result((void*)(fa - VM_PAGE), 2 * VM_PAGE, VM_RW, MOS_VM_MAP_FIXED), ERR(SYS_ERR_INVAL), "vm_fixed_over_head_fails");
++    EXPECT_RET(vm_map_result((void*)(fa + 0x100000 + 1), VM_PAGE, VM_RW, MOS_VM_MAP_FIXED), ERR(SYS_ERR_INVAL), "vm_fixed_unaligned_fails");
++    EXPECT_RET(vm_map_result(NULL, VM_PAGE, VM_RW, MOS_VM_MAP_FIXED), ERR(SYS_ERR_INVAL), "vm_fixed_null_address_fails");
++    EXPECT_RET(vm_map_result((void*)0x1000, VM_PAGE, VM_RW, MOS_VM_MAP_FIXED), ERR(SYS_ERR_INVAL), "vm_fixed_low_address_fails");
++    EXPECT_RET(vm_map_result((void*)(uintptr_t)TIB, VM_PAGE, VM_RW, MOS_VM_MAP_FIXED), ERR(SYS_ERR_INVAL), "vm_fixed_over_program_image_fails");
++    EXPECT_RET(vm_map_result((void*)(uintptr_t)0x7FFFFFE00000ULL, VM_PAGE, VM_RW, MOS_VM_MAP_FIXED), ERR(SYS_ERR_INVAL), "vm_fixed_above_user_space_fails");
++    EXPECT(vm_matches(f, 2 * VM_PAGE, 0x44), "vm_fixed_failures_leave_data_alone", "data changed");
++
++    /* No guard pages for a fixed mapping: the next page can be taken. */
++    uint8_t* g = (uint8_t*)mos_vm_map((void*)(fa + 2 * VM_PAGE), VM_PAGE, VM_RW, MOS_VM_MAP_FIXED);
++    EXPECT(PTR(g) == VM_FIX_A + 2 * VM_PAGE, "vm_fixed_adjacent_allowed", "got 0x%llx err %ld", PTR(g), mos_vm_last_error());
++    EXPECT_RET(mos_vm_unmap(f, 3 * VM_PAGE), SYS_SUCCESS, "vm_fixed_unmap_both");
++    uint8_t* again = (uint8_t*)mos_vm_map((void*)fa, VM_PAGE, VM_RW, MOS_VM_MAP_FIXED);
++    EXPECT(PTR(again) == VM_FIX_A, "vm_fixed_after_unmap_succeeds", "got 0x%llx err %ld", PTR(again), mos_vm_last_error());
++    EXPECT(again && vm_is_zero(again, VM_PAGE), "vm_fixed_reuse_reads_zero", "old data came back");
++    if (again) mos_vm_unmap(again, VM_PAGE);
++
++    /* Hints. */
++    uint8_t* h = (uint8_t*)mos_vm_map((void*)(uintptr_t)VM_HINT_A, 2 * VM_PAGE, VM_RW, 0);
++    EXPECT(PTR(h) == VM_HINT_A, "vm_hint_honoured_when_free", "got 0x%llx err %ld", PTR(h), mos_vm_last_error());
++    uint8_t* h2 = (uint8_t*)mos_vm_map((void*)(uintptr_t)VM_HINT_A, 2 * VM_PAGE, VM_RW, 0);
++    EXPECT(h2 != NULL && PTR(h2) >= VM_HINT_A + 3 * VM_PAGE, "vm_hint_busy_picks_a_higher_spot",
++           "got 0x%llx err %ld", PTR(h2), mos_vm_last_error());
++    uint8_t* h3 = (uint8_t*)mos_vm_map((void*)(uintptr_t)(VM_HINT_A + 0x400000 + 5), VM_PAGE, VM_RW, 0);
++    EXPECT(h3 != NULL && ((uintptr_t)h3 & (VM_PAGE - 1)) == 0 && PTR(h3) >= VM_HINT_A + 0x400000,
++           "vm_hint_unaligned_rounds_up", "got 0x%llx err %ld", PTR(h3), mos_vm_last_error());
++    if (h) mos_vm_unmap(h, 2 * VM_PAGE);
++    if (h2) mos_vm_unmap(h2, 2 * VM_PAGE);
++    if (h3) mos_vm_unmap(h3, VM_PAGE);
++}
++
++/* ------------------------------------------------------ unmap / protect */
++
++static void test_vm_unmap(void) {
++    stage("vm_unmap");
++    uint8_t* p = (uint8_t*)vm_new(3 * VM_PAGE, VM_RW);
++    if (!p) { check_fail("vm_unmap_setup", "map failed: %ld", mos_vm_last_error()); return; }
++    for (int i = 0; i < 3; i++) vm_fill(p + i * VM_PAGE, VM_PAGE, (uint8_t)(0x50 + i));
++
++    EXPECT_RET(mos_vm_unmap(p + VM_PAGE, VM_PAGE), SYS_SUCCESS, "vm_unmap_middle");
++    EXPECT(vm_matches(p, VM_PAGE, 0x50) && vm_matches(p + 2 * VM_PAGE, VM_PAGE, 0x52),
++           "vm_unmap_middle_pieces_keep_data", "a remaining piece lost its data");
++    uint8_t* hole = (uint8_t*)mos_vm_map(p + VM_PAGE, VM_PAGE, VM_RW, MOS_VM_MAP_FIXED);
++    EXPECT(hole == p + VM_PAGE, "vm_unmap_middle_hole_is_free", "fixed map in the hole: %llx err %ld", PTR(hole), mos_vm_last_error());
++    EXPECT(hole && vm_is_zero(hole, VM_PAGE), "vm_unmap_middle_hole_reads_zero_when_remapped", "old data came back");
++    if (hole) mos_vm_unmap(hole, VM_PAGE);
++    EXPECT_RET(mos_vm_unmap(p, VM_PAGE), SYS_SUCCESS, "vm_unmap_first_piece");
++    EXPECT(vm_matches(p + 2 * VM_PAGE, VM_PAGE, 0x52), "vm_unmap_last_piece_keeps_data", "data lost");
++    EXPECT_RET(mos_vm_unmap(p, 3 * VM_PAGE), SYS_SUCCESS, "vm_unmap_range_with_holes_succeeds");
++    EXPECT_RET(mos_vm_unmap(p, 3 * VM_PAGE), SYS_SUCCESS, "vm_unmap_twice_succeeds");
++    uint8_t* same = (uint8_t*)mos_vm_map(p, 3 * VM_PAGE, VM_RW, MOS_VM_MAP_FIXED);
++    EXPECT(same == p, "vm_unmap_whole_range_is_free", "fixed map got %llx err %ld", PTR(same), mos_vm_last_error());
++    if (same) mos_vm_unmap(same, 3 * VM_PAGE);
++
++    EXPECT_RET(mos_vm_unmap((void*)(uintptr_t)(VM_HINT_A + 0x10000000), 8 * VM_PAGE), SYS_SUCCESS, "vm_unmap_unmapped_range_succeeds");
++    p = (uint8_t*)vm_new(2 * VM_PAGE, VM_RW);
++    if (p) {
++        EXPECT_RET(mos_vm_unmap(p + 1, VM_PAGE), ERR(SYS_ERR_INVAL), "vm_unmap_unaligned_inval");
++        EXPECT_RET(mos_vm_unmap(p, 0), ERR(SYS_ERR_INVAL), "vm_unmap_zero_length_inval");
++        EXPECT_RET(mos_vm_unmap((void*)0x1000, VM_PAGE), ERR(SYS_ERR_INVAL), "vm_unmap_low_address_inval");
++        EXPECT_RET(mos_vm_unmap(p, 1), SYS_SUCCESS, "vm_unmap_length_rounds_up");
++        EXPECT_RET(mos_vm_protect(p + VM_PAGE, VM_PAGE, VM_RW), SYS_SUCCESS, "vm_unmap_length_1_left_second_page");
++        EXPECT_RET(mos_vm_protect(p, VM_PAGE, VM_RW), ERR(SYS_ERR_INVAL), "vm_unmap_length_1_took_first_page");
++        mos_vm_unmap(p, 2 * VM_PAGE);
++    }
++
++    expect_vm_fault("vm_hole", NULL, 0, "vm_unmap_middle_hole_faults");
++    expect_vm_fault("vm_unmapped", NULL, 0, "vm_unmap_whole_then_access_faults");
++}
++
++static void test_vm_protect(void) {
++    stage("vm_protect");
++    uint8_t* p = (uint8_t*)vm_new(4 * VM_PAGE, VM_RW);
++    if (!p) { check_fail("vm_protect_setup", "map failed: %ld", mos_vm_last_error()); return; }
++    vm_fill(p, 4 * VM_PAGE, 0x61);
++    EXPECT_RET(mos_vm_protect(p, 4 * VM_PAGE, MOS_VM_PROT_READ), SYS_SUCCESS, "vm_protect_rw_to_r");
++    EXPECT(vm_matches(p, 4 * VM_PAGE, 0x61), "vm_protect_r_keeps_data", "data changed");
++    EXPECT_RET(mos_vm_protect(p, 4 * VM_PAGE, VM_RW), SYS_SUCCESS, "vm_protect_r_to_rw");
++    p[5] = 0xEE;
++    EXPECT(p[5] == 0xEE, "vm_protect_rw_writable_again", "write did not stick");
++    vm_fill(p, 4 * VM_PAGE, 0x62);
++
++    EXPECT_RET(mos_vm_protect(p, 4 * VM_PAGE, MOS_VM_PROT_NONE), SYS_SUCCESS, "vm_protect_to_none");
++    EXPECT_RET(mos_vm_protect(p, 4 * VM_PAGE, VM_RW), SYS_SUCCESS, "vm_protect_none_to_rw");
++    EXPECT(vm_matches(p, 4 * VM_PAGE, 0x62), "vm_protect_none_keeps_contents", "data changed");
++
++    /* Part of a mapping: the rest stays as it was. */
++    EXPECT_RET(mos_vm_protect(p + VM_PAGE, 2 * VM_PAGE, MOS_VM_PROT_READ), SYS_SUCCESS, "vm_protect_middle_to_r");
++    p[0] = 0x71; p[3 * VM_PAGE] = 0x72;
++    EXPECT(p[0] == 0x71 && p[3 * VM_PAGE] == 0x72, "vm_protect_middle_leaves_ends_writable", "ends not writable");
++    EXPECT_RET(mos_vm_protect(p, 4 * VM_PAGE, VM_RW), SYS_SUCCESS, "vm_protect_whole_back_to_rw");
++
++    /* A hole in the range: INVAL, and nothing changes. */
++    EXPECT_RET(mos_vm_unmap(p + VM_PAGE, VM_PAGE), SYS_SUCCESS, "vm_protect_make_hole");
++    EXPECT_RET(mos_vm_protect(p, 4 * VM_PAGE, MOS_VM_PROT_READ), ERR(SYS_ERR_INVAL), "vm_protect_over_hole_inval");
++    p[0] = 0x73; p[3 * VM_PAGE] = 0x74;
++    EXPECT(p[0] == 0x73 && p[3 * VM_PAGE] == 0x74, "vm_protect_over_hole_changes_nothing", "pages became read-only");
++    EXPECT_RET(mos_vm_protect((void*)(uintptr_t)(VM_HINT_A + 0x10000000), VM_PAGE, VM_RW), ERR(SYS_ERR_INVAL), "vm_protect_unmapped_inval");
++    EXPECT_RET(mos_vm_protect(p + 1, VM_PAGE, VM_RW), ERR(SYS_ERR_INVAL), "vm_protect_unaligned_inval");
++    EXPECT_RET(mos_vm_protect(p, 0, VM_RW), ERR(SYS_ERR_INVAL), "vm_protect_zero_length_inval");
++    EXPECT_RET(mos_vm_protect(p, VM_PAGE, 8), ERR(SYS_ERR_INVAL), "vm_protect_bad_prot_inval");
++    mos_vm_unmap(p, 4 * VM_PAGE);
++
++    expect_vm_fault("vm_ro_write", NULL, 0, "vm_protect_write_to_read_only_faults");
++    expect_vm_fault("vm_none_read", NULL, 0, "vm_protect_read_of_none_faults");
++    expect_vm_fault("vm_none_write", NULL, 0, "vm_protect_write_to_none_faults");
++}
++
++static void test_vm_decommit(void) {
++    stage("vm_decommit");
++    uint8_t* p = (uint8_t*)vm_new(4 * VM_PAGE, VM_RW);
++    if (!p) { check_fail("vm_decommit_setup", "map failed: %ld", mos_vm_last_error()); return; }
++    for (int i = 0; i < 4; i++) vm_fill(p + i * VM_PAGE, VM_PAGE, (uint8_t)(0x81 + i));
++    EXPECT_RET(mos_vm_decommit(p + VM_PAGE, 2 * VM_PAGE), SYS_SUCCESS, "vm_decommit_middle");
++    EXPECT(vm_is_zero(p + VM_PAGE, 2 * VM_PAGE), "vm_decommit_reads_zero", "data survived");
++    EXPECT(vm_matches(p, VM_PAGE, 0x81) && vm_matches(p + 3 * VM_PAGE, VM_PAGE, 0x84),
++           "vm_decommit_neighbours_keep_data", "neighbour data lost");
++    vm_fill(p + VM_PAGE, 2 * VM_PAGE, 0x90);
++    EXPECT(vm_matches(p + VM_PAGE, 2 * VM_PAGE, 0x90), "vm_decommit_pages_still_mapped_and_writable", "data did not stick");
++    EXPECT_RET(mos_vm_protect(p + VM_PAGE, 2 * VM_PAGE, VM_RW), SYS_SUCCESS, "vm_decommit_pages_still_protectable");
++    EXPECT_RET(mos_vm_decommit(p, 4 * VM_PAGE), SYS_SUCCESS, "vm_decommit_whole");
++    EXPECT(vm_is_zero(p, 4 * VM_PAGE), "vm_decommit_whole_reads_zero", "data survived");
++    EXPECT_RET(mos_vm_decommit(p, 4 * VM_PAGE), SYS_SUCCESS, "vm_decommit_twice_succeeds");
++    EXPECT_RET(mos_vm_decommit(p + 1, VM_PAGE), ERR(SYS_ERR_INVAL), "vm_decommit_unaligned_inval");
++    EXPECT_RET(mos_vm_decommit(p, 0), ERR(SYS_ERR_INVAL), "vm_decommit_zero_length_inval");
++    EXPECT_RET(mos_vm_decommit(p, 5 * VM_PAGE), ERR(SYS_ERR_INVAL), "vm_decommit_past_the_end_inval");
++    EXPECT_RET(mos_vm_decommit((void*)(uintptr_t)(VM_HINT_A + 0x10000000), VM_PAGE), ERR(SYS_ERR_INVAL), "vm_decommit_unmapped_inval");
++    mos_vm_unmap(p, 4 * VM_PAGE);
++}
++
++/* ------------------------------------------------- physical memory use */
++
++static void test_vm_memory(void) {
++    stage("vm_memory");
++    const size_t GIB = (size_t)1 << 30;
++    if (vm_free_pages() < 0 || (uint64_t)vm_free_pages() == (uint64_t)ERR(SYS_ERR_INVAL)) {
++        check_fail("vm_memory_sysinfo", "SYS_SYSINFO page counters unavailable");
++        return;
++    }
++    long f0 = vm_free_pages();
++    uint8_t* big = (uint8_t*)mos_vm_map(NULL, GIB, VM_RW, 0);
++    EXPECT(big != NULL, "vm_map_1gib_succeeds", "failed: %ld (%s)", mos_vm_last_error(), ename(mos_vm_last_error()));
++    if (big) {
++        long f1 = vm_free_pages();
++        EXPECT(f0 - f1 <= VM_PAGES_SLACK, "vm_untouched_gib_costs_no_pages", "used %ld pages", f0 - f1);
++        EXPECT(big[0] == 0 && big[GIB / 2] == 0 && big[GIB - 1] == 0, "vm_gib_reads_zero_at_ends_and_middle", "not zero");
++        long f1b = vm_free_pages();
++        const int N = 256;
++        for (int i = 0; i < N; i++) big[(size_t)i * VM_PAGE + 1] = (uint8_t)(i + 1);
++        long f2 = vm_free_pages();
++        long d = f1b - f2;
++        EXPECT(d >= N - 16 && d <= N + VM_PAGES_SLACK, "vm_touching_256_pages_costs_about_256", "used %ld pages", d);
++        int ok = 1;
++        for (int i = 0; i < N; i++) if (big[(size_t)i * VM_PAGE + 1] != (uint8_t)(i + 1)) ok = 0;
++        EXPECT(ok, "vm_touched_pages_keep_data", "data changed");
++        EXPECT_RET(mos_vm_decommit(big, 128 * VM_PAGE), SYS_SUCCESS, "vm_decommit_128_touched_pages");
++        long f3 = vm_free_pages();
++        EXPECT(f3 - f2 >= 112 && f3 - f2 <= 128 + VM_PAGES_SLACK, "vm_decommit_gives_pages_back", "got back %ld pages", f3 - f2);
++        EXPECT_RET(mos_vm_unmap(big, GIB), SYS_SUCCESS, "vm_unmap_1gib");
++        long f4 = vm_free_pages();
++        EXPECT(f4 - f3 >= 112, "vm_unmap_gives_pages_back", "got back %ld pages", f4 - f3);
++        EXPECT(f0 - f4 <= VM_PAGES_SLACK, "vm_gib_cycle_leaks_nothing", "%ld pages still gone", f0 - f4);
++    }
++
++    /* POPULATE: the pages are taken at once. */
++    f0 = vm_free_pages();
++    uint8_t* pop = (uint8_t*)mos_vm_map(NULL, 64 * VM_PAGE, VM_RW, MOS_VM_MAP_POPULATE);
++    EXPECT(pop != NULL, "vm_populate_small_succeeds", "failed: %ld", mos_vm_last_error());
++    if (pop) {
++        long f1 = vm_free_pages();
++        EXPECT(f0 - f1 >= 60 && f0 - f1 <= 64 + VM_PAGES_SLACK, "vm_populate_takes_pages_immediately", "used %ld pages", f0 - f1);
++        EXPECT(vm_is_zero(pop, 64 * VM_PAGE), "vm_populate_pages_read_zero", "not zero");
++        long f2 = vm_free_pages();
++        EXPECT(f1 - f2 <= VM_PAGES_SLACK, "vm_populate_touching_costs_nothing_more", "used %ld more pages", f1 - f2);
++        mos_vm_unmap(pop, 64 * VM_PAGE);
++        long f3 = vm_free_pages();
++        EXPECT(f3 - f2 >= 60, "vm_populate_unmap_gives_pages_back", "got back %ld pages", f3 - f2);
++    }
++
++    /* POPULATE of something that cannot fit: NOMEM, no crash, no leak. */
++    f0 = vm_free_pages();
++    long e = 0;
++    void* huge = mos_vm_map_ex(NULL, (size_t)64 << 30, VM_RW, MOS_VM_MAP_POPULATE, &e);
++    EXPECT(huge == NULL && e == ERR(SYS_ERR_NOMEM), "vm_populate_64gib_fails_nomem", "ptr=%llx err=%ld (%s)", PTR(huge), e, ename(e));
++    if (huge) mos_vm_unmap(huge, (size_t)64 << 30);
++    long f1 = vm_free_pages();
++    EXPECT(f0 - f1 <= VM_PAGES_SLACK, "vm_populate_failure_leaks_no_pages", "%ld pages gone", f0 - f1);
++    uint8_t* after = (uint8_t*)vm_new(VM_PAGE, VM_RW);
++    EXPECT(after != NULL && (after[0] = 1, after[0] == 1), "vm_map_works_after_failed_populate", "failed: %ld", mos_vm_last_error());
++    if (after) mos_vm_unmap(after, VM_PAGE);
++
++    /* Many map/unmap cycles. */
++    f0 = vm_free_pages();
++    int failures = 0, dirty = 0, bad_addr = 0;
++    for (int i = 0; i < 2000; i++) {
++        size_t len = (size_t)(1 + i % 8) * VM_PAGE;
++        uint8_t* p = (uint8_t*)vm_new(len, VM_RW);
++        if (!p) { failures++; continue; }
++        if (PTR(p) < VM_MMAP_BASE || ((uintptr_t)p & (VM_PAGE - 1))) bad_addr++;
++        if (p[0] || p[len - 1]) dirty++;            /* a reused frame must come back zeroed */
++        p[0] = (uint8_t)(i | 1);
++        p[len - 1] = (uint8_t)(i | 1);
++        if (p[0] != (uint8_t)(i | 1)) failures++;
++        if (mos_vm_unmap(p, len) != 0) failures++;
++    }
++    long fe = vm_free_pages();
++    EXPECT(failures == 0 && bad_addr == 0, "vm_2000_map_unmap_cycles_work", "failures=%d bad addresses=%d", failures, bad_addr);
++    EXPECT(dirty == 0, "vm_2000_cycles_fresh_pages_always_zero", "%d mappings started with old data", dirty);
++    EXPECT(f0 - fe <= VM_PAGES_SLACK, "vm_2000_map_unmap_cycles_leak_no_pages", "%ld pages gone", f0 - fe);
++
++    /* Cycles with POPULATE too (frames taken and given back every time). */
++    f0 = vm_free_pages();
++    failures = 0;
++    for (int i = 0; i < 300; i++) {
++        uint8_t* p = (uint8_t*)mos_vm_map(NULL, 8 * VM_PAGE, VM_RW, MOS_VM_MAP_POPULATE);
++        if (!p) { failures++; continue; }
++        if (mos_vm_unmap(p, 8 * VM_PAGE) != 0) failures++;
++    }
++    fe = vm_free_pages();
++    EXPECT(failures == 0 && f0 - fe <= VM_PAGES_SLACK, "vm_300_populate_cycles_leak_no_pages", "failures=%d, %ld pages gone", failures, f0 - fe);
++}
++
++/* ------------------------------------------- guards, NX, code in memory */
++
++static void test_vm_faults(void) {
++    stage("vm_faults");
++    expect_vm_fault("vm_guard_before", NULL, 0, "vm_guard_page_before_mapping_faults");
++    expect_vm_fault("vm_guard_after", NULL, 0, "vm_guard_page_after_mapping_faults");
++    expect_vm_fault("vm_nx_data", NULL, 0, "vm_nx_exec_in_non_exec_mapping_faults");
++    expect_vm_fault("vm_nx_stack", NULL, 0, "vm_nx_exec_on_main_stack_faults");
++    /* The heap is non-executable (proc_map_user_heap_range sets NX). */
++    expect_vm_fault("vm_nx_heap", NULL, 0, "vm_nx_exec_in_malloc_memory_faults");
++    expect_vm_ok("vm_exec", NULL, 0, "vm_exec_in_exec_mapping_runs");
++}
++
++/* ------------------------------------------------------------- stacks */
++
++static void test_vm_stacks(void) {
++    stage("vm_stacks");
++    const size_t MIB = 1024u * 1024u;
++    expect_vm_ok("vm_stack_use", "4096", 0, "vm_stack_default_uses_4mib");
++    expect_vm_fault("vm_stack_use", "16384", 0, "vm_stack_default_16mib_overflows_into_guard");
++    expect_vm_ok("vm_stack_use", "128", 256 * 1024, "vm_stack_256k_uses_128k");
++    expect_vm_fault("vm_stack_use", "1024", 256 * 1024, "vm_stack_256k_using_1mib_faults");
++    expect_vm_ok("vm_stack_use", "16384", 32 * MIB, "vm_stack_32mib_uses_16mib");
++    expect_vm_fault("vm_stack_use", "65536", 32 * MIB, "vm_stack_32mib_using_64mib_faults");
++
++    /* Out-of-range sizes are clamped, not refused. */
++    expect_vm_ok("exit", "0", 1, "vm_stack_size_1_is_clamped_to_minimum");
++    expect_vm_ok("exit", "0", (size_t)4 << 30, "vm_stack_size_4gib_is_clamped_to_maximum");
++    expect_vm_ok("exit", "0", 64 * 1024, "vm_stack_size_64k_minimum_works");
++    expect_vm_ok("exit", "0", 1024 * MIB, "vm_stack_size_1gib_maximum_works");
++
++    /* A thread on a SYS_VM stack that runs off its end hits the guard. */
++    expect_vm_fault("vm_thread_overflow", NULL, 0, "vm_thread_stack_overflow_faults");
++}
++
++/* ------------------------------------------------------------- layout */
++
++static void test_vm_layout(void) {
++    stage("vm_layout");
++    volatile char local = 0;
++    uint64_t sp = PTR(&local);
++    uint64_t main_addr = PTR((int (*)(int, char**, char**))main);
++    EXPECT(main_addr >= TIB && main_addr < VM_MMAP_BASE, "layout_image_at_or_above_1tib", "main is at 0x%llx", main_addr);
++    EXPECT(PTR(&g_checks) >= TIB && PTR(&g_checks) < VM_MMAP_BASE, "layout_data_in_the_image", "g_checks is at 0x%llx", PTR(&g_checks));
++    EXPECT(sp < VM_STACK_TOP && sp >= VM_STACK_TOP - 8u * 1024u * 1024u, "layout_stack_below_0x7ffff0000000", "a local is at 0x%llx", sp);
++    EXPECT(VM_STACK_TOP - sp <= 1024u * 1024u, "layout_stack_use_starts_at_the_top", "a local is %llu bytes below the top", VM_STACK_TOP - sp);
++    EXPECT(PTR(g_argv) >= VM_STACK_TOP, "layout_argv_above_the_stack_top", "argv is at 0x%llx", PTR(g_argv));
++    EXPECT(g_argv && PTR(g_argv[0]) >= VM_STACK_TOP, "layout_argv0_string_above_the_stack_top", "argv[0] is at 0x%llx", PTR(g_argv ? g_argv[0] : 0));
++    EXPECT(PTR(g_envp) >= VM_STACK_TOP, "layout_envp_above_the_stack_top", "envp is at 0x%llx", PTR(g_envp));
++    void* h = malloc(1024);
++    EXPECT(h != NULL && PTR(h) < 0x100000000ULL, "layout_malloc_below_4gib", "malloc gave 0x%llx", PTR(h));
++    uint8_t* v = (uint8_t*)vm_new(VM_PAGE, VM_RW);
++    EXPECT(v != NULL && PTR(v) >= VM_MMAP_BASE && PTR(v) < VM_STACK_TOP - 1024u * 1024u * 1024u, "layout_vm_map_between_2tib_and_stack", "mapping at 0x%llx", PTR(v));
++    if (v) mos_vm_unmap(v, VM_PAGE);
++    free(h);
++}
++
++/* ------------------------------------------- system calls and mappings */
++
++static void test_vm_syscalls(void) {
++    stage("vm_syscalls");
++    const size_t N = 6000;
++    const char* path = TMP "/vm_io.bin";
++    uint8_t* a = (uint8_t*)vm_new(2 * VM_PAGE, VM_RW);
++    uint8_t* b = (uint8_t*)vm_new(2 * VM_PAGE, VM_RW);
++    if (!a || !b) { check_fail("vm_syscalls_setup", "map failed: %ld", mos_vm_last_error()); return; }
++    vm_fill(a, N, 0x5A);
++
++    if (exists(path)) mos_delete(path);
++    EXPECT_RET(mos_create(path, NULL, NULL), 0, "vm_io_create_file");
++    long fd = mos_open(path, SYS_O_RDWR);
++    long w = fd >= 0 ? mos_fwrite(fd, a, N) : fd;
++    if (fd >= 0) mos_close(fd);
++    EXPECT(w == (long)N, "vm_io_write_file_from_mapping", "wrote %ld of %lu", w, (unsigned long)N);
++    EXPECT(mos_file_size(path) == (long)N, "vm_io_file_has_the_size", "size %ld", mos_file_size(path));
++
++    fd = mos_open(path, SYS_O_RDONLY);
++    long got = 0, r = 0;
++    while (fd >= 0 && got < (long)N && (r = mos_read(fd, b + got, N - (size_t)got)) > 0) got += r;
++    if (fd >= 0) mos_close(fd);
++    EXPECT(got == (long)N, "vm_io_read_file_into_mapping", "read %ld of %lu (last result %ld)", got, (unsigned long)N, r);
++    EXPECT(got == (long)N && vm_matches(b, N, 0x5A), "vm_io_data_round_trips", "data differs");
++
++    syscall_stat_t* st = (syscall_stat_t*)(void*)(b + 4096);
++    memset(st, 0xCC, sizeof(*st));
++    EXPECT_RET(mos_stat(path, st), SYS_SUCCESS, "vm_stat_into_mapping");
++    EXPECT(st->type == SYS_STAT_FILE && st->size == N, "vm_stat_result_in_mapping", "type %d size %llu", (int)st->type, (unsigned long long)st->size);
++
++    char* mp = (char*)a + 100;
++    scopy(mp, 200, path);
++    syscall_stat_t local;
++    memset(&local, 0, sizeof(local));
++    EXPECT_RET(mos_stat(mp, &local), SYS_SUCCESS, "vm_stat_path_in_mapping");
++    EXPECT(local.size == N, "vm_stat_path_in_mapping_result", "size %llu", (unsigned long long)local.size);
++
++    /* Buffers that are not all in one usable mapping: INVAL. */
++    syscall_stat_t* edge = (syscall_stat_t*)(void*)(a + VM_PAGE + VM_PAGE - sizeof(*st) / 2);
++    EXPECT_RET(mos_stat(path, edge), ERR(SYS_ERR_INVAL), "vm_stat_out_straddling_mapping_end_inval");
++    EXPECT_RET(mos_stat(path, (syscall_stat_t*)(void*)(a + 2 * VM_PAGE)), ERR(SYS_ERR_INVAL), "vm_stat_out_in_guard_page_inval");
++    syscall_stat_t* ro = (syscall_stat_t*)(void*)b;
++    EXPECT_RET(mos_vm_protect(b, VM_PAGE, MOS_VM_PROT_READ), SYS_SUCCESS, "vm_stat_make_read_only");
++    EXPECT_RET(mos_stat(path, ro), ERR(SYS_ERR_INVAL), "vm_stat_out_in_read_only_mapping_inval");
++    EXPECT_RET(mos_vm_protect(b, VM_PAGE, MOS_VM_PROT_NONE), SYS_SUCCESS, "vm_stat_make_no_access");
++    EXPECT_RET(mos_stat(path, ro), ERR(SYS_ERR_INVAL), "vm_stat_out_in_no_access_mapping_inval");
++    EXPECT_RET(mos_stat((const char*)b, &local), ERR(SYS_ERR_INVAL), "vm_stat_path_in_no_access_mapping_inval");
++    char* tail = (char*)a + 2 * VM_PAGE - 12;
++    for (int i = 0; i < 12; i++) tail[i] = 'a';           /* no NUL before the guard page */
++    EXPECT_RET(mos_stat(tail, &local), ERR(SYS_ERR_INVAL), "vm_stat_unterminated_path_at_mapping_end_inval");
++
++    /* Note: SYS_READ does not validate its buffer in the kernel today, so
++     * reading a file into a read-only mapping is deliberately not asserted. */
++
++    mos_vm_unmap(a, 2 * VM_PAGE);
++    mos_vm_unmap(b, 2 * VM_PAGE);
++    mos_delete(path);
++}
++
++/* ------------------------------------------------------------ threads */
++
++static volatile uint64_t g_vmt_value;
++static volatile uint64_t g_vmt_sp;
++static volatile uint32_t g_vmt_done[4];
++static volatile uint64_t g_vmt_stack[4];
++static volatile uint32_t g_stub_word;     /* the machine-code thread stores 42 here */
++static volatile uint32_t g_stub_exit;     /* its exit futex */
++
++static void vm_thread_fn(void* arg) {
++    volatile uint8_t big[16384];
++    unsigned sum = 0;
++    for (unsigned i = 0; i < sizeof(big); i++) big[i] = (uint8_t)i;
++    for (unsigned i = 0; i < sizeof(big); i++) sum += big[i];
++    g_vmt_sp = PTR(big);
++    g_vmt_value = (uint64_t)(uintptr_t)arg + sum;
++}
++
++static void vm_thread_multi(void* arg) {
++    uintptr_t i = (uintptr_t)arg;
++    volatile uint8_t buf[2048];
++    buf[0] = (uint8_t)i;
++    mos_sleep(2 + (long)i);
++    g_vmt_stack[i] = PTR(buf);
++    g_vmt_done[i] = buf[0] == (uint8_t)i ? 1u : 2u;
++}
++
++/* Thread: mov dword [rdi],42 ; mov eax,SYS_EXIT ; xor edi,edi ; int 0x80 */
++static const uint8_t k_thread_stub[] = {
++    0xC7, 0x07, 0x2A, 0x00, 0x00, 0x00,
++    0xB8, (uint8_t)SYS_EXIT, 0x00, 0x00, 0x00,
++    0x31, 0xFF,
++    0xCD, 0x80,
++};
++
++/* Starts a thread at `entry` on the stack [base, base+len) and waits (up to
++ * about 2 s) for it. Returns the kernel's answer: thread id or error;
++ * *finished says whether it ended. */
++static long vm_raw_thread(void* entry, void* base, size_t len, int* finished) {
++    g_stub_word = 0;
++    g_stub_exit = 1;
++    syscall_thread_ex_t rq;
++    rq.entry = PTR(entry);
++    rq.stack_top = PTR(base) + len;
++    rq.arg = PTR(&g_stub_word);
++    rq.fs_base = 0;
++    rq.exit_futex = PTR(&g_stub_exit);
++    long id = mos_syscall(SYS_THREAD, SYS_THREAD_CREATE_EX, (long)(uintptr_t)&rq, 0);
++    *finished = 0;
++    if (id <= 0) return id;
++    for (int i = 0; i < 40 && g_stub_exit; i++) mos_futex_wait(&g_stub_exit, 1, 50ull * 1000000ull);
++    *finished = g_stub_exit == 0;
++    return id;
++}
++
++static void test_vm_threads(void) {
++    stage("vm_threads");
++    mos_thread_t t;
++    g_vmt_value = 0;
++    g_vmt_sp = 0;
++    int created = mos_thread_create_vm(&t, vm_thread_fn, (void*)1000, 64 * 1024, NULL);
++    EXPECT(created == 0, "vm_thread_on_vm_stack_created", "create returned %d", created);
++    if (created == 0) {
++        uint8_t* stack = (uint8_t*)t.stack;
++        size_t size = t.stack_size;
++        EXPECT(PTR(stack) >= VM_MMAP_BASE && size == 64 * 1024, "vm_thread_stack_is_a_vm_mapping", "stack 0x%llx size %lu", PTR(stack), (unsigned long)size);
++        mos_thread_join(&t);
++        unsigned sum = 0;
++        for (unsigned i = 0; i < 16384; i++) sum += (uint8_t)i;
++        EXPECT(g_vmt_value == 1000u + sum, "vm_thread_ran_and_joined", "value %llu, expected %u", (unsigned long long)g_vmt_value, 1000u + sum);
++        EXPECT(g_vmt_sp >= PTR(stack) && g_vmt_sp < PTR(stack) + size, "vm_thread_used_its_vm_stack", "local at 0x%llx, stack 0x%llx..", (unsigned long long)g_vmt_sp, PTR(stack));
++        EXPECT(t.stack == NULL && t.id == 0, "vm_thread_join_clears_the_handle", "stack=%llx id=%ld", PTR(t.stack), t.id);
++        void* again = mos_vm_map(stack, size, VM_RW, MOS_VM_MAP_FIXED);
++        EXPECT(again == (void*)stack, "vm_thread_join_unmaps_the_stack", "fixed map at the old stack: %llx err %ld", PTR(again), mos_vm_last_error());
++        if (again) mos_vm_unmap(again, size);
++    }
++
++    /* Several at once: distinct stacks, all finish. */
++    mos_thread_t ts[4];
++    int started = 0;
++    for (uintptr_t i = 0; i < 4; i++) {
++        g_vmt_done[i] = 0;
++        if (mos_thread_create_vm(&ts[i], vm_thread_multi, (void*)i, 32 * 1024, NULL) == 0) started++;
++    }
++    for (int i = 0; i < started; i++) mos_thread_join(&ts[i]);
++    int finished = 0, distinct = 1;
++    for (int i = 0; i < 4; i++) {
++        if (g_vmt_done[i] == 1) finished++;
++        for (int j = 0; j < i; j++) {
++            uint64_t d = g_vmt_stack[i] > g_vmt_stack[j] ? g_vmt_stack[i] - g_vmt_stack[j] : g_vmt_stack[j] - g_vmt_stack[i];
++            if (d < 32 * 1024) distinct = 0;
++        }
++    }
++    EXPECT(started == 4 && finished == 4, "vm_four_threads_on_vm_stacks_finish", "started %d finished %d", started, finished);
++    EXPECT(distinct, "vm_four_thread_stacks_do_not_overlap", "two stacks too close");
++
++    /* Existing creators are unchanged: malloc stacks still join and free. */
++    mos_thread_t m;
++    g_vmt_value = 0;
++    int mc = mos_thread_create_ex(&m, vm_thread_fn, (void*)5, 0, NULL);
++    if (mc == 0) mos_thread_join(&m);
++    EXPECT(mc == 0 && g_vmt_value >= 5, "vm_thread_create_ex_with_malloc_stack_still_works", "create %d value %llu", mc, (unsigned long long)g_vmt_value);
++    EXPECT(g_vmt_sp < 0x100000000ULL, "vm_thread_create_ex_stack_is_still_heap", "stack local at 0x%llx", (unsigned long long)g_vmt_sp);
++
++    /* Entry points: code in a PROT_EXEC mapping runs; anything else is refused. */
++    uint8_t* stk = (uint8_t*)vm_new(2 * VM_PAGE, VM_RW);
++    uint8_t* code = (uint8_t*)vm_new(VM_PAGE, VM_RW);
++    if (!stk || !code) { check_fail("vm_thread_stub_setup", "map failed: %ld", mos_vm_last_error()); return; }
++    for (size_t i = 0; i < sizeof(k_thread_stub); i++) code[i] = k_thread_stub[i];
++
++    int fin = 0;
++    long id = vm_raw_thread(code, stk, 2 * VM_PAGE, &fin);
++    EXPECT(id < 0, "vm_thread_entry_in_non_exec_mapping_refused", "thread id %ld (%s)", id, ename(id));
++    if (id > 0 && !fin) mos_sleep(50);
++    EXPECT_RET(id, ERR(SYS_ERR_INVAL), "vm_thread_entry_in_non_exec_mapping_is_inval");
++
++    EXPECT_RET(mos_vm_protect(code, VM_PAGE, MOS_VM_PROT_RX), SYS_SUCCESS, "vm_thread_stub_make_executable");
++    id = vm_raw_thread(code, stk, 2 * VM_PAGE, &fin);
++    EXPECT(id > 0, "vm_thread_entry_in_exec_mapping_created", "thread id %ld (%s)", id, ename(id));
++    EXPECT(fin && g_stub_word == 42, "vm_thread_in_exec_mapping_ran", "finished=%d word=%u", fin, (unsigned)g_stub_word);
++
++    EXPECT_RET(mos_vm_protect(code, VM_PAGE, MOS_VM_PROT_NONE), SYS_SUCCESS, "vm_thread_stub_make_no_access");
++    id = vm_raw_thread(code, stk, 2 * VM_PAGE, &fin);
++    EXPECT_RET(id, ERR(SYS_ERR_INVAL), "vm_thread_entry_in_no_access_mapping_inval");
++    EXPECT_RET(mos_vm_protect(code, VM_PAGE, MOS_VM_PROT_RX), SYS_SUCCESS, "vm_thread_stub_executable_again");
++
++    /* Stack that is not usable memory: refused even with good code. */
++    id = vm_raw_thread(code, (void*)(uintptr_t)(VM_HINT_A + 0x20000000), 2 * VM_PAGE, &fin);
++    EXPECT_RET(id, ERR(SYS_ERR_INVAL), "vm_thread_stack_in_unmapped_memory_inval");
++    id = vm_raw_thread(code, stk + 2 * VM_PAGE, VM_PAGE, &fin);           /* stack = the guard page */
++    EXPECT_RET(id, ERR(SYS_ERR_INVAL), "vm_thread_stack_in_guard_page_inval");
++
++    /* Entry in malloc memory or on the main stack: not executable. */
++    uint8_t* heap_code = (uint8_t*)malloc(64);
++    if (heap_code) {
++        for (size_t i = 0; i < sizeof(k_thread_stub); i++) heap_code[i] = k_thread_stub[i];
++        id = vm_raw_thread(heap_code, stk, 2 * VM_PAGE, &fin);
++        EXPECT_RET(id, ERR(SYS_ERR_INVAL), "vm_thread_entry_in_malloc_memory_inval");
++        free(heap_code);
++    }
++    uint8_t stack_code[32] __attribute__((aligned(16)));
++    for (size_t i = 0; i < sizeof(k_thread_stub); i++) ((volatile uint8_t*)stack_code)[i] = k_thread_stub[i];
++    id = vm_raw_thread(stack_code, stk, 2 * VM_PAGE, &fin);
++    EXPECT_RET(id, ERR(SYS_ERR_INVAL), "vm_thread_entry_on_main_stack_inval");
++
++    mos_vm_unmap(stk, 2 * VM_PAGE);
++    mos_vm_unmap(code, VM_PAGE);
++}
++
++static void test_vm(void) {
++    test_vm_layout();
++    test_vm_map();
++    test_vm_fixed_and_hint();
++    test_vm_unmap();
++    test_vm_protect();
++    test_vm_decommit();
++    test_vm_syscalls();
++    test_vm_threads();
++    test_vm_memory();
++    test_vm_faults();
++    test_vm_stacks();
++}
++
+ /* ================================================================== main */
+ 
+ int main(int argc, char** argv, char** envp) {
++    g_argv = argv;
++    g_envp = envp;
+     if (argc >= 3 && streq(argv[1], "--child")) return child_main(argc, argv, envp);
+ 
+     emit_fd(1, "OS0TEST begin");
+@@ -1697,6 +2522,7 @@ int main(int argc, char** argv, char** envp) {
+     test_bad_pointers();
+     test_spawn_failure_cleanup();
+     test_exec_relative();
++    test_vm();
  
      stage("cleanup");
      mos_chdir(g_start_cwd[0] ? g_start_cwd : "0:/");

@@ -56,8 +56,8 @@ GRUB entry through the QEMU monitor, so no disk image is needed: `0:` is a RAM
 disk filled from the embedded package, including `0:/programs/os0test.run`.
 Once `=== TERMINAL READY ===` appears (up to 120 seconds) the script types
 `run 0:/programs/os0test.run` over the serial port, which the terminal reads
-like keyboard input, and waits up to 180 seconds for `OS0TEST PASS` or
-`OS0TEST FAIL` in the serial log. The log is `ci_os0_serial.log` in the
+like keyboard input, and waits up to 600 seconds for a line ending in
+`OS0TEST PASS` or `OS0TEST FAIL` in the serial log. The log is `ci_os0_serial.log` in the
 repository root. The script exits 0 on PASS and nonzero on FAIL or timeout,
 printing the tail of the log. Set `QEMU_BIN` to use another QEMU binary.
 

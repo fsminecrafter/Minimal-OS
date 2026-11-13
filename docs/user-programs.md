@@ -35,6 +35,25 @@ The loader validates:
 - segment file-size and memory-size relationships;
 - maximum file and image sizes.
 
+The loader reads `main.elf` from the file one segment at a time, straight into
+the program's pages, so a large program needs no large kernel buffer. A file may
+be up to 256 MiB and an image up to 1 GiB; `.bss` takes memory only as it is used.
+
+## Address Space
+
+| Addresses | Contents |
+| --- | --- |
+| below 4 GiB | `SYS_HEAP` memory (`malloc`); the rest belongs to the kernel and is not accessible |
+| `0x10000000000` (1 TiB) | the image, each segment with its own protection |
+| from `0x20000000000` (2 TiB) | `SYS_VM` mappings |
+| up to `0x7FFFF0000000` | the main stack: 8 MiB unless `SYS_SPAWN` sets `stack_size`, with 64 KiB of no-access guard below it |
+| `0x7FFFF8000000` | `argv`, `envp` and their strings |
+
+Stack and `SYS_VM` pages take physical memory on first use. The stack, `SYS_HEAP`
+memory and `SYS_VM` mappings without `SYS_VM_PROT_EXEC` cannot be executed. The
+SDK's `link.ld` still links everything into one segment, so an SDK program's
+image is readable, writable and executable as a whole.
+
 The SDK linker script keeps the image base-relative. External symbols are not
 available because there is no dynamic linker or libc at runtime.
 

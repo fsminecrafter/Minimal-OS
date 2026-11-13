@@ -167,6 +167,32 @@ static void release_frame(uvm_space_t* s, uint64_t addr, uint64_t* pte, uint32_t
     s->committed_pages--;
 }
 
+// Frees the page tables that lie wholly inside [start, end), once their
+// frames are gone, so that mapping and unmapping does not pile up tables.
+// Tables that the range only partly covers stay (other mappings may use
+// them); uvm_destroy frees those.
+static void prune_tables(uint64_t* table, int shift, uint64_t table_base,
+                         uint64_t start, uint64_t end) {
+    uint64_t span = 1ULL << shift;              // what one entry of `table` covers
+    for (int i = 0; i < 512; i++) {
+        uint64_t lo = table_base + (uint64_t)i * span;
+        uint64_t hi = lo + span;
+        if (hi <= start) continue;
+        if (lo >= end) break;
+        uint64_t entry = table[i];
+        if (!(entry & PTE_P)) continue;
+        uint64_t* child = (uint64_t*)(uintptr_t)(entry & PTE_ADDR);
+        if (lo >= start && hi <= end) {
+            // Everything below is unmapped: page tables only, no frames.
+            if (shift > 21) prune_tables(child, shift - 9, lo, lo, hi);
+            table[i] = 0;
+            free_page(child);
+        } else if (shift > 21) {
+            prune_tables(child, shift - 9, lo, start, end);
+        }
+    }
+}
+
 static void reprotect_frame(uvm_space_t* s, uint64_t addr, uint64_t* pte, uint32_t prot) {
     *pte = (*pte & PTE_ADDR) | leaf_flags(prot);
     flush_page(s, addr);
@@ -357,6 +383,16 @@ uint64_t uvm_unmap(process_t* proc, uint64_t addr, uint64_t len) {
     uint64_t irq = space_lock(s);
     spare = carve(s, addr, end, spare);
     for_each_frame(s, addr, end, release_frame, 0);
+    for (uint64_t slot = (addr >> 39) & 0x1FF; slot <= ((end - 1) >> 39) & 0x1FF; slot++) {
+        uint64_t entry = s->pml4[slot];
+        if (entry & PTE_P)
+            prune_tables((uint64_t*)(uintptr_t)(entry & PTE_ADDR), 30, slot << 39, addr, end);
+    }
+    // The CPU may have cached the freed tables themselves.
+    if (space_is_loaded(s)) {
+        uint64_t cr3;
+        __asm__ volatile("mov %%cr3, %0; mov %0, %%cr3" : "=r"(cr3) :: "memory");
+    }
     space_unlock(s, irq);
     if (spare) free_mem(spare);
     return SYS_SUCCESS;

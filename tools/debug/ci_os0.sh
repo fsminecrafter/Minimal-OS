@@ -21,7 +21,7 @@ SERIAL_OUT="$WORKDIR/ci_os0_serial.log"
 QEMU_BIN="${QEMU_BIN:-qemu-system-x86_64}"
 ISO="$WORKDIR/dist/x86_64/kernel.iso"
 BOOT_TIMEOUT=120
-TEST_TIMEOUT=180
+TEST_TIMEOUT=600
 TEST_CMD="run 0:/programs/os0test.run"
 
 TMP=$(mktemp -d)

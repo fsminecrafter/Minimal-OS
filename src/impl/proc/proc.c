@@ -706,7 +706,8 @@ void kill(process_t* proc) {
 	fgpu_process_exit(proc->pid);
 	audio_streams_on_process_exit(proc->pid);
 	graphics_release_screen_for_pid(proc->pid);
-	if (proc->state != PROCESS_ZOMBIE && proc->state != PROCESS_TERMINATED)
+	if (proc->state != PROCESS_ZOMBIE && proc->state != PROCESS_TERMINATED &&
+	    !proc->crashed)                 /* ended because one of its threads crashed */
 		proc->killed = true;            /* SYS_WAIT reports it as killed */
 	proc->state = PROCESS_ZOMBIE;
 	// Pull it out of whatever per-CPU run queue it's sitting in so it

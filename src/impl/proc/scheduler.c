@@ -1056,6 +1056,13 @@ void process_exit_with_status(uint8_t exit_code, bool crashed,
 
     // Threads (SYS_THREAD): the program ending ends its threads, and a
     // crash in any of them ends the whole program.
+    if (crashed && current_process->mem_owner) {
+        // The program's own exit status says it crashed (SYS_WAIT).
+        process_t* owner = current_process->mem_owner;
+        owner->exit_code = exit_code;
+        owner->crashed = true;
+        owner->crash_vector = crash_vector;
+    }
     if (crashed) proc_kill_group(current_process);
     else if (!current_process->mem_owner) proc_kill_threads(current_process);
 

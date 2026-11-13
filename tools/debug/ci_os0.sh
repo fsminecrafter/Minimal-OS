@@ -14,11 +14,20 @@
 #    does not wrap, so extra presses stay on the last entry) and Enter.  Those
 #    keys are layout independent.  RamFS mode needs no disk image: 0: is a RAM
 #    disk filled from the embedded package, which includes 0:/programs/os0test.run.
+#
+# Environment
+#  * QEMU_EXTRA  extra QEMU arguments, appended to the command line (word split),
+#                e.g. QEMU_EXTRA="-cpu max -smp 4". The default CPU (qemu64) has no AVX.
+#  * GRUB_UP     number of 'up' presses after selecting the last GRUB entry; GRUB_UP=1
+#                picks "Minimal-OS (RamFS, noavx)", the entry above the RamFS one.
+#  * QEMU_BIN    the QEMU binary.
 set -euo pipefail
 
 WORKDIR=$(cd "$(dirname "$0")/../.." && pwd)
 SERIAL_OUT="$WORKDIR/ci_os0_serial.log"
 QEMU_BIN="${QEMU_BIN:-qemu-system-x86_64}"
+QEMU_EXTRA="${QEMU_EXTRA:-}"
+GRUB_UP="${GRUB_UP:-0}"
 ISO="$WORKDIR/dist/x86_64/kernel.iso"
 BOOT_TIMEOUT=120
 TEST_TIMEOUT=600
@@ -58,7 +67,7 @@ else
     echo "[ci-os0] No writable /dev/kvm, using TCG (slow)"
 fi
 
-echo "[ci-os0] Starting QEMU (headless), serial log: $SERIAL_OUT"
+echo "[ci-os0] Starting QEMU (headless), serial log: $SERIAL_OUT, extra args: ${QEMU_EXTRA:-none}"
 "$QEMU_BIN" \
     "${ACCEL[@]}" \
     -smp 2 -m "${QEMU_MEM:-1024M}" \
@@ -67,7 +76,8 @@ echo "[ci-os0] Starting QEMU (headless), serial log: $SERIAL_OUT"
     -chardev "pipe,id=ser0,path=$TMP/ser,logfile=$SERIAL_OUT" -serial chardev:ser0 \
     -chardev "pipe,id=mon0,path=$TMP/mon" -mon chardev=mon0,mode=readline \
     -device piix3-usb-uhci,id=uhci -device usb-kbd,bus=uhci.0 \
-    -no-reboot -no-shutdown &
+    -no-reboot -no-shutdown \
+    $QEMU_EXTRA &
 QEMU_PID=$!
 echo "[ci-os0] QEMU PID=$QEMU_PID"
 
@@ -110,6 +120,10 @@ wait_for() {
 sleep 2
 for _ in 1 2 3 4 5 6 7 8; do
     monitor_cmd "sendkey down"
+    sleep 0.4
+done
+for ((i = 0; i < GRUB_UP; i++)); do
+    monitor_cmd "sendkey up"
     sleep 0.4
 done
 monitor_cmd "sendkey ret"

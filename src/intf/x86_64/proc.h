@@ -8,6 +8,11 @@
 
 #define MAX_PROCESS_NAME_LEN 128
 #define STACK_SIZE 0x4000   // 16 KB
+// Kernel stack of a process. Every kernel entry (syscall, IRQ, exception)
+// saves the SIMD state on it; with AVX-512 that is ~2.7 KiB per level and
+// levels nest (syscall, then a timer IRQ while it sleeps, then a page fault
+// in the kernel), so 16 KiB would leave only ~7 KiB for the C code. 32 KiB.
+#define KERNEL_STACK_SIZE 0x8000
 
 // Process states
 typedef enum {

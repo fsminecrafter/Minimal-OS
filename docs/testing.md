@@ -61,6 +61,21 @@ like keyboard input, and waits up to 600 seconds for a line ending in
 repository root. The script exits 0 on PASS and nonzero on FAIL or timeout,
 printing the tail of the log. Set `QEMU_BIN` to use another QEMU binary.
 
+Two more variables select what is tested. `QEMU_EXTRA` is appended to the
+QEMU command line (word split): QEMU's default CPU, `qemu64`, has no AVX, so
+`QEMU_EXTRA="-cpu max"` is how the XSAVE/AVX path and the YMM torture test
+run (`-cpu max -smp 4` adds cores; a later `-smp` wins over the script's
+`-smp 2`). `GRUB_UP=1` presses `up` once after the last entry is selected,
+which picks "Minimal-OS (RamFS, noavx)" (the entry above the RamFS one, so the
+RamFS entry stays last). The configurations OS-2 was checked in:
+
+```sh
+bash tools/debug/ci_os0.sh                                   # qemu64: fxsave path
+QEMU_EXTRA="-cpu max" bash tools/debug/ci_os0.sh             # xsave + AVX2
+QEMU_EXTRA="-cpu max -smp 4" bash tools/debug/ci_os0.sh      # same on 4 cores
+QEMU_EXTRA="-cpu max" GRUB_UP=1 bash tools/debug/ci_os0.sh   # noavx flag
+```
+
 ## Interactive serial test
 
 ```sh

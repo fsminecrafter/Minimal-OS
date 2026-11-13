@@ -165,9 +165,9 @@ build/minimaSSL/%.o: Minimal-OS-SDK/libraries/minimaSSL/src/%.c $(header_files)
 		-I Minimal-OS-SDK/libraries/minimaSSL/src \
 		$(KERNEL_CFLAGS) -fno-builtin $< -o $@
 
-build/impl/%.o: src/impl/%.asm
+build/impl/%.o: src/impl/%.asm src/impl/simd_save.inc
 	mkdir -p $(dir $@)
-	nasm -f elf64 $< -o $@
+	nasm -f elf64 -I src/impl/ $< -o $@
 
 $(ap_trampoline_bin): src/impl/boot/ap_trampoline.asm
 	mkdir -p $(dir $@)

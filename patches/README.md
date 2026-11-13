@@ -1,6 +1,6 @@
 # Patches waiting for another repository
 
-`Minimal-OS-SDK-os0.patch` is the SDK half of the OS-0 and OS-1 work, three commits (new syscalls in
+`Minimal-OS-SDK-os0.patch` is the SDK half of the OS-0, OS-1 and OS-2 work, several commits (new syscalls in
 `syscall.h`, `thread.h` additions, `process.h`, the environment in `crt0.c`,
 `vm.h`, `programs/os0test` and docs). It was written in a session that could not push
 to the Minimal-OS-SDK repository. Apply it there, on top of commit `26794ca`:

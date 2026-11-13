@@ -653,7 +653,7 @@ static void schedule_irqs_off(void) {
             waitq_forget(to_free);
 
             if (to_free->kernel_stack) {
-                void* stack_base = (void*)((uint8_t*)to_free->kernel_stack - STACK_SIZE);
+                void* stack_base = (void*)((uint8_t*)to_free->kernel_stack - KERNEL_STACK_SIZE);
                 if (to_free->kernel_stack_page_backed)
                     free_pages(stack_base, to_free->kernel_stack_pages);
                 else

@@ -523,14 +523,14 @@ process_t* proc_create_ex(const char* file_name, void (*entry_point)(),
 		PANIC("Failed to create the address space of a new process");
 	}
 
-	void* stack = alloc(STACK_SIZE);
+	void* stack = alloc(KERNEL_STACK_SIZE);
 	if (!stack) {
-		proc->kernel_stack_pages = (STACK_SIZE + 0xFFFu) / 0x1000u;
+		proc->kernel_stack_pages = (KERNEL_STACK_SIZE + 0xFFFu) / 0x1000u;
 		stack = alloc_pages_zeroed(proc->kernel_stack_pages);
 		if (!stack) PANIC("Failed to allocate kernel stack");
 		proc->kernel_stack_page_backed = true;
 	}
-	proc->kernel_stack = (uint64_t*)((uint8_t*)stack + STACK_SIZE);
+	proc->kernel_stack = (uint64_t*)((uint8_t*)stack + KERNEL_STACK_SIZE);
 
 	void* user_stack = alloc(STACK_SIZE);
 	if (!user_stack) {

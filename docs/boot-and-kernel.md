@@ -55,6 +55,49 @@ The kernel option `serial-echo` copies everything the terminal prints to
 COM1, so a headless VM's serial log contains command output as well as the
 kernel's own messages (`tools/hyperv/mosvm.sh` boots with it).
 
+## SIMD State (SSE, AVX, AVX-512)
+
+The kernel is compiled without AVX; only user programs use the wide
+registers. `cpu_simd_init_bsp()` (`src/impl/cpu_simd.c`) runs first thing in
+`kernel_main`, before the IDT is loaded, and every AP runs `cpu_simd_init_ap()`
+at the top of `ap_entry_c`, before it can take an interrupt. When CPUID reports
+XSAVE and AVX they set `CR4.OSXSAVE` and `XCR0` to x87|SSE|AVX, plus opmask,
+ZMM_Hi256 and Hi16_ZMM when the CPU has AVX-512F. The save area size is
+`CPUID.(0xD,0).EBX` for that XCR0, rounded up to 64 bytes (AVX2: 832, AVX-512:
+2752). Without XSAVE or AVX, or with the `noavx` boot flag, nothing changes:
+`CR4.OSFXSR` only, `fxsave64`, 512 bytes.
+
+Nothing in `context_switch.asm` touches SIMD registers. Every kernel entry (the
+exception stub in `idt_isr.asm`, the IRQ stubs in `idt_.asm`, `int 0x80` in
+`syscall_isr.asm`) saves the interrupted code's state in a 64-byte aligned
+area on the kernel stack and restores it before `iretq`, through the
+`SIMD_SAVE`/`SIMD_RESTORE` macros in `src/impl/simd_save.inc`. A context
+switch happens inside a timer IRQ or a blocking syscall, deeper than one of
+those stubs, so a sleeping process's state is already on its own kernel stack
+and comes back when it unwinds. The macros pick `fxsave64` or `xsave64`
+(header zeroed first, `EDX:EAX` = `simd_xcr0`) from the global
+`simd_use_xsave`, which is final before interrupts are first enabled, so one
+kernel runs on both kinds of CPU. `xsaveopt` is not used: its init/modified
+tracking is tied to the linear address of the last `xrstor`, and stack
+addresses are reused between processes.
+
+Kernel stacks grew because of this. Entries nest: a syscall, a timer IRQ while
+it sleeps, a page fault in the kernel, each with up to ~2.7 KiB of state plus
+its frame. At 16 KiB that left about 7 KiB for C code (14 KiB before), so a
+process kernel stack is now `KERNEL_STACK_SIZE` = 32 KiB, AP boot stacks are 32
+KiB, and the per-CPU TSS stack (the double fault IST stack) is 16 KiB instead
+of 4 KiB. The boot CPU's stack is 256 KiB. A new process starts with whatever
+the previous code left in the registers (not cleared: a leak, not corruption).
+
+`SYS_SYSINFO` returns the `SYS_CPU_*` feature mask (`SYS_SYSINFO_CPU_FEATURES`)
+and the enabled XCR0 (`SYS_SYSINFO_XCR0`); the AVX-family bits are set only
+when the state is enabled, so a set bit means usable.
+
+**Boot flag `noavx`** keeps the SSE-only behaviour (a fallback for hardware
+trouble). It goes on the multiboot command line like `ramfs`; the GRUB entry
+"Minimal-OS (RamFS, noavx)" sets it. `tools/debug/ci_os0.sh` can boot it
+(see [testing.md](testing.md#os0-self-test-in-qemu)).
+
 ## Memory
 
 The physical memory manager (`src/impl/pmm.c`) allocates 4 KiB pages. The heap

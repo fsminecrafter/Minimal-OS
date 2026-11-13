@@ -1,4 +1,5 @@
 #include "x86_64/syscall.h"
+#include "x86_64/cpu_simd.h"
 #include "x86_64/wm_watchdog.h"
 #include "x86_64/acpi.h"
 #include "graphics.h"
@@ -420,6 +421,12 @@ static uint64_t sys_sysinfo_impl(uint64_t op) {
 
         case SYS_SYSINFO_PMM_FREE_PAGES:
             return (uint64_t)pmm_free_pages();
+
+        case SYS_SYSINFO_CPU_FEATURES:
+            return cpu_simd_features();
+
+        case SYS_SYSINFO_XCR0:
+            return simd_xcr0;
 
         default:
             return SYS_ERR_INVAL;

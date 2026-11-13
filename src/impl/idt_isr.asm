@@ -1,5 +1,7 @@
 BITS 64
 
+%include "simd_save.inc"
+
 extern isr_generic_handler
 
 global isr_spurious
@@ -68,19 +70,17 @@ isr_common_stub:
     push r11
     push rbp
 
-    mov rdi, [rsp + 80]        ; arg1 = vector
-    mov rsi, [rsp + 88]        ; arg2 = error_code
-    mov rdx, [rsp + 96]        ; arg3 = saved RIP
-    mov rcx, [rsp + 104]       ; arg4 = saved CS (privilege level)
-
-    mov rbp, rsp
-    sub rsp, 512
-    and rsp, -16
-    fxsave64 [rsp]
+    ; Save the SIMD state first: it needs rax/rcx/rdx, which are free (pushed
+    ; above). The frame is addressed through rbp, which SIMD_SAVE sets to the
+    ; rsp of this point, so [rbp] still holds the interrupted rbp.
+    SIMD_SAVE
+    mov rdi, [rbp + 80]        ; arg1 = vector
+    mov rsi, [rbp + 88]        ; arg2 = error_code
+    mov rdx, [rbp + 96]        ; arg3 = saved RIP
+    mov rcx, [rbp + 104]       ; arg4 = saved CS (privilege level)
     cld
     call isr_generic_handler
-    fxrstor64 [rsp]
-    mov rsp, rbp
+    SIMD_RESTORE
 
     pop rbp
     pop r11

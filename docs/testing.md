@@ -24,6 +24,7 @@ The target builds and runs:
 | `nv_hw_tests` | NVIDIA firmware, VBIOS, and resource-manager data parsing |
 | `hid_mouse_tests` | HID mouse report decoding |
 | `media_tests` | Host-testable media interfaces |
+| `os0_tests` | OS0 host helpers: time conversion, path resolution and the program argument block |
 
 These are ordinary host binaries under `build/tests/host`. The Makefile uses
 `HOSTCC` (default `gcc`) and `HOST_CFLAGS` for their compilation.
@@ -42,6 +43,23 @@ not validate every device or command.
 
 Required host tools include the normal kernel build dependencies and
 `qemu-system-x86_64`.
+
+## OS0 self-test in QEMU
+
+```sh
+make ci-os0
+```
+
+This builds the ISO, boots it headless in QEMU (2 CPUs, 1024 MiB, KVM only if
+`/dev/kvm` is writable, otherwise TCG) and selects the "Minimal-OS (RamFS)"
+GRUB entry through the QEMU monitor, so no disk image is needed: `0:` is a RAM
+disk filled from the embedded package, including `0:/programs/os0test.run`.
+Once `=== TERMINAL READY ===` appears (up to 120 seconds) the script types
+`run 0:/programs/os0test.run` over the serial port, which the terminal reads
+like keyboard input, and waits up to 600 seconds for a line ending in
+`OS0TEST PASS` or `OS0TEST FAIL` in the serial log. The log is `ci_os0_serial.log` in the
+repository root. The script exits 0 on PASS and nonzero on FAIL or timeout,
+printing the tail of the log. Set `QEMU_BIN` to use another QEMU binary.
 
 ## Interactive serial test
 

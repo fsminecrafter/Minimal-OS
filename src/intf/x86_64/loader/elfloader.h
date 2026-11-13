@@ -96,4 +96,43 @@ bool elf_register_page_buffer(void* buffer, size_t page_count);
 // this while a process is still executing code from the image.
 void elf_unload(elf_loaded_image_t* image);
 
+// ---- Loading straight into a program's address space (uvm.h) ----
+//
+// The file is read piece by piece through a callback, so neither the file
+// nor the image is ever held in kernel memory as a whole: each PT_LOAD
+// segment's bytes go from a small buffer into the program's pages, and
+// .bss pages are not touched at all (they read as zero on first use).
+
+#define PF_X 1u
+#define PF_W 2u
+#define PF_R 4u
+
+#define ELF_STREAM_MAX_FILE   (256ull * 1024 * 1024)
+#define ELF_STREAM_MAX_IMAGE  (1024ull * 1024 * 1024)
+#define ELF_STREAM_MAX_PHNUM  64
+
+// Reads `size` bytes at `offset` of the ELF file; returns how many it read.
+typedef uint32_t (*elf_read_fn)(void* ctx, uint64_t offset, void* buffer, uint32_t size);
+
+typedef struct {
+    elf_read_fn read;
+    void* ctx;
+    uint64_t file_size;
+    Elf64_Ehdr header;
+    Elf64_Phdr segments[ELF_STREAM_MAX_PHNUM];
+    uint64_t image_size;        // bytes from the base to the end of the last segment
+} elf_stream_t;
+
+struct process;
+
+// Reads and checks the headers. The image must be linked at address 0
+// (a static PIE), as the SDK's link.ld produces.
+bool elf_stream_open(elf_stream_t* elf, elf_read_fn read, void* ctx, uint64_t file_size);
+
+// Maps the image at `base` in `proc`'s address space, copies the segments
+// in, applies R_X86_64_RELATIVE relocations and gives every segment its
+// own protection (PF_R/PF_W/PF_X). Returns the entry point through
+// `entry`. On failure the caller destroys the process.
+bool elf_stream_load(elf_stream_t* elf, struct process* proc, uint64_t base, uint64_t* entry);
+
 #endif // ELFLOADER_H

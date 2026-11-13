@@ -1,3 +1,4 @@
+#include "x86_64/uvm.h"
 #include <stdint.h>
 #include "serial.h"
 #include "panic.h"
@@ -74,6 +75,9 @@ void isr_generic_handler(uint64_t vector, uint64_t error_code,
     if (vector == 14) {
         uint64_t cr2;
         asm volatile("mov %%cr2, %0" : "=r"(cr2));
+        // The first use of a page of program memory: it gets its frame
+        // and the instruction runs again.
+        if (uvm_handle_fault(cr2, error_code)) return;
         serial_write_str("\n!!! PAGE FAULT !!!\n  CR2 (faulting addr): 0x");
         serial_write_hex(cr2);
         serial_write_str("\n  Error code: 0x");

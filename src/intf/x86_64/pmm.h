@@ -17,6 +17,9 @@ void* alloc_page_zeroed(void);
 // Returns NULL if the requested run is unavailable.
 void* pmm_try_alloc_pages_zeroed(size_t count);
 
+// One page, not cleared, or NULL when the pool is empty.
+void* pmm_try_alloc_page(void);
+
 // Allocate/free contiguous runs of 4 KiB pages
 void* alloc_pages_zeroed(size_t count);
 void free_pages(void* base, size_t count);
@@ -28,6 +31,9 @@ void free_page(void* page);
 // Stats helpers
 size_t pmm_free_pages(void);
 size_t pmm_used_pages(void);
+size_t pmm_total_pages(void);
+// True when ptr lies inside the page pool.
+bool pmm_owns(const void* ptr);
 void pmm_stats(void);
 
 #endif // PMM_H

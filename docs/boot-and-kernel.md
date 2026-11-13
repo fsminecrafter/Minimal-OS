@@ -65,15 +65,27 @@ Use page allocation for DMA-aligned or page-owned memory. Use `alloc()` or
 `alloc_unzeroed()` for ordinary objects. Large structures such as directory
 descriptors are deliberately heap allocated because kernel stacks are small.
 
+At boot the kernel takes the largest free block of RAM below 4 GiB. The heap
+gets the lower half and the page pool the upper half (at least 64 MiB). The
+kernel reaches all of it through an identity mapping of the first 4 GiB, which
+every process shares.
+
+Program memory above 4 GiB is managed by `src/impl/proc/uvm.c`: a sorted list
+of mapped areas per program, with a protection each. A page gets a frame from
+the page pool on its first use, in the page-fault handler, and reads as zero
+until written. `SYS_VM` maps, unmaps, protects and decommits such areas. Kernel
+code copies into or out of another program's memory with `uvm_copy_in()` and
+`uvm_copy_out()`, which work through the frames whatever page tables are loaded.
+
 ## Processes And Threads
 
 Kernel processes are created with `createProcess(name, entry)`. A process entry
 must either loop, call `sleep()`, or terminate through `process_exit()`/`kill()`;
 returning from a raw kernel entry is not a normal completion mechanism.
 
-User `.run` programs are loaded as user processes. The loader creates an image,
-user stack, page mappings, and argument block, then enters ring 3 through the
-process trampoline. See [user programs](user-programs.md).
+User `.run` programs are loaded as user processes. The loader maps the image,
+the main stack and the argument block into the new program's address space, then
+enters ring 3 through the process trampoline. See [user programs](user-programs.md).
 
 Threads are lightweight wrappers around kernel processes. `thread_join()` polls
 for process termination while yielding through `sleep()`.

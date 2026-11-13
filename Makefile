@@ -64,6 +64,11 @@ dlrconnect_run := $(install2_source)/dlrconnect.run
 fglcube_run := $(install2_base_source)/fglcube.run
 fglcube_sources := $(wildcard Minimal-OS-SDK/programs/fglcube/*.c) \
 	Minimal-OS-SDK/include/farcadegl.h Minimal-OS-SDK/include/fgpu_abi.h
+# Self-test for the C-library syscalls (futex, TLS, clocks, stat/rename,
+# chdir, spawn/wait): SDK programs/os0test, installed as 0:/programs/os0test.run.
+os0test_run := $(install2_base_source)/os0test.run
+os0test_sources := $(wildcard Minimal-OS-SDK/programs/os0test/*.c) \
+	Minimal-OS-SDK/include/thread.h Minimal-OS-SDK/include/process.h Minimal-OS-SDK/include/syscall.h
 # Deliver Manager, the window for Deliver (SDK programs/delivermanager),
 # installed as 0:/programs/DeliverManager.run. It is built from the same
 # Deliver code as dlr.run.
@@ -88,6 +93,10 @@ $(mode_stamp):
 	mkdir -p $(dir $@)
 	rm -f build/resources/mode-*.stamp
 	touch $@
+
+# Everything in install2 is built, so a fresh clone has no such directory.
+$(install2_base_source):
+	mkdir -p $@
 
 install2_files := $(shell find $(install2_source) -type f 2>/dev/null)
 install3_files := $(shell find $(install3_source) -type f 2>/dev/null)
@@ -199,7 +208,7 @@ $(install1_object): $(install1_mpkg)
 		--redefine-sym _binary_build_resources_install1_mpkg_end=_binary_install1_mpkg_end \
 		$< $@
 
-$(install2_mpkg): $(mode_stamp) $(mosdesk_install_dep) $(install2_tree_deps) $(dlr_run) $(dlrconnect_run) $(fglcube_run) $(delivermanager_run) tools/mkpkg/mkpkg.py
+$(install2_mpkg): $(mode_stamp) $(mosdesk_install_dep) $(install2_tree_deps) $(dlr_run) $(dlrconnect_run) $(fglcube_run) $(os0test_run) $(delivermanager_run) tools/mkpkg/mkpkg.py
 	mkdir -p $(dir $@)
 	$(MKPKG) $(install2_source) $@ --store
 
@@ -208,6 +217,9 @@ $(dlr_run): $(dlr_source_files) Minimal-OS-SDK/build.sh Minimal-OS-SDK/crt0.c Mi
 
 $(fglcube_run): $(fglcube_sources) Minimal-OS-SDK/build.sh Minimal-OS-SDK/crt0.c Minimal-OS-SDK/link.ld
 	CC=$(CC) LD=$(LD) Minimal-OS-SDK/build.sh Minimal-OS-SDK/programs/fglcube --output $(CURDIR)/$@
+
+$(os0test_run): $(os0test_sources) Minimal-OS-SDK/build.sh Minimal-OS-SDK/crt0.c Minimal-OS-SDK/link.ld
+	CC=$(CC) LD=$(LD) Minimal-OS-SDK/build.sh Minimal-OS-SDK/programs/os0test --output $(CURDIR)/$@
 
 $(delivermanager_run): $(delivermanager_sources) Minimal-OS-SDK/build.sh Minimal-OS-SDK/crt0.c Minimal-OS-SDK/link.ld
 	CC=$(CC) LD=$(LD) Minimal-OS-SDK/build.sh Minimal-OS-SDK/programs/delivermanager --output $(CURDIR)/$@
@@ -370,7 +382,7 @@ $(mxplorer_run): mosdesk-build $(mxplorer_sources) Minimal-OS-SDK/build.sh
 	mkdir -p $(dir $@)
 	CC=$(CC) LD=$(LD) Minimal-OS-SDK/build.sh --output $(CURDIR)/$@ $(MOSDESK_DIR)/Mxplorer
 
-mosdesk-stage: mosdesk-dlr $(mxplorer_run) $(dlr_run) $(dlrconnect_run) $(fglcube_run) $(delivermanager_run)
+mosdesk-stage: mosdesk-dlr $(mxplorer_run) $(dlr_run) $(dlrconnect_run) $(fglcube_run) $(os0test_run) $(delivermanager_run)
 	rm -rf build/resources/mosdesk-install
 	mkdir -p build/resources/mosdesk-install/install2/mosWM \
 		build/resources/mosdesk-install/install2/Mxplorer \
@@ -571,11 +583,15 @@ run-dex: build-x86_64
 ci-test:
 	bash tools/debug/ci_test.sh
 
+.PHONY: ci-os0
+ci-os0:
+	bash tools/debug/ci_os0.sh
+
 .PHONY: test-host
 test-host: build/tests/host/gfx_blit_tests build/tests/host/fgpu_raster_tests build/tests/host/fgsl_tests \
 		build/tests/host/fgpu_ir_tests build/tests/host/nv_hw_tests build/tests/host/nv_sass_tests \
 		build/tests/host/video_gpu_tests build/tests/host/audio_stream_tests build/tests/host/hid_mouse_tests \
-		build/tests/host/media_tests build/tests/host/media_parallel_tests
+		build/tests/host/media_tests build/tests/host/media_parallel_tests build/tests/host/os0_tests
 	./build/tests/host/gfx_blit_tests
 	./build/tests/host/fgpu_raster_tests
 	./build/tests/host/fgsl_tests
@@ -587,6 +603,7 @@ test-host: build/tests/host/gfx_blit_tests build/tests/host/fgpu_raster_tests bu
 	./build/tests/host/media_tests
 	./build/tests/host/media_parallel_tests
 	./build/tests/host/hid_mouse_tests
+	./build/tests/host/os0_tests
 
 build/tests/host/audio_stream_tests: tests/host/audio_stream_tests.c src/modules/Audio/audio_streams.c $(header_files)
 	mkdir -p $(dir $@)
@@ -653,6 +670,10 @@ build/tools/mosmedia.exe: tools/media/mosmedia.c Minimal-OS-SDK/include/mosmedia
 	$(MINGW_CC) -std=c11 -O2 -Wall -Wextra -static -idirafter Minimal-OS-SDK/include tools/media/mosmedia.c -o $@
 
 build/tests/host/gfx_blit_tests: tests/host/gfx_blit_tests.c src/impl/handlers/gfx_blit.c
+	mkdir -p $(dir $@)
+	$(HOSTCC) $(HOST_CFLAGS) $^ -o $@
+
+build/tests/host/os0_tests: tests/host/os0_tests.c src/impl/timeconv.c src/impl/filesystem/fspaths.c src/impl/loader/argblock.c
 	mkdir -p $(dir $@)
 	$(HOSTCC) $(HOST_CFLAGS) $^ -o $@
 

@@ -8,6 +8,7 @@
 #include "serial.h"
 #include "string.h"
 #include "x86_64/port.h"
+#include "x86_64/spinlock.h"
 
 // System uptime tracking
 static uint64_t system_uptime_ms = 0;
@@ -16,6 +17,30 @@ static uint64_t last_pit_ticks = 0;
 // Current date/time cache
 static datetime_t current_datetime = {0};
 static uint64_t last_rtc_update_ms = 0;
+
+// Writers of current_datetime / system_uptime_ms / last_rtc_update_ms (the
+// timer tick and the time_set_* calls) hold g_time_lock (interrupts off on
+// this CPU, exclusive against other CPUs) and make g_time_seq odd while they
+// update. Readers that need a consistent view (time_get_datetime_snapshot)
+// take no lock and retry when the sequence was odd or changed, so a read
+// from any context, including the tick's own interrupt, never blocks and
+// never sees a half-carried rollover (e.g. 10:59:59 -> 11:00:00 with the
+// hour stepped but the minute not yet).
+static spinlock_t g_time_lock = SPINLOCK_INIT;
+static volatile uint32_t g_time_seq = 0;
+
+static inline uint64_t time_write_begin(void) {
+    uint64_t flags = spinlock_acquire(&g_time_lock);
+    g_time_seq++;
+    __sync_synchronize();
+    return flags;
+}
+
+static inline void time_write_end(uint64_t flags) {
+    __sync_synchronize();
+    g_time_seq++;
+    spinlock_release(&g_time_lock, flags);
+}
 
 // Static buffers for string returns (4 rotating buffers)
 static char time_str_bufs[4][64];
@@ -107,6 +132,7 @@ void time_tick(uint32_t pit_frequency) {
     last_pit_ticks = current_ticks;
 
     uint64_t ms_elapsed = (elapsed_ticks * 1000) / pit_frequency;
+    uint64_t wflags = time_write_begin();
     system_uptime_ms += ms_elapsed;
 
     // Advance time in 1-second steps
@@ -141,6 +167,8 @@ void time_tick(uint32_t pit_frequency) {
         }
     }
 
+    time_write_end(wflags);
+
     // No write-back here: the RTC keeps its own time and this clock was
     // read from it. Doing it from the timer interrupt cost a full RTC
     // read (plus writes and busy-waits) on every tick for a second at a
@@ -160,8 +188,36 @@ uint64_t time_get_uptime_sec(void) {
     return system_uptime_ms / 1000;
 }
 
+uint32_t time_get_subsecond_ms(void) {
+    uint32_t sub;
+    time_get_datetime_snapshot(NULL, &sub, NULL);
+    return sub;
+}
+
+void time_get_datetime_snapshot(datetime_t* dt, uint32_t* subsecond_ms, uint64_t* uptime_ms) {
+    for (;;) {
+        uint32_t seq = g_time_seq;
+        if (seq & 1u) { asm volatile("pause" ::: "memory"); continue; }
+        __sync_synchronize();
+        datetime_t d = current_datetime;
+        uint64_t up = system_uptime_ms;
+        uint64_t last = last_rtc_update_ms;
+        __sync_synchronize();
+        if (g_time_seq != seq) continue;
+        if (dt) *dt = d;
+        if (uptime_ms) *uptime_ms = up;
+        if (subsecond_ms) {
+            uint64_t sub = up - last;
+            *subsecond_ms = sub > 999 ? 999 : (uint32_t)sub;
+        }
+        return;
+    }
+}
+
 datetime_t time_get_datetime(void) {
-    return current_datetime;
+    datetime_t d;
+    time_get_datetime_snapshot(&d, NULL, NULL);
+    return d;
 }
 
 uint16_t time_get_year(void) {
@@ -486,64 +542,74 @@ const char* time_get_weekday_name_short(uint8_t day) {
 // SETTERS
 // ===========================================
 
+static void time_commit_datetime(const datetime_t* dt) {
+    uint64_t f = time_write_begin();
+    current_datetime = *dt;
+    time_write_end(f);
+}
+
 void time_set_datetime(const datetime_t* dt) {
     if (time_validate_datetime(dt)) {
-        current_datetime = *dt;
+        time_commit_datetime(dt);
         write_rtc_if_needed();
     }
 }
 
 void time_set_year(uint16_t year) {
-    current_datetime.year = year;
+    { uint64_t f = time_write_begin(); current_datetime.year = year; time_write_end(f); }
     write_rtc_if_needed();
 }
 
 void time_set_month(uint8_t month) {
     if (month >= 1 && month <= 12) {
-        current_datetime.month = month;
+        { uint64_t f = time_write_begin(); current_datetime.month = month; time_write_end(f); }
         write_rtc_if_needed();
     }
 }
 
 void time_set_day(uint8_t day) {
     if (day >= 1 && day <= 31) {
-        current_datetime.day = day;
+        { uint64_t f = time_write_begin(); current_datetime.day = day; time_write_end(f); }
         write_rtc_if_needed();
     }
 }
 
 void time_set_hour(uint8_t hour) {
     if (hour < 24) {
-        current_datetime.hour = hour;
+        { uint64_t f = time_write_begin(); current_datetime.hour = hour; time_write_end(f); }
         write_rtc_if_needed();
     }
 }
 
 void time_set_minute(uint8_t minute) {
     if (minute < 60) {
-        current_datetime.minute = minute;
+        { uint64_t f = time_write_begin(); current_datetime.minute = minute; time_write_end(f); }
         write_rtc_if_needed();
     }
 }
 
 void time_set_second(uint8_t second) {
     if (second < 60) {
-        current_datetime.second = second;
+        { uint64_t f = time_write_begin(); current_datetime.second = second; time_write_end(f); }
         write_rtc_if_needed();
     }
 }
 
 void time_set_date(uint16_t year, uint8_t month, uint8_t day) {
+    uint64_t f = time_write_begin();
     current_datetime.year = year;
     current_datetime.month = month;
     current_datetime.day = day;
+    time_write_end(f);
     write_rtc_if_needed();
 }
 
 void time_set_time(uint8_t hour, uint8_t minute, uint8_t second) {
+    uint64_t f = time_write_begin();
     current_datetime.hour = hour;
     current_datetime.minute = minute;
     current_datetime.second = second;
+    time_write_end(f);
     write_rtc_if_needed();
 }
 
@@ -551,33 +617,36 @@ void time_set_time(uint8_t hour, uint8_t minute, uint8_t second) {
 bool time_set_from_str(const char* datetime_str) {
     if (!datetime_str || strlen(datetime_str) < 19) return false;
     
+    datetime_t parsed = current_datetime;
+
     // Parse year
-    current_datetime.year = (datetime_str[0] - '0') * 1000 +
+    parsed.year = (datetime_str[0] - '0') * 1000 +
                             (datetime_str[1] - '0') * 100 +
                             (datetime_str[2] - '0') * 10 +
                             (datetime_str[3] - '0');
     
     // Parse month
-    current_datetime.month = (datetime_str[5] - '0') * 10 +
+    parsed.month = (datetime_str[5] - '0') * 10 +
                              (datetime_str[6] - '0');
     
     // Parse day
-    current_datetime.day = (datetime_str[8] - '0') * 10 +
+    parsed.day = (datetime_str[8] - '0') * 10 +
                            (datetime_str[9] - '0');
     
     // Parse hour
-    current_datetime.hour = (datetime_str[11] - '0') * 10 +
+    parsed.hour = (datetime_str[11] - '0') * 10 +
                             (datetime_str[12] - '0');
     
     // Parse minute
-    current_datetime.minute = (datetime_str[14] - '0') * 10 +
+    parsed.minute = (datetime_str[14] - '0') * 10 +
                               (datetime_str[15] - '0');
     
     // Parse second
-    current_datetime.second = (datetime_str[17] - '0') * 10 +
+    parsed.second = (datetime_str[17] - '0') * 10 +
                               (datetime_str[18] - '0');
     
-    if (time_validate_datetime(&current_datetime)) {
+    if (time_validate_datetime(&parsed)) {
+        time_commit_datetime(&parsed);
         write_rtc_if_needed();
         return true;
     }
@@ -587,7 +656,7 @@ bool time_set_from_str(const char* datetime_str) {
 
 bool time_set_from_str_if_newer(const char* datetime_str) {
     datetime_t build_datetime;
-    datetime_t rtc_datetime = current_datetime;
+    datetime_t rtc_datetime = time_get_datetime();
 
     if (!datetime_str || strlen(datetime_str) < 19) return false;
 
@@ -609,22 +678,22 @@ bool time_set_from_str_if_newer(const char* datetime_str) {
     if (!time_validate_datetime(&build_datetime)) return false;
     if (build_datetime.year != rtc_datetime.year)
         return build_datetime.year > rtc_datetime.year &&
-               (current_datetime = build_datetime, write_rtc_if_needed(), true);
+               (time_commit_datetime(&build_datetime), write_rtc_if_needed(), true);
     if (build_datetime.month != rtc_datetime.month)
         return build_datetime.month > rtc_datetime.month &&
-               (current_datetime = build_datetime, write_rtc_if_needed(), true);
+               (time_commit_datetime(&build_datetime), write_rtc_if_needed(), true);
     if (build_datetime.day != rtc_datetime.day)
         return build_datetime.day > rtc_datetime.day &&
-               (current_datetime = build_datetime, write_rtc_if_needed(), true);
+               (time_commit_datetime(&build_datetime), write_rtc_if_needed(), true);
     if (build_datetime.hour != rtc_datetime.hour)
         return build_datetime.hour > rtc_datetime.hour &&
-               (current_datetime = build_datetime, write_rtc_if_needed(), true);
+               (time_commit_datetime(&build_datetime), write_rtc_if_needed(), true);
     if (build_datetime.minute != rtc_datetime.minute)
         return build_datetime.minute > rtc_datetime.minute &&
-               (current_datetime = build_datetime, write_rtc_if_needed(), true);
+               (time_commit_datetime(&build_datetime), write_rtc_if_needed(), true);
     if (build_datetime.second <= rtc_datetime.second) return false;
 
-    current_datetime = build_datetime;
+    time_commit_datetime(&build_datetime);
     write_rtc_if_needed();
     return true;
 }

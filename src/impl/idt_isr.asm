@@ -54,25 +54,30 @@ ISR_ERR   30
 ISR_NOERR 31
 
 ; On entry: [rsp+0]=vector, [rsp+8]=error_code, [rsp+16]=saved RIP.
+; Every register the C handler may change is saved: a page fault that the
+; handler resolves (uvm_handle_fault) returns to the faulting instruction.
 isr_common_stub:
-    mov rdi, [rsp]         ; arg1 = vector
-    mov rsi, [rsp + 8]     ; arg2 = error_code
-    mov rdx, [rsp + 16]    ; arg3 = saved RIP
-    mov rcx, [rsp + 24]    ; arg4 = saved CS (privilege level)
-
     push rax
     push rcx
     push rdx
+    push rsi
+    push rdi
     push r8
     push r9
     push r10
     push r11
     push rbp
 
+    mov rdi, [rsp + 80]        ; arg1 = vector
+    mov rsi, [rsp + 88]        ; arg2 = error_code
+    mov rdx, [rsp + 96]        ; arg3 = saved RIP
+    mov rcx, [rsp + 104]       ; arg4 = saved CS (privilege level)
+
     mov rbp, rsp
     sub rsp, 512
     and rsp, -16
     fxsave64 [rsp]
+    cld
     call isr_generic_handler
     fxrstor64 [rsp]
     mov rsp, rbp
@@ -82,6 +87,8 @@ isr_common_stub:
     pop r10
     pop r9
     pop r8
+    pop rdi
+    pop rsi
     pop rdx
     pop rcx
     pop rax

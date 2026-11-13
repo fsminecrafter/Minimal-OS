@@ -42,8 +42,16 @@ void time_tick(uint32_t pit_frequency);
 uint64_t time_get_uptime_ms(void);
 uint64_t time_get_uptime_sec(void);
 
-// Get current date/time
+// Get current date/time (a consistent snapshot, never a half-carried rollover)
 datetime_t time_get_datetime(void);
+
+// One consistent snapshot of the date/time, the milliseconds since it last
+// stepped to a new second and the uptime in ms. Lock-free (sequence counter
+// retry); safe from any context. Any output may be NULL.
+void time_get_datetime_snapshot(datetime_t* dt, uint32_t* subsecond_ms, uint64_t* uptime_ms);
+
+// Milliseconds since the datetime last stepped to a new second (0..999)
+uint32_t time_get_subsecond_ms(void);
 
 // Get individual components
 uint16_t time_get_year(void);

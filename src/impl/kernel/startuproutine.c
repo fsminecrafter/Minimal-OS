@@ -15,6 +15,7 @@
 #include "x86_64/gdt.h"
 #include "x86_64/tss.h"
 #include "time.h"
+#include "x86_64/clock.h"
 #include "x86_64/ac97_driver.h"
 #include "x86_64/exec_trace.h"
 
@@ -38,7 +39,7 @@ void print_pic_masks() {
 
 // region_start/region_end: the free RAM block picked by
 // memlayout_pick_heap_region(). The heap gets the bottom of it and the
-// page pool the top PMM_POOL_SIZE bytes.
+// page pool the top half (at least PMM_POOL_SIZE bytes).
 void startroutine(uint64_t region_start, uint64_t region_end) {
     uintptr_t heap_start = align_up_uintptr((uintptr_t)region_start, 0x1000);
     if (heap_start < HEAP_MIN_START) {
@@ -49,7 +50,12 @@ void startroutine(uint64_t region_start, uint64_t region_end) {
         pmm_end - PMM_POOL_SIZE - heap_start < 0x1000000) {
         PANIC("Not enough RAM for separate heap and PMM regions");
     }
-    uintptr_t pmm_start = pmm_end - PMM_POOL_SIZE;
+    // The page pool backs program memory (images, stacks, SYS_VM), the
+    // heap everything else including SYS_HEAP: half each once there is
+    // room, and never less than PMM_POOL_SIZE for the pool.
+    uintptr_t pool_size = ((pmm_end - heap_start) / 2) & ~(uintptr_t)0x1FFFFF;
+    if (pool_size < PMM_POOL_SIZE) pool_size = PMM_POOL_SIZE;
+    uintptr_t pmm_start = pmm_end - pool_size;
     uint64_t uintheapsize = pmm_start - heap_start;
     print_set_color(PRINT_COLOR_WHITE, PRINT_COLOR_BLACK);
     print_str("Startup Routine\n");
@@ -91,6 +97,7 @@ void startroutine(uint64_t region_start, uint64_t region_end) {
     allocator_init((void*)heap_start, uintheapsize);
     pmm_init((void*)pmm_start, pmm_end - pmm_start);
     print_str("PIT working!\n");
+    clock_init();
     print_str("Init MMIO subsystem\n");
     extern void mmio_init(void);
     mmio_init();

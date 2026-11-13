@@ -2,6 +2,9 @@
 #include "x86_64/minimafs.h"
 #include "x86_64/allocator.h"
 #include "x86_64/pmm.h"
+#include "x86_64/uvm.h"
+#include "x86_64/syscall.h"
+#include "x86_64/proc.h"
 #include "string.h"
 #include "serial.h"
 
@@ -245,4 +248,216 @@ void elf_unload(elf_loaded_image_t* image) {
     image->entry_point = 0;
     image->page_backed = false;
     image->page_count = 0;
+}
+// ------------------------------------------------- loading into a program
+
+static bool stream_read(elf_stream_t* elf, uint64_t offset, void* buffer, uint32_t size) {
+    if (offset > elf->file_size || size > elf->file_size - offset) return false;
+    return elf->read(elf->ctx, offset, buffer, size) == size;
+}
+
+bool elf_stream_open(elf_stream_t* elf, elf_read_fn read, void* ctx, uint64_t file_size) {
+    if (!elf || !read) return false;
+    memset(elf, 0, sizeof(*elf));
+    elf->read = read;
+    elf->ctx = ctx;
+    elf->file_size = file_size;
+
+    if (file_size < sizeof(Elf64_Ehdr) || file_size > ELF_STREAM_MAX_FILE) {
+        serial_write_str("ELF: bad file size\n");
+        return false;
+    }
+    Elf64_Ehdr* eh = &elf->header;
+    if (!stream_read(elf, 0, eh, sizeof(*eh))) {
+        serial_write_str("ELF: cannot read the header\n");
+        return false;
+    }
+    if (memcmp(eh->e_ident, "\x7f" "ELF", 4) != 0 ||
+        eh->e_ident[4] != ELFCLASS64 || eh->e_ident[5] != ELFDATA2LSB) {
+        serial_write_str("ELF: bad magic/class (need little-endian ELF64)\n");
+        return false;
+    }
+    if (eh->e_machine != EM_X86_64) {
+        serial_write_str("ELF: wrong machine (need x86_64)\n");
+        return false;
+    }
+    if (eh->e_type != ET_EXEC && eh->e_type != ET_DYN) {
+        serial_write_str("ELF: unsupported e_type (need EXEC or DYN)\n");
+        return false;
+    }
+    if (eh->e_phnum == 0 || eh->e_phnum > ELF_STREAM_MAX_PHNUM ||
+        eh->e_phentsize != sizeof(Elf64_Phdr)) {
+        serial_write_str("ELF: bad program header table\n");
+        return false;
+    }
+    if (!stream_read(elf, eh->e_phoff, elf->segments,
+                     (uint32_t)(eh->e_phnum * sizeof(Elf64_Phdr)))) {
+        serial_write_str("ELF: program headers out of range\n");
+        return false;
+    }
+
+    uint64_t image_end = 0;
+    for (uint16_t i = 0; i < eh->e_phnum; i++) {
+        const Elf64_Phdr* ph = &elf->segments[i];
+        if (ph->p_type != PT_LOAD) continue;
+        if (ph->p_filesz > ph->p_memsz) {
+            serial_write_str("ELF: filesz > memsz\n");
+            return false;
+        }
+        if (ph->p_offset > file_size || ph->p_filesz > file_size - ph->p_offset) {
+            serial_write_str("ELF: segment data out of range\n");
+            return false;
+        }
+        if (ph->p_memsz > ELF_STREAM_MAX_IMAGE || ph->p_vaddr > ELF_STREAM_MAX_IMAGE) {
+            serial_write_str("ELF: image too large\n");
+            return false;
+        }
+        uint64_t seg_end = ph->p_vaddr + ph->p_memsz;
+        if (seg_end > image_end) image_end = seg_end;
+    }
+    if (image_end == 0 || image_end > ELF_STREAM_MAX_IMAGE) {
+        serial_write_str("ELF: image empty or too large\n");
+        return false;
+    }
+    if (eh->e_entry >= image_end) {
+        serial_write_str("ELF: entry point outside image\n");
+        return false;
+    }
+    elf->image_size = image_end;
+    return true;
+}
+
+static uint32_t segment_prot(const Elf64_Phdr* ph) {
+    uint32_t prot = 0;
+    if (ph->p_flags & PF_R) prot |= UVM_PROT_READ;
+    if (ph->p_flags & PF_W) prot |= UVM_PROT_READ | UVM_PROT_WRITE;
+    if (ph->p_flags & PF_X) prot |= UVM_PROT_READ | UVM_PROT_EXEC;
+    return prot;
+}
+
+#define ELF_CHUNK (64u * 1024u)
+
+static bool stream_relocate(elf_stream_t* elf, process_t* proc, uint64_t base, uint8_t* chunk) {
+    const Elf64_Phdr* dynamic = NULL;
+    for (uint16_t i = 0; i < elf->header.e_phnum; i++)
+        if (elf->segments[i].p_type == PT_DYNAMIC) dynamic = &elf->segments[i];
+    if (!dynamic) return true;
+    if (dynamic->p_vaddr > elf->image_size ||
+        dynamic->p_memsz > elf->image_size - dynamic->p_vaddr) return false;
+
+    // The dynamic section, as loaded.
+    uint64_t rela_off = 0, rela_size = 0, rela_ent = sizeof(Elf64_Rela);
+    uint64_t dyn_count = dynamic->p_memsz / sizeof(Elf64_Dyn);
+    bool end_seen = false;
+    for (uint64_t done = 0; done < dyn_count && !end_seen;) {
+        uint64_t n = dyn_count - done;
+        if (n > ELF_CHUNK / sizeof(Elf64_Dyn)) n = ELF_CHUNK / sizeof(Elf64_Dyn);
+        if (!uvm_copy_out(proc, base + dynamic->p_vaddr + done * sizeof(Elf64_Dyn),
+                          chunk, n * sizeof(Elf64_Dyn))) return false;
+        const Elf64_Dyn* dyn = (const Elf64_Dyn*)chunk;
+        for (uint64_t i = 0; i < n; i++) {
+            if (dyn[i].d_tag == DT_NULL) { end_seen = true; break; }
+            if (dyn[i].d_tag == DT_RELA)         rela_off  = dyn[i].d_val;
+            else if (dyn[i].d_tag == DT_RELASZ)  rela_size = dyn[i].d_val;
+            else if (dyn[i].d_tag == DT_RELAENT) rela_ent  = dyn[i].d_val;
+        }
+        done += n;
+    }
+    if (!rela_off || !rela_size) return true;
+    // Only the plain layout is produced by the toolchain.
+    if (rela_ent != sizeof(Elf64_Rela) || rela_off > elf->image_size ||
+        rela_size > elf->image_size - rela_off) return false;
+
+    // R_X86_64_RELATIVE is the only kind a self-contained static PIE
+    // needs; anything else names a symbol nobody here can resolve, and
+    // is left alone as before.
+    uint64_t count = rela_size / sizeof(Elf64_Rela);
+    for (uint64_t done = 0; done < count;) {
+        uint64_t n = count - done;
+        if (n > ELF_CHUNK / sizeof(Elf64_Rela)) n = ELF_CHUNK / sizeof(Elf64_Rela);
+        if (!uvm_copy_out(proc, base + rela_off + done * sizeof(Elf64_Rela),
+                          chunk, n * sizeof(Elf64_Rela))) return false;
+        const Elf64_Rela* rela = (const Elf64_Rela*)chunk;
+        for (uint64_t i = 0; i < n; i++) {
+            if ((uint32_t)(rela[i].r_info & 0xffffffffu) != R_X86_64_RELATIVE) continue;
+            if (rela[i].r_offset > elf->image_size - 8) return false;
+            uint64_t value = base + (uint64_t)rela[i].r_addend;
+            if (!uvm_copy_in(proc, base + rela[i].r_offset, &value, sizeof(value))) return false;
+        }
+        done += n;
+    }
+    return true;
+}
+
+bool elf_stream_load(elf_stream_t* elf, process_t* proc, uint64_t base, uint64_t* entry) {
+    if (!elf || !proc || !entry || !elf->image_size || (base & 0xFFF)) return false;
+
+    // One area for the whole image, without access for now: holes between
+    // segments stay that way.
+    if (uvm_map(proc, base, elf->image_size, UVM_PROT_NONE, UVM_MAP_FIXED) != base) {
+        serial_write_str("ELF: cannot map the image\n");
+        return false;
+    }
+
+    uint8_t* chunk = (uint8_t*)alloc_unzeroed(ELF_CHUNK);
+    if (!chunk) {
+        serial_write_str("ELF: OOM for the copy buffer\n");
+        return false;
+    }
+    bool ok = true;
+    for (uint16_t i = 0; ok && i < elf->header.e_phnum; i++) {
+        const Elf64_Phdr* ph = &elf->segments[i];
+        if (ph->p_type != PT_LOAD) continue;
+        for (uint64_t done = 0; ok && done < ph->p_filesz;) {
+            uint64_t n = ph->p_filesz - done;
+            if (n > ELF_CHUNK) n = ELF_CHUNK;
+            ok = stream_read(elf, ph->p_offset + done, chunk, (uint32_t)n) &&
+                 uvm_copy_in(proc, base + ph->p_vaddr + done, chunk, (size_t)n);
+            done += n;
+        }
+    }
+    if (!ok) serial_write_str("ELF: cannot load a segment (short read or out of memory)\n");
+    if (ok && !stream_relocate(elf, proc, base, chunk)) {
+        serial_write_str("ELF: bad relocation table\n");
+        ok = false;
+    }
+    free_mem(chunk);
+    if (!ok) return false;
+
+    // Protection, by page: a page two segments share gets both.
+    for (uint16_t i = 0; i < elf->header.e_phnum; i++) {
+        const Elf64_Phdr* ph = &elf->segments[i];
+        if (ph->p_type != PT_LOAD || !ph->p_memsz) continue;
+        uint64_t start = ph->p_vaddr & ~0xFFFull;
+        uint64_t end = (ph->p_vaddr + ph->p_memsz + 0xFFFull) & ~0xFFFull;
+        for (uint64_t page = start; page < end;) {
+            // Extend the run while the set of segments covering it is the same.
+            uint32_t prot = 0;
+            uint64_t run_end = end;
+            for (uint16_t j = 0; j < elf->header.e_phnum; j++) {
+                const Elf64_Phdr* other = &elf->segments[j];
+                if (other->p_type != PT_LOAD || !other->p_memsz) continue;
+                uint64_t o_start = other->p_vaddr & ~0xFFFull;
+                uint64_t o_end = (other->p_vaddr + other->p_memsz + 0xFFFull) & ~0xFFFull;
+                if (page >= o_start && page < o_end) {
+                    prot |= segment_prot(other);
+                    if (o_end < run_end) run_end = o_end;
+                } else if (o_start > page && o_start < run_end) {
+                    run_end = o_start;
+                }
+            }
+            if (uvm_protect(proc, base + page, run_end - page, prot) != SYS_SUCCESS) {
+                serial_write_str("ELF: cannot protect a segment\n");
+                return false;
+            }
+            page = run_end;
+        }
+    }
+
+    *entry = base + elf->header.e_entry;
+    serial_write_str("ELF: loaded at 0x"); serial_write_hex(base);
+    serial_write_str(" size="); serial_write_dec(elf->image_size);
+    serial_write_str(" entry=0x"); serial_write_hex(*entry);
+    serial_write_str("\n");
+    return true;
 }

@@ -11,6 +11,7 @@
 #include "x86_64/window_manager.h"
 #include "x86_64/allocator.h"
 #include "x86_64/pmm.h"
+#include "x86_64/uvm.h"
 #include "time.h"
 #include "panic.h"
 #include "x86_64/safeints.h"
@@ -169,8 +170,10 @@ int proc_map_user_heap_range(process_t* proc, void* address, size_t length) {
 		uint64_t* pt = (uint64_t*)(uintptr_t)(pd[pd_index] & ~0xFFFULL);
 		uint64_t pt_index = (page >> 12) & 0x1FF;
 		uint64_t pte = pt[pt_index];
-		if (!(pte & 1) || (pte & ~0xFFFULL) != page) return 0;
-		pt[pt_index] = pte | 0x4;
+		if (!(pte & 1) || (pte & 0x000FFFFFFFFFF000ULL) != page) return 0;
+		// User accessible, and never executable: code a program
+		// generates or loads goes into a SYS_VM mapping.
+		pt[pt_index] = pte | 0x4 | (1ULL << 63);
 		pd[pd_index] |= 0x4;
 		__asm__ volatile("invlpg (%0)" :: "r"(page) : "memory");
 	}
@@ -199,7 +202,7 @@ int proc_unmap_user_heap_range(process_t* proc, void* address, size_t length) {
 		if (!(pde & 1) || (pde & (1ULL << 7))) continue;
 		uint64_t* pt = (uint64_t*)(uintptr_t)(pde & ~0xFFFULL);
 		uint64_t pt_index = (page >> 12) & 0x1FF;
-		pt[pt_index] &= ~0x4ULL;
+		pt[pt_index] &= ~(0x4ULL | (1ULL << 63));
 		__asm__ volatile("invlpg (%0)" :: "r"(page) : "memory");
 	}
 	return 1;
@@ -261,10 +264,19 @@ int proc_user_heap_contains_range(process_t* proc, const void* address,
 	return 0;
 }
 
+int proc_user_range_ok(process_t* proc, const void* address,
+		       size_t length, bool write) {
+	proc = proc_mem_owner(proc);
+	if (proc_user_heap_contains_range(proc, address, length)) return 1;
+	// Image, stacks and SYS_VM mappings: uvm.c knows their protection.
+	return uvm_range_ok(proc, address, length, write) ? 1 : 0;
+}
+
 int proc_user_range_contains(process_t* proc, const void* address,
 			     size_t length) {
 	proc = proc_mem_owner(proc);
 	if (proc_user_heap_contains_range(proc, address, length)) return 1;
+	if (uvm_range_ok(proc, address, length, false)) return 1;
 	if (!proc || !address || !length) return 0;
 	uintptr_t start = (uintptr_t)address;
 	if (length > UINTPTR_MAX - start) return 0;
@@ -408,6 +420,8 @@ void proc_destroy_address_space(process_t* proc) {
 		proc->pml4 = 0;
 		return;
 	}
+
+	uvm_destroy(proc);
 
 	uint64_t* pml4 = (uint64_t*)(uintptr_t)proc->pml4;
 	uint64_t pml4e = pml4[0];
@@ -601,6 +615,9 @@ process_t* proc_create_ex(const char* file_name, void (*entry_point)(),
 	if (!proc->pml4) {
 		PANIC("Failed to create PML4 for new process");
 	}
+	if (privilege == PROC_PRIVILEGE_USER && !uvm_create(proc)) {
+		PANIC("Failed to create the address space of a new process");
+	}
 
 	void* stack = alloc(STACK_SIZE);
 	if (!stack) {
@@ -719,10 +736,10 @@ process_t* proc_create_thread_ex(process_t* owner, uint64_t entry,
 	if (exit_futex && ((exit_futex & 3u) ||
 	    !proc_user_range_contains(owner, (const void*)(uintptr_t)exit_futex, 4)))
 		return NULL;
-	// The code must be in the program's image, the stack (its top 256
-	// bytes at least) in memory the program owns.
-	if (!owner->user_image_size || entry < owner->user_image_address ||
-	    entry >= owner->user_image_address + owner->user_image_size)
+	// The code must be executable memory of the program (its image or a
+	// SYS_VM mapping with SYS_VM_PROT_EXEC), the stack (its top 256 bytes
+	// at least) memory the program owns.
+	if (!uvm_is_executable(owner, entry))
 		return NULL;
 	stack_top &= ~0xFULL;
 	if (stack_top < 0x1000 + 256 ||

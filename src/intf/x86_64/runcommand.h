@@ -52,6 +52,7 @@ typedef struct {
     uint64_t parent_pid;          // 0 = the calling process
     bool wait_record;             // its parent may SYS_WAIT for it
     bool terminal_foreground;     // the terminal treats it as the program it runs
+    uint64_t stack_size;          // main stack bytes; 0 = the default (8 MiB)
 } run_launch_t;
 
 // The general form of run_launch_file(), used by SYS_SPAWN and SYS_EXEC.

@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include "x86_64/spawn.h"
+#include "x86_64/uvm.h"
 #include "x86_64/proc.h"
 #include "x86_64/scheduler.h"
 #include "x86_64/spinlock.h"
@@ -399,8 +400,12 @@ void proc_spawn_on_exit(process_t* proc) {
         process_t* owner = proc->mem_owner;
         uint64_t addr = proc->exit_futex;
         proc->exit_futex = 0;
-        if (addr && proc_user_range_contains(owner, (const void*)(uintptr_t)addr, 4)) {
-            __atomic_store_n((volatile uint32_t*)(uintptr_t)addr, 0u, __ATOMIC_SEQ_CST);
+        if (addr && proc_user_range_ok(owner, (const void*)(uintptr_t)addr, 4, true)) {
+            // Through the frame for memory above 4 GiB: whatever page
+            // tables this runs on, the word is the owner's.
+            uint32_t zero = 0;
+            if (addr >= UVM_MIN) uvm_copy_in(owner, addr, &zero, sizeof(zero));
+            else __atomic_store_n((volatile uint32_t*)(uintptr_t)addr, 0u, __ATOMIC_SEQ_CST);
             futex_wake_for(owner, addr, UINT32_MAX);
         }
         return;
@@ -566,10 +571,15 @@ uint64_t proc_spawn(const syscall_spawn_t* request) {
     process_t* owner = proc_mem_owner(self);
     if (!owner || owner->privilege != PROC_PRIVILEGE_USER) return SYS_ERR_PERM;
     if (!syscall_user_range_ok(request, sizeof(uint64_t), false)) return SYS_ERR_INVAL;
-    if (request->size < sizeof(syscall_spawn_t) ||
-        !syscall_user_range_ok(request, sizeof(syscall_spawn_t), false))
-        return SYS_ERR_INVAL;
-    syscall_spawn_t r = *request;
+    // Fields after `flags` were added later: a shorter request from an
+    // older program leaves them 0.
+    uint64_t request_size = request->size;
+    if (request_size < offsetof(syscall_spawn_t, stack_size)) return SYS_ERR_INVAL;
+    if (request_size > sizeof(syscall_spawn_t)) request_size = sizeof(syscall_spawn_t);
+    if (!syscall_user_range_ok(request, request_size, false)) return SYS_ERR_INVAL;
+    syscall_spawn_t r;
+    memset(&r, 0, sizeof(r));
+    memcpy(&r, request, request_size);
     if (r.flags) return SYS_ERR_INVAL;
 
     sink_flush_orphans();
@@ -670,6 +680,7 @@ uint64_t proc_spawn(const syscall_spawn_t* request) {
     launch.err_sink = err_sink;
     launch.parent_pid = owner->pid;
     launch.wait_record = true;
+    launch.stack_size = r.stack_size;
     out_sink = err_sink = NULL;
     process_t* child = run_launch_ex(&launch);
     result = child ? child->pid : SYS_ERR_GENERIC;

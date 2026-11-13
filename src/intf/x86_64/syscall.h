@@ -1061,6 +1061,9 @@ typedef struct {
                                     // file (replaced) that receives the child's output
     const char* stderr_path;        // the same for stderr; may name the same file
     uint64_t flags;                 // 0
+    uint64_t stack_size;            // bytes of main stack; 0: the default (8 MiB).
+                                    // Between 64 KiB and 1 GiB. Stack pages only
+                                    // take memory once they are used.
 } syscall_spawn_t;
 
 // WAIT: rdi = child pid (SYS_WAIT_ANY for any child), rsi = flags, rdx =
@@ -1080,6 +1083,51 @@ typedef struct {
     uint32_t crash_vector;     // the CPU exception, when it crashed
     uint32_t reserved;
 } syscall_wait_t;
+
+// VM: rdi = operation. Memory of the program's own, in whole 4 KiB pages,
+// above everything else it has (addresses from 2 TiB up). Pages read as
+// zero until written and take physical memory only from their first use,
+// so a large mapping that is never touched costs nothing. Mappings the
+// kernel places have an unmapped page on both sides: running off either
+// end is a crash, not silent corruption. SYS_HEAP stays what malloc uses;
+// SYS_VM is for big blocks, for memory that must be given back, for
+// reserving address space, and for running generated or loaded code.
+//   SYS_VM_MAP:      rsi = const syscall_vm_map_t*. Returns the address, or
+//                    SYS_ERR_NOMEM / SYS_ERR_INVAL.
+//   SYS_VM_UNMAP:    rsi = address (page aligned), rdx = length. Frees the
+//                    pages; ones that are not mapped are skipped, so part
+//                    of a mapping, or several at once, can go.
+//   SYS_VM_PROTECT:  rsi = address, rdx = length, r10 = SYS_VM_PROT_* bits.
+//                    The whole range must be mapped. Contents are kept,
+//                    also while there is no access (SYS_VM_PROT_NONE).
+//   SYS_VM_DECOMMIT: rsi = address, rdx = length. Gives the physical memory
+//                    back; the pages stay mapped and read as zero again.
+// Protection: writable implies readable, and so does executable. Without
+// SYS_VM_PROT_EXEC the CPU refuses to run code from the pages. The main
+// stack and SYS_HEAP memory are never executable.
+#define SYS_VM 55
+#define SYS_VM_MAP      1u
+#define SYS_VM_UNMAP    2u
+#define SYS_VM_PROTECT  3u
+#define SYS_VM_DECOMMIT 4u
+
+#define SYS_VM_PROT_NONE  0u
+#define SYS_VM_PROT_READ  (1u << 0)
+#define SYS_VM_PROT_WRITE (1u << 1)
+#define SYS_VM_PROT_EXEC  (1u << 2)
+
+#define SYS_VM_MAP_FIXED    (1u << 0)  // exactly at `address` (page aligned), which
+                                       // must be free: nothing is ever replaced
+#define SYS_VM_MAP_POPULATE (1u << 1)  // take the physical memory now: fails with
+                                       // SYS_ERR_NOMEM instead of a later crash
+
+typedef struct {
+    uint64_t size;             // sizeof(syscall_vm_map_t)
+    uint64_t address;          // 0: anywhere; else the lowest address wanted
+    uint64_t length;           // bytes, rounded up to whole pages
+    uint32_t prot;             // SYS_VM_PROT_*
+    uint32_t flags;            // SYS_VM_MAP_*
+} syscall_vm_map_t;
 
 // The environment: a program's entry point gets it as its third argument
 // (RDI = argc, RSI = argv, RDX = envp), a NULL-terminated array of

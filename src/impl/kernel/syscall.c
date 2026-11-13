@@ -35,6 +35,7 @@
 #include "input.h"
 #include "x86_64/window_manager.h"
 #include "x86_64/spawn.h"
+#include "x86_64/uvm.h"
 #include "x86_64/waitq.h"
 #include "x86_64/clock.h"
 #include "timeconv.h"
@@ -53,7 +54,6 @@ static const char* syscall_resolve_path(const char* input, char* resolved) {
 }
 
 static bool user_range_ok(const void* ptr, size_t len, bool write) {
-    (void)write;
     if (!ptr || len == 0) return false;
 
     uintptr_t addr = (uintptr_t)ptr;
@@ -63,7 +63,7 @@ static bool user_range_ok(const void* ptr, size_t len, bool write) {
     if (addr > UINTPTR_MAX - len) return false;
 
     if (current_process && current_process->privilege == PROC_PRIVILEGE_USER) {
-        if (!proc_user_range_contains(current_process, ptr, len)) {
+        if (!proc_user_range_ok(current_process, ptr, len, write)) {
             return false;
         }
     }
@@ -1252,6 +1252,26 @@ static void syscall_dispatch_inner(syscall_regs_t* regs) {
                 default:                  regs->rax = SYS_ERR_INVAL; break;
             }
             return;
+        }
+        case SYS_VM: {
+            process_t* self = current_process;
+            if (!self || self->privilege != PROC_PRIVILEGE_USER) { regs->rax = SYS_ERR_PERM; return; }
+            switch (regs->rdi) {
+                case SYS_VM_MAP: {
+                    const syscall_vm_map_t* m = (const syscall_vm_map_t*)regs->rsi;
+                    if (!user_range_ok(m, sizeof(*m), false) || m->size < sizeof(*m)) {
+                        regs->rax = SYS_ERR_INVAL;
+                        return;
+                    }
+                    syscall_vm_map_t req = *m;
+                    regs->rax = uvm_map(self, req.address, req.length, req.prot, req.flags);
+                    return;
+                }
+                case SYS_VM_UNMAP:    regs->rax = uvm_unmap(self, regs->rsi, regs->rdx); return;
+                case SYS_VM_PROTECT:  regs->rax = uvm_protect(self, regs->rsi, regs->rdx, (uint32_t)regs->r10); return;
+                case SYS_VM_DECOMMIT: regs->rax = uvm_decommit(self, regs->rsi, regs->rdx); return;
+                default:              regs->rax = SYS_ERR_INVAL; return;
+            }
         }
         case SYS_STAT:
             regs->rax = sys_stat_impl((const char*)regs->rdi, (syscall_stat_t*)regs->rsi);

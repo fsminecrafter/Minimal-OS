@@ -225,6 +225,9 @@ int proc_user_heap_contains_range(process_t* proc, const void* address,
                                   size_t length);
 int proc_user_range_contains(process_t* proc, const void* address,
                              size_t length);
+// The same, and for `write` the range must be writable by the program.
+int proc_user_range_ok(process_t* proc, const void* address,
+		       size_t length, bool write);
 int proc_user_heap_untrack(process_t* proc, void* address);
 int proc_user_heap_resize(process_t* proc, void* old_address,
                           void* new_address, size_t new_size);

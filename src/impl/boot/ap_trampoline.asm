@@ -47,7 +47,7 @@ protected_mode_entry:
 
     mov ecx, 0xC0000080    ; EFER
     rdmsr
-    or eax, (1 << 8)       ; LME
+    or eax, (1 << 8) | (1 << 11)   ; LME + NXE (page tables use the NX bit)
     wrmsr
 
     mov eax, cr0

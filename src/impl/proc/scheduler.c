@@ -954,8 +954,20 @@ void scheduler_tick() {
 
     if (was_idle || !current_process) return;
     if (scheduler_is_idle_process(current_process)) {
-        // Idle on an AP: pick up anything woken or migrated here.
-        if (rq_total(&g_runqueues[cpu_id]) > 0) schedule();
+        // Idle on an AP: pick up anything woken or migrated here. Also
+        // when the process that last ran here has ended: its cleanup was
+        // put off until this core had left its stack (g_deferred_reap),
+        // and the cleanup pass is part of schedule(). Without this an
+        // idle core never freed it, and its parent waited forever. Two
+        // passes: the first only notes that the stack is free now.
+        static uint8_t reap_passes[MAX_CPUS];
+        if (g_deferred_reap[cpu_id]) reap_passes[cpu_id] = 2;
+        if (rq_total(&g_runqueues[cpu_id]) > 0) {
+            schedule();
+        } else if (reap_passes[cpu_id]) {
+            reap_passes[cpu_id]--;
+            schedule();
+        }
         return;
     }
 

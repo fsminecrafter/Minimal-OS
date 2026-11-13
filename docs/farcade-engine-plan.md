@@ -61,6 +61,7 @@ The work runs in three tracks:
 - **OS-0 done.** TLS, futex, clocks, stat/rename/chdir, spawn/wait, environment.
 - **OS-1 done.** Program memory above 4 GiB with demand-zero pages (`SYS_VM`), NX, guard pages, a streaming ELF loader, 8 MiB stacks, a page pool sized from RAM, and RAM above 4 GiB used for program pages.
 - **OS-2 done, AVX-512 untested.** XSAVE-based state saving, AVX/AVX2 usable, `noavx` flag, CPU features in SYSINFO. QEMU's emulation has no AVX-512, so that path has never run.
+- **System-call pointer checks done** (not in the original plan): every user pointer is checked before use; what is left is listed in `docs/syscall-pointers.md`.
 - Everything was tested in QEMU without KVM (`make ci-os0`); nothing has run on real hardware yet.
 - The SDK half waits in `patches/` until it is pushed to Minimal-OS-SDK.
 

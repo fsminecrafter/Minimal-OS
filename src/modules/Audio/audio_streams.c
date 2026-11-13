@@ -4,7 +4,7 @@
 /* Audio streams: see x86_64/audio_streams.h and SYS_AUDIO_STREAM in
  * syscall.h. */
 
-extern bool syscall_user_range_ok(const void* ptr, size_t len, bool write);
+#include "x86_64/user_ptr.h"
 
 #define CAP SYSCALL_AUDIO_STREAM_FRAMES      /* power of two */
 #define FREE 0u

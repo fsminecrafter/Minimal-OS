@@ -156,7 +156,7 @@ static void program_free(fgpu_shader_program_t* sp) {
     sp->used = false;
 }
 
-extern bool syscall_user_range_ok(const void* ptr, size_t len, bool write);
+#include "x86_64/user_ptr.h"
 
 static uint64_t caller(void) {
     return current_process ? current_process->pid : 0;
@@ -720,8 +720,27 @@ static uint64_t op_write_surface(syscall_gpu_request_t* r, uint64_t owner) {
     return SYS_SUCCESS;
 }
 
-uint64_t fgpu_syscall(syscall_gpu_request_t* r) {
-    if (!r || !syscall_user_range_ok(r, sizeof(*r), true) || r->size != sizeof(*r) ||
+static uint64_t fgpu_syscall_checked(syscall_gpu_request_t* r);
+
+// The request is copied into the kernel first: sizes and pointers are
+// validated and then used from the copy (the work below runs with
+// interrupts on, so a second thread of the program could otherwise change
+// `bytes` between a check and the memcpy). Only `handle` is written back.
+// Nothing here keeps a program pointer past the call: data is copied (or
+// copied out) before it returns, and the parallel workers only touch
+// kernel memory.
+uint64_t fgpu_syscall(syscall_gpu_request_t* user) {
+    syscall_gpu_request_t req;
+    if (!user || !syscall_user_range_ok(user, sizeof(req), true)) return SYS_ERR_INVAL;
+    memcpy(&req, user, sizeof(req));
+    uint32_t handle = req.handle;
+    uint64_t result = fgpu_syscall_checked(&req);
+    if (req.handle != handle) user->handle = req.handle;
+    return result;
+}
+
+static uint64_t fgpu_syscall_checked(syscall_gpu_request_t* r) {
+    if (r->size != sizeof(*r) ||
         r->version < SYS_GPU_ABI_VERSION_MIN || r->version > SYS_GPU_ABI_VERSION)
         return SYS_ERR_INVAL;
     uint64_t owner = caller();

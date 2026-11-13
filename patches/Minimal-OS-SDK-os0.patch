@@ -1,7 +1,7 @@
 From 2e82237589087ab693de903c6f03a762ad044a3e Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Thu, 12 Nov 2026 23:47:54 +0000
-Subject: [PATCH 1/4] OS-0: futex, TLS, clocks, stat/rename/chdir, spawn/wait,
+Subject: [PATCH 1/5] OS-0: futex, TLS, clocks, stat/rename/chdir, spawn/wait,
  environment
 
 syscall.h gains the kernel's new calls (SYS_FUTEX, SYS_CLOCK, SYS_STAT,
@@ -2796,7 +2796,7 @@ index 0000000..0ab1bc6
 From e793506e96b03a88fbee6574f7e1c22bed23ce80 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Fri, 13 Nov 2026 07:12:41 +0000
-Subject: [PATCH 2/4] os0test: checks for bad pointers, failed spawns, relative
+Subject: [PATCH 2/5] os0test: checks for bad pointers, failed spawns, relative
  exec, clock reads
 
 Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
@@ -2977,7 +2977,7 @@ index 0ab1bc6..8c7b36f 100644
 From ff1f09af3a14b89df6cb787d107f06d4ea5587a6 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Fri, 13 Nov 2026 07:30:24 +0000
-Subject: [PATCH 3/4] SYS_VM: vm.h, VM-backed thread stacks, spawn stack size,
+Subject: [PATCH 3/5] SYS_VM: vm.h, VM-backed thread stacks, spawn stack size,
  os0test VM checks
 
 vm.h wraps the kernel's SYS_VM (map, unmap, protect, decommit, reserve and
@@ -4623,7 +4623,7 @@ index 8c7b36f..f24dbc2 100644
 From eb1dc7f8a3ca14f9be1502f413346769aa0357d2 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Fri, 13 Nov 2026 12:07:53 +0000
-Subject: [PATCH 4/4] CPU features in SYSINFO; os0test SIMD state checks
+Subject: [PATCH 4/5] CPU features in SYSINFO; os0test SIMD state checks
 
 mos_sysinfo_cpu_features(), mos_sysinfo_xcr0() and mos_cpu_has() report
 what the CPU has and the OS has enabled. os0test loads patterns into the
@@ -5060,6 +5060,562 @@ index f24dbc2..a0dab54 100644
  
      stage("cleanup");
      mos_chdir(g_start_cwd[0] ? g_start_cwd : "0:/");
+-- 
+2.43.0
+
+
+From cabe10d10c23c0a8c31cb36e3e1c77c8ecaf9754 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 13 Nov 2026 12:12:35 +0000
+Subject: [PATCH 5/5] os0test: bad-pointer checks across the system calls
+
+Each family of calls is given an unmapped address, a kernel address, a
+no-access mapping, a read-only mapping as output and a buffer that runs
+past its mapping, and must fail without effect; the same calls are checked
+to still work with heap, stack, image and SYS_VM buffers.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0112xJofPtaNLntSK14Rcenm
+---
+ programs/os0test/main.c | 518 ++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 518 insertions(+)
+
+diff --git a/programs/os0test/main.c b/programs/os0test/main.c
+index a0dab54..1a90bd3 100644
+--- a/programs/os0test/main.c
++++ b/programs/os0test/main.c
+@@ -1729,6 +1729,523 @@ static void test_bad_pointers(void) {
+     EXPECT_RET(mos_exec(g_self, NULL, 2), ERR(SYS_ERR_INVAL), "exec_argc_without_argv_inval");
+ }
+ 
++/* ================================ user pointer checks: the whole surface */
++
++/* Buffers used as call arguments. Bad pointers (input = the kernel only
++ * reads it, output = it writes): an address nothing maps (above 4 GiB), a
++ * kernel address below 4 GiB, a PROT_NONE mapping, a read-only mapping (output
++ * only), and one byte before the end of a mapping (the next page is a
++ * guard). Good ones: heap, stack, image (.data, .rodata, .bss), SYS_VM. */
++static uint8_t* g_pb_rw;                 /* 1 page, read-write */
++static uint8_t* g_pb_ro;                 /* 1 page, read-only, holds a file path */
++static uint8_t* g_pb_none;               /* 1 page, PROT_NONE */
++static void* g_bad_out[5];
++static void* g_bad_in[4];
++static const char* const g_tag_out[5] = { "unmapped", "kernel", "prot_none", "readonly", "overrun" };
++static const char* const g_tag_in[4]  = { "unmapped", "kernel", "prot_none", "overrun" };
++static char g_bss_buf[256];
++static char g_data_buf[256] = { 'd' };
++static const char g_rodata_path[] = TMP "/ptr_data.bin";
++static const char g_rodata_text[] = "RODATA-TEXT-0123456789";
++
++/* The call is made with P set to each bad pointer; `want` is the result. */
++#define BAD_OUT_RET(base, want, expr) do { \
++    for (int bi_ = 0; bi_ < 5; bi_++) { void* P = g_bad_out[bi_]; char nm_[96]; \
++        kfmt(nm_, sizeof(nm_), "%s_%s", base, g_tag_out[bi_]); \
++        EXPECT_RET(expr, want, nm_); } } while (0)
++#define BAD_IN_RET(base, want, expr) do { \
++    for (int bi_ = 0; bi_ < 4; bi_++) { void* P = g_bad_in[bi_]; char nm_[96]; \
++        kfmt(nm_, sizeof(nm_), "%s_%s", base, g_tag_in[bi_]); \
++        EXPECT_RET(expr, want, nm_); } } while (0)
++/* Same, for calls whose gate may answer PERM or INVAL: any error. */
++#define BAD_OUT_NEG(base, expr) do { \
++    for (int bi_ = 0; bi_ < 5; bi_++) { void* P = g_bad_out[bi_]; char nm_[96]; \
++        kfmt(nm_, sizeof(nm_), "%s_%s", base, g_tag_out[bi_]); \
++        long r_ = (expr); EXPECT(r_ < 0, nm_, "got %ld", r_); } } while (0)
++
++static int pb_pattern_ok(const uint8_t* buf, size_t n, uint8_t seed, size_t from) {
++    for (size_t i = 0; i < n; i++) if (buf[i] != pattern_byte(from + i, seed)) return 0;
++    return 1;
++}
++
++static void test_bad_pointers_2(void) {
++    stage("bad_pointers_2");
++    g_pb_rw = (uint8_t*)mos_vm_map(NULL, 4096, MOS_VM_PROT_RW, 0);
++    g_pb_ro = (uint8_t*)mos_vm_map(NULL, 4096, MOS_VM_PROT_RW, 0);
++    g_pb_none = (uint8_t*)mos_vm_map(NULL, 4096, MOS_VM_PROT_NONE, 0);
++    if (!g_pb_rw || !g_pb_ro || !g_pb_none) {
++        check_fail("bad_pointers_2_setup", "vm map failed: %ld", mos_vm_last_error());
++        return;
++    }
++    scopy((char*)g_pb_ro, 4096, g_rodata_path);
++    EXPECT_RET(mos_vm_protect_raw(g_pb_ro, 4096, MOS_VM_PROT_READ), SYS_SUCCESS, "bp2_make_readonly");
++    g_pb_rw[4095] = 'a';                 /* an unterminated "string" at the very end */
++    g_bad_out[0] = g_bad_in[0] = (void*)0x300000000000ULL;
++    g_bad_out[1] = g_bad_in[1] = (void*)0x200000ULL;
++    g_bad_out[2] = g_bad_in[2] = g_pb_none;
++    g_bad_out[3] = g_pb_ro;
++    g_bad_out[4] = g_bad_in[3] = g_pb_rw + 4095;
++
++    uint8_t* heap = (uint8_t*)malloc(8192);
++    EXPECT(heap != NULL, "bp2_heap_alloc", "malloc failed");
++    if (!heap) return;
++    uint8_t stackbuf[256];
++
++    /* ---- files: SYS_READ, SYS_FWRITE */
++    EXPECT_RET(write_pattern(TMP "/ptr_data.bin", 256, 7), 0, "bp2_make_data_file");
++    long fd = mos_open(TMP "/ptr_data.bin", SYS_O_RDWR);
++    EXPECT(fd > 0, "bp2_open_data_file", "got %ld", fd);
++    if (fd <= 0) return;
++
++    EXPECT_RET(mos_seek(fd, 0), 0, "bp2_seek_start");
++    BAD_OUT_RET("read_bad_buffer", ERR(SYS_ERR_INVAL), mos_read(fd, P, 64));
++    EXPECT_RET(mos_tell(fd), 0, "read_bad_buffer_position_unchanged");
++    BAD_OUT_RET("read_bad_buffer_big", ERR(SYS_ERR_INVAL), mos_read(fd, P, 200));
++    EXPECT_RET(mos_tell(fd), 0, "read_bad_buffer_big_position_unchanged");
++    /* A read-only buffer must stay untouched. */
++    EXPECT(g_pb_ro[0] == g_rodata_path[0], "read_readonly_buffer_untouched", "changed");
++
++    memset(heap, 0, 64);
++    EXPECT_RET(mos_read(fd, heap, 16), 16, "read_into_heap");
++    EXPECT(pb_pattern_ok(heap, 16, 7, 0), "read_into_heap_content", "wrong data");
++    memset(stackbuf, 0, sizeof(stackbuf));
++    EXPECT_RET(mos_read(fd, stackbuf, 16), 16, "read_into_stack");
++    EXPECT(pb_pattern_ok(stackbuf, 16, 7, 16), "read_into_stack_content", "wrong data");
++    EXPECT_RET(mos_read(fd, g_bss_buf, 16), 16, "read_into_bss");
++    EXPECT(pb_pattern_ok((uint8_t*)g_bss_buf, 16, 7, 32), "read_into_bss_content", "wrong data");
++    EXPECT_RET(mos_read(fd, g_data_buf, 16), 16, "read_into_data");
++    EXPECT(pb_pattern_ok((uint8_t*)g_data_buf, 16, 7, 48), "read_into_data_content", "wrong data");
++    EXPECT_RET(mos_read(fd, g_pb_rw, 16), 16, "read_into_vm");
++    EXPECT(pb_pattern_ok(g_pb_rw, 16, 7, 64), "read_into_vm_content", "wrong data");
++    EXPECT_RET(mos_tell(fd), 80, "read_positive_position");
++    /* A capacity bigger than what is left is fine when the bytes written fit. */
++    EXPECT_RET(mos_seek(fd, 0), 0, "bp2_seek_start_again");
++    EXPECT_RET(mos_read(fd, g_pb_rw, 1u << 20), 256, "read_oversize_capacity_ok");
++    EXPECT_RET(mos_read(fd, g_pb_rw, 1u << 20), 0, "read_at_eof_returns_zero");
++    g_pb_rw[4095] = 'a';
++
++    /* SYS_FWRITE: reading from a bad buffer. */
++    EXPECT_RET(mos_seek(fd, 256), 0, "bp2_seek_end");
++    BAD_IN_RET("fwrite_bad_buffer", ERR(SYS_ERR_INVAL), mos_fwrite(fd, P, 16));
++    EXPECT_RET(mos_size(fd), 256, "fwrite_bad_buffer_file_unchanged");
++    EXPECT_RET(mos_fwrite(fd, g_rodata_text, 8), 8, "fwrite_from_rodata");
++    EXPECT_RET(mos_fwrite(fd, g_data_buf, 8), 8, "fwrite_from_data");
++    EXPECT_RET(mos_fwrite(fd, heap, 8), 8, "fwrite_from_heap");
++    EXPECT_RET(mos_fwrite(fd, stackbuf, 8), 8, "fwrite_from_stack");
++    EXPECT_RET(mos_fwrite(fd, g_pb_rw, 8), 8, "fwrite_from_vm");
++    EXPECT_RET(mos_fwrite(fd, g_pb_ro, 8), 8, "fwrite_from_readonly_vm");
++    EXPECT_RET(mos_size(fd), 256 + 48, "fwrite_positive_size");
++    mos_close(fd);
++
++    /* ---- paths: SYS_EXISTS, SYS_OPEN, SYS_MKDIR, SYS_CREATE, SYS_CHDIR, SYS_GET_METADATA */
++    BAD_IN_RET("exists_bad_path", ERR(SYS_ERR_INVAL), mos_exists((const char*)P));
++    BAD_IN_RET("open_bad_path", ERR(SYS_ERR_INVAL), mos_open((const char*)P, SYS_O_RDONLY));
++    BAD_IN_RET("mkdir_bad_path", ERR(SYS_ERR_INVAL), mos_mkdir((const char*)P));
++    BAD_IN_RET("create_bad_path", ERR(SYS_ERR_INVAL), mos_create((const char*)P, NULL, NULL));
++    BAD_IN_RET("chdir_bad_path", ERR(SYS_ERR_INVAL), mos_chdir((const char*)P));
++    BAD_IN_RET("delete_bad_path", ERR(SYS_ERR_INVAL), mos_delete((const char*)P));
++    BAD_IN_RET("create_bad_type", ERR(SYS_ERR_INVAL), mos_create(TMP "/ptr_never.txt", (const char*)P, NULL));
++    BAD_IN_RET("create_bad_format", ERR(SYS_ERR_INVAL), mos_create(TMP "/ptr_never.txt", "text", (const char*)P));
++    EXPECT(!exists(TMP "/ptr_never.txt"), "create_bad_arguments_created_nothing", "file exists");
++    BAD_IN_RET("stat_bad_path_all", ERR(SYS_ERR_INVAL), mos_stat((const char*)P, (syscall_stat_t*)heap));
++    EXPECT_RET(mos_exists(g_rodata_path), 1, "exists_path_in_rodata");
++    EXPECT_RET(mos_exists((const char*)g_pb_ro), 1, "exists_path_in_readonly_vm");
++    scopy((char*)heap, 256, g_rodata_path);
++    EXPECT_RET(mos_exists((const char*)heap), 1, "exists_path_in_heap");
++    scopy((char*)stackbuf, sizeof(stackbuf), g_rodata_path);
++    EXPECT_RET(mos_exists((const char*)stackbuf), 1, "exists_path_on_stack");
++    scopy((char*)g_pb_rw, 4096, g_rodata_path);
++    EXPECT_RET(mos_exists((const char*)g_pb_rw), 1, "exists_path_in_vm");
++    /* A path that fills its mapping to the last byte with a NUL there is fine. */
++    memset(g_pb_rw, 'a', 4096);
++    g_pb_rw[4095] = '\0';
++    EXPECT_RET(mos_exists((const char*)(g_pb_rw + 4090)), 0, "exists_path_ending_at_mapping_end");
++    g_pb_rw[4095] = 'a';
++    EXPECT_RET(mos_exists((const char*)(g_pb_rw + 4090)), ERR(SYS_ERR_INVAL), "exists_unterminated_path_inval");
++
++    /* ---- output structs: SYS_STAT, SYS_GET_METADATA, SYS_GETTIME, SYS_RANDOM, SYS_GETCWD */
++    BAD_OUT_RET("stat_bad_output", ERR(SYS_ERR_INVAL), mos_stat(g_rodata_path, (syscall_stat_t*)P));
++    EXPECT_RET(mos_stat(g_rodata_path, (syscall_stat_t*)heap), 0, "stat_output_in_heap");
++    EXPECT_RET(mos_stat(g_rodata_path, (syscall_stat_t*)g_pb_rw), 0, "stat_output_in_vm");
++    EXPECT_RET(mos_stat(g_rodata_path, (syscall_stat_t*)g_bss_buf), 0, "stat_output_in_bss");
++    BAD_OUT_RET("get_metadata_bad_output", ERR(SYS_ERR_INVAL), mos_get_metadata(g_rodata_path, (syscall_file_metadata_t*)P));
++    EXPECT_RET(mos_get_metadata(g_rodata_path, (syscall_file_metadata_t*)heap), 0, "get_metadata_output_in_heap");
++    BAD_OUT_RET("gettime_bad_output", ERR(SYS_ERR_INVAL), mos_syscall(SYS_GETTIME, (long)(uintptr_t)P, 0, 0));
++    EXPECT_RET(mos_syscall(SYS_GETTIME, (long)(uintptr_t)heap, 0, 0), 0, "gettime_output_in_heap");
++    EXPECT_RET(mos_syscall(SYS_GETTIME, (long)(uintptr_t)stackbuf, 0, 0), 0, "gettime_output_on_stack");
++    BAD_OUT_RET("random_bad_buffer", ERR(SYS_ERR_INVAL), mos_syscall(SYS_RANDOM, (long)(uintptr_t)P, 16, 0));
++    EXPECT_RET(mos_syscall(SYS_RANDOM, (long)(uintptr_t)heap, 16, 0), 16, "random_buffer_in_heap");
++    EXPECT_RET(mos_syscall(SYS_RANDOM, (long)(uintptr_t)g_pb_rw, 16, 0), 16, "random_buffer_in_vm");
++    BAD_OUT_RET("getcwd_bad_buffer", ERR(SYS_ERR_INVAL), mos_getcwd((char*)P, 256));
++    EXPECT_RET(mos_getcwd((char*)stackbuf, 4096), 0, "getcwd_oversize_capacity_on_stack_ok");
++    EXPECT_RET(mos_getcwd((char*)heap, 4096), 0, "getcwd_buffer_in_heap");
++
++    /* ---- SYS_LISTDIR, SYS_PSLIST: only the entries written have to fit */
++    mos_mkdir(TMP "/ptrdir");
++    write_text(TMP "/ptrdir/a.txt", "A");
++    write_text(TMP "/ptrdir/b.txt", "B");
++    BAD_OUT_RET("listdir_bad_output", ERR(SYS_ERR_INVAL), mos_listdir(TMP "/ptrdir", (syscall_dirent_t*)P, 8));
++    BAD_IN_RET("listdir_bad_path", ERR(SYS_ERR_INVAL), mos_listdir((const char*)P, (syscall_dirent_t*)heap, 8));
++    long n = mos_listdir(TMP "/ptrdir", (syscall_dirent_t*)heap, 8);
++    EXPECT(n == 2, "listdir_output_in_heap", "got %ld", n);
++    n = mos_listdir(TMP "/ptrdir", (syscall_dirent_t*)heap, 100);   /* capacity 100, buffer for 8+ */
++    EXPECT(n == 2, "listdir_oversize_capacity_ok", "got %ld", n);
++    n = mos_listdir(TMP "/ptrdir", (syscall_dirent_t*)g_pb_rw, 8);
++    EXPECT(n == 2, "listdir_output_in_vm", "got %ld", n);
++    BAD_OUT_RET("pslist_bad_output", ERR(SYS_ERR_INVAL), mos_pslist((syscall_process_info_t*)P, 4));
++    n = mos_pslist((syscall_process_info_t*)heap, 4);
++    EXPECT(n >= 1 && n <= 4, "pslist_output_in_heap", "got %ld", n);
++    n = mos_pslist((syscall_process_info_t*)g_pb_rw, 8);
++    EXPECT(n >= 1, "pslist_output_in_vm", "got %ld", n);
++
++    /* ---- SYS_WRITE (stdout/stderr and the log descriptor) */
++    BAD_IN_RET("write_stdout_bad_buffer", ERR(SYS_ERR_INVAL), mos_write_fd(1, (const char*)P, 16));
++    BAD_IN_RET("write_log_bad_buffer", ERR(SYS_ERR_INVAL), mos_write_fd(3, (const char*)P, 16));
++    EXPECT_RET(mos_write_fd(3, g_rodata_text, 8), 8, "write_log_from_rodata");
++    EXPECT_RET(mos_write_fd(3, g_pb_ro, 8), 8, "write_log_from_readonly_vm");
++
++    /* ---- SYS_WAIT, SYS_FUTEX, SYS_THREAD, SYS_VM, SYS_REGISTER_CLEANUP */
++    BAD_OUT_RET("wait_bad_output", ERR(SYS_ERR_INVAL), mos_wait_raw(SYS_WAIT_ANY, SYS_WAIT_NOHANG, (syscall_wait_t*)P));
++    BAD_IN_RET("futex_wake_bad_address", ERR(SYS_ERR_INVAL), mos_syscall(SYS_FUTEX, SYS_FUTEX_WAKE, (long)(uintptr_t)P, 1));
++    BAD_IN_RET("thread_create_bad_struct", ERR(SYS_ERR_INVAL), mos_syscall(SYS_THREAD, SYS_THREAD_CREATE, (long)(uintptr_t)P, 0));
++    BAD_IN_RET("thread_create_ex_bad_struct", ERR(SYS_ERR_INVAL), mos_syscall(SYS_THREAD, SYS_THREAD_CREATE_EX, (long)(uintptr_t)P, 0));
++    BAD_IN_RET("vm_map_bad_struct", ERR(SYS_ERR_INVAL), mos_vm_map_raw((const syscall_vm_map_t*)P));
++    EXPECT_RET(mos_syscall(SYS_REGISTER_CLEANUP, 0x300000000000LL, 0, 0), ERR(SYS_ERR_INVAL), "register_cleanup_unmapped_inval");
++    EXPECT_RET(mos_syscall(SYS_REGISTER_CLEANUP, 0x200000, 0, 0), ERR(SYS_ERR_INVAL), "register_cleanup_kernel_inval");
++    EXPECT_RET(mos_syscall(SYS_REGISTER_CLEANUP, (long)(uintptr_t)g_pb_rw, 0, 0), ERR(SYS_ERR_INVAL), "register_cleanup_not_executable_inval");
++
++    /* ---- SYS_PKG: the request's own pointers */
++    {
++        syscall_pkg_request_t pk;
++        memset(&pk, 0, sizeof(pk));
++        pk.op = SYS_PKG_INFO;
++        pk.path = g_rodata_path;
++        pk.out_count = (uint32_t*)g_pb_ro;
++        EXPECT_RET(mos_syscall(SYS_PKG, (long)(uintptr_t)&pk, 0, 0), ERR(SYS_ERR_INVAL), "pkg_info_readonly_out_count");
++        pk.out_count = NULL;
++        for (int i = 0; i < 4; i++) {
++            pk.path = (const char*)g_bad_in[i];
++            char nm[96]; kfmt(nm, sizeof(nm), "pkg_info_bad_path_%s", g_tag_in[i]);
++            EXPECT_RET(mos_syscall(SYS_PKG, (long)(uintptr_t)&pk, 0, 0), ERR(SYS_ERR_INVAL), nm);
++        }
++        BAD_IN_RET("pkg_bad_request", ERR(SYS_ERR_INVAL), mos_syscall(SYS_PKG, (long)(uintptr_t)P, 0, 0));
++    }
++
++    /* ---- SYS_USB keyboard info */
++    BAD_OUT_RET("usb_keyboard_info_bad_output", ERR(SYS_ERR_INVAL), mos_syscall(SYS_USB, SYS_USB_KEYBOARD_INFO, (long)(uintptr_t)P, 0));
++
++    /* ---- SYS_GRAPHICS */
++    {
++        syscall_graphics_request_t gr;
++        memset(&gr, 0, sizeof(gr));
++        gr.op = SYS_GRAPHICS_INFO;
++        for (int i = 0; i < 5; i++) {
++            gr.info = (syscall_graphics_info_t*)g_bad_out[i];
++            char nm[96]; kfmt(nm, sizeof(nm), "graphics_info_bad_output_%s", g_tag_out[i]);
++            EXPECT_RET(mos_syscall(SYS_GRAPHICS, (long)(uintptr_t)&gr, 0, 0), ERR(SYS_ERR_INVAL), nm);
++        }
++        BAD_OUT_NEG("graphics_bad_request", mos_syscall(SYS_GRAPHICS, (long)(uintptr_t)P, 0, 0));
++        gr.op = SYS_GRAPHICS_GET_WIDTH;
++        long w = mos_syscall(SYS_GRAPHICS, (long)(uintptr_t)&gr, 0, 0);
++        EXPECT(w >= 0, "graphics_get_width_still_works", "got %ld", w);
++    }
++
++    /* ---- SYS_WINDOW */
++    {
++        syscall_window_request_t wr;
++        memset(&wr, 0, sizeof(wr));
++        wr.size = sizeof(wr);
++        wr.version = SYS_WINDOW_ABI_VERSION;
++        BAD_IN_RET("window_bad_request", ERR(SYS_ERR_INVAL), mos_syscall(SYS_WINDOW, (long)(uintptr_t)P, 0, 0));
++        wr.op = SYS_WINDOW_GET_INFO; wr.id = 1;
++        for (int i = 0; i < 5; i++) {
++            wr.info = (syscall_window_info_t*)g_bad_out[i];
++            char nm[96]; kfmt(nm, sizeof(nm), "window_get_info_bad_output_%s", g_tag_out[i]);
++            EXPECT_RET(mos_syscall(SYS_WINDOW, (long)(uintptr_t)&wr, 0, 0), ERR(SYS_ERR_INVAL), nm);
++        }
++        wr.info = NULL;
++        wr.op = SYS_WINDOW_LIST; wr.capacity = 2;
++        for (int i = 0; i < 5; i++) {
++            wr.windows = (syscall_window_info_t*)g_bad_out[i];
++            char nm[96]; kfmt(nm, sizeof(nm), "window_list_bad_output_%s", g_tag_out[i]);
++            EXPECT_RET(mos_syscall(SYS_WINDOW, (long)(uintptr_t)&wr, 0, 0), ERR(SYS_ERR_INVAL), nm);
++        }
++        wr.windows = (syscall_window_info_t*)heap; wr.capacity = 4;
++        long c = mos_syscall(SYS_WINDOW, (long)(uintptr_t)&wr, 0, 0);
++        EXPECT(c >= 0, "window_list_output_in_heap", "got %ld", c);
++        wr.windows = (syscall_window_info_t*)g_pb_rw;
++        c = mos_syscall(SYS_WINDOW, (long)(uintptr_t)&wr, 0, 0);
++        EXPECT(c >= 0, "window_list_output_in_vm", "got %ld", c);
++        wr.windows = NULL; wr.capacity = 0;
++        c = mos_syscall(SYS_WINDOW, (long)(uintptr_t)&wr, 0, 0);
++        EXPECT(c >= 0, "window_list_count_only", "got %ld", c);
++        wr.op = SYS_WINDOW_NEXT_EVENT; wr.capacity = 0; wr.id = 1;
++        for (int i = 0; i < 5; i++) {
++            wr.event = (syscall_window_event_t*)g_bad_out[i];
++            char nm[96]; kfmt(nm, sizeof(nm), "window_next_event_bad_output_%s", g_tag_out[i]);
++            EXPECT_RET(mos_syscall(SYS_WINDOW, (long)(uintptr_t)&wr, 0, 0), ERR(SYS_ERR_INVAL), nm);
++        }
++        wr.event = NULL;
++        wr.op = SYS_WINDOW_PRESENT; wr.id = 1; wr.x = 0; wr.y = 0; wr.width = 8; wr.height = 8; wr.pitch = 32;
++        for (int i = 0; i < 4; i++) {
++            wr.pixels = (const uint32_t*)g_bad_in[i];
++            char nm[96]; kfmt(nm, sizeof(nm), "window_present_bad_pixels_%s", g_tag_in[i]);
++            EXPECT_RET(mos_syscall(SYS_WINDOW, (long)(uintptr_t)&wr, 0, 0), ERR(SYS_ERR_INVAL), nm);
++        }
++    }
++
++    /* ---- SYS_INPUT_READ (events written; a request that is fine gets PERM
++     * when this program does not own the screen, which is checked after) */
++    {
++        syscall_input_read_request_t ir;
++        memset(&ir, 0, sizeof(ir));
++        ir.size = sizeof(ir);
++        ir.version = SYS_INPUT_ABI_VERSION;
++        ir.capacity = 4;
++        BAD_IN_RET("input_read_bad_request", ERR(SYS_ERR_INVAL), mos_syscall(SYS_INPUT_READ, (long)(uintptr_t)P, 0, 0));
++        for (int i = 0; i < 5; i++) {
++            ir.events = (syscall_input_event_t*)g_bad_out[i];
++            char nm[96]; kfmt(nm, sizeof(nm), "input_read_bad_events_%s", g_tag_out[i]);
++            EXPECT_RET(mos_syscall(SYS_INPUT_READ, (long)(uintptr_t)&ir, 0, 0), ERR(SYS_ERR_INVAL), nm);
++        }
++        ir.events = (syscall_input_event_t*)heap;
++        for (int i = 0; i < 5; i++) {
++            ir.dropped_count = (uint64_t*)g_bad_out[i];
++            char nm[96]; kfmt(nm, sizeof(nm), "input_read_bad_dropped_count_%s", g_tag_out[i]);
++            EXPECT_RET(mos_syscall(SYS_INPUT_READ, (long)(uintptr_t)&ir, 0, 0), ERR(SYS_ERR_INVAL), nm);
++        }
++        ir.dropped_count = NULL;
++        long r = mos_syscall(SYS_INPUT_READ, (long)(uintptr_t)&ir, 0, 0);
++        EXPECT(r == ERR(SYS_ERR_PERM) || r >= 0, "input_read_valid_request_reaches_owner_check", "got %ld", r);
++        ir.events = (syscall_input_event_t*)stackbuf;
++        r = mos_syscall(SYS_INPUT_READ, (long)(uintptr_t)&ir, 0, 0);
++        EXPECT(r == ERR(SYS_ERR_PERM) || r >= 0, "input_read_events_on_stack_ok", "got %ld", r);
++    }
++
++    /* ---- SYS_GPU: ops that read or write program memory */
++    {
++        syscall_gpu_request_t g;
++        memset(&g, 0, sizeof(g));
++        g.size = sizeof(g);
++        g.version = SYS_GPU_ABI_VERSION;
++        BAD_OUT_RET("gpu_bad_request", ERR(SYS_ERR_INVAL), mos_syscall(SYS_GPU, (long)(uintptr_t)P, 0, 0));
++        g.op = SYS_GPU_INFO;
++        for (int i = 0; i < 5; i++) {
++            g.out = g_bad_out[i];
++            char nm[96]; kfmt(nm, sizeof(nm), "gpu_info_bad_output_%s", g_tag_out[i]);
++            EXPECT_RET(mos_syscall(SYS_GPU, (long)(uintptr_t)&g, 0, 0), ERR(SYS_ERR_INVAL), nm);
++        }
++        g.op = SYS_GPU_SUBMIT; g.bytes = 16;
++        for (int i = 0; i < 4; i++) {
++            g.data = g_bad_in[i];
++            char nm[96]; kfmt(nm, sizeof(nm), "gpu_submit_bad_commands_%s", g_tag_in[i]);
++            EXPECT_RET(mos_syscall(SYS_GPU, (long)(uintptr_t)&g, 0, 0), ERR(SYS_ERR_INVAL), nm);
++        }
++        g.op = SYS_GPU_CREATE_PROGRAM; g.bytes = 64;
++        for (int i = 0; i < 4; i++) {
++            g.data = g_bad_in[i];
++            char nm[96]; kfmt(nm, sizeof(nm), "gpu_create_program_bad_blob_%s", g_tag_in[i]);
++            EXPECT_RET(mos_syscall(SYS_GPU, (long)(uintptr_t)&g, 0, 0), ERR(SYS_ERR_INVAL), nm);
++        }
++        /* A buffer and a surface to upload to / read back from. */
++        memset(&g, 0, sizeof(g));
++        g.size = sizeof(g); g.version = SYS_GPU_ABI_VERSION;
++        g.op = SYS_GPU_CREATE_BUFFER; g.bytes = 4096;
++        long cb = mos_syscall(SYS_GPU, (long)(uintptr_t)&g, 0, 0);
++        uint32_t buf_id = g.handle;
++        memset(&g, 0, sizeof(g));
++        g.size = sizeof(g); g.version = SYS_GPU_ABI_VERSION;
++        g.op = SYS_GPU_CREATE_SURFACE; g.width = 16; g.height = 16; g.format = FGPU_FORMAT_XRGB8888;
++        g.flags = FGPU_SURFACE_SYSTEM_MEMORY;
++        long cs = mos_syscall(SYS_GPU, (long)(uintptr_t)&g, 0, 0);
++        uint32_t surf_id = g.handle;
++        if (cb == 0 && buf_id) {
++            g.op = SYS_GPU_UPLOAD_BUFFER; g.handle = buf_id; g.offset = 0; g.bytes = 256;
++            for (int i = 0; i < 4; i++) {
++                g.data = g_bad_in[i];
++                char nm[96]; kfmt(nm, sizeof(nm), "gpu_upload_buffer_bad_data_%s", g_tag_in[i]);
++                EXPECT_RET(mos_syscall(SYS_GPU, (long)(uintptr_t)&g, 0, 0), ERR(SYS_ERR_INVAL), nm);
++            }
++            g.data = heap;
++            EXPECT_RET(mos_syscall(SYS_GPU, (long)(uintptr_t)&g, 0, 0), 0, "gpu_upload_buffer_from_heap");
++            g.data = g_pb_ro;
++            EXPECT_RET(mos_syscall(SYS_GPU, (long)(uintptr_t)&g, 0, 0), 0, "gpu_upload_buffer_from_readonly_vm");
++            g.data = g_rodata_text; g.bytes = 16;
++            EXPECT_RET(mos_syscall(SYS_GPU, (long)(uintptr_t)&g, 0, 0), 0, "gpu_upload_buffer_from_rodata");
++            g.op = SYS_GPU_DESTROY_BUFFER; g.handle = buf_id;
++            EXPECT_RET(mos_syscall(SYS_GPU, (long)(uintptr_t)&g, 0, 0), 0, "gpu_destroy_buffer");
++        } else {
++            check_pass("gpu_buffer_checks (skipped: no buffer could be created)");
++        }
++        if (cs == 0 && surf_id) {
++            memset(&g, 0, sizeof(g));
++            g.size = sizeof(g); g.version = SYS_GPU_ABI_VERSION;
++            g.handle = surf_id; g.pitch = 64;
++            g.op = SYS_GPU_READBACK;
++            for (int i = 0; i < 5; i++) {
++                g.out = g_bad_out[i];
++                char nm[96]; kfmt(nm, sizeof(nm), "gpu_readback_bad_output_%s", g_tag_out[i]);
++                EXPECT_RET(mos_syscall(SYS_GPU, (long)(uintptr_t)&g, 0, 0), ERR(SYS_ERR_INVAL), nm);
++            }
++            g.out = heap;
++            EXPECT_RET(mos_syscall(SYS_GPU, (long)(uintptr_t)&g, 0, 0), 0, "gpu_readback_into_heap");
++            g.out = g_pb_rw;
++            EXPECT_RET(mos_syscall(SYS_GPU, (long)(uintptr_t)&g, 0, 0), 0, "gpu_readback_into_vm");
++            g.op = SYS_GPU_WRITE_SURFACE;
++            for (int i = 0; i < 4; i++) {
++                g.data = g_bad_in[i];
++                char nm[96]; kfmt(nm, sizeof(nm), "gpu_write_surface_bad_pixels_%s", g_tag_in[i]);
++                EXPECT_RET(mos_syscall(SYS_GPU, (long)(uintptr_t)&g, 0, 0), ERR(SYS_ERR_INVAL), nm);
++            }
++            g.data = heap;
++            EXPECT_RET(mos_syscall(SYS_GPU, (long)(uintptr_t)&g, 0, 0), 0, "gpu_write_surface_from_heap");
++            g.data = g_pb_ro;
++            EXPECT_RET(mos_syscall(SYS_GPU, (long)(uintptr_t)&g, 0, 0), 0, "gpu_write_surface_from_readonly_vm");
++            g.op = SYS_GPU_DESTROY_SURFACE;
++            EXPECT_RET(mos_syscall(SYS_GPU, (long)(uintptr_t)&g, 0, 0), 0, "gpu_destroy_surface");
++        } else {
++            check_pass("gpu_surface_checks (skipped: no surface could be created)");
++        }
++    }
++
++    /* ---- SYS_MEDIA: the tile decoder (frame is read, pixels written) */
++    {
++        syscall_media_request_t m;
++        memset(&m, 0, sizeof(m));
++        m.size = sizeof(m); m.version = SYS_MEDIA_ABI_VERSION; m.op = SYS_MEDIA_DECODE_TILES;
++        m.width = 16; m.height = 16; m.frame_bytes = 64;
++        BAD_OUT_RET("media_bad_request", ERR(SYS_ERR_INVAL), mos_syscall(SYS_MEDIA, (long)(uintptr_t)P, 0, 0));
++        m.pixels = (uint32_t*)heap;
++        for (int i = 0; i < 4; i++) {
++            m.frame = (const uint8_t*)g_bad_in[i];
++            char nm[96]; kfmt(nm, sizeof(nm), "media_tiles_bad_frame_%s", g_tag_in[i]);
++            EXPECT_RET(mos_syscall(SYS_MEDIA, (long)(uintptr_t)&m, 0, 0), ERR(SYS_ERR_INVAL), nm);
++        }
++        m.frame = stackbuf;
++        for (int i = 0; i < 5; i++) {
++            m.pixels = (uint32_t*)g_bad_out[i];
++            char nm[96]; kfmt(nm, sizeof(nm), "media_tiles_bad_pixels_%s", g_tag_out[i]);
++            long r = mos_syscall(SYS_MEDIA, (long)(uintptr_t)&m, 0, 0);
++            /* unaligned (overrun) pointers are refused by the alignment rule: still an error */
++            EXPECT(r == ERR(SYS_ERR_INVAL), nm, "got %ld", r);
++        }
++    }
++
++    /* ---- SYS_NET */
++    {
++        syscall_net_request_t nr;
++        memset(&nr, 0, sizeof(nr));
++        BAD_IN_RET("net_bad_request", ERR(SYS_ERR_INVAL), mos_syscall(SYS_NET, (long)(uintptr_t)P, 0, 0));
++        nr.op = SYS_NET_STATUS;
++        for (int i = 0; i < 5; i++) {
++            nr.out_status = (syscall_net_status_t*)g_bad_out[i];
++            char nm[96]; kfmt(nm, sizeof(nm), "net_status_bad_output_%s", g_tag_out[i]);
++            EXPECT_RET(mos_syscall(SYS_NET, (long)(uintptr_t)&nr, 0, 0), ERR(SYS_ERR_INVAL), nm);
++        }
++        nr.out_status = (syscall_net_status_t*)heap;
++        EXPECT_RET(mos_syscall(SYS_NET, (long)(uintptr_t)&nr, 0, 0), 0, "net_status_output_in_heap");
++        nr.out_status = (syscall_net_status_t*)g_pb_rw;
++        EXPECT_RET(mos_syscall(SYS_NET, (long)(uintptr_t)&nr, 0, 0), 0, "net_status_output_in_vm");
++        nr.out_status = NULL;
++        nr.op = SYS_NET_ADAPTERS; nr.len = sizeof(syscall_net_adapters_t);
++        for (int i = 0; i < 5; i++) {
++            nr.buf = g_bad_out[i];
++            char nm[96]; kfmt(nm, sizeof(nm), "net_adapters_bad_buffer_%s", g_tag_out[i]);
++            EXPECT_RET(mos_syscall(SYS_NET, (long)(uintptr_t)&nr, 0, 0), ERR(SYS_ERR_INVAL), nm);
++        }
++        nr.buf = heap;
++        EXPECT_RET(mos_syscall(SYS_NET, (long)(uintptr_t)&nr, 0, 0), 0, "net_adapters_buffer_in_heap");
++        nr.buf = NULL; nr.len = 0;
++        nr.op = SYS_NET_TCP_CONNECT; nr.ip = 0x7F000001u; nr.port = 80;
++        for (int i = 0; i < 5; i++) {
++            nr.out_handle = (uint64_t*)g_bad_out[i];
++            char nm[96]; kfmt(nm, sizeof(nm), "net_tcp_connect_bad_out_handle_%s", g_tag_out[i]);
++            EXPECT_RET(mos_syscall(SYS_NET, (long)(uintptr_t)&nr, 0, 0), ERR(SYS_ERR_INVAL), nm);
++        }
++        nr.out_handle = NULL;
++        nr.op = SYS_NET_RESOLVE; nr.out_ip = (uint32_t*)heap;
++        for (int i = 0; i < 4; i++) {
++            nr.host = (const char*)g_bad_in[i];
++            char nm[96]; kfmt(nm, sizeof(nm), "net_resolve_bad_host_%s", g_tag_in[i]);
++            EXPECT_RET(mos_syscall(SYS_NET, (long)(uintptr_t)&nr, 0, 0), ERR(SYS_ERR_INVAL), nm);
++        }
++        nr.host = "example.invalid";
++        for (int i = 0; i < 5; i++) {
++            nr.out_ip = (uint32_t*)g_bad_out[i];
++            char nm[96]; kfmt(nm, sizeof(nm), "net_resolve_bad_out_ip_%s", g_tag_out[i]);
++            EXPECT_RET(mos_syscall(SYS_NET, (long)(uintptr_t)&nr, 0, 0), ERR(SYS_ERR_INVAL), nm);
++        }
++        nr.out_ip = NULL;
++        nr.op = SYS_NET_UDP_SEND; nr.ip = 0x7F000001u; nr.port = 9; nr.local_port = 4000; nr.len = 16;
++        for (int i = 0; i < 4; i++) {
++            nr.buf = g_bad_in[i];
++            char nm[96]; kfmt(nm, sizeof(nm), "net_udp_send_bad_buffer_%s", g_tag_in[i]);
++            EXPECT_RET(mos_syscall(SYS_NET, (long)(uintptr_t)&nr, 0, 0), ERR(SYS_ERR_INVAL), nm);
++        }
++        nr.op = SYS_NET_UDP_RECV; nr.handle = 1;
++        for (int i = 0; i < 5; i++) {
++            nr.buf = g_bad_out[i];
++            char nm[96]; kfmt(nm, sizeof(nm), "net_udp_recv_bad_buffer_%s", g_tag_out[i]);
++            EXPECT_RET(mos_syscall(SYS_NET, (long)(uintptr_t)&nr, 0, 0), ERR(SYS_ERR_INVAL), nm);
++        }
++    }
++
++    /* ---- SYS_STORAGE, SYS_AUDIO*, SYS_TIMESYNC, SYS_ROOT (request pointers and nested ones) */
++    {
++        syscall_storage_request_t sr;
++        memset(&sr, 0, sizeof(sr));
++        sr.size = sizeof(sr); sr.version = SYS_STORAGE_ABI_VERSION;
++        BAD_OUT_RET("storage_bad_request", ERR(SYS_ERR_INVAL), mos_syscall(SYS_STORAGE, (long)(uintptr_t)P, 0, 0));
++        sr.op = SYS_STORAGE_LIST; sr.capacity = 4;
++        for (int i = 0; i < 5; i++) {
++            sr.devices = (syscall_storage_device_t*)g_bad_out[i];
++            char nm[96]; kfmt(nm, sizeof(nm), "storage_list_bad_devices_%s", g_tag_out[i]);
++            EXPECT_RET(mos_syscall(SYS_STORAGE, (long)(uintptr_t)&sr, 0, 0), ERR(SYS_ERR_INVAL), nm);
++        }
++        sr.devices = (syscall_storage_device_t*)heap;
++        long sl = mos_syscall(SYS_STORAGE, (long)(uintptr_t)&sr, 0, 0);
++        EXPECT(sl >= 0, "storage_list_devices_in_heap", "got %ld", sl);
++        sr.op = SYS_STORAGE_STATUS;
++        EXPECT_RET(mos_syscall(SYS_STORAGE, (long)(uintptr_t)&sr, 0, 0), 0, "storage_status_ok");
++
++        BAD_OUT_RET("audio_bad_request", ERR(SYS_ERR_INVAL), mos_syscall(SYS_AUDIO, (long)(uintptr_t)P, 0, 0));
++        BAD_OUT_RET("audio_mixer_bad_request", ERR(SYS_ERR_INVAL), mos_syscall(SYS_AUDIO_MIXER, (long)(uintptr_t)P, 0, 0));
++        BAD_OUT_RET("audio_stream_bad_request", ERR(SYS_ERR_INVAL), mos_syscall(SYS_AUDIO_STREAM, (long)(uintptr_t)P, 0, 0));
++        syscall_audio_mixer_t* mx = (syscall_audio_mixer_t*)heap;
++        memset(mx, 0, sizeof(*mx));
++        mx->op = SYS_AUDIO_MIXER_GET;
++        EXPECT_RET(mos_syscall(SYS_AUDIO_MIXER, (long)(uintptr_t)mx, 0, 0), 0, "audio_mixer_get_in_heap");
++        syscall_audio_request_t* ar = (syscall_audio_request_t*)heap;
++        memset(ar, 0, sizeof(*ar));
++        ar->size = sizeof(*ar); ar->version = SYS_AUDIO_ABI_VERSION; ar->op = SYS_AUDIO_STATUS;
++        EXPECT_RET(mos_syscall(SYS_AUDIO, (long)(uintptr_t)ar, 0, 0), 0, "audio_status_in_heap");
++        memset(ar, 0, sizeof(*ar));
++        ar->size = sizeof(*ar); ar->version = SYS_AUDIO_ABI_VERSION; ar->op = SYS_AUDIO_STATUS;
++        long ag = mos_syscall(SYS_AUDIO, (long)(uintptr_t)g_pb_rw, 0, 0);   /* garbage contents */
++        EXPECT(ag < 0, "audio_garbage_request_no_crash", "got %ld", ag);
++
++        /* SYS_TIMESYNC (38) and SYS_ROOT: a kernel-sized request in the heap, op STATUS */
++        BAD_OUT_RET("timesync_bad_request", ERR(SYS_ERR_INVAL), mos_syscall(38, (long)(uintptr_t)P, 0, 0));
++        BAD_OUT_RET("root_bad_request", ERR(SYS_ERR_INVAL), mos_syscall(SYS_ROOT, (long)(uintptr_t)P, 0, 0));
++        uint32_t* big = (uint32_t*)malloc(4096);
++        if (big) {
++            memset(big, 0, 4096);
++            big[0] = 2;     /* SYS_TIMESYNC_STATUS */
++            EXPECT_RET(mos_syscall(38, (long)(uintptr_t)big, 0, 0), 0, "timesync_status_in_heap");
++            memset(big, 0, 4096);
++            big[0] = 4;     /* SYS_ROOT_STATUS */
++            EXPECT_RET(mos_syscall(SYS_ROOT, (long)(uintptr_t)big, 0, 0), 0, "root_status_in_heap");
++            free(big);
++        }
++    }
++
++    /* The mappings are ours to give back. */
++    mos_vm_unmap(g_pb_rw, 4096);
++    mos_vm_unmap(g_pb_ro, 4096);
++    mos_vm_unmap(g_pb_none, 4096);
++    free(heap);
++}
++
+ /* ======================================== failed spawn leaves files alone */
+ 
+ static void test_spawn_failure_cleanup(void) {
+@@ -2754,6 +3271,7 @@ int main(int argc, char** argv, char** envp) {
+     test_spawn_crash_and_wait();
+     test_spawn_errors();
+     test_bad_pointers();
++    test_bad_pointers_2();
+     test_spawn_failure_cleanup();
+     test_exec_relative();
+     test_vm();
 -- 
 2.43.0
 

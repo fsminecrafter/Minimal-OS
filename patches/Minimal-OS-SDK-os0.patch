@@ -1,7 +1,7 @@
 From 2e82237589087ab693de903c6f03a762ad044a3e Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Thu, 12 Nov 2026 23:47:54 +0000
-Subject: [PATCH] OS-0: futex, TLS, clocks, stat/rename/chdir, spawn/wait,
+Subject: [PATCH 1/2] OS-0: futex, TLS, clocks, stat/rename/chdir, spawn/wait,
  environment
 
 syscall.h gains the kernel's new calls (SYS_FUTEX, SYS_CLOCK, SYS_STAT,
@@ -2789,6 +2789,187 @@ index 0000000..0ab1bc6
 +    mos_log("OS0TEST FAIL");
 +    return 1;
 +}
+-- 
+2.43.0
+
+
+From e793506e96b03a88fbee6574f7e1c22bed23ce80 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 13 Nov 2026 07:12:41 +0000
+Subject: [PATCH 2/2] os0test: checks for bad pointers, failed spawns, relative
+ exec, clock reads
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0112xJofPtaNLntSK14Rcenm
+---
+ programs/os0test/main.c | 140 ++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 140 insertions(+)
+
+diff --git a/programs/os0test/main.c b/programs/os0test/main.c
+index 0ab1bc6..8c7b36f 100644
+--- a/programs/os0test/main.c
++++ b/programs/os0test/main.c
+@@ -553,6 +553,26 @@ static void test_clocks(void) {
+            "not whole milliseconds: %llu", (unsigned long long)r0);
+     EXPECT(mos_time_unix() > (int64_t)y2020, "clock_time_unix", "process.h mos_time_unix() wrong");
+ 
++    /* Consecutive realtime reads, across at least one second step of the
++     * kernel's date/time, never jump by a minute or an hour (a read torn by
++     * a carry in the timer interrupt would). */
++    {
++        uint64_t t_end = mos_clock_monotonic_ns() + 1300ull * 1000000ull;
++        uint64_t last = mos_clock_realtime_ns();
++        uint64_t worst_fwd = 0, worst_back = 0;
++        unsigned reads = 0;
++        while (mos_clock_monotonic_ns() < t_end && reads < 2000000u) {
++            uint64_t now = mos_clock_realtime_ns();
++            if (now >= last) { if (now - last > worst_fwd) worst_fwd = now - last; }
++            else if (last - now > worst_back) worst_back = last - now;
++            last = now;
++            reads++;
++        }
++        EXPECT(worst_fwd < 1000000000ull && worst_back < 1000000000ull, "clock_realtime_reads_consistent",
++               "jumped forward %llu ns / back %llu ns within %u reads",
++               (unsigned long long)worst_fwd, (unsigned long long)worst_back, reads);
++    }
++
+     EXPECT_RET((long)mos_syscall(SYS_CLOCK, 99, 0, 0), ERR(SYS_ERR_INVAL), "clock_bad_which");
+ 
+     uint64_t hz = mos_clock_tsc_hz();
+@@ -1515,6 +1535,123 @@ static void test_spawn_errors(void) {
+     if (np > 0) emit_fd(1, "OS0TEST info a plain text file was started as pid %ld (wait=%ld)", np, leftover);
+ }
+ 
++/* ===================================================== user pointer checks */
++
++static void test_bad_pointers(void) {
++    stage("bad_pointers");
++    syscall_stat_t st;
++    static const uintptr_t bad[] = { 0x1000, 0x200000 };
++    static const char* const names_stat[] = { "stat_path_low_pointer_inval", "stat_path_kernel_pointer_inval" };
++    static const char* const names_from[] = { "rename_from_low_pointer_inval", "rename_from_kernel_pointer_inval" };
++    static const char* const names_to[] = { "rename_to_low_pointer_inval", "rename_to_kernel_pointer_inval" };
++    static const char* const names_xp[] = { "exec_path_low_pointer_inval", "exec_path_kernel_pointer_inval" };
++    static const char* const names_xv[] = { "exec_argv_low_pointer_inval", "exec_argv_kernel_pointer_inval" };
++    static const char* const names_xs[] = { "exec_argv_string_low_pointer_inval", "exec_argv_string_kernel_pointer_inval" };
++
++    write_text(TMP "/ptr_a.txt", "A");
++    for (int i = 0; i < 2; i++) {
++        const char* p = (const char*)bad[i];
++        EXPECT_RET(mos_stat(p, &st), ERR(SYS_ERR_INVAL), names_stat[i]);
++        EXPECT_RET(mos_rename(p, TMP "/ptr_b.txt"), ERR(SYS_ERR_INVAL), names_from[i]);
++        EXPECT_RET(mos_rename(TMP "/ptr_a.txt", p), ERR(SYS_ERR_INVAL), names_to[i]);
++        EXPECT_RET(mos_exec(p, NULL, 0), ERR(SYS_ERR_INVAL), names_xp[i]);
++        EXPECT_RET(mos_exec(g_self, (const char**)bad[i], 1), ERR(SYS_ERR_INVAL), names_xv[i]);
++        const char* av[2] = { (const char*)bad[i], NULL };
++        EXPECT_RET(mos_exec(g_self, av, 1), ERR(SYS_ERR_INVAL), names_xs[i]);
++    }
++    EXPECT(exists(TMP "/ptr_a.txt") && !exists(TMP "/ptr_b.txt"), "bad_pointer_rename_changed_nothing",
++           "a=%d b=%d", exists(TMP "/ptr_a.txt"), exists(TMP "/ptr_b.txt"));
++    /* argc > 0 with no argv */
++    EXPECT_RET(mos_exec(g_self, NULL, 2), ERR(SYS_ERR_INVAL), "exec_argc_without_argv_inval");
++}
++
++/* ======================================== failed spawn leaves files alone */
++
++static void test_spawn_failure_cleanup(void) {
++    stage("spawn_failure_cleanup");
++    static char buf[128];
++    mos_spawn_opts_t o;
++    memset(&o, 0, sizeof(o));
++    o.path = TMP "/no_such_program.run";
++
++    /* Missing program, stdout_path naming an existing file: untouched. */
++    write_text(TMP "/keep_out.txt", "KEEP-OUT");
++    write_text(TMP "/keep_err.txt", "KEEP-ERR");
++    o.stdout_path = TMP "/keep_out.txt";
++    o.stderr_path = TMP "/keep_err.txt";
++    EXPECT_RET(mos_spawn_ex(&o), ERR(SYS_ERR_NOTFOUND), "spawn_fail_missing_program_with_sinks");
++    long n = read_text(TMP "/keep_out.txt", buf, sizeof(buf));
++    EXPECT(n == 8 && streq(buf, "KEEP-OUT"), "spawn_fail_keeps_existing_stdout_file", "read %ld: '%s'", n, buf);
++    n = read_text(TMP "/keep_err.txt", buf, sizeof(buf));
++    EXPECT(n == 8 && streq(buf, "KEEP-ERR"), "spawn_fail_keeps_existing_stderr_file", "read %ld: '%s'", n, buf);
++
++    /* Fresh names: not created. */
++    o.stdout_path = TMP "/fresh_out.txt";
++    o.stderr_path = TMP "/fresh_err.txt";
++    EXPECT_RET(mos_spawn_ex(&o), ERR(SYS_ERR_NOTFOUND), "spawn_fail_missing_program_fresh_sinks");
++    EXPECT(!exists(TMP "/fresh_out.txt") && !exists(TMP "/fresh_err.txt"), "spawn_fail_creates_no_files",
++           "out=%d err=%d", exists(TMP "/fresh_out.txt"), exists(TMP "/fresh_err.txt"));
++
++    /* A real program, but stderr cannot be created: stdout untouched/not created. */
++    const char* argv[] = { g_self, "--child", "exit", "0", NULL };
++    o.path = g_self;
++    o.argv = argv;
++    o.stdout_path = TMP "/keep_out.txt";
++    o.stderr_path = TMP "/no_such_dir/err.txt";
++    long r = mos_spawn_ex(&o);
++    EXPECT(r < 0, "spawn_fail_bad_stderr_path_fails", "returned %ld", r);
++    n = read_text(TMP "/keep_out.txt", buf, sizeof(buf));
++    EXPECT(n == 8 && streq(buf, "KEEP-OUT"), "spawn_fail_bad_stderr_keeps_stdout_file", "read %ld: '%s'", n, buf);
++    o.stdout_path = TMP "/fresh_out2.txt";
++    r = mos_spawn_ex(&o);
++    EXPECT(r < 0 && !exists(TMP "/fresh_out2.txt"), "spawn_fail_bad_stderr_creates_no_stdout_file",
++           "returned %ld, exists=%d", r, exists(TMP "/fresh_out2.txt"));
++
++    /* stderr naming a directory: same. */
++    mos_mkdir(TMP "/errdir");
++    o.stdout_path = TMP "/keep_out.txt";
++    o.stderr_path = TMP "/errdir";
++    r = mos_spawn_ex(&o);
++    n = read_text(TMP "/keep_out.txt", buf, sizeof(buf));
++    EXPECT(r < 0 && n == 8 && streq(buf, "KEEP-OUT"), "spawn_fail_stderr_is_directory_keeps_stdout",
++           "returned %ld, read %ld: '%s'", r, n, buf);
++    EXPECT_RET(mos_wait(NULL), ERR(SYS_ERR_NOTFOUND), "spawn_fail_cleanup_leaves_no_children");
++}
++
++/* ============================================ SYS_EXEC and relative paths */
++
++static void test_exec_relative(void) {
++    stage("exec_relative");
++    /* Split our own path into directory and file name. */
++    char dir[512], base[128];
++    size_t len = slen(g_self), cut = 0;
++    for (size_t i = 0; i < len; i++) if (g_self[i] == '/') cut = i;
++    if (cut == 0 || cut + 1 >= len || len - cut > sizeof(base)) {
++        check_pass("exec_relative_path (skipped: unusual program path)");
++        return;
++    }
++    for (size_t i = 0; i < cut; i++) dir[i] = g_self[i];
++    dir[cut] = '\0';
++    scopy(base, sizeof(base), g_self + cut + 1);
++
++    /* In an unrelated directory, a relative name that is nowhere fails. */
++    EXPECT_RET(mos_chdir(TMP), SYS_SUCCESS, "exec_relative_chdir_elsewhere");
++    long r = mos_exec("os0test_no_such_program.run", NULL, 0);
++    EXPECT(r < 0, "exec_relative_missing_fails", "returned %ld", r);
++
++    /* In the program's own directory, the bare name starts it. */
++    mos_wait_result_t res;
++    EXPECT_RET(mos_chdir(dir), SYS_SUCCESS, "exec_relative_chdir_to_program_dir");
++    const char* av[] = { "--child", "exit", "5" };
++    long pid = mos_exec(base, av, 3);
++    long w = pid > 0 ? mos_waitpid(pid, 0, &res) : -1;
++    EXPECT(pid > 0 && w == pid && res.exit_code == 5 && !res.crashed, "exec_relative_name_uses_program_cwd",
++           "exec=%ld wait=%ld exit=%d", pid, w, res.exit_code);
++    pid = mos_exec("./", NULL, 0);
++    EXPECT(pid < 0, "exec_relative_directory_fails", "returned %ld", pid);
++    EXPECT_RET(mos_chdir(g_start_cwd), SYS_SUCCESS, "exec_relative_chdir_back");
++}
++
+ /* ================================================================== main */
+ 
+ int main(int argc, char** argv, char** envp) {
+@@ -1557,6 +1694,9 @@ int main(int argc, char** argv, char** envp) {
+     test_tsc();
+     test_spawn_crash_and_wait();
+     test_spawn_errors();
++    test_bad_pointers();
++    test_spawn_failure_cleanup();
++    test_exec_relative();
+ 
+     stage("cleanup");
+     mos_chdir(g_start_cwd[0] ? g_start_cwd : "0:/");
 -- 
 2.43.0
 

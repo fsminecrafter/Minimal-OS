@@ -7,7 +7,7 @@ to the Minimal-OS-SDK repository. Apply it there, on top of commit `26794ca`:
 
 ```sh
 cd Minimal-OS-SDK
-git am ../patches/Minimal-OS-SDK-os0.patch
+git am ../patches/Minimal-OS-SDK-os0.patch   # several commits
 ```
 
 Then push it, point the `Minimal-OS-SDK` submodule at the new commit, and

@@ -4,7 +4,6 @@
 #include "string.h"
 
 #define PAGE_SIZE 0x1000  // 4 KiB
-#define PMM_LEGACY_CONTIG_ALLOC 0
 
 // ===========================================
 // PMM STATE
@@ -14,9 +13,13 @@
 
 static uintptr_t page_pool_base  = 0;
 static size_t    page_pool_pages = 0;
+static size_t    page_pool_free  = 0;
+// Where the next single-page search starts: everything below it is used.
+static size_t    page_search_hint = 0;
 
-// Bitmap: one bit per page. Max 16384 pages (64MB) = 2KB of bitmap.
-#define PMM_MAX_PAGES 16384
+// One bit per page of the pool. The pool lies inside the identity-mapped
+// 4 GiB, so 2^20 pages (128 KiB of bitmap) covers the largest one.
+#define PMM_MAX_PAGES (1u << 20)
 #define BITMAP_WORDS  ((PMM_MAX_PAGES + 63) / 64)
 static uint64_t page_bitmap[BITMAP_WORDS];  // 0 = free, 1 = used
 
@@ -35,22 +38,18 @@ static inline void pmm_unlock(uint64_t flags) {
     __asm__ volatile("pushq %0; popfq" :: "r"(flags) : "memory", "cc");
 }
 
-// Mark a page index as used
 static inline void pmm_mark_used(size_t idx) {
     page_bitmap[idx / 64] |= (1ULL << (idx % 64));
 }
 
-// Mark a page index as free
 static inline void pmm_mark_free(size_t idx) {
     page_bitmap[idx / 64] &= ~(1ULL << (idx % 64));
 }
 
-// Check if a page index is free
 static inline bool pmm_is_free(size_t idx) {
     return (page_bitmap[idx / 64] & (1ULL << (idx % 64))) == 0;
 }
 
-// Convert page index to pointer
 static inline void* pmm_idx_to_ptr(size_t idx) {
     return (void*)(page_pool_base + idx * PAGE_SIZE);
 }
@@ -79,6 +78,8 @@ void pmm_init(void* base, size_t size) {
 
     page_pool_base  = (uintptr_t)base;
     page_pool_pages = size / PAGE_SIZE;
+    page_pool_free  = page_pool_pages;
+    page_search_hint = 0;
     pmm_spin = 0;
 
     // Clear bitmap — all pages start free
@@ -99,32 +100,58 @@ void pmm_init(void* base, size_t size) {
 // ALLOC / FREE PAGE
 // ===========================================
 
-void* pmm_try_alloc_pages_zeroed(size_t count) {
+// The caller holds the lock. PMM_MAX_PAGES when there is no free page.
+static size_t pmm_find_one(void) {
+    size_t words = (page_pool_pages + 63) / 64;
+    for (size_t w = page_search_hint / 64; w < words; w++) {
+        uint64_t free_bits = ~page_bitmap[w];
+        if (!free_bits) continue;
+        size_t idx = w * 64 + (size_t)__builtin_ctzll(free_bits);
+        if (idx >= page_pool_pages) break;
+        return idx;
+    }
+    return PMM_MAX_PAGES;
+}
+
+// The caller holds the lock. Start of a free run, or PMM_MAX_PAGES.
+static size_t pmm_find_run(size_t count) {
+    size_t run_start = PMM_MAX_PAGES;
+    size_t run_len = 0;
+    for (size_t i = page_search_hint; i < page_pool_pages; i++) {
+        // Skip a full word at once.
+        if ((i % 64) == 0 && page_bitmap[i / 64] == ~0ULL) {
+            run_len = 0;
+            i += 63;
+            continue;
+        }
+        if (pmm_is_free(i)) {
+            if (run_len == 0) run_start = i;
+            if (++run_len == count) return run_start;
+        } else {
+            run_len = 0;
+        }
+    }
+    return PMM_MAX_PAGES;
+}
+
+static void* pmm_take(size_t count, bool zero) {
     if (count == 0 || count > page_pool_pages) return NULL;
     uint64_t flags = pmm_lock();
 
     size_t run_start = PMM_MAX_PAGES;
-    size_t run_len = 0;
-    for (size_t i = 0; i < page_pool_pages; i++) {
-        if (pmm_is_free(i)) {
-            if (run_len == 0) run_start = i;
-            if (++run_len == count) break;
-        } else {
-            run_start = PMM_MAX_PAGES;
-            run_len = 0;
-        }
-    }
-
-    if (run_len < count || run_start == PMM_MAX_PAGES) {
+    if (page_pool_free >= count)
+        run_start = count == 1 ? pmm_find_one() : pmm_find_run(count);
+    if (run_start == PMM_MAX_PAGES) {
         pmm_unlock(flags);
         return NULL;
     }
 
+    // Never hand out the pages the caller is running on (a stack that was
+    // freed while still in use).
     uintptr_t rsp;
     __asm__ volatile("mov %%rsp, %0" : "=r"(rsp));
     uintptr_t page_start = page_pool_base + run_start * PAGE_SIZE;
-    uintptr_t page_end = page_start + count * PAGE_SIZE;
-    if (rsp >= page_start && rsp < page_end) {
+    if (rsp >= page_start && rsp < page_start + count * PAGE_SIZE) {
         pmm_unlock(flags);
         return NULL;
     }
@@ -132,11 +159,25 @@ void* pmm_try_alloc_pages_zeroed(size_t count) {
     for (size_t i = run_start; i < run_start + count; i++) {
         pmm_mark_used(i);
     }
+    page_pool_free -= count;
+    if (run_start == page_search_hint) {
+        size_t next = run_start + count;
+        while (next < page_pool_pages && !pmm_is_free(next)) next++;
+        page_search_hint = next;
+    }
     void* pages = pmm_idx_to_ptr(run_start);
     pmm_unlock(flags);
 
-    memset(pages, 0, count * PAGE_SIZE);
+    if (zero) memset(pages, 0, count * PAGE_SIZE);
     return pages;
+}
+
+void* pmm_try_alloc_pages_zeroed(size_t count) {
+    return pmm_take(count, true);
+}
+
+void* pmm_try_alloc_page(void) {
+    return pmm_take(1, false);
 }
 
 void* alloc_page_zeroed(void) {
@@ -145,7 +186,6 @@ void* alloc_page_zeroed(void) {
     return page;
 }
 
-#if !PMM_LEGACY_CONTIG_ALLOC
 // Allocate N contiguous pages, all zeroed
 void* alloc_pages_zeroed(size_t count) {
     if (count == 0) return NULL;
@@ -179,6 +219,8 @@ void free_page(void* page) {
     memset(page, 0xCC, PAGE_SIZE);
 
     pmm_mark_free(idx);
+    page_pool_free++;
+    if (idx < page_search_hint) page_search_hint = idx;
     pmm_unlock(flags);
 }
 
@@ -189,125 +231,26 @@ void free_pages(void* base, size_t count) {
         free_page((void*)((uintptr_t)base + i * PAGE_SIZE));
     }
 }
-#endif
-
-#if PMM_LEGACY_CONTIG_ALLOC
-/**
- * Allocate multiple contiguous pages (zeroed)
- *
- * This is CRITICAL for DMA buffers that need to be physically contiguous
- *
- * @param num_pages Number of 4KB pages to allocate
- * @return Pointer to first page, or NULL on failure
- */
-void* alloc_pages_zeroed(uint32_t num_pages) {
-    if (num_pages == 0) return NULL;
-
-    // For single page, use existing function
-    if (num_pages == 1) {
-        return alloc_page_zeroed();
-    }
-
-    // Find contiguous run of free pages
-    void* first_page = NULL;
-    uint32_t found_count = 0;
-
-    // Simple linear search (you may want to optimize this)
-    // This assumes your PMM tracks pages somehow
-    // Adjust based on your actual PMM implementation
-
-    extern uint32_t g_total_pages;  // Adjust to your PMM globals
-    extern bool g_page_allocated[];
-
-    for (uint32_t i = 0; i < g_total_pages && found_count < num_pages; i++) {
-        if (!g_page_allocated[i]) {
-            if (found_count == 0) {
-                // Start of potential run
-                first_page = (void*)(uintptr_t)(i * 0x1000);
-            }
-            found_count++;
-
-            if (found_count == num_pages) {
-                // Found enough contiguous pages!
-                // Mark them all as allocated
-                for (uint32_t j = 0; j < num_pages; j++) {
-                    g_page_allocated[i - num_pages + 1 + j] = true;
-                }
-
-                // Zero all pages
-                memset(first_page, 0, num_pages * 0x1000);
-
-                serial_write_str("PMM: Allocated ");
-                serial_write_dec(num_pages);
-                serial_write_str(" contiguous pages at 0x");
-                serial_write_hex((uintptr_t)first_page);
-                serial_write_str("\n");
-
-                return first_page;
-            }
-        } else {
-            // Reset search
-            found_count = 0;
-            first_page = NULL;
-        }
-    }
-
-    serial_write_str("PMM: Failed to allocate ");
-    serial_write_dec(num_pages);
-    serial_write_str(" contiguous pages\n");
-
-    return NULL;
-}
-
-/**
- * Free multiple contiguous pages
- *
- * @param ptr Pointer to first page
- * @param num_pages Number of pages to free
- */
-void free_pages(void* ptr, uint32_t num_pages) {
-    if (!ptr || num_pages == 0) return;
-
-    uintptr_t page_addr = (uintptr_t)ptr;
-
-    // Verify alignment
-    if (page_addr & 0xFFF) {
-        serial_write_str("PMM: free_pages called with unaligned pointer\n");
-        return;
-    }
-
-    extern bool g_page_allocated[];
-
-    // Free each page
-    for (uint32_t i = 0; i < num_pages; i++) {
-        uint32_t page_index = (page_addr / 0x1000) + i;
-        g_page_allocated[page_index] = false;
-    }
-
-    serial_write_str("PMM: Freed ");
-    serial_write_dec(num_pages);
-    serial_write_str(" pages at 0x");
-    serial_write_hex(page_addr);
-    serial_write_str("\n");
-}
-#endif
 
 // ===========================================
 // QUERY
 // ===========================================
 
 size_t pmm_free_pages(void) {
-    uint64_t flags = pmm_lock();
-    size_t free = 0;
-    for (size_t i = 0; i < page_pool_pages; i++) {
-        if (pmm_is_free(i)) free++;
-    }
-    pmm_unlock(flags);
-    return free;
+    return page_pool_free;
+}
+
+size_t pmm_total_pages(void) {
+    return page_pool_pages;
 }
 
 size_t pmm_used_pages(void) {
-    return page_pool_pages - pmm_free_pages();
+    return page_pool_pages - page_pool_free;
+}
+
+bool pmm_owns(const void* ptr) {
+    uintptr_t addr = (uintptr_t)ptr;
+    return addr >= page_pool_base && addr < page_pool_base + page_pool_pages * PAGE_SIZE;
 }
 
 void pmm_stats(void) {
@@ -320,50 +263,4 @@ void pmm_stats(void) {
     serial_write_str("Used KB:     "); serial_write_dec(used * 4);        serial_write_str("\n");
     serial_write_str("Free KB:     "); serial_write_dec(free * 4);        serial_write_str("\n");
     serial_write_str("=================\n");
-}
-
-/*
- * ALTERNATIVE SIMPLER VERSION
- * If your PMM doesn't track individual page allocation,
- * you can use this simplified version:
- */
- 
-void* alloc_pages_zeroed_simple(uint32_t num_pages) {
-    if (num_pages == 0) return NULL;
-    
-    // Allocate pages one at a time and hope they're contiguous
-    // (This is NOT guaranteed to work for large allocations!)
-    void* first = alloc_page_zeroed();
-    if (!first) return NULL;
-    
-    void* current = first;
-    
-    for (uint32_t i = 1; i < num_pages; i++) {
-        void* next = alloc_page_zeroed();
-        if (!next) {
-            // Failed to allocate - free what we got so far
-            for (uint32_t j = 0; j < i; j++) {
-                free_page((uint8_t*)first + (j * 0x1000));
-            }
-            return NULL;
-        }
-        
-        // Check if contiguous
-        if ((uintptr_t)next != (uintptr_t)current + 0x1000) {
-            serial_write_str("PMM WARNING: Non-contiguous pages allocated!\n");
-            serial_write_str("  This may cause DMA issues!\n");
-        }
-        
-        current = next;
-    }
-    
-    return first;
-}
- 
-void free_pages_simple(void* ptr, uint32_t num_pages) {
-    if (!ptr || num_pages == 0) return;
-    
-    for (uint32_t i = 0; i < num_pages; i++) {
-        free_page((uint8_t*)ptr + (i * 0x1000));
-    }
 }

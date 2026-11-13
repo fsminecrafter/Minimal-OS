@@ -139,15 +139,11 @@ uint64_t clock_monotonic_ns(void) {
 }
 
 uint64_t clock_realtime_ns(void) {
+    // One sequence-counter snapshot of date, time and sub-second part, so a
+    // read during the tick's minute/hour carry cannot be torn.
     datetime_t dt;
     uint32_t sub;
-    uint64_t up;
-    int tries = 0;
-    do {
-        up = time_get_uptime_ms();
-        dt = time_get_datetime();
-        sub = time_get_subsecond_ms();
-    } while (up != time_get_uptime_ms() && ++tries < 8);
+    time_get_datetime_snapshot(&dt, &sub, NULL);
 
     int64_t secs = timeconv_unix_from_civil(dt.year, dt.month, dt.day,
                                             dt.hour, dt.minute, dt.second);

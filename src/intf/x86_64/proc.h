@@ -170,6 +170,9 @@ typedef struct process {
     bool wait_record;
     // Ended by kill() rather than by exiting or crashing.
     bool killed;
+    // Owner only: the address space above 4 GiB (uvm.h) - image, main
+    // stack, SYS_VM mappings.
+    struct uvm_space* uvm;
 } process_t;
 
 // The process whose address space `p` runs in: its owner for a thread.

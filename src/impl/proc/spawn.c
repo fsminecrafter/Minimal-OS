@@ -90,15 +90,21 @@ static void sink_free(stdio_sink_t* s) {
 }
 
 // Creates `resolved` afresh (an existing file is replaced) and a sink for it.
-static stdio_sink_t* sink_create(const char* resolved) {
-    if (minimafs_exists(resolved)) {
-        if (minimafs_is_dir(resolved) || !minimafs_delete_file(resolved)) return NULL;
-    }
-    if (!minimafs_create_file(resolved, "text", "txt")) return NULL;
+// *created_new is set when the file did not exist before, so that a failed
+// spawn can remove it again (see proc_spawn). A replaced file's old contents
+// are gone for good: restoring them would mean holding a whole file in memory.
+static stdio_sink_t* sink_create(const char* resolved, bool* created_new) {
+    // Allocate first: nothing on disk is touched when memory is short.
     stdio_sink_t* s = (stdio_sink_t*)alloc(sizeof(stdio_sink_t));
     if (!s) return NULL;
     s->buffer = (uint8_t*)alloc_unzeroed(SINK_CAPACITY);
     if (!s->buffer) { free_mem(s); return NULL; }
+    bool existed = minimafs_exists(resolved);
+    if (existed) {
+        if (minimafs_is_dir(resolved) || !minimafs_delete_file(resolved)) { sink_free(s); return NULL; }
+    }
+    if (!minimafs_create_file(resolved, "text", "txt")) { sink_free(s); return NULL; }
+    if (created_new) *created_new = !existed;
     s->refs = 1;
     strncpy(s->path, resolved, sizeof(s->path) - 1);
     return s;
@@ -201,7 +207,8 @@ static char* cwd_copy(process_t* owner) {
 
 // Length of a NUL-terminated string in the calling program's memory, at
 // most `max` bytes; false when it is not entirely the program's or longer.
-static bool user_strlen(const char* s, size_t max, size_t* out_len) {
+// Also used by the syscall layer (SYS_STAT, SYS_RENAME, SYS_EXEC).
+bool proc_user_strlen(const char* s, size_t max, size_t* out_len) {
     if (!s) return false;
     for (size_t i = 0; i < max; i++) {
         uintptr_t a = (uintptr_t)s + i;
@@ -215,7 +222,7 @@ static bool user_strlen(const char* s, size_t max, size_t* out_len) {
 uint64_t proc_chdir(const char* path) {
     process_t* owner = proc_mem_owner(current_process);
     if (!owner || owner->privilege != PROC_PRIVILEGE_USER) return SYS_ERR_PERM;
-    if (!user_strlen(path, MINIMAFS_MAX_PATH, NULL)) return SYS_ERR_INVAL;
+    if (!proc_user_strlen(path, MINIMAFS_MAX_PATH, NULL)) return SYS_ERR_INVAL;
     char* resolved = (char*)alloc_unzeroed(MINIMAFS_MAX_PATH);
     if (!resolved) return SYS_ERR_NOMEM;
     if (!proc_resolve_path(owner, path, resolved)) { free_mem(resolved); return SYS_ERR_INVAL; }
@@ -499,7 +506,7 @@ static bool pack_user_strings(const char* const* list, uint64_t count, bool coun
             break;
         }
         size_t len;
-        if (!user_strlen(s, SPAWN_MAX_BLOCK, &len)) return false;
+        if (!proc_user_strlen(s, SPAWN_MAX_BLOCK, &len)) return false;
         total += len + 1;
         if (total > SPAWN_MAX_BLOCK) return false;
         n++;
@@ -534,10 +541,23 @@ static const char** unpack_strings(const char* packed, uint32_t len, uint32_t co
     return v;
 }
 
+// True when the directory a resolved path ("N:/dir/file") lies in exists.
+static bool parent_dir_exists(const char* path) {
+    char parent[MINIMAFS_MAX_PATH];
+    size_t n = strlen(path);
+    if (n >= sizeof(parent)) return false;
+    memcpy(parent, path, n + 1);
+    char* slash = strrchr(parent, '/');
+    if (!slash) return false;
+    if (slash > parent && slash[-1] == ':') return true;   // "N:/file": the root
+    *slash = '\0';
+    return minimafs_is_dir(parent);
+}
+
 // A sink for a stdout/stderr path of the request (resolved against the
 // caller's working directory).
 static bool resolve_user_path(process_t* proc, const char* user_path, char* resolved) {
-    if (!user_strlen(user_path, MINIMAFS_MAX_PATH, NULL)) return false;
+    if (!proc_user_strlen(user_path, MINIMAFS_MAX_PATH, NULL)) return false;
     return proc_resolve_path(proc, user_path, resolved);
 }
 
@@ -561,6 +581,8 @@ uint64_t proc_spawn(const syscall_spawn_t* request) {
     const char** argv = NULL;
     stdio_sink_t* out_sink = NULL;
     stdio_sink_t* err_sink = NULL;
+    char* inherited_cwd = NULL;
+    bool out_created = false, err_created = false;
     uint32_t argv_len = 0, argc = 0, env_len = 0;
     if (!scratch) return SYS_ERR_NOMEM;
     char* path = scratch;
@@ -595,7 +617,6 @@ uint64_t proc_spawn(const syscall_spawn_t* request) {
     if ((size_t)argv_len + env_len > SPAWN_MAX_BLOCK) goto done;
 
     // Working directory: the given one (must be a directory), or the caller's.
-    char* inherited_cwd = NULL;
     if (r.cwd) {
         if (!resolve_user_path(self, r.cwd, cwd)) goto done;
         const char* colon = strchr(cwd, ':');
@@ -605,21 +626,33 @@ uint64_t proc_spawn(const syscall_spawn_t* request) {
         inherited_cwd = cwd_copy(owner);
     }
 
-    // Output: new files, or wherever the caller's output goes.
+    // Output paths: resolve and check everything that can be checked now.
+    // The files themselves are only created right before the launch, so a
+    // spawn that fails for any reason found above leaves the filesystem alone.
     if (r.stdout_path) {
-        if (!resolve_user_path(self, r.stdout_path, out_path)) { free_mem(inherited_cwd); goto done; }
-        out_sink = sink_create(out_path);
-        if (!out_sink) { free_mem(inherited_cwd); result = SYS_ERR_GENERIC; goto done; }
+        if (!resolve_user_path(self, r.stdout_path, out_path)) goto done;
+        if (minimafs_exists(out_path) && minimafs_is_dir(out_path)) { result = SYS_ERR_GENERIC; goto done; }
+        if (!parent_dir_exists(out_path)) { result = SYS_ERR_NOTFOUND; goto done; }
+    }
+    if (r.stderr_path) {
+        if (!resolve_user_path(self, r.stderr_path, err_path)) goto done;
+        if (minimafs_exists(err_path) && minimafs_is_dir(err_path)) { result = SYS_ERR_GENERIC; goto done; }
+        if (!parent_dir_exists(err_path)) { result = SYS_ERR_NOTFOUND; goto done; }
+    }
+
+    // Create the sinks (the last step before the launch).
+    if (r.stdout_path) {
+        out_sink = sink_create(out_path, &out_created);
+        if (!out_sink) { result = SYS_ERR_GENERIC; goto done; }
     } else {
         out_sink = sink_get(owner->out_sink);
     }
     if (r.stderr_path) {
-        if (!resolve_user_path(self, r.stderr_path, err_path)) { free_mem(inherited_cwd); goto done; }
         if (r.stdout_path && strcmp(err_path, out_path) == 0) {
             err_sink = sink_get(out_sink);
         } else {
-            err_sink = sink_create(err_path);
-            if (!err_sink) { free_mem(inherited_cwd); result = SYS_ERR_GENERIC; goto done; }
+            err_sink = sink_create(err_path, &err_created);
+            if (!err_sink) { result = SYS_ERR_GENERIC; goto done; }
         }
     } else {
         err_sink = sink_get(owner->err_sink);
@@ -639,12 +672,21 @@ uint64_t proc_spawn(const syscall_spawn_t* request) {
     launch.wait_record = true;
     out_sink = err_sink = NULL;
     process_t* child = run_launch_ex(&launch);
-    if (inherited_cwd) free_mem(inherited_cwd);
     result = child ? child->pid : SYS_ERR_GENERIC;
 
 done:
+    if (inherited_cwd) free_mem(inherited_cwd);
     if (out_sink) stdio_sink_put(out_sink);
     if (err_sink) stdio_sink_put(err_sink);
+    // A spawn that failed after creating its output files takes them back
+    // (the sinks were released above, with nothing buffered, so nothing is
+    // appended afterwards). Limit: a file that already existed was replaced
+    // by an empty one before the launch and its old contents are not
+    // restored; only files this spawn newly created are removed.
+    if ((int64_t)result < 0) {
+        if (out_created) minimafs_delete_file(out_path);
+        if (err_created) minimafs_delete_file(err_path);
+    }
     if (argv) free_mem((void*)argv);
     if (argv_packed) free_mem(argv_packed);
     if (env) free_mem(env);

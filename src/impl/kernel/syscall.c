@@ -870,9 +870,29 @@ static uint64_t sys_random_impl(void* buf, uint64_t len) {
     return len;
 }
 
+// spawn.c: length of a NUL-terminated string entirely inside the calling
+// program's memory (at most `max` bytes).
+bool proc_user_strlen(const char* s, size_t max, size_t* out_len);
+
+// Biggest single argv string SYS_EXEC accepts from a program.
+#define SYS_EXEC_MAX_ARG_LEN (64u * 1024u)
+
 static uint64_t sys_exec_impl(const char* path, const char** argv, uint64_t argc) {
     if (!path) { serial_write_str("SYS_EXEC: missing path\n"); return SYS_ERR_INVAL; }
     if (argc > 16) { serial_write_str("SYS_EXEC: too many args\n"); return SYS_ERR_INVAL; }
+
+    // A program's path, argv array and every argv string must be its own
+    // memory (the kernel reads them below and in the launch).
+    if (isCurrentProcessUser()) {
+        if (!proc_user_strlen(path, MINIMAFS_MAX_PATH, NULL)) return SYS_ERR_INVAL;
+        if (argc) {
+            if (!argv || !user_range_ok(argv, argc * sizeof(char*), false)) return SYS_ERR_INVAL;
+            for (uint64_t i = 0; i < argc; i++) {
+                const char* a = argv[i];
+                if (a && !proc_user_strlen(a, SYS_EXEC_MAX_ARG_LEN, NULL)) return SYS_ERR_INVAL;
+            }
+        }
+    }
 
     serial_write_str("SYS_EXEC: request path=");
     serial_write_str(path);
@@ -881,7 +901,22 @@ static uint64_t sys_exec_impl(const char* path, const char** argv, uint64_t argc
     serial_write_str("\n");
 
     char normalized[MINIMAFS_MAX_PATH];
-    if (!run_normalize_path(path, normalized, sizeof(normalized))) {
+    if (isCurrentProcessUser()) {
+        // Relative paths are the program's own (its working directory), like
+        // SYS_SPAWN. A program started from the root (what run_normalize_path
+        // always assumed) is still found: when nothing is at the resolved
+        // path and the input has no drive, fall back to "0:/<path>".
+        if (!proc_resolve_path(current_process, path, normalized)) {
+            serial_write_str("SYS_EXEC: invalid path\n");
+            return SYS_ERR_INVAL;
+        }
+        if ((!minimafs_exists(normalized) || minimafs_is_dir(normalized)) && !strchr(path, ':')) {
+            char fallback[MINIMAFS_MAX_PATH];
+            if (run_normalize_path(path, fallback, sizeof(fallback)) &&
+                minimafs_exists(fallback) && !minimafs_is_dir(fallback))
+                strcpy(normalized, fallback);
+        }
+    } else if (!run_normalize_path(path, normalized, sizeof(normalized))) {
         serial_write_str("SYS_EXEC: invalid path\n");
         return SYS_ERR_INVAL;
     }
@@ -911,7 +946,10 @@ static uint64_t sys_exec_impl(const char* path, const char** argv, uint64_t argc
 
 static uint64_t sys_stat_impl(const char* path, syscall_stat_t* out) {
     if (!path || !out) return SYS_ERR_INVAL;
-    if (isCurrentProcessUser() && !user_range_ok(out, sizeof(*out), true)) return SYS_ERR_INVAL;
+    if (isCurrentProcessUser() &&
+        (!user_range_ok(out, sizeof(*out), true) ||
+         !proc_user_strlen(path, MINIMAFS_MAX_PATH, NULL)))
+        return SYS_ERR_INVAL;
     char resolved[MINIMAFS_MAX_PATH];
     if (!syscall_resolve_path(path, resolved)) return SYS_ERR_INVAL;
     minimafs_stat_t st;
@@ -931,6 +969,10 @@ static uint64_t sys_stat_impl(const char* path, syscall_stat_t* out) {
 
 static uint64_t sys_rename_impl(const char* from, const char* to) {
     if (!from || !to) return SYS_ERR_INVAL;
+    if (isCurrentProcessUser() &&
+        (!proc_user_strlen(from, MINIMAFS_MAX_PATH, NULL) ||
+         !proc_user_strlen(to, MINIMAFS_MAX_PATH, NULL)))
+        return SYS_ERR_INVAL;
     char* paths = (char*)alloc_unzeroed(2u * MINIMAFS_MAX_PATH);
     if (!paths) return SYS_ERR_NOMEM;
     char* a = paths;

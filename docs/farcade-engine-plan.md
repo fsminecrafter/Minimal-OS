@@ -17,17 +17,19 @@ decisions:
 
 ### Where Minimal-OS stands today (the facts that shape this plan)
 
+Updated after OS-0 to OS-5 (see the status list under Part A). Everything in the "Today" column has only run in QEMU, not on real hardware.
+
 | Area | Today | What it means for the engine |
 | --- | --- | --- |
-| 3D | FGPU (`SYS_GPU` 40) runs **in the kernel under one global lock**. The CPU backend is a scalar raster with a parallel barrier on every draw and a bytecode interpreter (8 lanes, SSE). It has no MRT, mips, compute, SSBOs, scissor, instancing or integer formats. | The CPU backend *is* the renderer on QEMU, Intel and AMD, so it needs a JIT, binning and FGPU v3. |
+| 3D | FGPU (`SYS_GPU` 40) runs in the kernel with a context per program and one render lock. The CPU backend has a tile-binning rasterizer, an x86 shader JIT (SSE4.1 and AVX2) and asynchronous submits with fences. It still has **no MRT, mips, compute, SSBOs, scissor, instancing or integer formats** (OS-6 and OS-7). | The CPU backend *is* the renderer on QEMU, Intel and AMD. The engine starts at FL0; mips, scissor and MRT wait for OS-6. |
 | NVIDIA | Turing GSP-RM and copy engine work on an RTX 2060. The 3D engine and SASS compiler aren't proven on a card yet. | A bonus path, not a dependency. |
-| CPU | SSE2 only (no `CR4.OSXSAVE`, so AVX faults). **All of a program's threads are pinned to one core** (`proc_create_thread`, `src/impl/proc/proc.c:700`). | Kernel work is needed for AVX and multicore. SSE4.1 already works on `-cpu host`/`max`. |
-| Memory | `malloc` is a syscall per call into the kernel heap below 4 GiB (identity-mapped, no NX). There is no mmap. ELF ≤16 MiB, image ≤64 MiB, a 64 KiB stack with no guard page, and a 64 MiB page pool that panics when empty. | The engine needs its own allocator now; GCC on the OS needs virtual-memory work. |
-| Runtime | No libc, libm, STL or `operator new`. Static PIE with RELATIVE relocations only (so no ifunc). | Port mlibc, add a GCC `x86_64-minimalos` target, and dispatch SIMD by hand. |
+| CPU | **AVX and AVX2 work** (XSAVE state saving, OS-2; AVX-512 untested). **A program's threads run on all cores** (OS-3), with affinity and priority calls. One intermittent kernel crash in the thread tests is still open. | The job system can use every core. AVX2 code paths are picked by hand at startup (no ifunc). |
+| Memory | Programs live above 4 GiB with `SYS_VM` (map, unmap, protect, decommit; demand-zero pages, NX, guard pages). ELF files up to 256 MiB are streamed in, the main stack is 8 MiB (configurable), and the page pool is sized from RAM, including RAM above 4 GiB. The SDK's own `malloc` is still one syscall per call. | The engine's allocator sits on `SYS_VM`. GCC on the OS has the address space it needs. |
+| Runtime | TLS, futex, clocks, spawn/wait and the environment exist (OS-0). The SDK's C library is still tiny: no libm, STL or `operator new`. Static PIE with RELATIVE relocations only (so no ifunc). | Until mlibc is ported, the engine carries a small C/C++ runtime of its own (`runtime/minimalos` in the engine repo). |
 | On-OS tools | Nothing compiles or interprets on the OS except the FGSL compiler and Mxplorer's JS. | The native toolchain is on the critical path. |
-| Display/input/audio | Copy-based present (about 4 copies per frame through mosWM), no vsync. USB HID boot keyboard and mouse only, no hubs or gamepads. 8 PCM16 kernel-mixed streams. | Shared surfaces, scaled present and gamepads go on the OS track. |
-| Files | MinimaFS: 32-bit offsets, no mtime/rename/chdir, `0:/` paths. | Content-hash builds; pak parts of at most 2 GiB. |
-| Licence | OS, SDK and MOSdesk are GPLv3. `farcadegl.h`, `fglsl.h` and `crt0.c` get compiled into every game. | **Decide before release:** relicense the SDK runtime files (MIT, or GPL plus a linking exception). |
+| Display/input/audio | Full-screen present is one copy, straight to the framebuffer, scaled 1x to 3x and paced by a timer (no vsync). Window frames can be shared with the window manager (OS-5), but mosWM's use of them is untested. USB HID boot keyboard and mouse only, no hubs or gamepads. 8 PCM16 kernel-mixed streams. | The editor runs full screen first and in a window after the desktop test. Gamepads are on the OS track (OS-8). |
+| Files | MinimaFS: 32-bit offsets, no modification times. `stat`, `rename`, `chdir` and `/` paths exist (OS-0). File reads are synchronous. | Content-hash builds; pak parts of at most 2 GiB; streaming reads on their own thread. |
+| Licence | OS, SDK, MOSdesk and the engine repository are GPLv3. `farcadegl.h`, `fglsl.h` and `crt0.c` get compiled into every game. | **Decide before release:** relicense the runtime files (MIT, or GPL plus a linking exception). |
 
 ---
 
@@ -261,6 +263,29 @@ For distant rings, each world cell has a **baked proxy**: one merged voxel/clust
 - **2-core QEMU+KVM, FL0/FL1-low, 640×360 → 720p at 30 fps:** ≈53 of 66 core-ms.
 - **FL0 on today's kernel, before OS-4:** demo quality only (about 10–20 fps at 640×480 for small scenes).
 
+#### C4.8 Streaming: maps, objects and textures
+One streaming system serves all three. It reads only cooked paks (never `.mof` or source files), on its own I/O thread with decode jobs, and nothing in it blocks a frame. Each pool has a fixed memory budget; what is loaded is decided by priority, and the lowest priority is evicted first.
+
+- **Maps (the world):**
+  - The world is cut into 32 m cells (C3). A cell holds its entity list (instances, lights, script references), collision and a navigation tile.
+  - Cells load in a ring around the camera, widened in the direction of travel, with hysteresis so a player on a border does not make cells flap. States: unloaded, loading, active, asleep.
+  - Things that must always exist (the player, game rules, the sky) live in an always-loaded layer.
+  - Beyond the loaded ring the cell proxies of C4.4 are drawn, so an unloaded cell never disappears from view.
+- **Objects:**
+  - Every asset has a small record that is always in memory (bounds, material ids, its coarsest LOD or voxel root) and a payload that streams: CLOD pages (C4.2), voxel bricks (C4.3), collision meshes, animation clips, audio.
+  - Pages are requested by projected error, so detail arrives where it is visible. The top levels stay resident, so there is always something to draw.
+- **Textures:**
+  - The cooker writes each texture as a mip chain: a small resident tail (64x64 and below, stored with the material) plus one chunk per larger mip.
+  - What to load comes from the texel density on screen: computed on the CPU per cluster or instance at FL0, read from a feedback pass at FL1 and up.
+  - **FL0 (today's GPU interface: no mips):** a texture streams in whole steps. Its surface is rebuilt at the next size (64, 256, 1024) and swapped when the upload is done.
+  - **FL1 (OS-6: mips and trilinear):** mips stream one at a time, with the lowest loaded mip clamped and faded in.
+  - **FL2 (stretch):** virtual textures with sparse pages.
+- **Budgets (starting values):** geometry 256 MB on a desktop and 64 MB in a VM (C4.2); textures 512 MB and 96 MB; cell data 64 MB and 16 MB.
+- **Pak layout for streaming:** chunks aligned to 64 KiB, each compressed on its own (zstd, LZ4 for the hot path), with neighbours in the world stored next to each other so one read brings several.
+- **In the editor:** a streaming overlay (what is loaded, queued and evicted, per pool), and a "keep loaded" flag per asset.
+- **What it needs from the OS:** threads on all cores (done), file reads that do not hold up other threads (a dedicated I/O thread is enough today), mips (OS-6), and later faster storage paths (OS-8).
+- **When:** the pak reader and the asynchronous loader come with E1. Map and object streaming come with E5, FL0 texture steps with E5, and per-mip streaming with E7.
+
 ### C5. Scripting: Lua 5.4 and C++ in one project
 - **How mixing works:** both languages register into the same flecs world, through the same reflection.
   - C++ components: `struct Health { float hp, max; }; FE_REFLECT(Health, (hp,f32), (max,f32));`. They appear automatically in Lua (`e:get(Health).hp`) and in the inspector.
@@ -340,6 +365,8 @@ MyGame/
    - **C++:** the native `msdk` compiles the module and statically links `libfe.a` + `liblua.a` into `main.elf`, then wraps it in a MINIRUN1 `.run`.
 4. Package the `.run` + paks as an `.mpkg` / Deliver package. It installs to `0:/programs/<Game>.run` + `0:/games/<Game>/`, with a MOSdesk icon (from `Resources/icon.bmp`).
 5. "Run standalone" spawns the exported game as its own process.
+
+**The runtime.** There is one engine runtime, `libfe` (renderer, ECS, physics, audio, Lua, streaming). It is not installed separately on the player's machine: every exported game carries it inside its own `.run`. A Lua-only game is the prebuilt player (`feplayer`, which is `libfe` plus a `main`) next to the game's paks; a game with C++ code is linked with `libfe.a` into its own binary. The editor links the same library, which is what "Play" runs.
 
 ---
 

@@ -176,6 +176,13 @@ rasterizer (one barrier per draw, scalar); the kernel does this with the `fgpuol
 boot flag (GRUB entry "Minimal-OS (RamFS, fgpuold)", two above the last entry).
 The host benchmark (`make bench-fgpu`) and the differential tests use the switch.
 
+**Helpers.** The parallel phases run on `smp_par` (`smp_par.h`): the calling core
+plus one preemptible kernel process `smp-par` per other core (not the master core),
+woken for each job. A busy core's helper starts at its next tick and the scheduler
+shares the core with programs; parts nobody took are done by the caller. The boot
+flag `smpparipi` brings back the older helpers, which run inside an IPI handler with
+interrupts off until the job ends.
+
 **One pass for everyone.** The kernel keeps a single pass, used under the render
 lock (see "Objects and contexts" above). The pass itself keeps its scratch in the
 pass, but the batch buffers in `fgpu_raster.c` are still static per worker, so two

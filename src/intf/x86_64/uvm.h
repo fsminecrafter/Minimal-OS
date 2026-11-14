@@ -17,8 +17,10 @@
  * kernel heap below 4 GiB.
  *
  * Threads share their owner's space; every function here takes any member
- * of the group. A group runs on one CPU, so page-table changes are only
- * flushed on the CPU that makes them.
+ * of the group. Threads of a group may run on several CPUs at once: every
+ * change that removes or reduces access is flushed on all CPUs that have
+ * the space loaded (tlb.h) before the frames behind it are reused and
+ * before the call returns.
  */
 
 struct process;
@@ -83,6 +85,18 @@ bool uvm_copy_out(struct process* proc, uint64_t addr, void* dst, size_t len);
 // Page-fault entry (isr_handlers.c). True when the fault was a first touch
 // of a mapped page and is now resolved: the instruction can run again.
 bool uvm_handle_fault(uint64_t fault_address, uint64_t error_code);
+
+// Scheduler hook (interrupts off): this CPU is about to load `to`'s page
+// tables after `from`'s. Keeps each space's mask of CPUs that may have it
+// loaded (the CPUs a TLB shootdown has to reach, tlb.h).
+void uvm_cpu_switch(struct process* from, struct process* to);
+
+// Flushes [start, end) on every CPU that may have the space loaded.
+void uvm_flush_range(struct process* proc, uint64_t start, uint64_t end);
+
+// A page fault on kernel-heap memory below 4 GiB made by a program: true
+// when it was a stale TLB entry (proc.c).
+bool proc_heap_stale_fault(struct process* proc, uint64_t fault_address, uint64_t error_code);
 
 // Bytes of frames a space holds, and bytes it has mapped.
 uint64_t uvm_committed_bytes(struct process* proc);

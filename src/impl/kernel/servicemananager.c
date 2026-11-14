@@ -246,6 +246,7 @@ static bool service_script_run_path(const char* script, char* out, size_t out_si
 // those commands do not provide a process pid for service monitoring.
 static void service_run_and_wait(service_entry_t* svc) {
     process_t* proc = NULL;
+    uint64_t service_pid = 0;
     char target_path[MINIMAFS_MAX_PATH];
     const char* raw_path = NULL;
 
@@ -294,7 +295,7 @@ static void service_run_and_wait(service_entry_t* svc) {
         const char* resolved = run_normalize_path(raw_path, normalized, sizeof(normalized));
         if (resolved) {
             // Services launched this way take no arguments today.
-            proc = run_launch_file(resolved, 0, NULL);
+            proc = run_launch_file_pid(resolved, 0, NULL, &service_pid);
         }
     }
 
@@ -308,10 +309,10 @@ static void service_run_and_wait(service_entry_t* svc) {
     serial_write_str("[SERVICES] '");
     serial_write_str(service_display_name(svc));
     serial_write_str("' started (PID ");
-    serial_write_dec(proc->pid);
+    serial_write_dec(service_pid);
     serial_write_str(")\n");
 
-    thread_join(proc->pid);
+    thread_join(service_pid);
 
     serial_write_str("[SERVICES] '");
     serial_write_str(service_display_name(svc));

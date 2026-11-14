@@ -979,10 +979,13 @@ typedef struct {
 // THREADS (SYS_THREAD)
 // ---------------------------------------------------------------------------
 // rdi = operation, rsi = argument. A thread runs in its program's memory
-// (same heap, same globals) on a stack the program provides, on the same
-// CPU as the program. It ends with SYS_EXIT (that thread only); the
-// program exiting ends all its threads, and a crash in any thread ends
-// the whole program. The SDK's thread.h wraps this.
+// (same heap, same globals) on a stack the program provides. Threads of a
+// program run in parallel on different CPUs: a new thread goes to the least
+// loaded CPU its affinity allows, and the scheduler may move it later (the
+// 'threads1cpu' boot flag keeps all of a program's threads on one CPU, see
+// SYS_THREAD_INFO). It ends with SYS_EXIT (that thread only); the program
+// exiting ends all its threads, and a crash in any thread ends the whole
+// program. The SDK's thread.h wraps this.
 #define SYS_THREAD 47
 
 #define SYS_THREAD_CREATE 1u   // rsi = syscall_thread_t*: returns the thread id
@@ -1011,6 +1014,39 @@ typedef struct {
                                // sets to 0 and wakes (all SYS_FUTEX waiters) once
                                // the thread has ended and left its stack
 } syscall_thread_ex_t;
+
+// Affinity, priority and CPU queries (threads of the calling program, or the
+// caller itself with id 0). The CPU count is SYS_SYSINFO_CORE_COUNT.
+//   SYS_THREAD_SET_AFFINITY: rsi = thread id (0 = caller), rdx = CPU mask,
+//       bit n = CPU n; 0 = any CPU. SYS_ERR_INVAL when the mask names no
+//       online CPU or the thread is not the caller's; SYS_ERR_PERM when the
+//       kernel pins threads ('threads1cpu'). Takes effect at once: a thread
+//       running on a CPU outside the mask moves.
+//   SYS_THREAD_GET_AFFINITY: rsi = thread id (0 = caller): the mask (all
+//       online CPUs when unrestricted), or a SYS_ERR_* value (negative).
+//   SYS_THREAD_SET_PRIORITY: rsi = thread id (0 = caller), rdx =
+//       SYS_THREAD_PRIO_*: the best scheduler level the thread may run at.
+//       HIGH (the default) starts at the interactive level and is demoted
+//       while it uses its whole time slice; NORMAL and LOW never run above
+//       that level, so they only get a CPU when higher levels on it are
+//       idle (LOW runs only when nothing else on its CPU wants it, except
+//       for the periodic anti-starvation boost). New threads inherit the
+//       creating thread's priority and affinity.
+//   SYS_THREAD_GET_PRIORITY: rsi = thread id (0 = caller).
+//   SYS_THREAD_GET_CPU: the CPU the calling thread runs on right now.
+//   SYS_THREAD_INFO: flag bits, SYS_THREAD_INFO_*.
+#define SYS_THREAD_SET_AFFINITY 6u
+#define SYS_THREAD_GET_AFFINITY 7u
+#define SYS_THREAD_SET_PRIORITY 8u
+#define SYS_THREAD_GET_PRIORITY 9u
+#define SYS_THREAD_GET_CPU      10u
+#define SYS_THREAD_INFO         11u
+
+#define SYS_THREAD_PRIO_HIGH   0u
+#define SYS_THREAD_PRIO_NORMAL 1u
+#define SYS_THREAD_PRIO_LOW    2u
+
+#define SYS_THREAD_INFO_MULTICORE (1u << 0)   // threads run on any CPU (not pinned)
 
 // ---------------------------------------------------------------------------
 // WHAT A C LIBRARY NEEDS: futex, clocks, stat/rename, working directory,

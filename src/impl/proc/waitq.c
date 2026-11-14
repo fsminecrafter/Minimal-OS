@@ -6,6 +6,7 @@
 #include "x86_64/proc.h"
 #include "x86_64/scheduler.h"
 #include "x86_64/spinlock.h"
+#include "x86_64/tlb.h"
 #include "x86_64/syscall.h"
 #include "time.h"
 
@@ -43,6 +44,7 @@ static void waitq_unlink_locked(waitq_bucket_t* b, waitq_waiter_t* w) {
 // interrupts off across schedule()).
 static inline void waitq_raw_lock(waitq_bucket_t* b) {
     while (__sync_lock_test_and_set(&b->lock.locked, 1)) {
+        tlb_poll();
         __asm__ volatile("pause" ::: "memory");
     }
 }

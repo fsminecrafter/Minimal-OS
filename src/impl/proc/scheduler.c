@@ -24,6 +24,7 @@
 #include "x86_64/boot_options.h"
 #include "x86_64/waitq.h"
 #include "x86_64/spawn.h"
+#include "x86_64/tlb.h"
 
 #define SCHED_DEBUG 0   // 0 = off, 1 = important, 2 = verbose
 
@@ -73,6 +74,9 @@ void scheduler_set_fs_base(process_t* self, uint64_t value) {
 static void switch_to(process_t* current, process_t* next) {
     next->on_cpu = 1;
     load_fs_base_for(next);
+    // Keeps each address space's mask of CPUs that have it loaded (the
+    // CPUs a TLB shootdown has to reach).
+    uvm_cpu_switch(current, next);
     context_switch(current, next, current ? &current->on_cpu : NULL);
 }
 
@@ -148,10 +152,21 @@ static process_t* rq_pop(percpu_runqueue_t* rq, uint32_t level) {
     return proc;
 }
 
-static process_t* rq_pop_highest(percpu_runqueue_t* rq) {
+// The best queued process that no CPU is still switching away from (a
+// process another CPU queued for us while its registers and stack are
+// still live over there must wait; `self` is the one running here).
+static process_t* rq_pop_runnable(percpu_runqueue_t* rq, process_t* self) {
     for (uint32_t level = 0; level < SCHED_NUM_LEVELS; level++) {
-        process_t* proc = rq_pop(rq, level);
-        if (proc) return proc;
+        process_t* prev = NULL;
+        for (process_t* p = rq->head[level]; p; prev = p, p = p->rq_next) {
+            if (p->on_cpu && p != self) continue;
+            if (prev) prev->rq_next = p->rq_next;
+            else      rq->head[level] = p->rq_next;
+            if (rq->tail[level] == p) rq->tail[level] = prev;
+            rq->count[level]--;
+            p->rq_next = NULL;
+            return p;
+        }
     }
     return NULL;
 }
@@ -162,19 +177,58 @@ static uint32_t rq_total(percpu_runqueue_t* rq) {
     return total;
 }
 
-static uint32_t pick_least_loaded_cpu(void) {
+// Affinity: a mask of CPUs the process may run on (0 = any).
+bool scheduler_cpu_allowed(const process_t* p, uint32_t cpu) {
+    if (!p || !p->affinity) return true;
+    return cpu < 64 && ((p->affinity >> cpu) & 1u);
+}
+
+// What a CPU has to do: programs (at any level, a busy one sinks to the
+// background level) and kernel processes above the background level, queued
+// or running. A kernel process spinning at the background level (the boot
+// core's idle loop, a polling driver) yields to any user work, so it does
+// not make its CPU look busy.
+static bool counts_as_load(const process_t* p, uint32_t level) {
+    if (!p || scheduler_is_idle_process(p)) return false;
+    return p->privilege == PROC_PRIVILEGE_USER || level < SCHED_LEVEL_BACKGROUND;
+}
+
+static uint32_t cpu_load(uint32_t cpu, const process_t* discount) {
+    uint32_t load = 0;
+    uint64_t flags = spinlock_acquire(&g_runqueues[cpu].lock);
+    for (uint32_t level = 0; level < SCHED_NUM_LEVELS; level++)
+        for (process_t* p = g_runqueues[cpu].head[level]; p; p = p->rq_next)
+            if (counts_as_load(p, level)) load++;
+    spinlock_release(&g_runqueues[cpu].lock, flags);
+    process_t* running = smp_current_process_for_cpu(cpu);
+    if (running && running != discount && running->state == PROCESS_RUNNING &&
+        counts_as_load(running, running->sched_level))
+        load++;
+    return load;
+}
+
+static uint32_t pick_least_loaded_cpu_for(const process_t* proc, const uint32_t* group_on_cpu) {
+    // A thread is usually created by a thread of its own program that then
+    // waits for it (join): do not count the creator as load, or its CPU
+    // looks as busy as one that is about to run a new worker.
+    const process_t* discount = (proc && proc->mem_owner && current_process &&
+                                 proc_mem_owner(current_process) == proc->mem_owner)
+                                    ? current_process : NULL;
     uint32_t online = smp_online_cpu_count();
     if (online == 0) online = 1;
     if (online > MAX_CPUS) online = MAX_CPUS;
 
     uint32_t best_cpu = 0;
     uint32_t best_load = 0xFFFFFFFFu;
+    bool any_allowed = false;
+    for (uint32_t cpu = 0; cpu < online; cpu++)
+        if (scheduler_cpu_allowed(proc, cpu)) any_allowed = true;
 
     for (uint32_t cpu = 0; cpu < online; cpu++) {
-        uint64_t flags = spinlock_acquire(&g_runqueues[cpu].lock);
-        uint32_t load = rq_total(&g_runqueues[cpu]);
-        spinlock_release(&g_runqueues[cpu].lock, flags);
-
+        if (any_allowed && !scheduler_cpu_allowed(proc, cpu)) continue;
+        // Threads of one program first spread over the CPUs, whatever else
+        // runs there; the load only breaks ties.
+        uint32_t load = cpu_load(cpu, discount) + (group_on_cpu ? group_on_cpu[cpu] * 64u : 0u);
         if (load < best_load) {
             best_load = load;
             best_cpu = cpu;
@@ -183,12 +237,71 @@ static uint32_t pick_least_loaded_cpu(void) {
     return best_cpu;
 }
 
+static inline uint32_t prio_level(const process_t* p) {
+    return p->sched_prio < SCHED_NUM_LEVELS ? p->sched_prio : SCHED_NUM_LEVELS - 1;
+}
+
+// An idle AP only looks at its run queue at its next tick (up to 1 ms
+// away); work that arrives for it gets an IPI so it starts at once.
+static void kick_if_idle(uint32_t cpu) {
+    if (cpu >= MAX_CPUS || smp_is_master_core_id(cpu) || !g_cpus[cpu].online) return;
+    if (cpu == smp_current_cpu_id()) return;
+    process_t* cur = smp_current_process_for_cpu(cpu);
+    if (!cur || scheduler_is_idle_process(cur)) smp_send_resched(cpu);
+}
+
+// Queues a not-yet-queued process on `cpu`. With require_ready the push is
+// skipped (false) when it was killed meanwhile: checked under the queue's
+// lock, which kill()'s state change takes too.
+static bool enqueue_on(process_t* proc, uint32_t cpu, bool require_ready) {
+    percpu_runqueue_t* rq = &g_runqueues[cpu];
+    uint64_t flags = spinlock_acquire(&rq->lock);
+    bool ok = !require_ready || proc->state == PROCESS_READY;
+    if (ok) {
+        proc->sched_level = prio_level(proc);
+        proc->sched_ticks_used = 0;
+        proc->sched_cpu = cpu;
+        rq_push(rq, proc, proc->sched_level);
+    }
+    spinlock_release(&rq->lock, flags);
+    if (ok) kick_if_idle(cpu);
+    return ok;
+}
+
+void scheduler_start_thread(process_t* t, process_t* owner) {
+    if (!t) return;
+    process_state_t expected = PROCESS_PAUSED;
+    // Killed while it was being set up: stays dead, never queued.
+    if (!__atomic_compare_exchange_n(&t->state, &expected, PROCESS_READY, false,
+                                     __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
+        return;
+    uint32_t cpu;
+    if (kernel_boot_threads_multicore && owner && owner->sched_cpu < MAX_CPUS) {
+        // How many live threads (and the owner) of the program each CPU
+        // already has, not counting the creating thread: it usually waits.
+        uint32_t group[MAX_CPUS];
+        memset(group, 0, sizeof(group));
+        uint64_t lf = scheduler_lock();
+        for (process_t* p = proc_list_head; p; p = p->next) {
+            if (p == t || p == current_process || proc_mem_owner(p) != owner) continue;
+            if (p->state != PROCESS_READY && p->state != PROCESS_RUNNING) continue;
+            if (p->sched_cpu < MAX_CPUS) group[p->sched_cpu]++;
+        }
+        scheduler_unlock(lf);
+        cpu = pick_least_loaded_cpu_for(t, group);
+    } else {
+        cpu = (!owner || owner->sched_cpu >= MAX_CPUS) ? pick_least_loaded_cpu_for(t, NULL)
+                                                      : owner->sched_cpu;
+    }
+    if (!enqueue_on(t, cpu, true)) return;
+}
+
 void scheduler_enqueue_new(process_t* proc) {
     if (!proc) return;
 
-    proc->sched_level = SCHED_LEVEL_INTERACTIVE;
+    proc->sched_level = prio_level(proc);
     proc->sched_ticks_used = 0;
-    proc->sched_cpu = pick_least_loaded_cpu();
+    proc->sched_cpu = pick_least_loaded_cpu_for(proc, NULL);
     if (proc->privilege == PROC_PRIVILEGE_USER) {
         serial_write_str("SCHED: enqueue user pid=");
         serial_write_dec(proc->pid);
@@ -201,20 +314,15 @@ void scheduler_enqueue_new(process_t* proc) {
 
     percpu_runqueue_t* rq = &g_runqueues[proc->sched_cpu];
     uint64_t flags = spinlock_acquire(&rq->lock);
-    rq_push(rq, proc, SCHED_LEVEL_INTERACTIVE);
+    rq_push(rq, proc, proc->sched_level);
     spinlock_release(&rq->lock, flags);
+    kick_if_idle(proc->sched_cpu);
 }
 
 void scheduler_enqueue_on_cpu(process_t* proc, uint32_t cpu) {
     if (!proc) return;
     if (cpu >= MAX_CPUS) { scheduler_enqueue_new(proc); return; }
-    proc->sched_level = SCHED_LEVEL_INTERACTIVE;
-    proc->sched_ticks_used = 0;
-    proc->sched_cpu = cpu;
-    percpu_runqueue_t* rq = &g_runqueues[cpu];
-    uint64_t flags = spinlock_acquire(&rq->lock);
-    rq_push(rq, proc, SCHED_LEVEL_INTERACTIVE);
-    spinlock_release(&rq->lock, flags);
+    enqueue_on(proc, cpu, false);
 }
 
 void scheduler_enqueue_existing(process_t* proc) {
@@ -227,12 +335,12 @@ void scheduler_enqueue_existing(process_t* proc) {
         return;
     }
 
-    proc->sched_level = SCHED_LEVEL_INTERACTIVE;
+    proc->sched_level = prio_level(proc);
     proc->sched_ticks_used = 0;
 
     percpu_runqueue_t* rq = &g_runqueues[proc->sched_cpu];
     uint64_t flags = spinlock_acquire(&rq->lock);
-    rq_push(rq, proc, SCHED_LEVEL_INTERACTIVE);
+    rq_push(rq, proc, proc->sched_level);
     spinlock_release(&rq->lock, flags);
 }
 
@@ -293,6 +401,11 @@ bool scheduler_wake(process_t* proc) {
     if (!proc) return false;
     // A waiting process is on no queue, so nothing moves it between CPUs.
     uint32_t cpu = proc->sched_cpu < MAX_CPUS ? proc->sched_cpu : 0;
+    // Its affinity changed while it slept: wake it on a CPU it may use. Not
+    // while it is still switching away from its old one (on_cpu): it then
+    // sits on that CPU's queue and the tick moves it.
+    bool relocate = !scheduler_cpu_allowed(proc, cpu) && !proc->on_cpu;
+    if (relocate) cpu = pick_least_loaded_cpu_for(proc, NULL);
     percpu_runqueue_t* rq = &g_runqueues[cpu];
     bool woke = false;
     uint64_t flags = spinlock_acquire(&rq->lock);
@@ -300,13 +413,16 @@ bool scheduler_wake(process_t* proc) {
     if (__atomic_compare_exchange_n(&proc->state, &expected, PROCESS_READY,
                                     false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
         proc->wake_time_ms = 0;
-        // Woken from a wait: back to the interactive level, like a sleep.
-        proc->sched_level = SCHED_LEVEL_INTERACTIVE;
+        if (relocate) proc->sched_cpu = cpu;
+        // Woken from a wait: back to the interactive level (or its priority
+        // floor), like a sleep.
+        proc->sched_level = prio_level(proc);
         proc->sched_ticks_used = 0;
-        rq_push(rq, proc, SCHED_LEVEL_INTERACTIVE);
+        rq_push(rq, proc, proc->sched_level);
         woke = true;
     }
     spinlock_release(&rq->lock, flags);
+    if (woke) kick_if_idle(cpu);
     return woke;
 }
 
@@ -339,14 +455,9 @@ void scheduler_rebalance(void) {
     uint32_t busiest_load = 0, idlest_load = 0xFFFFFFFFu;
 
     for (uint32_t cpu = 0; cpu < online; cpu++) {
-        uint64_t flags = spinlock_acquire(&g_runqueues[cpu].lock);
-        uint32_t load = rq_total(&g_runqueues[cpu]);
-        spinlock_release(&g_runqueues[cpu].lock, flags);
-
-        // Account for the currently running process as well as queued work.
-        // Sleeping/idle current processes do not contribute to load.
-        process_t* running = smp_current_process_for_cpu(cpu);
-        if (running && running->state == PROCESS_RUNNING) load++;
+        // Queued work plus the running process (sleeping or idle ones do
+        // not count, nor does a kernel process spinning in the background).
+        uint32_t load = cpu_load(cpu, NULL);
 
         if (load > busiest_load) { busiest_load = load; busiest_cpu = cpu; }
         if (load < idlest_load)  { idlest_load  = load; idlest_cpu  = cpu; }
@@ -390,8 +501,10 @@ void scheduler_rebalance(void) {
             // then got parked with no wake-up: the desktop froze when an
             // app was opened (the app's load triggered the rebalance).
             if (candidate->privilege != PROC_PRIVILEGE_USER) continue;
-            // A program with threads stays on one CPU (see proc.h).
-            if (candidate->mem_owner || candidate->thread_count) continue;
+            // With 'threads1cpu' a program with threads stays on one CPU.
+            if (!kernel_boot_threads_multicore &&
+                (candidate->mem_owner || candidate->thread_count)) continue;
+            if (!scheduler_cpu_allowed(candidate, idlest_cpu)) continue;
             if (candidate->cpu_time_ms < migrant_cpu_time) {
                 migrant = candidate;
                 migrant_level = level;
@@ -431,6 +544,7 @@ void scheduler_rebalance(void) {
 
     spinlock_release(&second->lock, f2);
     spinlock_release(&first->lock, f1);
+    if (migrant) kick_if_idle(idlest_cpu);
 }
 
 void scheduler_priority_boost(void) {
@@ -443,6 +557,11 @@ void scheduler_priority_boost(void) {
 
         for (uint32_t level = 1; level < SCHED_NUM_LEVELS; level++) {
             process_t* proc;
+            // Everything goes to the interactive level for a while, the
+            // priority floor included: that is what keeps a LOW or NORMAL
+            // thread from starving behind busy higher levels. It sinks
+            // again as it uses up its slices; a wake-up returns it to its
+            // floor (prio_level).
             while ((proc = rq_pop(rq, level)) != NULL) {
                 proc->sched_level = SCHED_LEVEL_INTERACTIVE;
                 proc->sched_ticks_used = 0;
@@ -485,6 +604,8 @@ static void wake_sleeping_processes() {
     uint64_t current_time = time_get_uptime_ms();
     uint32_t this_cpu = smp_current_cpu_id();
 
+    // Under the list lock: other CPUs reap (free) processes from the list.
+    uint64_t list_flags = scheduler_lock();
     for (process_t* proc = proc_list_head; proc != NULL; proc = proc->next) {
         if (proc->state == PROCESS_WAITING && proc->wake_time_ms > 0) {
             if (current_time >= proc->wake_time_ms) {
@@ -509,6 +630,7 @@ static void wake_sleeping_processes() {
             }
         }
     }
+    scheduler_unlock(list_flags);
 }
 
 static bool process_is_current_on_any_cpu(process_t* proc) {
@@ -599,6 +721,23 @@ bool scheduler_is_idle_process(const process_t* proc) {
     return proc && proc >= &g_ap_idle[0] && proc < &g_ap_idle[MAX_CPUS];
 }
 
+// Puts a READY process that is still running here (about to be switched
+// away from) on the queue of a CPU its affinity allows. The other CPU skips
+// it until this one is done with its stack (on_cpu).
+static void requeue_elsewhere(process_t* p) {
+    uint32_t dest = pick_least_loaded_cpu_for(p, NULL);
+    percpu_runqueue_t* rq = &g_runqueues[dest];
+    uint64_t flags = spinlock_acquire(&rq->lock);
+    // Killed meanwhile (the state changes under this lock): never queue it.
+    bool queue = p->state == PROCESS_READY;
+    if (queue) {
+        p->sched_cpu = dest;
+        rq_push(rq, p, p->sched_level);
+    }
+    spinlock_release(&rq->lock, flags);
+    if (queue) kick_if_idle(dest);
+}
+
 static void schedule_irqs_off(void) {
     uint32_t cpu_id = smp_current_cpu_id();
     percpu_runqueue_t* rq = &g_runqueues[cpu_id];
@@ -624,7 +763,7 @@ static void schedule_irqs_off(void) {
                 deferred = curr == g_deferred_reap[i];
             }
             // An owner's address space outlives its threads: reap them first.
-            if (deferred || process_is_current_on_any_cpu(curr) ||
+            if (deferred || curr->on_cpu || process_is_current_on_any_cpu(curr) ||
                 (!curr->mem_owner && curr->thread_count)) {
                 prev = curr;
                 curr = curr->next;
@@ -694,7 +833,7 @@ static void schedule_irqs_off(void) {
 
     process_t* next = NULL;
     for (;;) {
-        next = rq_pop_highest(rq);
+        next = rq_pop_runnable(rq, old);
         if (!next) break;
 
         if (next->state == PROCESS_ZOMBIE || next->state == PROCESS_TERMINATED) {
@@ -711,6 +850,12 @@ static void schedule_irqs_off(void) {
             // dispatch something that isn't actually READY.
             continue;
         }
+        // Taken for this CPU under the queue lock, the same lock kill()
+        // changes the state under: a killed process is either still queued
+        // (and removed) or already marked running and on a CPU, where the
+        // kill finds and stops it.
+        next->state = PROCESS_RUNNING;
+        next->on_cpu = 1;
         break;
     }
 
@@ -731,7 +876,13 @@ static void schedule_irqs_off(void) {
         // and queued at once.
         bool old_runnable = old && (old->state == PROCESS_RUNNING ||
                                     old->state == PROCESS_READY);
-        if (old_runnable) old->state = PROCESS_RUNNING;
+        // A thread whose affinity no longer includes this CPU goes to one
+        // it may use even though nothing else wants this one.
+        bool leave = old_runnable && idle && old != idle &&
+                     old->privilege == PROC_PRIVILEGE_USER &&
+                     !scheduler_cpu_allowed(old, cpu_id);
+        if (leave) { old->state = PROCESS_READY; old_runnable = false; }
+        else if (old_runnable) old->state = PROCESS_RUNNING;
         spinlock_release(&rq->lock, rq_flags);
 
         if (old_runnable) {
@@ -749,6 +900,7 @@ static void schedule_irqs_off(void) {
             }
             idle->state = PROCESS_RUNNING;
             current_process = idle;
+            if (leave) requeue_elsewhere(old);
             switch_to(old, idle);
         }
         return;
@@ -756,11 +908,16 @@ static void schedule_irqs_off(void) {
 
     // Requeue the outgoing process (it was never itself in the queue
     // while running) behind whatever's now at the front of its level.
+    bool migrate_old = false;
     if (old && old->state == PROCESS_RUNNING && old != idle) {
         old->state = PROCESS_READY;
-        rq_push(rq, old, old->sched_level);
+        if (old->privilege == PROC_PRIVILEGE_USER && !scheduler_cpu_allowed(old, cpu_id))
+            migrate_old = true;             // affinity changed: another CPU's queue
+        else
+            rq_push(rq, old, old->sched_level);
     }
     spinlock_release(&rq->lock, rq_flags);
+    if (migrate_old) requeue_elsewhere(old);
 
     if (old && (old->state == PROCESS_ZOMBIE || old->state == PROCESS_TERMINATED)) {
         g_deferred_reap[cpu_id] = old;
@@ -872,8 +1029,21 @@ void sleep(uint64_t milliseconds) {
     }
 
     uint64_t wake_time = time_get_uptime_ms() + milliseconds;
-    current_process->wake_time_ms = wake_time;
-    current_process->state = PROCESS_WAITING;
+    process_t* self = current_process;
+    self->wake_time_ms = wake_time;
+    // Never turn a process that another CPU has just killed back into a
+    // waiting one: it would be woken again and run on.
+    for (;;) {
+        process_state_t st = __atomic_load_n(&self->state, __ATOMIC_SEQ_CST);
+        if (st == PROCESS_ZOMBIE || st == PROCESS_TERMINATED) {
+            self->wake_time_ms = 0;
+            schedule();
+            return;
+        }
+        if (__atomic_compare_exchange_n(&self->state, &st, PROCESS_WAITING, false,
+                                        __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
+            break;
+    }
 
     if (SCHED_DEBUG >= 2) {
         serial_write_str("[SLEEP] ");
@@ -899,22 +1069,36 @@ static volatile uint64_t g_global_tick_count = 0;
 
 static void expire_cleanup_requests(void) {
     uint64_t now = time_get_uptime_ms();
-    for (process_t* proc = proc_list_head; proc; proc = proc->next) {
-        if (!proc->cleanup_requested ||
-            proc->state == PROCESS_ZOMBIE || proc->state == PROCESS_TERMINATED ||
-            now < proc->cleanup_deadline_ms) {
-            continue;
+    for (;;) {
+        // Found and marked dead under the list lock (other CPUs reap from it);
+        // the cleanup calls that follow only need the pid.
+        uint64_t pid = 0;
+        bool is_current = false;
+        const char* name = NULL;
+        uint64_t flags = scheduler_lock();
+        for (process_t* proc = proc_list_head; proc; proc = proc->next) {
+            if (!proc->cleanup_requested ||
+                proc->state == PROCESS_ZOMBIE || proc->state == PROCESS_TERMINATED ||
+                now < proc->cleanup_deadline_ms) {
+                continue;
+            }
+            proc->cleanup_requested = false;
+            pid = proc->pid;
+            name = proc->name;      // valid until it is reaped, which needs the next tick
+            is_current = proc == current_process;
+            scheduler_mark_dead(proc, PROCESS_ZOMBIE);
+            break;
         }
+        scheduler_unlock(flags);
+        if (!pid) return;
         serial_write_str("[PROC] Cleanup timeout, terminating ");
-        serial_write_str(proc->name);
+        serial_write_str(name);
         serial_write_str("\n");
-        window_manager_process_exit(proc->pid);
-        fgpu_process_exit(proc->pid);
-        audio_streams_on_process_exit(proc->pid);
-        graphics_release_screen_for_pid(proc->pid);
-        proc->state = PROCESS_ZOMBIE;
-        scheduler_dequeue(proc);
-        if (proc == current_process) schedule();
+        window_manager_process_exit(pid);
+        fgpu_process_exit(pid);
+        audio_streams_on_process_exit(pid);
+        graphics_release_screen_for_pid(pid);
+        if (is_current) schedule();
     }
 }
 
@@ -971,6 +1155,15 @@ void scheduler_tick() {
         return;
     }
 
+    // Killed while running here (another CPU's kill): leave it now. Also a
+    // user thread whose affinity moved elsewhere.
+    if (current_process->state == PROCESS_ZOMBIE || current_process->state == PROCESS_TERMINATED ||
+        (current_process->privilege == PROC_PRIVILEGE_USER &&
+         !scheduler_cpu_allowed(current_process, cpu_id))) {
+        schedule();
+        return;
+    }
+
     current_process->sched_ticks_used++;
     current_process->cpu_time_ms++;
 
@@ -1019,6 +1212,94 @@ void scheduler_tick() {
     }
 }
 
+// ===========================================
+// Killing, kicking, affinity and priority (OS-3)
+// ===========================================
+
+// Tells every other CPU that is running `p` to look at its run queue now
+// (scheduler_ipi() makes it leave a dead or misplaced process).
+void scheduler_kick(process_t* p) {
+    if (!p) return;
+    uint32_t self = smp_current_cpu_id();
+    uint32_t n = g_cpu_count < MAX_CPUS ? g_cpu_count : MAX_CPUS;
+    for (uint32_t i = 0; i < n; i++)
+        if (i != self && g_cpus[i].online && smp_current_process_for_cpu(i) == p)
+            smp_send_resched(i);
+}
+
+// Sets ZOMBIE (or TERMINATED) and takes the process off its run queue as
+// one step under that queue's lock. The dispatcher pops and starts
+// processes under the same lock, so afterwards a dead process is either
+// never started or already marked on a CPU (on_cpu), and the CPU running
+// it is kicked.
+void scheduler_mark_dead(process_t* p, process_state_t state) {
+    if (!p) return;
+    percpu_runqueue_t* rq;
+    uint64_t flags;
+    for (;;) {
+        uint32_t cpu = p->sched_cpu < MAX_CPUS ? p->sched_cpu : 0;
+        rq = &g_runqueues[cpu];
+        flags = spinlock_acquire(&rq->lock);
+        uint32_t again = p->sched_cpu < MAX_CPUS ? p->sched_cpu : 0;
+        if (again == cpu) break;
+        spinlock_release(&rq->lock, flags);     // moved to another queue meanwhile
+    }
+    if (p->state != PROCESS_TERMINATED) __atomic_store_n(&p->state, state, __ATOMIC_SEQ_CST);
+    rq_remove_locked(rq, p);
+    spinlock_release(&rq->lock, flags);
+    scheduler_kick(p);
+}
+
+// The reschedule IPI (tlb.c): the CPU runs its scheduler when its current
+// process is dead or no longer allowed here, or when it is idle and work
+// has been queued for it.
+void scheduler_ipi(void) {
+    if (!scheduler_on) return;
+    process_t* p = current_process;
+    if (!p) return;
+    uint32_t cpu = smp_current_cpu_id();
+    if (p->state == PROCESS_ZOMBIE || p->state == PROCESS_TERMINATED) { schedule(); return; }
+    if (scheduler_is_idle_process(p)) {
+        if (cpu < MAX_CPUS && rq_total(&g_runqueues[cpu]) > 0) schedule();
+        return;
+    }
+    if (p->privilege == PROC_PRIVILEGE_USER && !scheduler_cpu_allowed(p, cpu)) schedule();
+}
+
+int scheduler_set_affinity(process_t* p, uint64_t mask) {
+    if (!p) return -1;
+    p->affinity = mask;
+    if (p == current_process) return 0;     // the caller reschedules itself
+    // Queued on a CPU it may not use: move it. Running elsewhere: kick it.
+    percpu_runqueue_t* rq;
+    uint64_t flags;
+    uint32_t cpu;
+    for (;;) {
+        cpu = p->sched_cpu < MAX_CPUS ? p->sched_cpu : 0;
+        rq = &g_runqueues[cpu];
+        flags = spinlock_acquire(&rq->lock);
+        uint32_t again = p->sched_cpu < MAX_CPUS ? p->sched_cpu : 0;
+        if (again == cpu) break;
+        spinlock_release(&rq->lock, flags);
+    }
+    bool moved = false;
+    if (!scheduler_cpu_allowed(p, cpu) && p->state == PROCESS_READY)
+        moved = rq_remove_locked(rq, p);
+    spinlock_release(&rq->lock, flags);
+    if (moved) requeue_elsewhere(p);
+    else scheduler_kick(p);
+    return 0;
+}
+
+void scheduler_set_priority(process_t* p, uint32_t prio) {
+    if (!p) return;
+    if (prio >= SCHED_NUM_LEVELS) prio = SCHED_NUM_LEVELS - 1;
+    p->sched_prio = prio;
+    // Takes effect at once for a level above the new floor; a lower level
+    // only rises at the next wake or boost.
+    if (p->sched_level < prio) p->sched_level = prio;
+}
+
 void scheduler_get_stats(uint64_t* switches, uint64_t* idle) {
     if (switches) *switches = total_context_switches;
     if (idle) *idle = idle_cycles;
@@ -1061,7 +1342,22 @@ void process_exit_with_status(uint8_t exit_code, bool crashed,
     }
 
     // Threads (SYS_THREAD): the program ending ends its threads, and a
-    // crash in any of them ends the whole program.
+    // crash in any of them ends the whole program. Threads run on several
+    // CPUs, so two of them can crash at once, or one while the owner exits:
+    // the first claims the program's end; the others just stop (waiting for
+    // each other to leave the CPU would never finish).
+    {
+        process_t* self = current_process;
+        process_t* grp = proc_mem_owner(self);
+        if (self->privilege == PROC_PRIVILEGE_USER && grp &&
+            (self->mem_owner || self->thread_count) && (crashed || !self->mem_owner)) {
+            if (__atomic_exchange_n(&grp->group_dying, 1u, __ATOMIC_SEQ_CST)) {
+                scheduler_mark_dead(self, PROCESS_TERMINATED);
+                schedule();
+                for (;;) asm volatile("sti; hlt" ::: "memory");
+            }
+        }
+    }
     if (crashed && current_process->mem_owner) {
         // The program's own exit status says it crashed (SYS_WAIT).
         process_t* owner = current_process->mem_owner;
@@ -1094,8 +1390,12 @@ void process_exit_with_status(uint8_t exit_code, bool crashed,
                                     crash_vector);
     // Its memory goes back now (never used again: this does not return to
     // the program). Its threads are off the run queues by this point.
-    if (!current_process->mem_owner && current_process->privilege == PROC_PRIVILEGE_USER)
+    if (!current_process->mem_owner && current_process->privilege == PROC_PRIVILEGE_USER) {
+        // Threads on other CPUs were told to stop; none may still run in
+        // the address space that is about to be unmapped.
+        proc_wait_threads_off_cpu(current_process);
         uvm_release_all(current_process);
+    }
     current_process->state = PROCESS_TERMINATED;
     schedule();
 

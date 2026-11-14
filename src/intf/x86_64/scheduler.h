@@ -126,6 +126,25 @@ bool scheduler_wake(process_t* proc);
 // running here. Call with interrupts off.
 void scheduler_resume_self(void);
 
+// Sets ZOMBIE (or TERMINATED) and removes `proc` from its run queue in one
+// step under that queue's lock, then kicks a CPU that is running it (an IPI
+// makes it leave). kill() and the group exit paths use this instead of
+// writing the state and calling scheduler_dequeue().
+void scheduler_mark_dead(process_t* proc, process_state_t state);
+// IPI the CPUs (other than this one) that are running `proc`.
+void scheduler_kick(process_t* proc);
+// The reschedule IPI handler body (tlb.c).
+void scheduler_ipi(void);
+// Starts a user thread created PAUSED: READY and queued (on the least
+// loaded CPU its affinity allows, or the owner's with 'threads1cpu'),
+// unless it was killed meanwhile.
+void scheduler_start_thread(process_t* thread, process_t* owner);
+// Affinity: mask of CPUs (bit n = CPU n), 0 = any. Priority: the best MLFQ
+// level the process may sit at (SCHED_LEVEL_*).
+bool scheduler_cpu_allowed(const process_t* proc, uint32_t cpu);
+int scheduler_set_affinity(process_t* proc, uint64_t mask);
+void scheduler_set_priority(process_t* proc, uint32_t prio);
+
 // Sets a user thread's FS base (TLS pointer) and loads it now when it is
 // the calling thread.
 void scheduler_set_fs_base(process_t* self, uint64_t value);

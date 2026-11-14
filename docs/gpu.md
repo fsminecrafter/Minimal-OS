@@ -53,6 +53,37 @@ ABI version 2 added shader programs (`CREATE_PROGRAM`,
 plus the `FGPU_STATE_BLEND` state. The kernel still accepts version-1
 requests, so older programs keep working.
 
+ABI version 3 adds asynchronous submits. `SUBMIT` with
+`FGPU_SUBMIT_ASYNC` copies the command buffer, queues it and returns at
+once with a fence in `handle` (increasing, never 0); `SYS_GPU_WAIT`
+(handle = fence, 0 for all; bytes = timeout in ns, 0 to poll, ~0 forever)
+waits for it, returns the triangles drawn by async submits since the last
+`WAIT` in `handle`, and `SYS_ERR_INVAL` once when one of those buffers was
+rejected. A program's queued buffers run in order, and every other call of
+that program (readback, present, uploads, destroys, a plain `SUBMIT`)
+first waits for them, so results are always seen. At most 4 are queued
+per program; a fifth `SUBMIT` waits for room. `FGPU_CAP_ASYNC` in
+`SYS_GPU_INFO` says the kernel has this. Version-2 requests ignore the
+flag. A kernel process, `fgpu-worker`, runs the queued buffers; it is
+preemptible like any process.
+
+**Objects and contexts.** Objects belong to a program, not a thread: all
+threads of a program share its surfaces, buffers and shaders, and a thread
+that ends frees nothing. They live in one table per type (grown on
+demand); a handle encodes slot, type and a generation, so a stale or
+wrong-type handle is not found. Each program may hold 1024 surfaces, 4096
+buffers and 1024 shader programs. Each program has a context: a lock (its
+calls and queued buffers run one at a time), its counts, its fences.
+Drawing and presenting share one render lock (the CPU rasterizer keeps one
+pass and per-worker scratch). With the CPU backend alone, creating,
+uploading, reading back and freeing need only the program's own lock, so
+they overlap another program's rendering; with a hardware backend or VRAM
+they take the render lock too. A thread killed in the middle of a GPU call
+leaves its locks to the next waiter, and its recorded draws are dropped.
+When a program ends, its queued buffers are dropped and its objects freed
+then, or by the worker or the next GPU call if a lock is busy at that
+moment.
+
 ### CPU backend
 
 `fgpu_raster.c` runs the pipeline: vertex stage, near-plane clipping,
@@ -145,13 +176,10 @@ rasterizer (one barrier per draw, scalar); the kernel does this with the `fgpuol
 boot flag (GRUB entry "Minimal-OS (RamFS, fgpuold)", two above the last entry).
 The host benchmark (`make bench-fgpu`) and the differential tests use the switch.
 
-**Not done yet (OS-4).** Preemptible kernel worker threads instead of `smp_par`,
-per-process contexts instead of `g_busy`, and asynchronous submit with fences. The
-pass is per target and everything it keeps (workers' scratch, chunk pool, bin lists)
-sits in the pass, not in globals, so a context per process can own one pass; the
-kernel currently has a single pass guarded by `g_busy`. Deferring draws across
-submits only needs the flush points above to stay (they are already called), plus
-an exact triangle count some other way.
+**One pass for everyone.** The kernel keeps a single pass, used under the render
+lock (see "Objects and contexts" above). The pass itself keeps its scratch in the
+pass, but the batch buffers in `fgpu_raster.c` are still static per worker, so two
+passes could not render at once yet.
 
 ### Shader machine
 

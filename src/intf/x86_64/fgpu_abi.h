@@ -33,8 +33,9 @@
 
 #define SYS_GPU 40
 // Version 2 adds shader programs, vertex layouts, textures and blending.
-// The kernel still accepts version-1 requests.
-#define SYS_GPU_ABI_VERSION 2u
+// Version 3 adds asynchronous submits with fences (FGPU_SUBMIT_ASYNC,
+// SYS_GPU_WAIT). The kernel still accepts version-1 and -2 requests.
+#define SYS_GPU_ABI_VERSION 3u
 #define SYS_GPU_ABI_VERSION_MIN 1u
 
 enum {
@@ -52,7 +53,21 @@ enum {
     SYS_GPU_CREATE_PROGRAM,     // data = shader blob, bytes = its size -> handle
     SYS_GPU_DESTROY_PROGRAM,    // handle
     SYS_GPU_WRITE_SURFACE,      // handle, data = pixels, pitch = bytes per row
+    // ABI version 3
+    SYS_GPU_WAIT = 14,          // handle = fence (0 = all queued), bytes = timeout in ns
+                                // (0 = just check, ~0 = forever) -> SYS_SUCCESS, or
+                                // SYS_ERR_TIMEDOUT; handle out = triangles drawn by
+                                // async submits since the last WAIT; SYS_ERR_INVAL
+                                // when one of them was rejected since the last WAIT
 };
+
+// SUBMIT flags (ABI version 3)
+// The command buffer is copied and queued; SUBMIT returns at once with a
+// fence in `handle` (increasing, never 0). Queued buffers of a program run
+// in order, before any later call of that program other than SUBMIT with
+// this flag and WAIT (a READBACK, PRESENT, upload or plain SUBMIT sees
+// their results). At most 4 are queued per program; a fifth SUBMIT waits.
+#define FGPU_SUBMIT_ASYNC  (1u << 0)
 
 // Surface formats
 #define FGPU_FORMAT_XRGB8888  1u
@@ -94,6 +109,7 @@ typedef struct {
 #define FGPU_CAP_VRAM_FAST_READ (1u << 4)
 #define FGPU_CAP_HW_3D          (1u << 5)
 #define FGPU_CAP_SHADERS        (1u << 6)   // shader programs (ABI 2)
+#define FGPU_CAP_ASYNC          (1u << 7)   // FGPU_SUBMIT_ASYNC and SYS_GPU_WAIT (ABI 3)
 
 typedef struct {
     uint32_t size;              // sizeof(syscall_gpu_info_t), set by caller

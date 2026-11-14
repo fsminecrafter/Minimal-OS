@@ -345,7 +345,7 @@ cube with one color per face (`NULL` for the default colors);
 | Buffer size | 16 MiB |
 | Command buffer | 1 MiB per submit (FarcadeGL grows its buffer as needed) |
 | Shader program | 2048 instructions per stage, 32 temporary vec4s, 8 varyings, 64 uniform vec4s (a `mat4` uses 4), 256 constant vec4s, 4 texture units |
-| Objects per process | 64 surfaces (contexts and textures), 128 buffers, 64 shaders, shared with other processes |
+| Objects per process | 1024 surfaces (contexts and textures), 4096 buffers, 1024 shaders; shared by the threads of a program |
 
 ## Performance
 

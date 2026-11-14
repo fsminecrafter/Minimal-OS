@@ -649,6 +649,24 @@ static uint64_t sys_window_impl(const syscall_window_request_t* user_request) {
                 return SYS_ERR_INVAL;
             break;
         }
+        case SYS_WINDOW_MAP_FRAME:
+        case SYS_WINDOW_TAKE_DAMAGE: {
+            // The kernel fills a copy; it goes back to the program only on
+            // success (the mapping is made while the call runs).
+            syscall_window_shared_t* user_shared = request->shared;
+            if (!user_shared ||
+                !user_range_ok(user_shared, sizeof(*user_shared), true))
+                return SYS_ERR_INVAL;
+            syscall_window_shared_t shared_copy;
+            memset(&shared_copy, 0, sizeof(shared_copy));
+            request->shared = &shared_copy;
+            uint64_t result = window_manager_syscall(&request_copy, getCurrentPID(),
+                current_process && current_process->is_window_manager);
+            if (result == SYS_SUCCESS &&
+                !syscall_user_copy_out(user_shared, &shared_copy, sizeof(shared_copy)))
+                return SYS_ERR_INVAL;
+            return result;
+        }
         case SYS_WINDOW_NEXT_EVENT:
         case SYS_WINDOW_POST_EVENT:
             if (!request->event ||

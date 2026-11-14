@@ -1054,6 +1054,23 @@ static uint64_t op_present_to(syscall_gpu_request_t* r, fgpu_surface_t* s, uint6
         uint64_t res = window_manager_syscall(&w, owner, false);
         if (res != SYS_SUCCESS) return res;
         if (s->width < info.width || s->height < info.height) return SYS_ERR_INVAL;
+        // Shared frames: render straight into the window's back buffer.
+        window_present_target_t target;
+        if (window_manager_present_target(r->window_id, owner, &target)) {
+            if (s->width < target.width || s->height < target.height) {
+                // The window grew since it was checked: abandon the target.
+                window_manager_present_done(r->window_id, owner, &target, 0, 0, 0, 0);
+                return SYS_ERR_INVAL;
+            }
+            hw_sync();
+            const uint32_t* src_px = (const uint32_t*)surface_cpu_view(s);
+            for (uint32_t row = 0; row < target.height; row++)
+                memcpy(target.pixels + (size_t)row * target.pitch_px,
+                       src_px + (size_t)row * s->pitch,
+                       (size_t)target.width * sizeof(uint32_t));
+            return window_manager_present_done(r->window_id, owner, &target,
+                                               0, 0, target.width, target.height);
+        }
         memset(&w, 0, sizeof(w));
         w.size = sizeof(w);
         w.version = SYS_WINDOW_ABI_VERSION;

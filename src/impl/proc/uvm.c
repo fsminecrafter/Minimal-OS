@@ -21,6 +21,10 @@
 // area has no access (UVM_PROT_NONE). The contents wait for the next
 // uvm_protect().
 #define PTE_HELD  (1ULL << 9)
+// Software bit: the frame belongs to a shared object (uvm_shm_t), not to
+// this space. Such an entry is never freed with its page; the area's
+// reference on the object is what is given up when the mapping goes.
+#define PTE_SHARED (1ULL << 10)
 #define PTE_NX    (1ULL << 63)
 #define PTE_ADDR  0x000FFFFFFFFFF000ULL
 
@@ -33,8 +37,21 @@
 typedef struct uvm_area {
     uint64_t start, end;            // page aligned, end exclusive
     uint32_t prot;
+    uvm_shm_t* shm;                 // shared object behind the area, or NULL
+    uint32_t max_prot;              // shared areas: what uvm_protect() may grant
     struct uvm_area* next;          // sorted by address, never overlapping
 } uvm_area_t;
+
+// A reference-counted run of frames from the page pool that can be mapped
+// into several spaces. The frames are contiguous (so the kernel has one
+// linear view of them through the identity map) and zeroed when created.
+// One reference belongs to whoever created it (the kernel), one to every
+// area that maps it; the frames go back to the pool with the last one.
+struct uvm_shm {
+    volatile int refs;
+    uint64_t pages;
+    uint8_t* base;
+};
 
 typedef struct uvm_space {
     uvm_area_t* areas;
@@ -221,12 +238,22 @@ static void for_each_frame(uvm_space_t* s, uint64_t start, uint64_t end, pte_fn 
 
 static void release_frame(uvm_space_t* s, uint64_t addr, uint64_t* pte, flushctx_t* fc, uint32_t arg) {
     (void)arg;
+    // Shared frames are not ours to free (callers keep shared areas out of
+    // their ranges; this is the last line of defence).
+    if (*pte & PTE_SHARED) return;
     void* frame = (void*)(uintptr_t)(*pte & PTE_ADDR);
     *pte = 0;
     s->committed_pages--;
     fc_note(fc, addr);
     fc->frames[fc->n++] = frame;
     if (fc->n == FLUSH_BATCH) fc_flush(fc);
+}
+
+// Takes a shared frame out of the page tables without freeing it.
+static void release_frame_shared(uvm_space_t* s, uint64_t addr, uint64_t* pte, flushctx_t* fc, uint32_t arg) {
+    (void)s; (void)arg;
+    *pte = 0;
+    fc_note(fc, addr);
 }
 
 // Frees the page tables that lie wholly inside [start, end), once their
@@ -275,9 +302,9 @@ static void prune_tables(prunectx_t* pc, uint64_t* table, int shift, uint64_t ta
 static void reprotect_frame(uvm_space_t* s, uint64_t addr, uint64_t* pte, flushctx_t* fc, uint32_t prot) {
     (void)s;
     uint64_t old = *pte;
-    *pte = (old & PTE_ADDR) | leaf_flags(prot);
+    *pte = (old & (PTE_ADDR | PTE_SHARED)) | leaf_flags(prot);
     // Entries that do not change need no flush.
-    if (*pte != (old & (PTE_ADDR | PTE_P | PTE_W | PTE_U | PTE_NX | PTE_HELD))) fc_note(fc, addr);
+    if (*pte != (old & (PTE_ADDR | PTE_P | PTE_W | PTE_U | PTE_NX | PTE_HELD | PTE_SHARED))) fc_note(fc, addr);
 }
 
 static inline bool range_valid(uint64_t addr, uint64_t len) {
@@ -309,7 +336,7 @@ static void free_tables(uint64_t* table, int level) {
     for (int i = 0; i < 512; i++) {
         uint64_t entry = table[i];
         if (level == 1) {
-            if (pte_has_frame(entry)) pmm_free_page_unscrubbed((void*)(uintptr_t)(entry & PTE_ADDR));
+            if (pte_has_frame(entry) && !(entry & PTE_SHARED)) pmm_free_page_unscrubbed((void*)(uintptr_t)(entry & PTE_ADDR));
             continue;
         }
         if (!(entry & PTE_P) || (entry & PTE_HUGE)) continue;
@@ -329,6 +356,7 @@ void uvm_destroy(process_t* proc) {
     }
     for (uvm_area_t* a = s->areas; a;) {
         uvm_area_t* next = a->next;
+        if (a->shm) uvm_shm_put(a->shm);
         free_mem(a);
         a = next;
     }
@@ -385,6 +413,8 @@ static uvm_area_t* carve(uvm_space_t* s, uint64_t start, uint64_t end, uvm_area_
         spare->start = cut_end;
         spare->end = a->end;
         spare->prot = a->prot;
+        spare->shm = NULL;          // shared areas are never cut in the middle
+        spare->max_prot = 0;
         spare->next = a->next;
         a->end = cut_start;
         a->next = spare;
@@ -403,6 +433,8 @@ static void split_at(uvm_space_t* s, uint64_t at, uvm_area_t** spare) {
     n->start = at;
     n->end = a->end;
     n->prot = a->prot;
+    n->shm = NULL;                  // shared areas are never split
+    n->max_prot = 0;
     n->next = a->next;
     a->end = at;
     a->next = n;
@@ -438,6 +470,8 @@ uint64_t uvm_map(process_t* proc, uint64_t addr, uint64_t len, uint32_t prot, ui
     n->start = start;
     n->end = start + len;
     n->prot = prot;
+    n->shm = NULL;
+    n->max_prot = 0;
     insert_area(s, n);
     space_unlock(s, irq);
 
@@ -460,6 +494,7 @@ uint64_t uvm_unmap(process_t* proc, uint64_t addr, uint64_t len) {
     uvm_space_t* s = space_of(proc);
     if (!s || !range_valid(addr, len)) return SYS_ERR_INVAL;
     uint64_t end = addr + round_up(len);
+    bool failed = false;            // a shared area was only partly in range
     uvm_area_t* spare = (uvm_area_t*)alloc(sizeof(*spare));
     if (!spare) return SYS_ERR_NOMEM;
 
@@ -476,8 +511,33 @@ uint64_t uvm_unmap(process_t* proc, uint64_t addr, uint64_t len) {
             break;
         }
         if (next->start > at) at = next->start;
+        if (next->shm) {
+            // A shared area goes whole or not at all: its reference is
+            // given up with the mapping, and its frames stay with the
+            // object (other spaces may map them).
+            uvm_shm_t* shm = next->shm;
+            uint64_t a_start = next->start, a_end = next->end;
+            bool whole = a_start >= addr && a_end <= end;
+            if (whole) {
+                carve(s, a_start, a_end, NULL);
+                flushctx_t fc;
+                fc_init(&fc, s);
+                for_each_frame(s, a_start, a_end, release_frame_shared, &fc, 0);
+                fc_flush(&fc);
+            } else {
+                failed = true;
+            }
+            space_unlock(s, irq);
+            if (whole) uvm_shm_put(shm);
+            let_interrupts_in();
+            at = a_end;
+            continue;
+        }
         uint64_t piece_end = (at & ~(UVM_CHUNK - 1)) + UVM_CHUNK;
         if (piece_end > end) piece_end = end;
+        // Stop short of a shared area that begins inside the piece.
+        for (uvm_area_t* a = next->next; a && a->start < piece_end; a = a->next)
+            if (a->shm) { piece_end = a->start; break; }
         spare = carve(s, at, piece_end, spare);
         flushctx_t fc;
         fc_init(&fc, s);
@@ -492,7 +552,9 @@ uint64_t uvm_unmap(process_t* proc, uint64_t addr, uint64_t len) {
     prunectx_t pc;
     pc.s = s;
     pc.n = 0;
-    for (uint64_t slot = (addr >> 39) & 0x1FF; slot <= ((end - 1) >> 39) & 0x1FF; slot++) {
+    // A shared area that was only partly in range is still mapped, perhaps
+    // through a table that lies inside the range: prune nothing then.
+    for (uint64_t slot = (addr >> 39) & 0x1FF; !failed && slot <= ((end - 1) >> 39) & 0x1FF; slot++) {
         uint64_t entry = s->pml4[slot];
         if (entry & PTE_P)
             prune_tables(&pc, (uint64_t*)(uintptr_t)(entry & PTE_ADDR), 30, slot << 39, addr, end);
@@ -502,7 +564,7 @@ uint64_t uvm_unmap(process_t* proc, uint64_t addr, uint64_t len) {
     prune_flush(&pc);
     space_unlock(s, irq);
     if (spare) free_mem(spare);
-    return SYS_SUCCESS;
+    return failed ? SYS_ERR_INVAL : SYS_SUCCESS;
 }
 
 uint64_t uvm_protect(process_t* proc, uint64_t addr, uint64_t len, uint32_t prot) {
@@ -520,7 +582,14 @@ uint64_t uvm_protect(process_t* proc, uint64_t addr, uint64_t len, uint32_t prot
 
     uint64_t irq = space_lock(s);
     uint64_t result = SYS_ERR_INVAL;
-    if (covered(s, addr, end, 0)) {
+    bool shared_ok = true;
+    // A shared area changes protection whole (it is never split), and never
+    // beyond what it was mapped with; it can not become executable.
+    for (uvm_area_t* a = s->areas; a && a->start < end; a = a->next) {
+        if (a->end <= addr || !a->shm) continue;
+        if (a->start < addr || a->end > end || (prot & ~a->max_prot)) shared_ok = false;
+    }
+    if (shared_ok && covered(s, addr, end, 0)) {
         split_at(s, addr, &spare1);
         split_at(s, end, &spare2);
         for (uvm_area_t* a = area_at(s, addr); a && a->start < end; a = a->next) a->prot = prot;
@@ -557,6 +626,10 @@ uint64_t uvm_decommit(process_t* proc, uint64_t addr, uint64_t len) {
     uint64_t end = addr + round_up(len);
     uint64_t irq = space_lock(s);
     bool ok = covered(s, addr, end, 0);
+    // Frames of a shared area belong to the object, not to this space:
+    // decommit is refused there (SYS_ERR_INVAL).
+    for (uvm_area_t* a = s->areas; ok && a && a->start < end; a = a->next)
+        if (a->end > addr && a->shm) ok = false;
     space_unlock(s, irq);
     if (!ok) return SYS_ERR_INVAL;
     for (uint64_t at = addr; at < end;) {
@@ -684,7 +757,7 @@ bool uvm_handle_fault(uint64_t fault_address, uint64_t error_code) {
             // entry up to the area's protection and run the access again.
             uint64_t* pte = walk(s, page, false);
             if (pte && (*pte & PTE_P)) {
-                uint64_t want = (*pte & PTE_ADDR) | leaf_flags(a->prot);
+                uint64_t want = (*pte & (PTE_ADDR | PTE_SHARED)) | leaf_flags(a->prot);
                 if ((*pte & (PTE_P | PTE_W | PTE_U | PTE_NX)) != (want & (PTE_P | PTE_W | PTE_U | PTE_NX)))
                     *pte = want;
                 __asm__ volatile("invlpg (%0)" :: "r"(page) : "memory");
@@ -709,4 +782,86 @@ uint64_t uvm_committed_bytes(process_t* proc) {
 uint64_t uvm_mapped_bytes(process_t* proc) {
     uvm_space_t* s = space_of(proc);
     return s ? s->mapped_pages * PAGE : 0;
+}
+
+// ------------------------------------------------------------ shared memory
+
+uvm_shm_t* uvm_shm_create(uint64_t bytes) {
+    if (!bytes || bytes > (1ULL << 32)) return NULL;
+    uint64_t pages = round_up(bytes) / PAGE;
+    uvm_shm_t* shm = (uvm_shm_t*)alloc(sizeof(*shm));
+    if (!shm) return NULL;
+    void* frames = pmm_try_alloc_pages_zeroed((size_t)pages);
+    if (!frames) {
+        free_mem(shm);
+        return NULL;
+    }
+    shm->refs = 1;
+    shm->pages = pages;
+    shm->base = (uint8_t*)frames;
+    return shm;
+}
+
+uvm_shm_t* uvm_shm_get(uvm_shm_t* shm) {
+    if (shm) __atomic_fetch_add(&shm->refs, 1, __ATOMIC_SEQ_CST);
+    return shm;
+}
+
+void uvm_shm_put(uvm_shm_t* shm) {
+    if (!shm) return;
+    if (__atomic_sub_fetch(&shm->refs, 1, __ATOMIC_SEQ_CST) != 0) return;
+    // Last reference: no space maps it any more (an area holds one), and
+    // the shootdown of the last unmap has finished.
+    for (uint64_t i = 0; i < shm->pages; i++)
+        pmm_free_page_unscrubbed(shm->base + i * PAGE);
+    free_mem(shm);
+}
+
+void* uvm_shm_base(uvm_shm_t* shm) { return shm ? shm->base : NULL; }
+uint64_t uvm_shm_size(uvm_shm_t* shm) { return shm ? shm->pages * PAGE : 0; }
+
+uint64_t uvm_map_shm(process_t* proc, uvm_shm_t* shm, uint64_t addr, uint32_t prot) {
+    uvm_space_t* s = space_of(proc);
+    if (!s || !shm) return SYS_ERR_INVAL;
+    if (prot & ~(UVM_PROT_READ | UVM_PROT_WRITE)) return SYS_ERR_INVAL;   // never executable
+    uint64_t len = shm->pages * PAGE;
+    uvm_area_t* n = (uvm_area_t*)alloc(sizeof(*n));
+    if (!n) return SYS_ERR_NOMEM;
+
+    // The whole area is filled in under the lock, before it becomes
+    // visible: a thread that touches it must never find a page without its
+    // frame (the fault path would hand it a private one).
+    uint64_t irq = space_lock(s);
+    uint64_t from = UVM_MMAP_BASE;
+    if (addr >= UVM_MIN && addr < UVM_MAX) from = round_up(addr);
+    uint64_t start = find_room(s, from, len);
+    if (!start && from != UVM_MMAP_BASE) start = find_room(s, UVM_MMAP_BASE, len);
+    uint64_t result = start;
+    if (!start) {
+        result = SYS_ERR_NOMEM;
+    } else {
+        uint64_t flags = leaf_flags(prot) | PTE_SHARED;
+        uint64_t done = 0;
+        for (; done < shm->pages; done++) {
+            uint64_t* pte = walk(s, start + done * PAGE, true);
+            if (!pte) break;
+            *pte = (uint64_t)(uintptr_t)(shm->base + done * PAGE) | flags;
+        }
+        if (done < shm->pages) {
+            // Tables ran out: nothing was visible yet, so no flush is needed.
+            for (uint64_t i = 0; i < done; i++) *walk(s, start + i * PAGE, false) = 0;
+            result = SYS_ERR_NOMEM;
+        } else {
+            n->start = start;
+            n->end = start + len;
+            n->prot = prot;
+            n->max_prot = prot;
+            n->shm = uvm_shm_get(shm);
+            insert_area(s, n);
+            n = NULL;
+        }
+    }
+    space_unlock(s, irq);
+    if (n) free_mem(n);
+    return result;
 }

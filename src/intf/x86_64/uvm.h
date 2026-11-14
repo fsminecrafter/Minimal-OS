@@ -82,6 +82,32 @@ bool uvm_is_executable(struct process* proc, uint64_t addr);
 bool uvm_copy_in(struct process* proc, uint64_t addr, const void* src, size_t len);
 bool uvm_copy_out(struct process* proc, uint64_t addr, void* dst, size_t len);
 
+// ---- Shared memory
+//
+// A uvm_shm_t is a reference-counted run of zeroed, physically contiguous
+// frames from the page pool, mapped into any number of spaces (each with
+// its own protection, e.g. read-only for a window manager). The creator
+// holds one reference (uvm_shm_create) and every mapping holds one; the
+// frames return to the pool when the last reference goes. Unmap, exit and
+// uvm_destroy of one space therefore never free frames another space still
+// maps. The kernel reaches the frames directly (uvm_shm_base: identity map).
+//
+// A shared area is filled at creation (no demand-zero), always NX, and is
+// never split: uvm_unmap() must cover it whole (partial: SYS_ERR_INVAL,
+// nothing changes), uvm_protect() likewise and only down to what it was
+// mapped with, and uvm_decommit() on it is refused with SYS_ERR_INVAL.
+typedef struct uvm_shm uvm_shm_t;
+// NULL when `bytes` (rounded up to pages) of contiguous low memory are not free.
+uvm_shm_t* uvm_shm_create(uint64_t bytes);
+uvm_shm_t* uvm_shm_get(uvm_shm_t* shm);        // takes a reference, returns shm
+void uvm_shm_put(uvm_shm_t* shm);               // gives one up (may free)
+void* uvm_shm_base(uvm_shm_t* shm);
+uint64_t uvm_shm_size(uvm_shm_t* shm);          // bytes, page multiple
+// Maps all of it at a kernel-chosen address (at or above `addr` when it is
+// in the program range) with UVM_PROT_READ and/or UVM_PROT_WRITE.
+// Returns the address or a SYS_ERR_* value.
+uint64_t uvm_map_shm(struct process* proc, uvm_shm_t* shm, uint64_t addr, uint32_t prot);
+
 // Page-fault entry (isr_handlers.c). True when the fault was a first touch
 // of a mapped page and is now resolved: the instruction can run again.
 bool uvm_handle_fault(uint64_t fault_address, uint64_t error_code);

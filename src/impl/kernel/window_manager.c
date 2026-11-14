@@ -4,11 +4,14 @@
 #include "x86_64/proc.h"
 #include "x86_64/scheduler.h"
 #include "x86_64/spinlock.h"
+#include "x86_64/uvm.h"
 #include "string.h"
 
 #define WINDOW_MIN_WIDTH 64u
 #define WINDOW_MIN_HEIGHT 48u
 #define WINDOW_TOTAL_FRAME_LIMIT (64u * 1024u * 1024u)
+// Shared frame buffers (two per window) count against their own limit.
+#define WINDOW_TOTAL_SHARED_LIMIT (128u * 1024u * 1024u)
 #define WINDOW_POSITION_LIMIT 32768u
 #define WINDOW_FLAG_MASK (SYSCALL_WINDOW_VISIBLE | SYSCALL_WINDOW_RESIZABLE | \
                           SYSCALL_WINDOW_FULLSCREEN | SYSCALL_WINDOW_MAXIMIZED | \
@@ -21,8 +24,18 @@
 typedef struct {
     bool active;
     syscall_window_info_t info;
-    uint32_t* pixels;
+    uint32_t* pixels;               // copy path frame; NULL once the window is shared
     size_t pixel_bytes;
+    // Shared frames (SYS_WINDOW_MAP_FRAME): one object with two buffers.
+    // The window holds one reference; every mapping holds its own, so a
+    // replaced object lives on until the last space unmaps it.
+    uvm_shm_t* shm;
+    size_t shm_bytes;
+    uint32_t buf_stride;            // bytes between the two buffers
+    uint32_t front;                 // buffer last presented
+    uint32_t generation;            // bumps whenever `shm` is replaced
+    // Area changed since the manager last asked (damage_w == 0: none).
+    uint32_t damage_x, damage_y, damage_w, damage_h;
     syscall_window_event_t events[SYSCALL_WINDOW_MAX_EVENTS];
     uint32_t event_head;
     uint32_t event_count;
@@ -30,9 +43,12 @@ typedef struct {
 
 static managed_window_t g_windows[SYSCALL_WINDOW_MAX_WINDOWS];
 static uint32_t g_next_window_id = 1;
+// Generations are global, so a reused window id never repeats one.
+static uint32_t g_shared_generation;
 static uint32_t g_focused_window;
 static uint64_t g_window_manager_pid;
 static size_t g_frame_bytes;
+static size_t g_shared_bytes;
 static spinlock_t g_window_lock = SPINLOCK_INIT;
 
 static managed_window_t* find_window(uint32_t id) {
@@ -82,6 +98,86 @@ static bool may_control(const managed_window_t* window, uint64_t caller_pid) {
 static void copy_window_info(syscall_window_info_t* out,
                              const managed_window_t* window) {
     *out = window->info;
+}
+
+// The frame the manager sees: the last presented shared buffer, or the
+// copy-path frame.
+static uint32_t* front_pixels(const managed_window_t* window) {
+    if (window->shm)
+        return (uint32_t*)((uint8_t*)uvm_shm_base(window->shm) +
+                           (size_t)window->front * window->buf_stride);
+    return window->pixels;
+}
+
+static void damage_add(managed_window_t* window, uint32_t x, uint32_t y,
+                       uint32_t w, uint32_t h) {
+    if (!window->damage_w || !window->damage_h) {
+        window->damage_x = x; window->damage_y = y;
+        window->damage_w = w; window->damage_h = h;
+        return;
+    }
+    uint32_t x2 = window->damage_x + window->damage_w;
+    uint32_t y2 = window->damage_y + window->damage_h;
+    if (x < window->damage_x) window->damage_x = x;
+    if (y < window->damage_y) window->damage_y = y;
+    if (x + w > x2) x2 = x + w;
+    if (y + h > y2) y2 = y + h;
+    window->damage_w = x2 - window->damage_x;
+    window->damage_h = y2 - window->damage_y;
+}
+
+// Drops the window's references on its shared frames (mappings keep theirs).
+static void shared_release(managed_window_t* window) {
+    if (window->shm) uvm_shm_put(window->shm);
+    window->shm = NULL;
+    g_shared_bytes -= window->shm_bytes;
+    window->shm_bytes = 0;
+}
+
+// Frees everything a window holds; the caller clears the slot.
+static void window_free(managed_window_t* window) {
+    g_frame_bytes -= window->pixel_bytes;
+    if (window->pixels) free_mem(window->pixels);
+    window->pixels = NULL;
+    shared_release(window);
+}
+
+// A new object for a width x height window: two buffers, zeroed. Sets
+// *stride and *bytes. NULL when over the limit or out of contiguous memory.
+static uvm_shm_t* shared_alloc(uint32_t width, uint32_t height, size_t old_bytes,
+                               uint32_t* stride, size_t* bytes) {
+    size_t row = (size_t)width * sizeof(uint32_t);
+    size_t buffer = (row * height + 4095u) & ~(size_t)4095u;
+    size_t total = buffer * SYSCALL_WINDOW_SHARED_BUFFERS;
+    if (total > WINDOW_TOTAL_SHARED_LIMIT - (g_shared_bytes - old_bytes))
+        return NULL;
+    uvm_shm_t* shm = uvm_shm_create(total);
+    if (!shm) return NULL;
+    *stride = (uint32_t)buffer;
+    *bytes = total;
+    return shm;
+}
+
+// Moves a copy-path window to shared frames: its pixels become buffer 0.
+static uint64_t enter_shared(managed_window_t* window) {
+    uint32_t stride;
+    size_t bytes;
+    uvm_shm_t* shm = shared_alloc(window->info.width, window->info.height, 0,
+                                  &stride, &bytes);
+    if (!shm) return SYS_ERR_NOMEM;
+    memcpy(uvm_shm_base(shm), window->pixels, window->pixel_bytes);
+    g_frame_bytes -= window->pixel_bytes;
+    free_mem(window->pixels);
+    window->pixels = NULL;
+    window->pixel_bytes = 0;
+    window->shm = shm;
+    window->shm_bytes = bytes;
+    g_shared_bytes += bytes;
+    window->buf_stride = stride;
+    window->front = 0;
+    window->generation = ++g_shared_generation;
+    damage_add(window, 0, 0, window->info.width, window->info.height);
+    return SYS_SUCCESS;
 }
 
 static bool push_event(managed_window_t* window,
@@ -164,24 +260,50 @@ static uint64_t resize_window(managed_window_t* window, uint32_t width,
     if (!dimensions_ok(width, height, &new_bytes)) return SYS_ERR_INVAL;
     if (window->event_count == SYSCALL_WINDOW_MAX_EVENTS)
         return SYS_ERR_BUSY;
-    if (new_bytes > WINDOW_TOTAL_FRAME_LIMIT -
-                    (g_frame_bytes - window->pixel_bytes))
-        return SYS_ERR_GENERIC;
-
-    uint32_t* pixels = alloc(new_bytes);
-    if (!pixels) return SYS_ERR_GENERIC;
     uint32_t copy_width = width < window->info.width ? width : window->info.width;
     uint32_t copy_height = height < window->info.height ? height : window->info.height;
-    for (uint32_t y = 0; y < copy_height; y++) {
-        memcpy(pixels + (size_t)y * width,
-               window->pixels + (size_t)y * window->info.width,
-               (size_t)copy_width * sizeof(uint32_t));
-    }
 
-    free_mem(window->pixels);
-    g_frame_bytes = g_frame_bytes - window->pixel_bytes + new_bytes;
-    window->pixels = pixels;
-    window->pixel_bytes = new_bytes;
+    if (window->shm) {
+        // Shared frames are replaced, never resized in place: mappings of
+        // the old object stay valid (and keep their old size) until their
+        // owners unmap them; MAP_FRAME again gives the new ones. The old
+        // front buffer is copied into the new buffer 0.
+        uint32_t stride;
+        size_t bytes;
+        uvm_shm_t* shm = shared_alloc(width, height, window->shm_bytes, &stride, &bytes);
+        if (!shm) return SYS_ERR_NOMEM;
+        for (uint32_t y = 0; y < copy_height; y++) {
+            memcpy((uint8_t*)uvm_shm_base(shm) + (size_t)y * width * sizeof(uint32_t),
+                   front_pixels(window) + (size_t)y * window->info.width,
+                   (size_t)copy_width * sizeof(uint32_t));
+        }
+        shared_release(window);
+        window->shm = shm;
+        window->shm_bytes = bytes;
+        g_shared_bytes += bytes;
+        window->buf_stride = stride;
+        window->front = 0;
+        window->generation = ++g_shared_generation;
+        window->damage_w = window->damage_h = 0;
+        damage_add(window, 0, 0, width, height);
+    } else {
+        if (new_bytes > WINDOW_TOTAL_FRAME_LIMIT -
+                        (g_frame_bytes - window->pixel_bytes))
+            return SYS_ERR_GENERIC;
+        uint32_t* pixels = alloc(new_bytes);
+        if (!pixels) return SYS_ERR_GENERIC;
+        for (uint32_t y = 0; y < copy_height; y++) {
+            memcpy(pixels + (size_t)y * width,
+                   window->pixels + (size_t)y * window->info.width,
+                   (size_t)copy_width * sizeof(uint32_t));
+        }
+        free_mem(window->pixels);
+        g_frame_bytes = g_frame_bytes - window->pixel_bytes + new_bytes;
+        window->pixels = pixels;
+        window->pixel_bytes = new_bytes;
+        window->damage_w = window->damage_h = 0;
+        damage_add(window, 0, 0, width, height);
+    }
     window->info.width = width;
     window->info.height = height;
 
@@ -236,6 +358,7 @@ static uint64_t create_window(const syscall_window_request_t* request,
     slot->active = true;
     slot->pixels = pixels;
     slot->pixel_bytes = bytes;
+    slot->generation = 0;
     while (find_window(g_next_window_id)) {
         g_next_window_id = (g_next_window_id % SYSCALL_WINDOW_MAX_WINDOWS) + 1;
     }
@@ -336,8 +459,7 @@ uint64_t window_manager_syscall(const syscall_window_request_t* request,
     uint64_t result = SYS_SUCCESS;
     switch (request->op) {
         case SYS_WINDOW_CLOSE:
-            g_frame_bytes -= window->pixel_bytes;
-            free_mem(window->pixels);
+            window_free(window);
             if (g_focused_window == window->info.id) g_focused_window = 0;
             memset(window, 0, sizeof(*window));
             break;
@@ -412,15 +534,107 @@ uint64_t window_manager_syscall(const syscall_window_request_t* request,
                 break;
             }
             const uint32_t* source = request->pixels;
+            uint32_t* frame_pixels = front_pixels(window);
             for (uint32_t y = request->y;
                  y < request->y + request->height; y++) {
-                memcpy(window->pixels + (size_t)y * window->info.width +
+                memcpy(frame_pixels + (size_t)y * window->info.width +
                            request->x,
                        (const uint8_t*)source + (size_t)y * request->pitch +
                            (size_t)request->x * sizeof(uint32_t),
                        (size_t)request->width * sizeof(uint32_t));
             }
             window->info.frame_version++;
+            damage_add(window, request->x, request->y, request->width,
+                       request->height);
+            break;
+        }
+        case SYS_WINDOW_MAP_FRAME: {
+            syscall_window_shared_t* out = request->shared;
+            bool owner = caller_pid == window->info.owner_pid;
+            process_t* me = current_process;
+            if (!out || !me || me->privilege != PROC_PRIVILEGE_USER) {
+                result = SYS_ERR_INVAL;
+                break;
+            }
+            // The owner draws (RW); the manager reads (RO). Nobody else.
+            if (!owner && !is_manager) {
+                result = SYS_ERR_PERM;
+                break;
+            }
+            if (!window->shm) {
+                // The manager can not turn another program's window into a
+                // shared one; it keeps using GET_FRAME for it.
+                result = owner ? enter_shared(window) : SYS_ERR_AGAIN;
+                if (result != SYS_SUCCESS) break;
+            }
+            memset(out, 0, sizeof(*out));
+            out->buffer_stride = window->buf_stride;
+            out->width = window->info.width;
+            out->height = window->info.height;
+            out->pitch = window->info.width * sizeof(uint32_t);
+            out->buffer_count = SYSCALL_WINDOW_SHARED_BUFFERS;
+            out->generation = window->generation;
+            out->front = window->front;
+            out->frame_version = window->info.frame_version;
+            // Map outside the window lock (it may touch many pages); our
+            // reference keeps the object alive even if the window is
+            // resized or closed meanwhile.
+            uvm_shm_t* shm = uvm_shm_get(window->shm);
+            spinlock_release(&g_window_lock, lock_flags);
+            uint64_t address = uvm_map_shm(me, shm, 0,
+                owner ? (UVM_PROT_READ | UVM_PROT_WRITE) : UVM_PROT_READ);
+            uvm_shm_put(shm);
+            if (address >= (uint64_t)-16) return address;
+            out->address = address;
+            return SYS_SUCCESS;
+        }
+        case SYS_WINDOW_PRESENT_SHARED: {
+            if (caller_pid != window->info.owner_pid) {
+                result = SYS_ERR_PERM;
+                break;
+            }
+            uint32_t w = request->width, h = request->height;
+            uint32_t x = request->x, y = request->y;
+            if (!w && !h) {              // no rectangle: the whole window
+                x = y = 0;
+                w = window->info.width;
+                h = window->info.height;
+            }
+            if (!window->shm || request->flags >= SYSCALL_WINDOW_SHARED_BUFFERS ||
+                !w || !h || x > window->info.width || y > window->info.height ||
+                w > window->info.width - x || h > window->info.height - y) {
+                result = SYS_ERR_INVAL;
+                break;
+            }
+            window->front = request->flags;
+            window->info.frame_version++;
+            damage_add(window, x, y, w, h);
+            break;
+        }
+        case SYS_WINDOW_TAKE_DAMAGE: {
+            syscall_window_shared_t* out = request->shared;
+            if (!is_manager) {
+                result = SYS_ERR_PERM;
+                break;
+            }
+            if (!out) {
+                result = SYS_ERR_INVAL;
+                break;
+            }
+            memset(out, 0, sizeof(*out));
+            out->buffer_stride = window->buf_stride;
+            out->width = window->info.width;
+            out->height = window->info.height;
+            out->pitch = window->info.width * sizeof(uint32_t);
+            out->buffer_count = window->shm ? SYSCALL_WINDOW_SHARED_BUFFERS : 0;
+            out->generation = window->generation;
+            out->front = window->front;
+            out->frame_version = window->info.frame_version;
+            out->damage_x = window->damage_x;
+            out->damage_y = window->damage_y;
+            out->damage_width = window->damage_w;
+            out->damage_height = window->damage_h;
+            window->damage_w = window->damage_h = 0;
             break;
         }
         case SYS_WINDOW_GET_INFO:
@@ -437,9 +651,10 @@ uint64_t window_manager_syscall(const syscall_window_request_t* request,
                 result = is_manager ? SYS_ERR_INVAL : SYS_ERR_PERM;
                 break;
             }
+            const uint32_t* source_pixels = front_pixels(window);
             for (uint32_t y = 0; y < frame->height; y++) {
                 memcpy((uint8_t*)frame->pixels + (size_t)y * frame->pitch,
-                       window->pixels + (size_t)y * window->info.width,
+                       source_pixels + (size_t)y * window->info.width,
                        (size_t)window->info.width * sizeof(uint32_t));
             }
             break;
@@ -481,10 +696,64 @@ void window_manager_process_exit(uint64_t pid) {
     for (uint32_t i = 0; i < SYSCALL_WINDOW_MAX_WINDOWS; i++) {
         managed_window_t* window = &g_windows[i];
         if (!window->active || window->info.owner_pid != pid) continue;
-        g_frame_bytes -= window->pixel_bytes;
-        free_mem(window->pixels);
+        window_free(window);
         if (g_focused_window == window->info.id) g_focused_window = 0;
         memset(window, 0, sizeof(*window));
     }
     spinlock_release(&g_window_lock, flags);
+}
+
+bool window_manager_present_target(uint32_t window_id, uint64_t owner_pid,
+                                   window_present_target_t* target) {
+    uint64_t flags = spinlock_acquire(&g_window_lock);
+    managed_window_t* window = find_window(window_id);
+    bool ok = false;
+    if (window && window->info.owner_pid == owner_pid) {
+        // A copy-path window becomes a shared one here (its pixels move to
+        // buffer 0); when that is not possible the caller copies instead.
+        if (window->shm || enter_shared(window) == SYS_SUCCESS) {
+            target->buffer = window->front ^ 1u;
+            // The caller's own reference: a resize or close meanwhile
+            // drops the window's, not this one.
+            target->pin = uvm_shm_get(window->shm);
+            target->pixels = (uint32_t*)((uint8_t*)uvm_shm_base(window->shm) +
+                                         (size_t)target->buffer * window->buf_stride);
+            target->pitch_px = window->info.width;
+            target->width = window->info.width;
+            target->height = window->info.height;
+            ok = true;
+        }
+    }
+    spinlock_release(&g_window_lock, flags);
+    return ok;
+}
+
+uint64_t window_manager_present_done(uint32_t window_id, uint64_t owner_pid,
+                                     window_present_target_t* target,
+                                     uint32_t x, uint32_t y, uint32_t w,
+                                     uint32_t h) {
+    uint64_t flags = spinlock_acquire(&g_window_lock);
+    managed_window_t* window = find_window(window_id);
+    uint64_t result;
+    if (!window || window->info.owner_pid != owner_pid) {
+        result = SYS_ERR_NOTFOUND;
+    } else if (window->shm != (uvm_shm_t*)target->pin) {
+        // Resized while the caller was drawing: the buffer it filled
+        // belongs to the old object, nothing is presented.
+        result = SYS_ERR_AGAIN;
+    } else if (!w && !h) {
+        result = SYS_SUCCESS;                   // abandoned
+    } else if (!w || !h || x > window->info.width || y > window->info.height ||
+               w > window->info.width - x || h > window->info.height - y) {
+        result = SYS_ERR_INVAL;
+    } else {
+        window->front = target->buffer;
+        window->info.frame_version++;
+        damage_add(window, x, y, w, h);
+        result = SYS_SUCCESS;
+    }
+    spinlock_release(&g_window_lock, flags);
+    uvm_shm_put((uvm_shm_t*)target->pin);       // the caller's reference, always
+    target->pin = NULL;
+    return result;
 }

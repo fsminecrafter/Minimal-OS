@@ -120,6 +120,25 @@ until written. `SYS_VM` maps, unmaps, protects and decommits such areas. Kernel
 code copies into or out of another program's memory with `uvm_copy_in()` and
 `uvm_copy_out()`, which work through the frames whatever page tables are loaded.
 
+**Shared areas.** A `uvm_shm_t` (`uvm.h`) is a reference-counted run of zeroed,
+physically contiguous frames from the low page pool that can be mapped into
+several spaces with `uvm_map_shm()`, each with its own protection (read-only
+for the window manager) and always NX. The creator holds one reference and every
+mapping (a `uvm_area_t` with `shm` set) holds one; the frames return to the pool
+when the last goes, so `uvm_unmap`, `uvm_release_all` and `uvm_destroy` of one
+space never free frames another space still maps. Their page-table entries carry
+the software bit `PTE_SHARED`, which `release_frame`, `free_tables` and
+`uvm_protect`/the fault path respect (the bit is kept, the frame is not freed).
+The pages are filled in at creation under the space lock, before the area is
+visible (no demand-zero). A shared area is never split: `uvm_unmap` and
+`uvm_protect` must cover it whole (otherwise `SYS_ERR_INVAL` and that area stays as it is; other areas in the range are still handled),
+`uvm_protect` may not grant more than the mapping started with or add
+execute, and `uvm_decommit` on one is refused with `SYS_ERR_INVAL`. Unmapping
+clears the entries, shoots down the TLBs of every CPU that has the space loaded
+(`tlb.h`) and only then drops the reference. The kernel writes into the frames
+through `uvm_shm_base()` (identity map). The window manager uses this for window
+frames (see [User programs](user-programs.md#window-frames)).
+
 ## Processes And Threads
 
 Kernel processes are created with `createProcess(name, entry)`. A process entry

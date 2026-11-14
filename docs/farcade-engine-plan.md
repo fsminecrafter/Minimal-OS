@@ -9,7 +9,7 @@ You want a real game engine for Minimal-OS, in its own repository (to be created
 - It has modern graphics: CLOD virtual geometry with voxels as the far representation (no impostors), a screen-space + voxel hybrid GI (no ray tracing), and far-away proxies that carry no instance data.
 - It is fast.
 
-Your decisions:
+decisions:
 1. **The editor and toolchain run on Minimal-OS only.** Game makers never need a PC. The engine developer (you) still builds the engine and editor on the PC (WSL/Docker) and tests them in QEMU.
 2. **All rendering goes through FarcadeGL.** It already falls back between the kernel's CPU backend and the NVIDIA Turing backend, so speed work goes into FGPU itself.
 3. **Scripting is Lua 5.4.**

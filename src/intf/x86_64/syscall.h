@@ -302,7 +302,33 @@ typedef enum {
     SYS_WINDOW_NEXT_EVENT,
     SYS_WINDOW_POST_EVENT,
     SYS_WINDOW_REGISTER_MANAGER,
+    // Shared frames (no pixel copies); see syscall_window_shared_t.
+    SYS_WINDOW_MAP_FRAME,        // map the window's frame buffers (owner: RW, manager: RO)
+    SYS_WINDOW_PRESENT_SHARED,   // owner: buffer `flags` is ready, damage x/y/width/height
+    SYS_WINDOW_TAKE_DAMAGE,      // manager: damage since the last call + current buffer
 } syscall_window_op_t;
+
+// A window that has been mapped with SYS_WINDOW_MAP_FRAME has two buffers
+// of width*4 bytes per row, `buffer_stride` bytes apart, in one shared
+// object. `front` is the one last presented: the manager reads it, the
+// owner draws into the other and presents it with SYS_WINDOW_PRESENT_SHARED.
+// Passed in the `shared` member of the request; kernel fills every field.
+#define SYSCALL_WINDOW_SHARED_BUFFERS 2u
+typedef struct {
+    uint64_t address;        // buffer 0 in the caller's space (buffer i: + i*buffer_stride)
+    uint64_t buffer_stride;  // bytes from one buffer to the next
+    uint32_t width;
+    uint32_t height;
+    uint32_t pitch;          // bytes per row
+    uint32_t buffer_count;   // SYSCALL_WINDOW_SHARED_BUFFERS, 0 = the window uses the copy path
+    uint32_t generation;     // changes whenever the buffers are replaced (resize)
+    uint32_t front;          // buffer last presented
+    uint32_t frame_version;  // counts presents
+    uint32_t damage_x;       // TAKE_DAMAGE: changed area since the last call
+    uint32_t damage_y;
+    uint32_t damage_width;   // 0: nothing changed
+    uint32_t damage_height;
+} syscall_window_shared_t;
 
 #define SYSCALL_WINDOW_VISIBLE      (1u << 0)
 #define SYSCALL_WINDOW_RESIZABLE    (1u << 1)
@@ -398,7 +424,10 @@ typedef struct {
     syscall_window_info_t* info;
     syscall_window_info_t* windows;
     uint32_t capacity;
-    syscall_window_frame_t* frame;
+    union {
+        syscall_window_frame_t* frame;
+        syscall_window_shared_t* shared;   // the shared-frame ops
+    };
     syscall_window_event_t* event;
     syscall_window_style_t style;
 } syscall_window_request_t;

@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "gfx_blit.h"
 
@@ -117,11 +118,80 @@ static void test_surface_bounds_and_present(void) {
     assert(!gfx_surface_valid(&overflow));
 }
 
+// Reference: every destination pixel looked up one by one.
+static void scale_reference(uint32_t* dst, uint32_t dw, uint32_t dh, uint32_t dstride,
+                            const uint32_t* src, uint32_t sstride, const gfx_rect_t* r,
+                            uint32_t k, int32_t dx, int32_t dy) {
+    for (int32_t y = 0; y < r->h * (int32_t)k; y++) {
+        for (int32_t x = 0; x < r->w * (int32_t)k; x++) {
+            int64_t px = (int64_t)dx + x, py = (int64_t)dy + y;
+            if (px < 0 || py < 0 || px >= dw || py >= dh) continue;
+            dst[(size_t)py * dstride + px] = src[(size_t)(r->y + y / (int32_t)k) * sstride +
+                                                  r->x + x / (int32_t)k];
+        }
+    }
+}
+
+static uint32_t rng_state = 12345;
+static uint32_t rnd(void) {
+    rng_state = rng_state * 1664525u + 1013904223u;
+    return rng_state >> 8;
+}
+
+static void test_scale_blit(void) {
+    // Odd sizes, strides larger than widths, offsets and clipping on every side.
+    for (int iter = 0; iter < 600; iter++) {
+        uint32_t k = 1 + (uint32_t)iter % 3;
+        uint32_t sw = 1 + rnd() % 70, sh = 1 + rnd() % 20;
+        uint32_t sstride = sw + rnd() % 5;
+        uint32_t dw = 1 + rnd() % 200, dh = 1 + rnd() % 60;
+        uint32_t dstride = dw + rnd() % 7;
+        uint32_t* src = malloc((size_t)sstride * sh * 4);
+        uint32_t* a = malloc((size_t)dstride * dh * 4);
+        uint32_t* b = malloc((size_t)dstride * dh * 4);
+        uint32_t* c = malloc((size_t)dstride * dh * 4);
+        assert(src && a && b && c);
+        for (size_t i = 0; i < (size_t)sstride * sh; i++) src[i] = rnd() | 0x01000000u;
+        for (size_t i = 0; i < (size_t)dstride * dh; i++) a[i] = b[i] = c[i] = 0xDEAD0000u + (uint32_t)i;
+        gfx_rect_t r = { 0, 0, (int32_t)sw, (int32_t)sh };
+        if (iter & 1) {     // a sub-rectangle, sometimes sticking out of the source
+            r.x = (int32_t)(rnd() % sw) - 2; r.y = (int32_t)(rnd() % sh) - 1;
+            r.w = 1 + (int32_t)(rnd() % sw); r.h = 1 + (int32_t)(rnd() % sh);
+        }
+        int32_t dx = (int32_t)(rnd() % (dw + 80)) - 40, dy = (int32_t)(rnd() % (dh + 40)) - 20;
+        // Reference works on the part of the rect that lies inside the source.
+        gfx_rect_t in = r;
+        if (in.x < 0) { in.w += in.x; dx += -r.x * (int32_t)k; in.x = 0; }
+        if (in.y < 0) { in.h += in.y; dy += -r.y * (int32_t)k; in.y = 0; }
+        if (in.x + in.w > (int32_t)sw) in.w = (int32_t)sw - in.x;
+        if (in.y + in.h > (int32_t)sh) in.h = (int32_t)sh - in.y;
+        if (in.w > 0 && in.h > 0) scale_reference(a, dw, dh, dstride, src, sstride, &in, k, dx, dy);
+        gfx_surface_t ss = { src, (size_t)sstride * sh * 4, sw, sh, sstride };
+        gfx_surface_t ds = { b, (size_t)dstride * dh * 4, dw, dh, dstride };
+        gfx_surface_t dt = { c, (size_t)dstride * dh * 4, dw, dh, dstride };
+        int32_t odx = (iter & 1) ? dx - ((r.x < 0) ? -r.x * (int32_t)k : 0) : dx;
+        int32_t ody = (iter & 1) ? dy - ((r.y < 0) ? -r.y * (int32_t)k : 0) : dy;
+        assert(gfx_scale_blit(&ds, &ss, &r, k, odx, ody, false));
+        assert(gfx_scale_blit(&dt, &ss, &r, k, odx, ody, true));
+        assert(memcmp(a, b, (size_t)dstride * dh * 4) == 0);
+        assert(memcmp(a, c, (size_t)dstride * dh * 4) == 0);
+        free(src); free(a); free(b); free(c);
+    }
+    uint32_t px[4] = {0}, one = 1;
+    gfx_surface_t d = { px, sizeof(px), 2, 2, 2 }, s1 = { &one, 4, 1, 1, 1 };
+    gfx_rect_t r1 = { 0, 0, 1, 1 };
+    assert(!gfx_scale_blit(&d, &s1, &r1, 0, 0, 0, false));
+    assert(!gfx_scale_blit(&d, &s1, &r1, 4, 0, 0, false));
+    assert(gfx_scale_blit(&d, &s1, &r1, 3, INT32_MAX, INT32_MIN, true));   // far off screen
+    assert(gfx_scale_blit(&d, &s1, &r1, 2, 0, 0, false) && px[0] == 1 && px[3] == 1);
+}
+
 int main(void) {
     test_clip_rect();
     test_fill_and_blit();
     test_hostile_clip_and_alpha();
     test_surface_bounds_and_present();
+    test_scale_blit();
     puts("gfx_blit_tests: PASS");
     return 0;
 }

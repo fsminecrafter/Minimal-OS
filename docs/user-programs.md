@@ -57,6 +57,38 @@ image is readable, writable and executable as a whole.
 The SDK linker script keeps the image base-relative. External symbols are not
 available because there is no dynamic linker or libc at runtime.
 
+## Window Frames
+
+`SYS_WINDOW_PRESENT` copies pixels into a kernel frame and mosWM copies them out
+again (`SYS_WINDOW_GET_FRAME`); that path is unchanged. Three ops, appended to
+`syscall_window_op_t`, share the frame instead (`syscall_window_shared_t`, passed in
+the `shared` member of the request, which shares storage with `frame`):
+
+- `SYS_WINDOW_MAP_FRAME` maps the window's two buffers (one object, `buffer_count` 2,
+  `buffer_stride` bytes apart, `width * 4` bytes per row). The owner gets them
+  writable, the registered manager read-only, nobody else (`SYS_ERR_PERM`). The first
+  call by the owner turns the window into a shared one (its pixels become buffer 0);
+  the manager asking about a window that is not shared gets `SYS_ERR_AGAIN` and keeps
+  using `GET_FRAME`. `SYS_ERR_NOMEM`: no contiguous memory, or over the 128 MiB limit
+  for shared frames (counted separately from the 64 MiB of the copy path). Every call
+  makes a new mapping; the caller unmaps it (`SYS_VM_UNMAP`, `2 * buffer_stride`).
+- `SYS_WINDOW_PRESENT_SHARED`: owner only; `flags` is the buffer number that is ready,
+  `x/y/width/height` the damage (both 0: everything). That buffer becomes the front
+  one (what the manager shows); the owner draws into the other. Damage is the
+  part that differs from the buffer shown before.
+- `SYS_WINDOW_TAKE_DAMAGE`: manager only. Returns the geometry, `generation`, `front`,
+  `frame_version` and the union of damage rectangles since the last call (copy-path
+  presents are included; `buffer_count` is 0 for those windows), and clears it.
+
+Resizing replaces the object: the window drops its reference, `generation` increases,
+`front` becomes 0 and the old front pixels are copied into the new buffer 0. Existing
+mappings stay valid, show the old frame and are no longer updated; mapping again gives
+the new buffers. The old frames are freed when the last process unmaps them or ends,
+and a closed window's frames likewise. `window_manager_present_target()` /
+`window_manager_present_done()` (the target holds its own reference on the frames) let kernel code (FGPU `op_present`) render into the
+back buffer and publish it with a damage rectangle; they fall back to the copy path
+(return false) when the window cannot be shared.
+
 ## Arguments And Exit
 
 The first argument is the program path. Extra arguments follow it. The SDK

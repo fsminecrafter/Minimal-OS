@@ -14,6 +14,7 @@
 #include "serial.h"
 #include "string.h"
 #include "x86_64/scheduler.h"
+#include "x86_64/clock.h"
 #include "x86_64/smp_par.h"
 
 /*
@@ -21,20 +22,21 @@
  * programs per process, runs submitted command buffers and presents
  * finished frames to the screen (copy or page flip) or to a window.
  *
+ * Objects belong to a program (all its threads share them) and live in
+ * per-type tables with per-program quotas; each program has a context
+ * (its lock, its counts, the fences of its asynchronous submits). Drawing
+ * and presenting share one render lock; a kernel worker process runs
+ * asynchronous submits.
+ *
  * Clears and draws are offered to the adapter's hardware backend first
  * (fgpu_backend.h); whatever it does not take runs on the CPU backend
  * (fgpu_raster.c, shaders in fgpu_shader.c). Before the CPU touches a
  * surface or buffer, queued GPU work is finished (hw_sync).
  */
 
-#define FGPU_MAX_SURFACES 64
-#define FGPU_MAX_BUFFERS 128
-#define FGPU_MAX_PROGRAMS 64
-
 typedef struct {
-    bool used;
-    uint32_t id;
-    uint64_t owner;
+    uint32_t id;                // its handle
+    uint64_t owner;             // the program (group owner) it belongs to
     uint32_t width, height, format, flags;
     uint32_t pitch;             // in pixels / floats
     void* mem;
@@ -45,7 +47,6 @@ typedef struct {
 } fgpu_surface_t;
 
 typedef struct {
-    bool used;
     uint32_t id;
     uint64_t owner;
     uint64_t size;
@@ -56,7 +57,6 @@ typedef struct {
 } fgpu_buffer_t;
 
 typedef struct {
-    bool used;
     uint32_t id;
     uint64_t owner;
     uint32_t* blob;             // kernel copy; `program` points into it
@@ -64,11 +64,6 @@ typedef struct {
     void* hw;                   // the hardware backend's compiled program, or NULL
 } fgpu_shader_program_t;
 
-static fgpu_surface_t g_surfaces[FGPU_MAX_SURFACES];
-static fgpu_buffer_t g_buffers[FGPU_MAX_BUFFERS];
-static fgpu_shader_program_t g_programs[FGPU_MAX_PROGRAMS];
-static uint32_t g_next_id = 1;
-static volatile int g_busy;
 static uint64_t g_flipped_owner;        // pid whose surface is on screen, 0 = none
 
 /* Hardware backend, chosen once by fgpu_backend_select(). */
@@ -77,7 +72,7 @@ static const char* g_hw_why = "not chosen yet";
 static bool g_hw_pending;               // GPU work queued since the last finish()
 
 /* CPU draws are recorded in a pass and rendered at flush (fgpu_raster.h,
- * docs/gpu.md "Binned rasterizer"). Flush points, all under g_busy: the end of
+ * docs/gpu.md "Binned rasterizer"). Flush points, all under the render lock: the end of
  * every SUBMIT (so the reported triangle count is exact and nothing stays
  * pending between syscalls), before the hardware backend gets a clear or
  * draw (CPU draws recorded earlier must land first), and at the start of
@@ -185,61 +180,272 @@ static void program_free(fgpu_shader_program_t* sp) {
     sp->hw = NULL;
     fgpu_program_release(&sp->program);     // OS-4: frees the compiled shader code
     free_mem(sp->blob);
-    sp->used = false;
+    free_mem(sp);
 }
 
 #include "x86_64/user_ptr.h"
+#include "x86_64/spinlock.h"
+#include "x86_64/waitq.h"
+#include "x86_64/clock.h"
+#include "time.h"
 
+// The calling thread (window and screen ownership go by it, as before).
 static uint64_t caller(void) {
     return current_process ? current_process->pid : 0;
 }
 
-static volatile uint64_t g_busy_owner;
-
-static void lock(void) {
-    while (__sync_lock_test_and_set(&g_busy, 1)) {
-        // A process killed while holding the lock must not block everyone.
-        uint64_t holder = g_busy_owner;
-        if (holder && !findProcessByPID(holder)) {
-            g_busy_owner = 0;
-            __sync_lock_release(&g_busy);
-            continue;
-        }
-        sleep(1);
-    }
-    g_busy_owner = caller();
+// The program GPU objects belong to: the group owner, so that all threads
+// of a program share its surfaces, buffers and shaders, and a thread that
+// ends frees nothing of them.
+static uint64_t caller_group(void) {
+    process_t* p = current_process;
+    if (!p) return 0;
+    process_t* o = proc_mem_owner(p);
+    return o ? o->pid : p->pid;
 }
 
-static void unlock(void) {
-    g_busy_owner = 0;
-    __sync_lock_release(&g_busy);
+/* -------------------------------------------------------------- locks
+ *
+ * Sleeping locks for code that runs with interrupts on and may take long
+ * (rendering): a waiter spins briefly, then sleeps on a wait queue. A lock
+ * whose holder died holding it (a thread killed in the middle of a GPU
+ * call) is taken over by the next waiter, as the old global lock did.
+ *
+ * Order: context lock, then the render lock, then g_table_lock (a
+ * spinlock, held only for table lookups and changes).
+ */
+typedef struct {
+    volatile uint32_t locked;
+    volatile uint64_t holder;   // pid of the holding thread
+} fgpu_mutex_t;
+
+static bool mutex_should_sleep(void* m) { return ((fgpu_mutex_t*)m)->locked != 0; }
+
+static bool mutex_try(fgpu_mutex_t* m) {
+    if (__sync_lock_test_and_set(&m->locked, 1)) return false;
+    m->holder = caller();
+    return true;
+}
+
+static void mutex_lock(fgpu_mutex_t* m) {
+    for (uint32_t spins = 0;; spins++) {
+        if (mutex_try(m)) return;
+        uint64_t h = m->holder;
+        if (h && !findProcessByPID(h) &&
+            __sync_bool_compare_and_swap(&m->holder, h, caller())) return;
+        if (spins < 64) { __asm__ volatile("pause"); continue; }
+        // The deadline only bounds how long a dead holder goes unnoticed.
+        waitq_wait(m, 0, mutex_should_sleep, m, time_get_uptime_ms() + 10);
+    }
+}
+
+static void mutex_unlock(fgpu_mutex_t* m) {
+    m->holder = 0;
+    __sync_lock_release(&m->locked);
+    waitq_wake(m, 0, 1);
+}
+
+// The CPU rasterizer (one pass, static per-worker batches), the hardware
+// backend and the screen are shared by everyone: drawing and presenting
+// hold this lock.
+static fgpu_mutex_t g_render;
+
+// Whether creating, writing, reading or freeing objects needs the render
+// lock too: when queued hardware work may be using them (hw_sync) or VRAM
+// is handed out. With the CPU backend alone, programs can upload, read
+// back and create while another one renders.
+static bool memops_need_render(void) {
+    gpu_adapter_t* a = gpu_primary_adapter();
+    return g_hw || (a && (a->caps & GPU_CAP_VRAM_HEAP));
+}
+
+/* ------------------------------------------------------ object tables
+ *
+ * One table per object type, shared by all programs, grown on demand up to
+ * FGPU_TABLE_MAX slots. A handle is (generation << 20) | (type << 18) |
+ * (slot + 1): looking one up is O(1), a stale handle (a freed and reused
+ * slot) does not match, and handles stay positive as int32. Every object is
+ * owned by one program and only found by it.
+ */
+enum { OBJ_SURFACE = 1, OBJ_BUFFER = 2, OBJ_PROGRAM = 3, OBJ_TYPES = 4 };
+
+#define FGPU_TABLE_MAX (1u << 16)
+// Per-program quotas, so that one program cannot use up the tables.
+static const uint32_t k_quota[OBJ_TYPES] = { 0, 1024, 4096, 1024 };
+
+typedef struct {
+    void* obj;
+    uint64_t owner;
+    uint16_t gen;
+} fgpu_slot_t;
+
+typedef struct {
+    fgpu_slot_t* slots;
+    uint32_t cap, used, hint;
+} fgpu_table_t;
+
+static fgpu_table_t g_tables[OBJ_TYPES];
+static spinlock_t g_table_lock = SPINLOCK_INIT;
+
+static uint32_t table_insert(uint32_t type, void* obj, uint64_t owner) {
+    fgpu_table_t* t = &g_tables[type];
+    for (;;) {
+        uint64_t f = spinlock_acquire(&g_table_lock);
+        if (t->used < t->cap) {
+            for (uint32_t n = 0; n < t->cap; n++) {
+                uint32_t i = (t->hint + n) % t->cap;
+                fgpu_slot_t* sl = &t->slots[i];
+                if (sl->obj) continue;
+                sl->obj = obj;
+                sl->owner = owner;
+                sl->gen = (uint16_t)((sl->gen + 1) & 0x7FF);
+                if (!sl->gen) sl->gen = 1;
+                t->used++;
+                t->hint = i + 1;
+                uint32_t h = ((uint32_t)sl->gen << 20) | (type << 18) | (i + 1);
+                spinlock_release(&g_table_lock, f);
+                return h;
+            }
+        }
+        uint32_t cap = t->cap;
+        spinlock_release(&g_table_lock, f);
+        if (cap >= FGPU_TABLE_MAX) return 0;
+        // Grow outside the spinlock (the heap may take a while), then swap.
+        uint32_t ncap = cap ? cap * 2 : 64;
+        fgpu_slot_t* ns = (fgpu_slot_t*)alloc_unzeroed((size_t)ncap * sizeof(*ns));
+        if (!ns) return 0;
+        memset(ns, 0, (size_t)ncap * sizeof(*ns));
+        fgpu_slot_t* old = NULL;
+        f = spinlock_acquire(&g_table_lock);
+        if (t->cap == cap) {
+            if (cap) memcpy(ns, t->slots, (size_t)cap * sizeof(*ns));
+            old = t->slots;
+            t->slots = ns;
+            t->cap = ncap;
+            ns = NULL;
+        }
+        spinlock_release(&g_table_lock, f);
+        if (ns) free_mem(ns);
+        if (old) free_mem(old);
+    }
+}
+
+static bool handle_split(uint32_t type, uint32_t h, uint32_t* slot, uint16_t* gen) {
+    if (!h || ((h >> 18) & 3u) != type || !(h & 0x3FFFFu)) return false;
+    *slot = (h & 0x3FFFFu) - 1;
+    *gen = (uint16_t)(h >> 20);
+    return true;
+}
+
+static void* table_get(uint32_t type, uint32_t h, uint64_t owner) {
+    uint32_t i;
+    uint16_t gen;
+    if (!handle_split(type, h, &i, &gen)) return NULL;
+    void* obj = NULL;
+    uint64_t f = spinlock_acquire(&g_table_lock);
+    fgpu_table_t* t = &g_tables[type];
+    if (i < t->cap && t->slots[i].obj && t->slots[i].gen == gen && t->slots[i].owner == owner)
+        obj = t->slots[i].obj;
+    spinlock_release(&g_table_lock, f);
+    return obj;
+}
+
+static void table_remove(uint32_t type, uint32_t h) {
+    uint32_t i;
+    uint16_t gen;
+    if (!handle_split(type, h, &i, &gen)) return;
+    uint64_t f = spinlock_acquire(&g_table_lock);
+    fgpu_table_t* t = &g_tables[type];
+    if (i < t->cap && t->slots[i].obj && t->slots[i].gen == gen) {
+        t->slots[i].obj = NULL;
+        t->slots[i].owner = 0;
+        t->used--;
+    }
+    spinlock_release(&g_table_lock, f);
+}
+
+// Takes one object of `owner` out of the table, or NULL when none is left.
+static void* table_take_owned(uint32_t type, uint64_t owner) {
+    void* obj = NULL;
+    uint64_t f = spinlock_acquire(&g_table_lock);
+    fgpu_table_t* t = &g_tables[type];
+    for (uint32_t i = 0; i < t->cap; i++) {
+        if (t->slots[i].obj && t->slots[i].owner == owner) {
+            obj = t->slots[i].obj;
+            t->slots[i].obj = NULL;
+            t->slots[i].owner = 0;
+            t->used--;
+            break;
+        }
+    }
+    spinlock_release(&g_table_lock, f);
+    return obj;
 }
 
 static fgpu_surface_t* find_surface(uint32_t id, uint64_t owner) {
-    if (!id) return NULL;
-    for (int i = 0; i < FGPU_MAX_SURFACES; i++) {
-        if (g_surfaces[i].used && g_surfaces[i].id == id && g_surfaces[i].owner == owner)
-            return &g_surfaces[i];
-    }
-    return NULL;
+    return (fgpu_surface_t*)table_get(OBJ_SURFACE, id, owner);
 }
 
 static fgpu_shader_program_t* find_program(uint32_t id, uint64_t owner) {
-    if (!id) return NULL;
-    for (int i = 0; i < FGPU_MAX_PROGRAMS; i++) {
-        if (g_programs[i].used && g_programs[i].id == id && g_programs[i].owner == owner)
-            return &g_programs[i];
-    }
-    return NULL;
+    return (fgpu_shader_program_t*)table_get(OBJ_PROGRAM, id, owner);
 }
 
 static fgpu_buffer_t* find_buffer(uint32_t id, uint64_t owner) {
-    if (!id) return NULL;
-    for (int i = 0; i < FGPU_MAX_BUFFERS; i++) {
-        if (g_buffers[i].used && g_buffers[i].id == id && g_buffers[i].owner == owner)
-            return &g_buffers[i];
+    return (fgpu_buffer_t*)table_get(OBJ_BUFFER, id, owner);
+}
+
+/* ------------------------------------------------------------ contexts
+ *
+ * One per program that uses SYS_GPU: its lock (the program's GPU calls and
+ * its queued command buffers run one at a time, in order), its object
+ * counts for the quotas, and the fences of asynchronous submits.
+ */
+typedef struct fgpu_ctx {
+    struct fgpu_ctx* next;
+    uint64_t owner;
+    fgpu_mutex_t lock;
+    uint32_t counts[OBJ_TYPES];
+    volatile uint32_t fence_submitted;  // last fence handed out
+    volatile uint32_t fence_done;       // last fence whose commands ran
+    volatile uint32_t jobs;             // queued or running command buffers
+    volatile uint32_t async_triangles;  // drawn by async submits since the last WAIT
+    volatile bool async_failed;         // an async command buffer was rejected
+    volatile bool dead;                 // the program ended; freed by ctx_gc()
+    uint64_t pace_interval_ns;          // FGPU_PRESENT_PACED (0 = 60 Hz)
+    uint64_t pace_last_ns;              // the last frame boundary
+} fgpu_ctx_t;
+
+static fgpu_ctx_t* g_ctxs;
+static spinlock_t g_ctx_lock = SPINLOCK_INIT;
+static volatile bool g_gc_pending;
+
+static fgpu_ctx_t* ctx_find(uint64_t owner, bool create) {
+    uint64_t f = spinlock_acquire(&g_ctx_lock);
+    for (fgpu_ctx_t* c = g_ctxs; c; c = c->next) {
+        if (c->owner == owner && !c->dead) {
+            spinlock_release(&g_ctx_lock, f);
+            return c;
+        }
     }
-    return NULL;
+    spinlock_release(&g_ctx_lock, f);
+    if (!create) return NULL;
+    fgpu_ctx_t* n = (fgpu_ctx_t*)alloc(sizeof(fgpu_ctx_t));
+    if (!n) return NULL;
+    memset(n, 0, sizeof(*n));
+    n->owner = owner;
+    f = spinlock_acquire(&g_ctx_lock);
+    // Another thread of the same program may have made one meanwhile.
+    for (fgpu_ctx_t* c = g_ctxs; c; c = c->next) {
+        if (c->owner == owner && !c->dead) {
+            spinlock_release(&g_ctx_lock, f);
+            free_mem(n);
+            return c;
+        }
+    }
+    n->next = g_ctxs;
+    g_ctxs = n;
+    spinlock_release(&g_ctx_lock, f);
+    return n;
 }
 
 // True when draws run on the graphics card itself: what it renders from
@@ -307,43 +513,151 @@ static void release_flip_locked(void) {
     graphics_terminal_redraw();
 }
 
+static void surface_free(fgpu_surface_t* s) {
+    surface_gone(s);
+    unplace(s->mem, s->in_vram, s->vram_offset, s->adapter);
+    free_mem(s);
+}
+
+static void buffer_free(fgpu_buffer_t* b) {
+    unplace(b->mem, b->in_vram, b->vram_offset, b->adapter);
+    free_mem(b);
+}
+
+/* Asynchronous submits (FGPU_SUBMIT_ASYNC): command buffers queued here
+ * are run in order by one kernel worker process (fgpu_worker), each under
+ * its program's context lock and the render lock, like a synchronous
+ * SUBMIT. */
+typedef struct fgpu_job {
+    struct fgpu_job* next;
+    fgpu_ctx_t* ctx;
+    uint32_t* cmd;
+    uint32_t words;
+    uint32_t fence;
+} fgpu_job_t;
+
+static fgpu_job_t* g_job_head;
+static fgpu_job_t* g_job_tail;
+static spinlock_t g_job_lock = SPINLOCK_INIT;
+static volatile uint32_t g_worker_started;
+
+static void wake_worker(void) { waitq_wake(&g_job_head, 0, 1); }
+
+// Frees everything `c` owns. Needs c->lock and, when memops_need_render(),
+// the render lock.
+static void ctx_free_objects(fgpu_ctx_t* c) {
+    void* o;
+    while ((o = table_take_owned(OBJ_SURFACE, c->owner))) surface_free((fgpu_surface_t*)o);
+    while ((o = table_take_owned(OBJ_BUFFER, c->owner))) buffer_free((fgpu_buffer_t*)o);
+    while ((o = table_take_owned(OBJ_PROGRAM, c->owner))) program_free((fgpu_shader_program_t*)o);
+    for (int t = 0; t < OBJ_TYPES; t++) c->counts[t] = 0;
+}
+
+// Frees `c` and what it owns if nobody holds its locks and nothing of it
+// is queued; true when done. Never sleeps (exit paths may have interrupts
+// off): lock attempts only.
+static bool ctx_try_release(fgpu_ctx_t* c) {
+    if (__atomic_load_n(&c->jobs, __ATOMIC_SEQ_CST)) return false;
+    if (!mutex_try(&c->lock)) return false;
+    bool render = memops_need_render();
+    if (render && !mutex_try(&g_render)) {
+        mutex_unlock(&c->lock);
+        return false;
+    }
+    if (render) hw_sync();
+    ctx_free_objects(c);
+    if (render) mutex_unlock(&g_render);
+    uint64_t f = spinlock_acquire(&g_ctx_lock);
+    for (fgpu_ctx_t** pp = &g_ctxs; *pp; pp = &(*pp)->next) {
+        if (*pp == c) { *pp = c->next; break; }
+    }
+    spinlock_release(&g_ctx_lock, f);
+    // No one can find it any more; whoever waits on its lock is a thread of
+    // the ended program.
+    free_mem(c);
+    return true;
+}
+
+// Frees contexts of ended programs that could not be freed at exit, and a
+// page flip left by a program that is gone. Runs at the start of SYS_GPU
+// calls and in the worker.
+static void ctx_gc(void) {
+    if (!g_gc_pending) return;
+    g_gc_pending = false;
+    for (;;) {
+        fgpu_ctx_t* dead = NULL;
+        uint64_t f = spinlock_acquire(&g_ctx_lock);
+        for (fgpu_ctx_t* c = g_ctxs; c; c = c->next) if (c->dead) { dead = c; break; }
+        spinlock_release(&g_ctx_lock, f);
+        if (!dead) break;
+        if (!ctx_try_release(dead)) { g_gc_pending = true; break; }
+    }
+    if (g_flipped_owner && !findProcessByPID(g_flipped_owner) && mutex_try(&g_render)) {
+        release_flip_locked();
+        mutex_unlock(&g_render);
+    }
+}
+
+// A thread or a whole program ends. Called on exit paths that may run with
+// interrupts off: nothing here sleeps.
 void fgpu_process_exit(uint64_t pid) {
     if (!pid) return;
-    if (g_busy && g_busy_owner == pid) {
-        g_busy_owner = 0;
-        __sync_lock_release(&g_busy);
+    // A thread killed in the middle of a GPU call: its locks are released
+    // and the draws it recorded are dropped, not drawn.
+    if (g_render.locked && g_render.holder == pid) {
+        if (g_pass) fgpu_pass_discard(g_pass);
+        hw_sync();
+        if (g_flipped_owner == pid) release_flip_locked();
+        mutex_unlock(&g_render);
+    } else if (g_flipped_owner == pid && mutex_try(&g_render)) {
+        release_flip_locked();
+        mutex_unlock(&g_render);
+    } else if (g_flipped_owner == pid) {
+        g_gc_pending = true;
     }
-    // Called on exit paths that may run with interrupts off; never sleep
-    // there waiting for the lock.
-    if (__sync_lock_test_and_set(&g_busy, 1)) {
-        serial_write_str("fgpu: busy at process exit, resources kept\n");
-        return;
+    uint64_t f = spinlock_acquire(&g_ctx_lock);
+    for (fgpu_ctx_t* c = g_ctxs; c; c = c->next) {
+        if (c->lock.locked && c->lock.holder == pid) mutex_unlock(&c->lock);
     }
-    g_busy_owner = pid;
-    // Draws recorded by a process that died mid-submit are dropped, not drawn.
-    if (g_pass) fgpu_pass_discard(g_pass);
-    hw_sync();
-    if (g_flipped_owner == pid) release_flip_locked();
-    for (int i = 0; i < FGPU_MAX_SURFACES; i++) {
-        fgpu_surface_t* s = &g_surfaces[i];
-        if (s->used && s->owner == pid) {
-            surface_gone(s);
-            unplace(s->mem, s->in_vram, s->vram_offset, s->adapter);
-            s->used = false;
+    fgpu_ctx_t* mine = NULL;
+    for (fgpu_ctx_t* c = g_ctxs; c; c = c->next) {
+        if (c->owner == pid && !c->dead) { mine = c; break; }
+    }
+    if (mine) mine->dead = true;
+    spinlock_release(&g_ctx_lock, f);
+    if (!mine) return;          // a thread, or a program that never used the GPU
+
+    // Its queued command buffers are dropped.
+    fgpu_job_t* drop = NULL;
+    f = spinlock_acquire(&g_job_lock);
+    fgpu_job_t** pp = &g_job_head;
+    g_job_tail = NULL;
+    while (*pp) {
+        fgpu_job_t* j = *pp;
+        if (j->ctx == mine) {
+            *pp = j->next;
+            j->next = drop;
+            drop = j;
+        } else {
+            g_job_tail = j;
+            pp = &j->next;
         }
     }
-    for (int i = 0; i < FGPU_MAX_BUFFERS; i++) {
-        fgpu_buffer_t* b = &g_buffers[i];
-        if (b->used && b->owner == pid) {
-            unplace(b->mem, b->in_vram, b->vram_offset, b->adapter);
-            b->used = false;
-        }
+    spinlock_release(&g_job_lock, f);
+    while (drop) {
+        fgpu_job_t* n = drop->next;
+        free_mem(drop->cmd);
+        free_mem(drop);
+        __atomic_fetch_sub(&mine->jobs, 1, __ATOMIC_SEQ_CST);
+        drop = n;
     }
-    for (int i = 0; i < FGPU_MAX_PROGRAMS; i++) {
-        fgpu_shader_program_t* sp = &g_programs[i];
-        if (sp->used && sp->owner == pid) program_free(sp);
+    waitq_wake(mine, 1, 0xFFFFFFFFu);
+    if (!ctx_try_release(mine)) {
+        // Busy (the worker is running one of its buffers, or another CPU
+        // holds the render lock): freed by the worker or the next GPU call.
+        g_gc_pending = true;
+        if (g_worker_started) wake_worker();
     }
-    unlock();
 }
 
 /* ------------------------------------------------------------ commands */
@@ -596,7 +910,7 @@ static uint64_t op_info(syscall_gpu_request_t* r) {
     } else {
         strcpy(info.name, "no GPU");
     }
-    info.caps |= FGPU_CAP_SHADERS;
+    info.caps |= FGPU_CAP_SHADERS | FGPU_CAP_ASYNC | FGPU_CAP_SCALED_PRESENT | FGPU_CAP_PACED_PRESENT;
     if (g_hw) info.caps |= g_hw->caps;
     info.screen_width = graphics_get_width();
     info.screen_height = graphics_get_height();
@@ -622,11 +936,8 @@ static uint64_t op_create_surface(syscall_gpu_request_t* r, uint64_t owner) {
             r->width != screen->width || r->height != screen->height) return SYS_ERR_INVAL;
         pitch = screen->pitch / 4;
     }
-    int slot = -1;
-    for (int i = 0; i < FGPU_MAX_SURFACES; i++) if (!g_surfaces[i].used) { slot = i; break; }
-    if (slot < 0) return SYS_ERR_NOMEM;
-    fgpu_surface_t* s = &g_surfaces[slot];
-    memset(s, 0, sizeof(*s));
+    fgpu_surface_t* s = (fgpu_surface_t*)alloc(sizeof(fgpu_surface_t));
+    if (!s) return SYS_ERR_NOMEM;
     uint64_t bytes = (uint64_t)pitch * r->height * 4;
     // Depth buffers are read for every pixel: keep them in system memory
     // unless VRAM reads are cheap. Scanout surfaces must be in VRAM.
@@ -634,43 +945,104 @@ static uint64_t op_create_surface(syscall_gpu_request_t* r, uint64_t owner) {
     bool allow_vram = !(r->flags & FGPU_SURFACE_SYSTEM_MEMORY);
     s->mem = place(bytes, cpu_reads, allow_vram || scanout, color, owner,
                    &s->in_vram, &s->vram_offset, &s->adapter);
-    if (!s->mem) return SYS_ERR_NOMEM;
+    if (!s->mem) { free_mem(s); return SYS_ERR_NOMEM; }
     if (scanout && !s->in_vram) {
         unplace(s->mem, false, 0, NULL);
+        free_mem(s);
         return SYS_ERR_NOMEM;
     }
-    s->used = true;
-    s->id = g_next_id++;
     s->owner = owner;
     s->width = r->width;
     s->height = r->height;
     s->format = r->format;
     s->flags = r->flags;
     s->pitch = pitch;
+    s->id = table_insert(OBJ_SURFACE, s, owner);
+    if (!s->id) { surface_free(s); return SYS_ERR_NOMEM; }
     r->handle = s->id;
     return SYS_SUCCESS;
 }
 
 static uint64_t op_create_buffer(syscall_gpu_request_t* r, uint64_t owner) {
     if (!r->bytes || r->bytes > FGPU_MAX_BUFFER_BYTES) return SYS_ERR_INVAL;
-    int slot = -1;
-    for (int i = 0; i < FGPU_MAX_BUFFERS; i++) if (!g_buffers[i].used) { slot = i; break; }
-    if (slot < 0) return SYS_ERR_NOMEM;
-    fgpu_buffer_t* b = &g_buffers[slot];
-    memset(b, 0, sizeof(*b));
+    fgpu_buffer_t* b = (fgpu_buffer_t*)alloc(sizeof(fgpu_buffer_t));
+    if (!b) return SYS_ERR_NOMEM;
     b->mem = place(r->bytes, true, true, true, owner, &b->in_vram, &b->vram_offset, &b->adapter);
-    if (!b->mem) return SYS_ERR_NOMEM;
-    b->used = true;
-    b->id = g_next_id++;
+    if (!b->mem) { free_mem(b); return SYS_ERR_NOMEM; }
     b->owner = owner;
     b->size = r->bytes;
+    b->id = table_insert(OBJ_BUFFER, b, owner);
+    if (!b->id) { buffer_free(b); return SYS_ERR_NOMEM; }
     r->handle = b->id;
     return SYS_SUCCESS;
 }
 
-static uint64_t op_present(syscall_gpu_request_t* r, uint64_t owner) {
-    fgpu_surface_t* s = find_surface(r->handle, owner);
+static uint64_t op_present_to(syscall_gpu_request_t* r, fgpu_surface_t* s, uint64_t owner,
+                              uint32_t scale);
+
+// ---- frame pacing (FGPU_PRESENT_PACED) ----
+// Per program (its context): frame boundaries are pace_last_ns + n * interval
+// on the monotonic clock. A present that arrives early sleeps to the next
+// boundary (the scheduler sleeps in whole milliseconds, so the last stretch
+// is a short spin with interrupts on). One that is late by less than a frame
+// goes straight through and keeps the phase; later than that restarts the
+// phase from now. It runs before the render lock is taken, so a paced
+// program does not hold up anyone else's GPU calls.
+#define FGPU_PACE_DEFAULT_NS 16666667ull
+
+static uint64_t pace_wait(fgpu_ctx_t* c) {
+    uint64_t iv = c->pace_interval_ns ? c->pace_interval_ns : FGPU_PACE_DEFAULT_NS;
+    uint64_t now = clock_monotonic_ns();
+    uint64_t target = c->pace_last_ns ? c->pace_last_ns + iv : now;
+    if (now >= target + iv) target = now;
+    for (;;) {
+        now = clock_monotonic_ns();
+        if (now >= target) break;
+        uint64_t left = target - now;
+        if (left >= 2000000ull) sleep(left / 1000000ull - 1);
+        else __asm__ volatile("pause");
+    }
+    c->pace_last_ns = target;
+    return clock_monotonic_ns();
+}
+
+static uint64_t op_set_pace(fgpu_ctx_t* c, syscall_gpu_request_t* r) {
+    uint64_t ns = r->bytes ? r->bytes : FGPU_PACE_DEFAULT_NS;
+    if (ns < FGPU_PACE_MIN_NS || ns > FGPU_PACE_MAX_NS) return SYS_ERR_INVAL;
+    c->pace_interval_ns = ns;
+    c->pace_last_ns = 0;
+    return SYS_SUCCESS;
+}
+
+// `group` owns the surface; `owner` is the calling thread, which windows
+// and the screen are checked against. `stamp`: the time a paced present
+// was let through (pace_wait, already done by the caller).
+static uint64_t op_present(syscall_gpu_request_t* r, uint64_t group, uint64_t owner, uint64_t stamp) {
+    fgpu_surface_t* s = find_surface(r->handle, group);
     if (!s || s->format != FGPU_FORMAT_XRGB8888) return SYS_ERR_NOTFOUND;
+    // Before ABI 3 only FLIP existed and other bits were ignored.
+    if (r->version < 3) r->flags &= FGPU_PRESENT_FLIP;
+    const uint32_t scale_bits = r->flags & (FGPU_PRESENT_SCALE2 | FGPU_PRESENT_SCALE3);
+    if ((r->flags & ~FGPU_PRESENT_KNOWN) ||
+        scale_bits == (FGPU_PRESENT_SCALE2 | FGPU_PRESENT_SCALE3) ||
+        (scale_bits && (r->window_id || (r->flags & FGPU_PRESENT_FLIP))))
+        return SYS_ERR_INVAL;
+    const uint32_t scale = (r->flags & FGPU_PRESENT_SCALE3) ? 3u :
+                           (r->flags & FGPU_PRESENT_SCALE2) ? 2u : 1u;
+    const bool paced = (r->flags & FGPU_PRESENT_PACED) != 0;
+    if (paced && r->out && !syscall_user_range_ok(r->out, sizeof(stamp), true))
+        return SYS_ERR_INVAL;
+    if (!r->window_id && (!graphics_has_screen_owner() || graphics_screen_owner_pid() != owner))
+        return SYS_ERR_PERM;
+    uint64_t res = op_present_to(r, s, owner, scale);
+    if (res == SYS_SUCCESS && paced && r->out &&
+        !syscall_user_copy_out(r->out, &stamp, sizeof(stamp)))
+        return SYS_ERR_INVAL;
+    return res;
+}
+
+static uint64_t op_present_to(syscall_gpu_request_t* r, fgpu_surface_t* s, uint64_t owner,
+                              uint32_t scale) {
 
     if (r->window_id) {
         syscall_window_request_t w;
@@ -684,6 +1056,23 @@ static uint64_t op_present(syscall_gpu_request_t* r, uint64_t owner) {
         uint64_t res = window_manager_syscall(&w, owner, false);
         if (res != SYS_SUCCESS) return res;
         if (s->width < info.width || s->height < info.height) return SYS_ERR_INVAL;
+        // Shared frames: render straight into the window's back buffer.
+        window_present_target_t target;
+        if (window_manager_present_target(r->window_id, owner, &target)) {
+            if (s->width < target.width || s->height < target.height) {
+                // The window grew since it was checked: abandon the target.
+                window_manager_present_done(r->window_id, owner, &target, 0, 0, 0, 0);
+                return SYS_ERR_INVAL;
+            }
+            hw_sync();
+            const uint32_t* src_px = (const uint32_t*)surface_cpu_view(s);
+            for (uint32_t row = 0; row < target.height; row++)
+                memcpy(target.pixels + (size_t)row * target.pitch_px,
+                       src_px + (size_t)row * s->pitch,
+                       (size_t)target.width * sizeof(uint32_t));
+            return window_manager_present_done(r->window_id, owner, &target,
+                                               0, 0, target.width, target.height);
+        }
         memset(&w, 0, sizeof(w));
         w.size = sizeof(w);
         w.version = SYS_WINDOW_ABI_VERSION;
@@ -697,9 +1086,7 @@ static uint64_t op_present(syscall_gpu_request_t* r, uint64_t owner) {
         return window_manager_syscall(&w, owner, false);
     }
 
-    // Screen: only for the process that owns it.
-    if (!graphics_has_screen_owner() || graphics_screen_owner_pid() != owner)
-        return SYS_ERR_PERM;
+    // Screen (the owner check is in op_present).
     if ((r->flags & FGPU_PRESENT_FLIP) && (s->flags & FGPU_SURFACE_SCANOUT) &&
         s->in_vram && s->adapter && s->adapter->flip) {
         if (!s->adapter->flip(s->adapter, s->vram_offset)) return SYS_ERR_INVAL;
@@ -708,40 +1095,38 @@ static uint64_t op_present(syscall_gpu_request_t* r, uint64_t owner) {
     }
     if (g_flipped_owner == owner) release_flip_locked();
     hw_sync();
+    // Straight from the surface into the framebuffer (scaled if asked), no
+    // back buffer copy: see graphics_present_scaled().
     gfx_surface_t src = { (uint32_t*)surface_cpu_view(s), (size_t)s->pitch * s->height * 4,
                           s->width, s->height, s->pitch };
-    gfx_rect_t rect = { 0, 0, (int32_t)s->width, (int32_t)s->height };
-    if (!graphics_backbuffer_blit(&src, &rect, r->x, r->y, false)) return SYS_ERR_INVAL;
-    gfx_rect_t dst = { r->x, r->y, (int32_t)s->width, (int32_t)s->height };
-    return graphics_backbuffer_present(&dst) ? SYS_SUCCESS : SYS_ERR_INVAL;
+    return graphics_present_scaled(&src, scale, r->x, r->y) ? SYS_SUCCESS : SYS_ERR_INVAL;
 }
 
 static uint64_t op_create_program(syscall_gpu_request_t* r, uint64_t owner) {
     if (!r->data || r->bytes < sizeof(fgpu_shader_header_t) || r->bytes > FGPU_MAX_PROGRAM_BYTES ||
         (r->bytes & 3) || !syscall_user_range_ok(r->data, (size_t)r->bytes, false))
         return SYS_ERR_INVAL;
-    int slot = -1;
-    for (int i = 0; i < FGPU_MAX_PROGRAMS; i++) if (!g_programs[i].used) { slot = i; break; }
-    if (slot < 0) return SYS_ERR_NOMEM;
     // Check the kernel's own copy, so the program cannot change afterwards.
     uint32_t* blob = (uint32_t*)alloc_unzeroed((size_t)r->bytes);
     if (!blob) return SYS_ERR_NOMEM;
     memcpy(blob, r->data, (size_t)r->bytes);
-    fgpu_shader_program_t* sp = &g_programs[slot];
+    fgpu_shader_program_t* sp = (fgpu_shader_program_t*)alloc(sizeof(fgpu_shader_program_t));
+    if (!sp) { free_mem(blob); return SYS_ERR_NOMEM; }
     const char* why = "";
     if (!fgpu_program_check(blob, (uint32_t)r->bytes, &sp->program, &why)) {
         serial_write_str("fgpu: shader program rejected: ");
         serial_write_str(why);
         serial_write_str("\n");
         free_mem(blob);
+        free_mem(sp);
         return SYS_ERR_INVAL;
     }
     fgpu_program_jit(&sp->program);         // OS-4: compile now (here we may allocate); falls back silently
-    sp->used = true;
-    sp->id = g_next_id++;
     sp->owner = owner;
     sp->blob = blob;
     sp->hw = g_hw && g_hw->program_create ? g_hw->program_create(&sp->program) : NULL;
+    sp->id = table_insert(OBJ_PROGRAM, sp, owner);
+    if (!sp->id) { program_free(sp); return SYS_ERR_NOMEM; }
     r->handle = sp->id;
     return SYS_SUCCESS;
 }
@@ -779,41 +1164,247 @@ uint64_t fgpu_syscall(syscall_gpu_request_t* user) {
     return result;
 }
 
+// Runs one command buffer (kernel copy) for `owner`: needs its context
+// lock and the render lock. Returns the result; *triangles gets the count.
+static uint64_t run_commands(uint64_t owner, const uint32_t* cmd, uint32_t words, uint32_t* triangles) {
+    *triangles = 0;
+    exec_state_t* st = (exec_state_t*)alloc(sizeof(exec_state_t));
+    if (!st) return SYS_ERR_NOMEM;
+    memset(st, 0, sizeof(*st));
+    st->owner = owner;
+    st->pipe.program = FGPU_PROGRAM_COLOR;
+    st->pipe.constants = (const float (*)[4])st->constants;
+    fgpu_layout_default(&st->layout);
+    if (!g_pass) g_pass = fgpu_pass_create();     // NULL: draws run immediately
+    uint64_t result = execute(st, cmd, words);
+    st->triangles += pass_flush();      // also when the buffer failed half way
+    *triangles = st->triangles;
+    free_mem(st);
+    return result;
+}
+
+/* ------------------------------------------------- async submit worker */
+
+#define FGPU_MAX_QUEUED_PER_CTX 4u
+
+static bool worker_should_sleep(void* unused) {
+    (void)unused;
+    return !g_job_head && !g_gc_pending;
+}
+
+static fgpu_job_t* job_pop(void) {
+    uint64_t f = spinlock_acquire(&g_job_lock);
+    fgpu_job_t* j = g_job_head;
+    if (j) {
+        g_job_head = j->next;
+        if (!g_job_head) g_job_tail = NULL;
+    }
+    spinlock_release(&g_job_lock, f);
+    return j;
+}
+
+// A kernel process: preemptible like any other, so long command buffers
+// do not hold up the program that queued them or anyone else.
+static void fgpu_worker(void) {
+    __asm__ volatile("sti");
+    for (;;) {
+        ctx_gc();
+        fgpu_job_t* j = job_pop();
+        if (!j) {
+            waitq_wait(&g_job_head, 0, worker_should_sleep, NULL, 0);
+            continue;
+        }
+        fgpu_ctx_t* c = j->ctx;
+        mutex_lock(&c->lock);
+        if (!c->dead) {
+            uint32_t tris = 0;
+            mutex_lock(&g_render);
+            uint64_t res = run_commands(c->owner, j->cmd, j->words, &tris);
+            mutex_unlock(&g_render);
+            __atomic_fetch_add(&c->async_triangles, tris, __ATOMIC_SEQ_CST);
+            if (res != SYS_SUCCESS) c->async_failed = true;
+        }
+        __atomic_store_n(&c->fence_done, j->fence, __ATOMIC_SEQ_CST);
+        mutex_unlock(&c->lock);
+        free_mem(j->cmd);
+        free_mem(j);
+        // The context may be freed (ctx_gc) as soon as this reaches 0.
+        __atomic_fetch_sub(&c->jobs, 1, __ATOMIC_SEQ_CST);
+        waitq_wake(c, 1, 0xFFFFFFFFu);
+    }
+}
+
+static bool start_worker(void) {
+    if (__atomic_load_n(&g_worker_started, __ATOMIC_ACQUIRE) == 2) return true;
+    uint32_t expect = 0;
+    if (__atomic_compare_exchange_n(&g_worker_started, &expect, 1, false,
+                                    __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+        if (!proc_create("fgpu-worker", fgpu_worker)) {
+            __atomic_store_n(&g_worker_started, 0, __ATOMIC_RELEASE);
+            return false;
+        }
+        __atomic_store_n(&g_worker_started, 2, __ATOMIC_RELEASE);
+        return true;
+    }
+    // Another thread is starting it.
+    while (__atomic_load_n(&g_worker_started, __ATOMIC_ACQUIRE) == 1) __asm__ volatile("pause");
+    return __atomic_load_n(&g_worker_started, __ATOMIC_ACQUIRE) == 2;
+}
+
+typedef struct {
+    fgpu_ctx_t* ctx;
+    uint32_t fence;
+    uint32_t backlog;           // wait until at most this many are queued (fence = 0)
+} fence_wait_t;
+
+static bool fence_pending(const fence_wait_t* w) {
+    if (w->ctx->dead) return false;
+    if (!w->fence) return __atomic_load_n(&w->ctx->jobs, __ATOMIC_SEQ_CST) > w->backlog;
+    return (int32_t)(__atomic_load_n(&w->ctx->fence_done, __ATOMIC_SEQ_CST) - w->fence) < 0;
+}
+
+static bool fence_should_sleep(void* p) { return fence_pending((const fence_wait_t*)p); }
+
+// Waits until `fence` has run (fence 0: until no more than `backlog`
+// command buffers are queued). timeout_ns: 0 = just check, ~0 = forever.
+static uint64_t fence_wait(fgpu_ctx_t* c, uint32_t fence, uint32_t backlog, uint64_t timeout_ns) {
+    fence_wait_t w = { c, fence, backlog };
+    uint64_t start = clock_monotonic_ns();
+    for (;;) {
+        if (!fence_pending(&w)) return SYS_SUCCESS;
+        uint64_t now = clock_monotonic_ns();
+        if (timeout_ns != ~0ull && now - start >= timeout_ns) return SYS_ERR_TIMEDOUT;
+        uint64_t deadline = time_get_uptime_ms() + 10;
+        if (timeout_ns != ~0ull) {
+            uint64_t left_ms = (timeout_ns - (now - start)) / 1000000ull + 1;
+            if (left_ms < 10) deadline = time_get_uptime_ms() + left_ms;
+        }
+        waitq_wait(c, 1, fence_should_sleep, &w, deadline);
+    }
+}
+
+// Waits until every command buffer the program queued has run, so that
+// what it does next sees their results.
+static void ctx_drain(fgpu_ctx_t* c) {
+    if (__atomic_load_n(&c->jobs, __ATOMIC_SEQ_CST)) fence_wait(c, 0, 0, ~0ull);
+}
+
+static uint64_t op_submit_async(fgpu_ctx_t* c, syscall_gpu_request_t* r, uint32_t* cmd) {
+    if (!start_worker()) return SYS_ERR_NOMEM;
+    // Back-pressure: a program that queues faster than the GPU draws waits.
+    if (__atomic_load_n(&c->jobs, __ATOMIC_SEQ_CST) >= FGPU_MAX_QUEUED_PER_CTX)
+        fence_wait(c, 0, FGPU_MAX_QUEUED_PER_CTX - 1, ~0ull);
+    fgpu_job_t* j = (fgpu_job_t*)alloc(sizeof(fgpu_job_t));
+    if (!j) return SYS_ERR_NOMEM;
+    j->ctx = c;
+    j->cmd = cmd;
+    j->words = (uint32_t)(r->bytes / 4);
+    __atomic_fetch_add(&c->jobs, 1, __ATOMIC_SEQ_CST);
+    uint64_t f = spinlock_acquire(&g_job_lock);
+    // Fences are handed out in queue order (under the queue lock), so the
+    // worker completes them in increasing order.
+    uint32_t fence = c->fence_submitted + 1;
+    if (!fence) fence = 1;      // 0 means "all"
+    c->fence_submitted = fence;
+    j->fence = fence;
+    j->next = NULL;
+    if (g_job_tail) g_job_tail->next = j;
+    else g_job_head = j;
+    g_job_tail = j;
+    spinlock_release(&g_job_lock, f);
+    wake_worker();
+    r->handle = fence;
+    return SYS_SUCCESS;
+}
+
+static uint64_t op_wait(fgpu_ctx_t* c, syscall_gpu_request_t* r) {
+    uint32_t fence = r->handle;
+    uint64_t timeout = r->bytes;
+    uint64_t res = fence ? fence_wait(c, fence, 0, timeout) : fence_wait(c, 0, 0, timeout);
+    if (res != SYS_SUCCESS) return res;
+    r->handle = __atomic_exchange_n(&c->async_triangles, 0, __ATOMIC_SEQ_CST);
+    if (c->async_failed) {
+        c->async_failed = false;
+        return SYS_ERR_INVAL;
+    }
+    return SYS_SUCCESS;
+}
+
 static uint64_t fgpu_syscall_checked(syscall_gpu_request_t* r) {
     if (r->size != sizeof(*r) ||
         r->version < SYS_GPU_ABI_VERSION_MIN || r->version > SYS_GPU_ABI_VERSION)
         return SYS_ERR_INVAL;
-    uint64_t owner = caller();
     if (r->op == SYS_GPU_INFO) return op_info(r);
+    uint64_t owner = caller();
+    uint64_t group = caller_group();
 
     // Rendering can take a while: let the timer and other processes run.
     // The syscall stub saved this process's SSE state.
     __asm__ volatile("sti");
-    lock();
-    // Everything but SUBMIT has the CPU read or write GPU memory (or free it).
-    // Nothing is normally pending between syscalls (SUBMIT flushes at its end);
-    // this keeps that true if a later change defers work across submits.
-    if (r->op != SYS_GPU_SUBMIT) { fgpu_flush_pending(); hw_sync(); }
+    ctx_gc();
     uint64_t result = SYS_ERR_INVAL;
+    // SUBMIT copies the command buffer before taking any lock.
+    uint32_t* cmd = NULL;
+    if (r->op == SYS_GPU_SUBMIT) {
+        if (!r->data || r->bytes < 4 || r->bytes > FGPU_MAX_COMMAND_BYTES || (r->bytes & 3) ||
+            !syscall_user_range_ok(r->data, (size_t)r->bytes, false)) goto out;
+        cmd = (uint32_t*)alloc_unzeroed((size_t)r->bytes);
+        if (!cmd) { result = SYS_ERR_NOMEM; goto out; }
+        memcpy(cmd, r->data, (size_t)r->bytes);
+    }
+    fgpu_ctx_t* c = ctx_find(group, true);
+    if (!c) { result = SYS_ERR_NOMEM; goto out; }
+
+    if (r->op == SYS_GPU_WAIT) { result = op_wait(c, r); goto out; }
+    bool async = r->op == SYS_GPU_SUBMIT && r->version >= 3 && (r->flags & FGPU_SUBMIT_ASYNC);
+    if (async) {
+        result = op_submit_async(c, r, cmd);
+        if (result == SYS_SUCCESS) cmd = NULL;      // the worker frees it
+        goto out;
+    }
+    // Everything else sees the results of the program's queued submits.
+    ctx_drain(c);
+    mutex_lock(&c->lock);
+    uint64_t stamp = 0;
+    if (r->op == SYS_GPU_PRESENT && r->version >= 3 &&
+        (r->flags & FGPU_PRESENT_PACED) && !(r->flags & ~FGPU_PRESENT_KNOWN))
+        stamp = pace_wait(c);
+    bool render = r->op == SYS_GPU_SUBMIT || r->op == SYS_GPU_PRESENT ||
+                  r->op == SYS_GPU_RELEASE_DISPLAY || memops_need_render();
+    if (render) {
+        mutex_lock(&g_render);
+        // Everything but SUBMIT has the CPU read or write GPU memory (or
+        // free it). Nothing is pending between calls (SUBMIT flushes at its
+        // end); this keeps that true if a later change defers work.
+        if (r->op != SYS_GPU_SUBMIT) { fgpu_flush_pending(); hw_sync(); }
+    }
     switch (r->op) {
         case SYS_GPU_CREATE_SURFACE:
-            result = op_create_surface(r, owner);
+            if (c->counts[OBJ_SURFACE] >= k_quota[OBJ_SURFACE]) { result = SYS_ERR_NOMEM; break; }
+            result = op_create_surface(r, group);
+            if (result == SYS_SUCCESS) c->counts[OBJ_SURFACE]++;
             break;
         case SYS_GPU_DESTROY_SURFACE: {
-            fgpu_surface_t* s = find_surface(r->handle, owner);
+            fgpu_surface_t* s = find_surface(r->handle, group);
             if (!s) { result = SYS_ERR_NOTFOUND; break; }
-            if (g_flipped_owner == owner) release_flip_locked();
-            surface_gone(s);
-            unplace(s->mem, s->in_vram, s->vram_offset, s->adapter);
-            s->used = false;
+            if (g_flipped_owner == owner) {
+                if (!render) mutex_lock(&g_render);
+                release_flip_locked();
+                if (!render) mutex_unlock(&g_render);
+            }
+            table_remove(OBJ_SURFACE, s->id);
+            surface_free(s);
+            c->counts[OBJ_SURFACE]--;
             result = SYS_SUCCESS;
             break;
         }
         case SYS_GPU_CREATE_BUFFER:
-            result = op_create_buffer(r, owner);
+            if (c->counts[OBJ_BUFFER] >= k_quota[OBJ_BUFFER]) { result = SYS_ERR_NOMEM; break; }
+            result = op_create_buffer(r, group);
+            if (result == SYS_SUCCESS) c->counts[OBJ_BUFFER]++;
             break;
         case SYS_GPU_UPLOAD_BUFFER: {
-            fgpu_buffer_t* b = find_buffer(r->handle, owner);
+            fgpu_buffer_t* b = find_buffer(r->handle, group);
             if (!b) { result = SYS_ERR_NOTFOUND; break; }
             if (!r->data || r->offset > b->size || r->bytes > b->size - r->offset ||
                 !syscall_user_range_ok(r->data, (size_t)r->bytes, false)) break;
@@ -822,40 +1413,22 @@ static uint64_t fgpu_syscall_checked(syscall_gpu_request_t* r) {
             break;
         }
         case SYS_GPU_DESTROY_BUFFER: {
-            fgpu_buffer_t* b = find_buffer(r->handle, owner);
+            fgpu_buffer_t* b = find_buffer(r->handle, group);
             if (!b) { result = SYS_ERR_NOTFOUND; break; }
-            unplace(b->mem, b->in_vram, b->vram_offset, b->adapter);
-            b->used = false;
+            table_remove(OBJ_BUFFER, b->id);
+            buffer_free(b);
+            c->counts[OBJ_BUFFER]--;
             result = SYS_SUCCESS;
             break;
         }
         case SYS_GPU_SUBMIT: {
-            if (!r->data || r->bytes < 4 || r->bytes > FGPU_MAX_COMMAND_BYTES || (r->bytes & 3) ||
-                !syscall_user_range_ok(r->data, (size_t)r->bytes, false)) break;
-            uint32_t* cmd = (uint32_t*)alloc_unzeroed((size_t)r->bytes);
-            exec_state_t* st = (exec_state_t*)alloc(sizeof(exec_state_t));
-            if (!cmd || !st) {
-                if (cmd) free_mem(cmd);
-                if (st) free_mem(st);
-                result = SYS_ERR_NOMEM;
-                break;
-            }
-            memcpy(cmd, r->data, (size_t)r->bytes);
-            memset(st, 0, sizeof(*st));
-            st->owner = owner;
-            st->pipe.program = FGPU_PROGRAM_COLOR;
-            st->pipe.constants = (const float (*)[4])st->constants;
-            fgpu_layout_default(&st->layout);
-            if (!g_pass) g_pass = fgpu_pass_create();     // NULL: draws run immediately
-            result = execute(st, cmd, (uint32_t)(r->bytes / 4));
-            st->triangles += pass_flush();      // also when the buffer failed half way
-            r->handle = st->triangles;
-            free_mem(st);
-            free_mem(cmd);
+            uint32_t tris = 0;
+            result = run_commands(group, cmd, (uint32_t)(r->bytes / 4), &tris);
+            r->handle = tris;
             break;
         }
         case SYS_GPU_READBACK: {
-            fgpu_surface_t* s = find_surface(r->handle, owner);
+            fgpu_surface_t* s = find_surface(r->handle, group);
             if (!s) { result = SYS_ERR_NOTFOUND; break; }
             uint64_t row = (uint64_t)s->width * 4;
             if (!r->out || r->pitch < row ||
@@ -869,29 +1442,39 @@ static uint64_t fgpu_syscall_checked(syscall_gpu_request_t* r) {
             break;
         }
         case SYS_GPU_PRESENT:
-            result = op_present(r, owner);
+            result = op_present(r, group, owner, stamp);
+            break;
+        case SYS_GPU_SET_PACE:
+            result = op_set_pace(c, r);
             break;
         case SYS_GPU_RELEASE_DISPLAY:
             if (g_flipped_owner == owner) release_flip_locked();
             result = SYS_SUCCESS;
             break;
         case SYS_GPU_CREATE_PROGRAM:
-            result = op_create_program(r, owner);
+            if (c->counts[OBJ_PROGRAM] >= k_quota[OBJ_PROGRAM]) { result = SYS_ERR_NOMEM; break; }
+            result = op_create_program(r, group);
+            if (result == SYS_SUCCESS) c->counts[OBJ_PROGRAM]++;
             break;
         case SYS_GPU_DESTROY_PROGRAM: {
-            fgpu_shader_program_t* sp = find_program(r->handle, owner);
+            fgpu_shader_program_t* sp = find_program(r->handle, group);
             if (!sp) { result = SYS_ERR_NOTFOUND; break; }
+            table_remove(OBJ_PROGRAM, sp->id);
             program_free(sp);
+            c->counts[OBJ_PROGRAM]--;
             result = SYS_SUCCESS;
             break;
         }
         case SYS_GPU_WRITE_SURFACE:
-            result = op_write_surface(r, owner);
+            result = op_write_surface(r, group);
             break;
         default:
             break;
     }
-    unlock();
+    if (render) mutex_unlock(&g_render);
+    mutex_unlock(&c->lock);
+out:
+    if (cmd) free_mem(cmd);
     __asm__ volatile("cli");
     return result;
 }

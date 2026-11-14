@@ -17,6 +17,7 @@
 #include "x86_64/gdt.h"
 #include "x86_64/gpu.h"
 #include "x86_64/fgpu.h"
+#include "x86_64/smp_par.h"
 #include "x86_64/gpu_manager.h"
 #include "x86_64/gpucore.h"
 #include "time.h"
@@ -113,6 +114,7 @@ void kernel_main(uint64_t mb2_info_addr) {
     kernel_boot_debug = multiboot2_has_cmdline_token(mb_info, "--debug");
     kernel_boot_serial_echo = multiboot2_has_cmdline_token(mb_info, "serial-echo");
     kernel_boot_fgpuold = multiboot2_has_cmdline_token(mb_info, "fgpuold");
+    kernel_boot_smpparipi = multiboot2_has_cmdline_token(mb_info, "smpparipi");
     // Multicore user threads: on unless 'threads1cpu'; 'smpthreads' forces on.
     kernel_boot_threads_multicore = !multiboot2_has_cmdline_token(mb_info, "threads1cpu") ||
                                     multiboot2_has_cmdline_token(mb_info, "smpthreads");

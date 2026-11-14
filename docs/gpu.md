@@ -53,6 +53,37 @@ ABI version 2 added shader programs (`CREATE_PROGRAM`,
 plus the `FGPU_STATE_BLEND` state. The kernel still accepts version-1
 requests, so older programs keep working.
 
+ABI version 3 adds asynchronous submits. `SUBMIT` with
+`FGPU_SUBMIT_ASYNC` copies the command buffer, queues it and returns at
+once with a fence in `handle` (increasing, never 0); `SYS_GPU_WAIT`
+(handle = fence, 0 for all; bytes = timeout in ns, 0 to poll, ~0 forever)
+waits for it, returns the triangles drawn by async submits since the last
+`WAIT` in `handle`, and `SYS_ERR_INVAL` once when one of those buffers was
+rejected. A program's queued buffers run in order, and every other call of
+that program (readback, present, uploads, destroys, a plain `SUBMIT`)
+first waits for them, so results are always seen. At most 4 are queued
+per program; a fifth `SUBMIT` waits for room. `FGPU_CAP_ASYNC` in
+`SYS_GPU_INFO` says the kernel has this. Version-2 requests ignore the
+flag. A kernel process, `fgpu-worker`, runs the queued buffers; it is
+preemptible like any process.
+
+**Objects and contexts.** Objects belong to a program, not a thread: all
+threads of a program share its surfaces, buffers and shaders, and a thread
+that ends frees nothing. They live in one table per type (grown on
+demand); a handle encodes slot, type and a generation, so a stale or
+wrong-type handle is not found. Each program may hold 1024 surfaces, 4096
+buffers and 1024 shader programs. Each program has a context: a lock (its
+calls and queued buffers run one at a time), its counts, its fences.
+Drawing and presenting share one render lock (the CPU rasterizer keeps one
+pass and per-worker scratch). With the CPU backend alone, creating,
+uploading, reading back and freeing need only the program's own lock, so
+they overlap another program's rendering; with a hardware backend or VRAM
+they take the render lock too. A thread killed in the middle of a GPU call
+leaves its locks to the next waiter, and its recorded draws are dropped.
+When a program ends, its queued buffers are dropped and its objects freed
+then, or by the worker or the next GPU call if a lock is busy at that
+moment.
+
 ### CPU backend
 
 `fgpu_raster.c` runs the pipeline: vertex stage, near-plane clipping,
@@ -145,13 +176,69 @@ rasterizer (one barrier per draw, scalar); the kernel does this with the `fgpuol
 boot flag (GRUB entry "Minimal-OS (RamFS, fgpuold)", two above the last entry).
 The host benchmark (`make bench-fgpu`) and the differential tests use the switch.
 
-**Not done yet (OS-4).** Preemptible kernel worker threads instead of `smp_par`,
-per-process contexts instead of `g_busy`, and asynchronous submit with fences. The
-pass is per target and everything it keeps (workers' scratch, chunk pool, bin lists)
-sits in the pass, not in globals, so a context per process can own one pass; the
-kernel currently has a single pass guarded by `g_busy`. Deferring draws across
-submits only needs the flush points above to stay (they are already called), plus
-an exact triangle count some other way.
+**Helpers.** The parallel phases run on `smp_par` (`smp_par.h`): the calling core
+plus one preemptible kernel process `smp-par` per other core (not the master core),
+woken for each job. A busy core's helper starts at its next tick and the scheduler
+shares the core with programs; parts nobody took are done by the caller. The boot
+flag `smpparipi` brings back the older helpers, which run inside an IPI handler with
+interrupts off until the job ends.
+
+**One pass for everyone.** The kernel keeps a single pass, used under the render
+lock (see "Objects and contexts" above). The pass itself keeps its scratch in the
+pass, but the batch buffers in `fgpu_raster.c` are still static per worker, so two
+passes could not render at once yet.
+
+### Present: scaled, paced, no back buffer (OS-5)
+
+`SYS_GPU_PRESENT` to the screen (the screen owner only) used to copy the
+surface into the kernel back buffer (`graphics_backbuffer_blit`) and then
+copy the back buffer into the framebuffer (`graphics_backbuffer_present`):
+two full-frame copies, the second one with plain stores into write-combining
+memory. Now it is one: `graphics_present_scaled()` (`graphics.c`) calls
+`gfx_scale_blit()` (`gfx_blit.c`), which expands each source row into a
+960-pixel stack chunk (SSE2 shuffles, no `<emmintrin.h>`: the freestanding
+build has no hosted headers) and writes the chunk to every destination row it
+covers with 16-byte non-temporal stores (`movntdq`) and an `sfence` at the end.
+Scale 1, 2 and 3 are nearest neighbour; the image is placed at `x, y` and
+clipped on all four sides. The work is done in bands of 16 source rows with
+the graphics lock (interrupts off) dropped between bands. No damage rectangle:
+every present copies the whole surface.
+
+The back buffer is only used by `SYS_GRAPHICS_BLIT` / `SYS_GRAPHICS_PRESENT`
+(the terminal and its cursor draw straight into the framebuffer and stay off
+while a program owns the screen), so it is kept lazily: a direct present marks
+it stale, and the next back-buffer blit or rectangle present first reads the
+framebuffer back into it. A program that mixes both kinds of present pays one
+slow read of write-combining memory at each switch; a program that only uses
+`SYS_GPU_PRESENT` never does. Screens that are not 32-bit XRGB with the usual
+channel order scale into the back buffer and use the old converting present.
+Page flipping (`FGPU_PRESENT_FLIP`) is unchanged and excludes scaling.
+
+New flags (new bits of `FGPU_PRESENT_*`, everything else is rejected with
+`SYS_ERR_INVAL`): `SCALE2`, `SCALE3` (screen only; exclusive with each other
+and with `FLIP`) and `PACED`. Caps: `FGPU_CAP_SCALED_PRESENT` (1<<8),
+`FGPU_CAP_PACED_PRESENT` (1<<9). The ABI version is not changed by this.
+
+`PACED` waits for the next frame boundary of the pace interval (default
+1/60 s; `SYS_GPU_SET_PACE`, op 16, `bytes` = interval in ns, 0 = default,
+1 ms to 1 s) on `clock_monotonic_ns()` before presenting (screen or window).
+Boundaries are `last + n * interval`; a present that is late by less than one
+interval goes straight through and keeps the phase, later than that restarts
+the phase. The wait is `sleep()` in whole milliseconds minus one, then a spin
+of under 2 ms with interrupts on; the adapters here have no vblank to wait for.
+If `out` is non-NULL, the present time (ns, taken just after the wait, before the copy) is written
+there. Each program has its own pacer (in its GPU context), and the wait happens
+before the render lock is taken, so other programs' GPU calls do not wait for it.
+
+Benchmark (`make bench-gfx-scale`, host memory, not write-combining, so only a
+CPU-side indication): 960x540 -> 1920x1080 2x about 0.6 ms standard stores,
+about 0.7 ms with non-temporal stores. On the plan's budget (C4.7, 1.5 ms)
+the real figure is set by write-combining throughput to the framebuffer, which
+only a card can show. `tests/host/gfx_blit_tests.c` checks the scaler against
+a pixel-by-pixel reference (1x/2x/3x, odd sizes, strides, offsets, clipping on
+every side, both store kinds); `os0test` checks the flag combinations, the
+timestamp pointer and the pace interval; `SCALE_CHECK=2 FGLCUBE_ARGS="--scale 2"
+ONLY=new bash tools/debug/ci_fglcube.sh` checks a screenshot is made of 2x2 blocks.
 
 ### Shader machine
 

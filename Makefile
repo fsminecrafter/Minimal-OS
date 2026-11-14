@@ -718,6 +718,15 @@ build/tests/host/gfx_blit_tests: tests/host/gfx_blit_tests.c src/impl/handlers/g
 	mkdir -p $(dir $@)
 	$(HOSTCC) $(HOST_CFLAGS) $^ -o $@
 
+# Scaled present (SSE2, non-temporal stores) on the host (not part of test-host).
+.PHONY: bench-gfx-scale
+bench-gfx-scale: build/tests/host/gfx_scale_bench
+	./build/tests/host/gfx_scale_bench
+
+build/tests/host/gfx_scale_bench: tests/host/gfx_scale_bench.c src/impl/handlers/gfx_blit.c src/intf/gfx_blit.h
+	mkdir -p $(dir $@)
+	$(HOSTCC) $(HOST_CFLAGS) -O2 $(filter %.c,$^) -o $@
+
 build/tests/host/os0_tests: tests/host/os0_tests.c src/impl/timeconv.c src/impl/filesystem/fspaths.c src/impl/loader/argblock.c
 	mkdir -p $(dir $@)
 	$(HOSTCC) $(HOST_CFLAGS) $^ -o $@

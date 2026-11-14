@@ -30,4 +30,13 @@ bool gfx_blit_alpha(gfx_surface_t* dst, const gfx_surface_t* src,
 bool gfx_present_rect(gfx_surface_t* dst, const gfx_surface_t* src,
                       const gfx_rect_t* rect);
 
+// Nearest-neighbour integer upscale (scale 1, 2 or 3) of src_rect into dst
+// with the scaled image's top-left at (dst_x, dst_y). Clipped to dst and to
+// the source surface; offsets may be negative. `stream` uses non-temporal
+// stores (for write-combining memory such as the framebuffer) and ends
+// with a store fence. dst->stride is in pixels. Pixels are copied as-is.
+bool gfx_scale_blit(gfx_surface_t* dst, const gfx_surface_t* src,
+                    const gfx_rect_t* src_rect, uint32_t scale,
+                    int32_t dst_x, int32_t dst_y, bool stream);
+
 #endif /* GFX_BLIT_H */

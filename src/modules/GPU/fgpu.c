@@ -1020,6 +1020,8 @@ static uint64_t op_set_pace(fgpu_ctx_t* c, syscall_gpu_request_t* r) {
 static uint64_t op_present(syscall_gpu_request_t* r, uint64_t group, uint64_t owner, uint64_t stamp) {
     fgpu_surface_t* s = find_surface(r->handle, group);
     if (!s || s->format != FGPU_FORMAT_XRGB8888) return SYS_ERR_NOTFOUND;
+    // Before ABI 3 only FLIP existed and other bits were ignored.
+    if (r->version < 3) r->flags &= FGPU_PRESENT_FLIP;
     const uint32_t scale_bits = r->flags & (FGPU_PRESENT_SCALE2 | FGPU_PRESENT_SCALE3);
     if ((r->flags & ~FGPU_PRESENT_KNOWN) ||
         scale_bits == (FGPU_PRESENT_SCALE2 | FGPU_PRESENT_SCALE3) ||
@@ -1364,7 +1366,8 @@ static uint64_t fgpu_syscall_checked(syscall_gpu_request_t* r) {
     ctx_drain(c);
     mutex_lock(&c->lock);
     uint64_t stamp = 0;
-    if (r->op == SYS_GPU_PRESENT && (r->flags & FGPU_PRESENT_PACED) && !(r->flags & ~FGPU_PRESENT_KNOWN))
+    if (r->op == SYS_GPU_PRESENT && r->version >= 3 &&
+        (r->flags & FGPU_PRESENT_PACED) && !(r->flags & ~FGPU_PRESENT_KNOWN))
         stamp = pace_wait(c);
     bool render = r->op == SYS_GPU_SUBMIT || r->op == SYS_GPU_PRESENT ||
                   r->op == SYS_GPU_RELEASE_DISPLAY || memops_need_render();

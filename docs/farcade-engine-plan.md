@@ -293,6 +293,10 @@ One streaming system serves all three. It reads only cooked paks (never `.mof` o
   - Systems in either language: Lua `fe.system("Move", {Position, Velocity}, fn)`, C++ `FE_SYSTEM(Move, Position&, const Velocity&)`, ordered in one pipeline.
   - Calls across: Lua calls C++ functions exported with `FE_FUNCTION`, C++ calls Lua with `fe::lua::call("player.on_hit", ...)`, and both share one event bus.
   - Easy mode: a `Script` component with `on_start/on_update/on_event` callbacks (Unity/Godot style). Capable mode: plain ECS systems.
+  - **Scripts on objects (editor side done in farcade-engine, see its `docs/scripting.md`):**
+    - An object holds several scripts, run in Inspector order.
+    - Each script declares inputs in `-- @prop` comments, which the editor reads without Lua. Types: number (optionally with a range), text, toggle, list, object link.
+    - Scripts on different objects reach each other through object links: `self.door:script("door")`, `obj:send(event, ...)`, `fe.broadcast`. These run-time calls arrive with the Lua VM.
 - **Fast Lua 5.4:**
   - Generational GC stepped within about 0.5 ms per frame, and an engine allocator through `lua_Alloc`.
   - Entities as light userdata (the 64-bit flecs id, generation checked on use, no allocation). Multi-return accessors (`x,y,z = fe.pos(e)`).

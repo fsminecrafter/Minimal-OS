@@ -59,6 +59,8 @@ enum {
                                 // SYS_ERR_TIMEDOUT; handle out = triangles drawn by
                                 // async submits since the last WAIT; SYS_ERR_INVAL
                                 // when one of them was rejected since the last WAIT
+    // 15 is reserved
+    SYS_GPU_SET_PACE = 16,      // bytes = frame interval in ns (0 = 60 Hz)
 };
 
 // SUBMIT flags (ABI version 3)
@@ -78,7 +80,17 @@ enum {
 #define FGPU_SURFACE_SCANOUT       (1u << 1)   // screen-sized, can be flipped to
 
 // Present flags
-#define FGPU_PRESENT_FLIP  (1u << 0)   // page flip if possible (screen only)
+#define FGPU_PRESENT_FLIP   (1u << 0)  // page flip if possible (screen only)
+#define FGPU_PRESENT_SCALE2 (1u << 1)  // screen only: upscale 2x, nearest
+#define FGPU_PRESENT_SCALE3 (1u << 2)  // screen only: upscale 3x, nearest
+#define FGPU_PRESENT_PACED  (1u << 3)  // wait for the next frame boundary first
+#define FGPU_PRESENT_KNOWN  0x0Fu      // all bits above; others are rejected
+// SCALE2 and SCALE3 exclude each other and FLIP. The scaled image is placed
+// at (x, y) and clipped to the screen. With PACED (screen or window), a
+// nonzero `out` points to a uint64_t that receives the present time in
+// nanoseconds on the monotonic clock (see SYS_GPU_SET_PACE).
+#define FGPU_PACE_MIN_NS  1000000ull      // 1 ms
+#define FGPU_PACE_MAX_NS  1000000000ull   // 1 s
 
 #define FGPU_MAX_SURFACE_SIZE 4096u
 #define FGPU_MAX_BUFFER_BYTES (16u * 1024u * 1024u)
@@ -110,6 +122,8 @@ typedef struct {
 #define FGPU_CAP_HW_3D          (1u << 5)
 #define FGPU_CAP_SHADERS        (1u << 6)   // shader programs (ABI 2)
 #define FGPU_CAP_ASYNC          (1u << 7)   // FGPU_SUBMIT_ASYNC and SYS_GPU_WAIT (ABI 3)
+#define FGPU_CAP_SCALED_PRESENT (1u << 8)   // PRESENT SCALE2/SCALE3 flags
+#define FGPU_CAP_PACED_PRESENT  (1u << 9)   // PRESENT_PACED, SYS_GPU_SET_PACE
 
 typedef struct {
     uint32_t size;              // sizeof(syscall_gpu_info_t), set by caller

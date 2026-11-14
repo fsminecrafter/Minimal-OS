@@ -1,3 +1,4 @@
+#pragma GCC optimize("O2")
 #include "gfx_blit.h"
 #include "string.h"
 #include <stddef.h>
@@ -197,5 +198,119 @@ bool gfx_present_rect(gfx_surface_t* dst, const gfx_surface_t* src,
                 src->pixels[src_index + (uint32_t)x];
         }
     }
+    return true;
+}
+
+// ---- scaled / streamed present ----
+//
+// Each source row is expanded into a small stack chunk (stays in L1) and the
+// chunk is then written to the destination, once for every destination row
+// the source row covers. That keeps the expansion separate from the
+// destination's alignment, so arbitrary offsets and clips need no special
+// cases, and the destination only sees full 16-byte non-temporal stores.
+
+#if defined(__SSE2__)
+// GCC vector types instead of <emmintrin.h>: that header pulls in hosted
+// headers the freestanding kernel build does not have.
+typedef int gfx_v4si __attribute__((vector_size(16)));
+typedef int gfx_v4si_u __attribute__((vector_size(16), aligned(4), may_alias));
+typedef long long gfx_v2di __attribute__((vector_size(16)));
+#define GFX_HAVE_SSE2 1
+#endif
+
+#define GFX_CHUNK 960u      // destination pixels; a multiple of 4, 8 and 12
+
+// tmp[0 .. o1-o0) = pixels o0 .. o1-1 of the source row scaled by k.
+static void gfx_expand_row(uint32_t* tmp, const uint32_t* s, uint32_t k,
+                           uint32_t o0, uint32_t o1) {
+    uint32_t o = o0;
+    if (k == 1) {
+        memcpy(tmp, s + o0, (size_t)(o1 - o0) * sizeof(uint32_t));
+        return;
+    }
+#ifdef GFX_HAVE_SSE2
+    const uint32_t group = 4u * k;
+    while (o < o1 && (o % group) != 0u) { tmp[o - o0] = s[o / k]; o++; }
+    for (; o + group <= o1; o += group) {
+        gfx_v4si v = *(const gfx_v4si_u*)(s + o / k);
+        gfx_v4si_u* d = (gfx_v4si_u*)(tmp + (o - o0));
+        if (k == 2) {
+            d[0] = __builtin_shufflevector(v, v, 0, 0, 1, 1);
+            d[1] = __builtin_shufflevector(v, v, 2, 2, 3, 3);
+        } else {
+            d[0] = __builtin_shufflevector(v, v, 0, 0, 0, 1);
+            d[1] = __builtin_shufflevector(v, v, 1, 1, 2, 2);
+            d[2] = __builtin_shufflevector(v, v, 2, 3, 3, 3);
+        }
+    }
+#endif
+    for (; o < o1; o++) tmp[o - o0] = s[o / k];
+}
+
+// Copies n pixels to d; with `stream`, 16-byte aligned stretches use
+// non-temporal stores.
+static void gfx_store_row(uint32_t* d, const uint32_t* t, size_t n, bool stream) {
+#ifdef GFX_HAVE_SSE2
+    if (stream) {
+        while (n && ((uintptr_t)d & 15u)) { *d++ = *t++; n--; }
+        for (; n >= 4; n -= 4, d += 4, t += 4) {
+            gfx_v4si v = *(const gfx_v4si_u*)t;
+            __builtin_ia32_movntdq((gfx_v2di*)d, (gfx_v2di)v);
+        }
+    }
+#else
+    (void)stream;
+#endif
+    while (n) { *d++ = *t++; n--; }
+}
+
+bool gfx_scale_blit(gfx_surface_t* dst, const gfx_surface_t* src,
+                    const gfx_rect_t* src_rect, uint32_t scale,
+                    int32_t dst_x, int32_t dst_y, bool stream) {
+    if (!gfx_surface_valid(dst) || !gfx_surface_valid(src) || !src_rect ||
+        scale < 1u || scale > 3u) {
+        return false;
+    }
+    gfx_rect_t bounds = { 0, 0, (int32_t)src->width, (int32_t)src->height };
+    gfx_rect_t sr;
+    if (src_rect->w <= 0 || src_rect->h <= 0) return true;
+    if (!gfx_clip_rect(src_rect, &bounds, &sr)) return true;
+
+    // The scaled image, relative to its own origin, spans [0, sw) x [0, sh)
+    // pixels from the clipped source rect; its origin lands at (ox, oy).
+    const int64_t k = scale;
+    const int64_t ox = (int64_t)dst_x + (sr.x - (int64_t)src_rect->x) * k;
+    const int64_t oy = (int64_t)dst_y + (sr.y - (int64_t)src_rect->y) * k;
+    const int64_t sw = (int64_t)sr.w * k;
+    const int64_t sh = (int64_t)sr.h * k;
+    // Visible part in destination coordinates.
+    int64_t vx0 = ox > 0 ? ox : 0;
+    int64_t vy0 = oy > 0 ? oy : 0;
+    int64_t vx1 = ox + sw < (int64_t)dst->width ? ox + sw : (int64_t)dst->width;
+    int64_t vy1 = oy + sh < (int64_t)dst->height ? oy + sh : (int64_t)dst->height;
+    if (vx1 <= vx0 || vy1 <= vy0) return true;
+
+    uint32_t tmp[GFX_CHUNK];
+    const int64_t first_sy = (vy0 - oy) / k;
+    const int64_t last_sy = (vy1 - 1 - oy) / k;
+    for (int64_t sy = first_sy; sy <= last_sy; sy++) {
+        const uint32_t* srow = src->pixels + (size_t)(sr.y + sy) * src->stride + sr.x;
+        int64_t r0 = oy + sy * k;
+        int64_t r1 = r0 + k;
+        if (r0 < vy0) r0 = vy0;
+        if (r1 > vy1) r1 = vy1;
+        for (int64_t cx = vx0; cx < vx1; cx += GFX_CHUNK) {
+            int64_t ce = cx + GFX_CHUNK;
+            if (ce > vx1) ce = vx1;
+            gfx_expand_row(tmp, srow, scale, (uint32_t)(cx - ox), (uint32_t)(ce - ox));
+            for (int64_t r = r0; r < r1; r++) {
+                gfx_store_row(dst->pixels + (size_t)r * dst->stride + cx, tmp,
+                              (size_t)(ce - cx), stream);
+            }
+        }
+    }
+#ifdef GFX_HAVE_SSE2
+    if (stream) __builtin_ia32_sfence();
+#endif
     return true;
 }

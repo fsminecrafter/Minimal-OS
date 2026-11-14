@@ -17,6 +17,8 @@
 #  * MAX_DIFF_PPM   allowed share of differing pixels in parts per million (default 2000).
 #                   The two rasterizers agree exactly on everything except the 1/256 pixel
 #                   snapping of triangle edges of a perspective picture.
+#  * SCALE_CHECK   N (2 or 3): with FGLCUBE_ARGS="--scale N", also check that the screenshot
+#                   is built of aligned NxN blocks of one color (nearest-neighbour upscale)
 #  * ONLY           "new" or "old": run just that mode (no comparison)
 #  * QEMU_EXTRA, QEMU_BIN, QEMU_MEM  as in ci_os0.sh
 # One QEMU runs at a time. The "old" run picks the GRUB entry two above the last one
@@ -135,9 +137,10 @@ if [ "${ONLY:-}" != "new" ]; then
 fi
 
 # PNG conversion, cube check and comparison.
-python3 -I - "$OUT_DIR" "$MAX_DIFF_PPM" "${ONLY:-}" <<'EOF'
+SCALE_CHECK="${SCALE_CHECK:-}" python3 -I - "$OUT_DIR" "$MAX_DIFF_PPM" "${ONLY:-}" <<'EOF'
 import sys, zlib, struct, os
 out, max_ppm, only = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+scale_check = int(os.environ.get('SCALE_CHECK') or 0)
 
 def read_ppm(path):
     data = open(path, 'rb').read()
@@ -159,6 +162,9 @@ def write_png(path, w, h, rgb):
 imgs = {}
 for label in ('new', 'old'):
     p = os.path.join(out, label + '.ppm')
+    # With ONLY set, a screenshot of the other mode is left from an earlier run.
+    if only and label != only:
+        continue
     if os.path.exists(p):
         w, h, pix = read_ppm(p)
         write_png(os.path.join(out, label + '.png'), w, h, pix)
@@ -171,6 +177,20 @@ for label in ('new', 'old'):
         if frac < 0.02:
             print(f"FAIL: {label} picture shows (almost) nothing")
             sys.exit(1)
+        if scale_check:
+            k = scale_check
+            bad = tot = 0
+            for by in range(0, h - k + 1, k):
+                for bx in range(0, w - k + 1, k):
+                    ref = pix[(by * w + bx) * 3:(by * w + bx) * 3 + 3]
+                    tot += 1
+                    if any(pix[((by + dy) * w + bx + dx) * 3:((by + dy) * w + bx + dx) * 3 + 3] != ref
+                           for dy in range(k) for dx in range(k)):
+                        bad += 1
+            print(f"{label}: {bad} of {tot} {k}x{k} blocks are not one color")
+            if bad:
+                print("FAIL: picture is not a clean %dx upscale" % k)
+                sys.exit(1)
 if len(imgs) == 2:
     (w, h, a), (w2, h2, b) = imgs['new'], imgs['old']
     if (w, h) != (w2, h2):

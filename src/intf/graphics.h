@@ -61,6 +61,8 @@ bool graphics_backbuffer_blit(const gfx_surface_t* src,
                               const gfx_rect_t* src_rect,
                               int32_t dst_x, int32_t dst_y, bool alpha);
 bool graphics_backbuffer_present(const gfx_rect_t* rect);
+bool graphics_present_scaled(const gfx_surface_t* src, uint32_t scale,
+                             int32_t x, int32_t y);
 
 // Core drawing functions
 void graphics_write_pixel(int32_t x, int32_t y, uint8_t r, uint8_t g, uint8_t b);

@@ -18,6 +18,7 @@ static uint32_t* g_backbuffer = NULL;
 static size_t g_backbuffer_bytes = 0;
 static uint32_t g_backbuffer_width = 0;
 static uint32_t g_backbuffer_height = 0;
+static bool g_backbuffer_stale = false;      // the screen was written directly, see below
 static bool g_backbuffer_external = false;   // lives in VRAM, not the heap
 static spinlock_t g_graphics_lock = SPINLOCK_INIT;
 bool graphics_safety_mode = true;
@@ -32,6 +33,7 @@ bool graphics_claim_screen(void) {
     const uint64_t pid = getCurrentPID();
     uint64_t flags = spinlock_acquire(&g_graphics_lock);
     if (g_screen_owner_pid == UINT64_MAX || g_screen_owner_pid == pid) {
+        if (g_screen_owner_pid != pid) g_backbuffer_stale = false;   // a new owner
         g_screen_owner_pid = pid;
         spinlock_release(&g_graphics_lock, flags);
         return true;
@@ -876,10 +878,48 @@ bool graphics_get_display_info(gfx_display_info_t* info) {
     return true;
 }
 
+// graphics_present_scaled() writes the screen without going through the back
+// buffer, which then no longer matches what is shown. Whoever uses the back
+// buffer next (a partial blit, a rectangle present) gets it refreshed from
+// the screen first, in bands with the lock dropped in between (reading
+// write-combining memory is slow). This only happens when a program mixes the
+// two kinds of present; claiming the screen forgets the old picture.
+static void graphics_backbuffer_sync(void) {
+    uint64_t flags = spinlock_acquire(&g_graphics_lock);
+    if (!g_backbuffer_stale || !g_backbuffer || !g_gpu || !g_gpu->fb ||
+        !graphics_backbuffer_ensure_locked()) {
+        spinlock_release(&g_graphics_lock, flags);
+        return;
+    }
+    g_backbuffer_stale = false;
+    const bool fast_format = g_gpu->red_position == 16 &&
+        g_gpu->red_mask_size == 8 && g_gpu->green_position == 8 &&
+        g_gpu->green_mask_size == 8 && g_gpu->blue_position == 0 &&
+        g_gpu->blue_mask_size == 8 && g_gpu->bpp == 4;
+    spinlock_release(&g_graphics_lock, flags);
+    if (!fast_format) return;   // cannot be unpacked; the next full blit rewrites it
+    for (uint32_t y0 = 0; ; y0 += 32) {
+        flags = spinlock_acquire(&g_graphics_lock);
+        if (!g_gpu || !g_gpu->fb || !g_backbuffer || y0 >= g_gpu->height ||
+            y0 >= g_backbuffer_height) {
+            spinlock_release(&g_graphics_lock, flags);
+            return;
+        }
+        const uint32_t w = g_gpu->width < g_backbuffer_width ? g_gpu->width : g_backbuffer_width;
+        for (uint32_t y = y0; y < y0 + 32 && y < g_gpu->height && y < g_backbuffer_height; ++y) {
+            memcpy(g_backbuffer + (size_t)y * g_backbuffer_width,
+                   (const void*)((uintptr_t)g_gpu->fb + (size_t)y * g_gpu->pitch),
+                   (size_t)w * sizeof(uint32_t));
+        }
+        spinlock_release(&g_graphics_lock, flags);
+    }
+}
+
 bool graphics_backbuffer_blit(const gfx_surface_t* src,
                               const gfx_rect_t* src_rect,
                               int32_t dst_x, int32_t dst_y, bool alpha) {
     if (!gfx_surface_valid(src) || !src_rect) return false;
+    graphics_backbuffer_sync();
     uint64_t flags = spinlock_acquire(&g_graphics_lock);
     if (!graphics_backbuffer_ensure_locked()) {
         spinlock_release(&g_graphics_lock, flags);
@@ -899,6 +939,7 @@ bool graphics_backbuffer_blit(const gfx_surface_t* src,
 
 bool graphics_backbuffer_present(const gfx_rect_t* rect) {
     if (!rect || rect->w <= 0 || rect->h <= 0) return false;
+    graphics_backbuffer_sync();
     uint64_t flags = spinlock_acquire(&g_graphics_lock);
     if (!graphics_backbuffer_ensure_locked()) {
         spinlock_release(&g_graphics_lock, flags);
@@ -940,6 +981,66 @@ bool graphics_backbuffer_present(const gfx_rect_t* rect) {
         }
     }
     spinlock_release(&g_graphics_lock, flags);
+    return true;
+}
+
+// Presents `src` scaled by 1, 2 or 3 (nearest) with its top-left at (x, y),
+// clipped to the screen. With a screen format the surface can be copied as-is
+// (the usual XRGB8888), the pixels go straight into the framebuffer with
+// non-temporal stores and the back buffer is left alone (marked stale, see
+// graphics_backbuffer_sync). Any other format is scaled into the back
+// buffer and converted by graphics_backbuffer_present(). The work is done in
+// bands with the lock dropped in between, so a 1080p frame does not keep
+// interrupts off for its whole length.
+bool graphics_present_scaled(const gfx_surface_t* src, uint32_t scale,
+                             int32_t x, int32_t y) {
+    if (!gfx_surface_valid(src) || scale < 1u || scale > 3u) return false;
+    uint64_t flags = spinlock_acquire(&g_graphics_lock);
+    if (!g_gpu || !g_gpu->fb || !graphics_backbuffer_ensure_locked()) {
+        spinlock_release(&g_graphics_lock, flags);
+        return false;
+    }
+    const bool fast_format = g_gpu->red_position == 16 &&
+        g_gpu->red_mask_size == 8 && g_gpu->green_position == 8 &&
+        g_gpu->green_mask_size == 8 && g_gpu->blue_position == 0 &&
+        g_gpu->blue_mask_size == 8 && g_gpu->bpp == 4 && (g_gpu->pitch & 3u) == 0;
+    spinlock_release(&g_graphics_lock, flags);
+
+    const uint32_t band = 16;   // source rows per lock hold
+    for (uint32_t sy = 0; sy < src->height; sy += band) {
+        const uint32_t rows = src->height - sy < band ? src->height - sy : band;
+        gfx_rect_t rect = { 0, (int32_t)sy, (int32_t)src->width, (int32_t)rows };
+        const int64_t band_y = (int64_t)y + (int64_t)sy * scale;
+        if (band_y >= (int64_t)graphics_get_height()) break;
+        if (band_y + (int64_t)rows * scale <= 0) continue;
+        flags = spinlock_acquire(&g_graphics_lock);
+        if (!g_gpu || !g_gpu->fb || !graphics_backbuffer_ensure_locked()) {
+            spinlock_release(&g_graphics_lock, flags);
+            return false;
+        }
+        bool ok;
+        if (fast_format) {
+            gfx_surface_t dst = {
+                (uint32_t*)g_gpu->fb, (size_t)g_gpu->pitch * g_gpu->height,
+                g_gpu->width, g_gpu->height, g_gpu->pitch / 4u
+            };
+            ok = gfx_scale_blit(&dst, src, &rect, scale, x, (int32_t)band_y, true);
+            g_backbuffer_stale = true;
+        } else {
+            gfx_surface_t dst = {
+                g_backbuffer, g_backbuffer_bytes, g_backbuffer_width,
+                g_backbuffer_height, g_backbuffer_width
+            };
+            ok = gfx_scale_blit(&dst, src, &rect, scale, x, (int32_t)band_y, false);
+        }
+        spinlock_release(&g_graphics_lock, flags);
+        if (!ok) return false;
+    }
+    if (!fast_format) {
+        const gfx_rect_t dst = { x, y, (int32_t)(src->width * scale),
+                                 (int32_t)(src->height * scale) };
+        return graphics_backbuffer_present(&dst);
+    }
     return true;
 }
 

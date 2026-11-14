@@ -14,6 +14,7 @@
 #include "serial.h"
 #include "string.h"
 #include "x86_64/scheduler.h"
+#include "x86_64/clock.h"
 #include "x86_64/smp_par.h"
 
 /*
@@ -410,6 +411,8 @@ typedef struct fgpu_ctx {
     volatile uint32_t async_triangles;  // drawn by async submits since the last WAIT
     volatile bool async_failed;         // an async command buffer was rejected
     volatile bool dead;                 // the program ended; freed by ctx_gc()
+    uint64_t pace_interval_ns;          // FGPU_PRESENT_PACED (0 = 60 Hz)
+    uint64_t pace_last_ns;              // the last frame boundary
 } fgpu_ctx_t;
 
 static fgpu_ctx_t* g_ctxs;
@@ -907,7 +910,7 @@ static uint64_t op_info(syscall_gpu_request_t* r) {
     } else {
         strcpy(info.name, "no GPU");
     }
-    info.caps |= FGPU_CAP_SHADERS | FGPU_CAP_ASYNC;
+    info.caps |= FGPU_CAP_SHADERS | FGPU_CAP_ASYNC | FGPU_CAP_SCALED_PRESENT | FGPU_CAP_PACED_PRESENT;
     if (g_hw) info.caps |= g_hw->caps;
     info.screen_width = graphics_get_width();
     info.screen_height = graphics_get_height();
@@ -974,11 +977,70 @@ static uint64_t op_create_buffer(syscall_gpu_request_t* r, uint64_t owner) {
     return SYS_SUCCESS;
 }
 
+static uint64_t op_present_to(syscall_gpu_request_t* r, fgpu_surface_t* s, uint64_t owner,
+                              uint32_t scale);
+
+// ---- frame pacing (FGPU_PRESENT_PACED) ----
+// Per program (its context): frame boundaries are pace_last_ns + n * interval
+// on the monotonic clock. A present that arrives early sleeps to the next
+// boundary (the scheduler sleeps in whole milliseconds, so the last stretch
+// is a short spin with interrupts on). One that is late by less than a frame
+// goes straight through and keeps the phase; later than that restarts the
+// phase from now. It runs before the render lock is taken, so a paced
+// program does not hold up anyone else's GPU calls.
+#define FGPU_PACE_DEFAULT_NS 16666667ull
+
+static uint64_t pace_wait(fgpu_ctx_t* c) {
+    uint64_t iv = c->pace_interval_ns ? c->pace_interval_ns : FGPU_PACE_DEFAULT_NS;
+    uint64_t now = clock_monotonic_ns();
+    uint64_t target = c->pace_last_ns ? c->pace_last_ns + iv : now;
+    if (now >= target + iv) target = now;
+    for (;;) {
+        now = clock_monotonic_ns();
+        if (now >= target) break;
+        uint64_t left = target - now;
+        if (left >= 2000000ull) sleep(left / 1000000ull - 1);
+        else __asm__ volatile("pause");
+    }
+    c->pace_last_ns = target;
+    return clock_monotonic_ns();
+}
+
+static uint64_t op_set_pace(fgpu_ctx_t* c, syscall_gpu_request_t* r) {
+    uint64_t ns = r->bytes ? r->bytes : FGPU_PACE_DEFAULT_NS;
+    if (ns < FGPU_PACE_MIN_NS || ns > FGPU_PACE_MAX_NS) return SYS_ERR_INVAL;
+    c->pace_interval_ns = ns;
+    c->pace_last_ns = 0;
+    return SYS_SUCCESS;
+}
+
 // `group` owns the surface; `owner` is the calling thread, which windows
-// and the screen are checked against.
-static uint64_t op_present(syscall_gpu_request_t* r, uint64_t group, uint64_t owner) {
+// and the screen are checked against. `stamp`: the time a paced present
+// was let through (pace_wait, already done by the caller).
+static uint64_t op_present(syscall_gpu_request_t* r, uint64_t group, uint64_t owner, uint64_t stamp) {
     fgpu_surface_t* s = find_surface(r->handle, group);
     if (!s || s->format != FGPU_FORMAT_XRGB8888) return SYS_ERR_NOTFOUND;
+    const uint32_t scale_bits = r->flags & (FGPU_PRESENT_SCALE2 | FGPU_PRESENT_SCALE3);
+    if ((r->flags & ~FGPU_PRESENT_KNOWN) ||
+        scale_bits == (FGPU_PRESENT_SCALE2 | FGPU_PRESENT_SCALE3) ||
+        (scale_bits && (r->window_id || (r->flags & FGPU_PRESENT_FLIP))))
+        return SYS_ERR_INVAL;
+    const uint32_t scale = (r->flags & FGPU_PRESENT_SCALE3) ? 3u :
+                           (r->flags & FGPU_PRESENT_SCALE2) ? 2u : 1u;
+    const bool paced = (r->flags & FGPU_PRESENT_PACED) != 0;
+    if (paced && r->out && !syscall_user_range_ok(r->out, sizeof(stamp), true))
+        return SYS_ERR_INVAL;
+    if (!r->window_id && (!graphics_has_screen_owner() || graphics_screen_owner_pid() != owner))
+        return SYS_ERR_PERM;
+    uint64_t res = op_present_to(r, s, owner, scale);
+    if (res == SYS_SUCCESS && paced && r->out &&
+        !syscall_user_copy_out(r->out, &stamp, sizeof(stamp)))
+        return SYS_ERR_INVAL;
+    return res;
+}
+
+static uint64_t op_present_to(syscall_gpu_request_t* r, fgpu_surface_t* s, uint64_t owner,
+                              uint32_t scale) {
 
     if (r->window_id) {
         syscall_window_request_t w;
@@ -1005,9 +1067,7 @@ static uint64_t op_present(syscall_gpu_request_t* r, uint64_t group, uint64_t ow
         return window_manager_syscall(&w, owner, false);
     }
 
-    // Screen: only for the process that owns it.
-    if (!graphics_has_screen_owner() || graphics_screen_owner_pid() != owner)
-        return SYS_ERR_PERM;
+    // Screen (the owner check is in op_present).
     if ((r->flags & FGPU_PRESENT_FLIP) && (s->flags & FGPU_SURFACE_SCANOUT) &&
         s->in_vram && s->adapter && s->adapter->flip) {
         if (!s->adapter->flip(s->adapter, s->vram_offset)) return SYS_ERR_INVAL;
@@ -1016,12 +1076,11 @@ static uint64_t op_present(syscall_gpu_request_t* r, uint64_t group, uint64_t ow
     }
     if (g_flipped_owner == owner) release_flip_locked();
     hw_sync();
+    // Straight from the surface into the framebuffer (scaled if asked), no
+    // back buffer copy: see graphics_present_scaled().
     gfx_surface_t src = { (uint32_t*)surface_cpu_view(s), (size_t)s->pitch * s->height * 4,
                           s->width, s->height, s->pitch };
-    gfx_rect_t rect = { 0, 0, (int32_t)s->width, (int32_t)s->height };
-    if (!graphics_backbuffer_blit(&src, &rect, r->x, r->y, false)) return SYS_ERR_INVAL;
-    gfx_rect_t dst = { r->x, r->y, (int32_t)s->width, (int32_t)s->height };
-    return graphics_backbuffer_present(&dst) ? SYS_SUCCESS : SYS_ERR_INVAL;
+    return graphics_present_scaled(&src, scale, r->x, r->y) ? SYS_SUCCESS : SYS_ERR_INVAL;
 }
 
 static uint64_t op_create_program(syscall_gpu_request_t* r, uint64_t owner) {
@@ -1287,6 +1346,9 @@ static uint64_t fgpu_syscall_checked(syscall_gpu_request_t* r) {
     // Everything else sees the results of the program's queued submits.
     ctx_drain(c);
     mutex_lock(&c->lock);
+    uint64_t stamp = 0;
+    if (r->op == SYS_GPU_PRESENT && (r->flags & FGPU_PRESENT_PACED) && !(r->flags & ~FGPU_PRESENT_KNOWN))
+        stamp = pace_wait(c);
     bool render = r->op == SYS_GPU_SUBMIT || r->op == SYS_GPU_PRESENT ||
                   r->op == SYS_GPU_RELEASE_DISPLAY || memops_need_render();
     if (render) {
@@ -1360,7 +1422,10 @@ static uint64_t fgpu_syscall_checked(syscall_gpu_request_t* r) {
             break;
         }
         case SYS_GPU_PRESENT:
-            result = op_present(r, group, owner);
+            result = op_present(r, group, owner, stamp);
+            break;
+        case SYS_GPU_SET_PACE:
+            result = op_set_pace(c, r);
             break;
         case SYS_GPU_RELEASE_DISPLAY:
             if (g_flipped_owner == owner) release_flip_locked();

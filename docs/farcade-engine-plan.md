@@ -65,7 +65,7 @@ The work runs in three tracks:
 - **OS-4 in progress.** Done: the tile-binning rasterizer (binning, hierarchical Z, small-triangle path; default, `fgpuold` selects the previous one) and the shader JIT (`fgpu_jit_x64.c`: SSE4.1 and AVX2 code, checked against the interpreter by a fuzzer; `nojit` turns it off). Both are well short of the C4.7 targets when measured on one 2.1 GHz core: about 8 M small triangles/s against 30 M/s, and 7 G lane-instructions/s at best against 16 G. The largest remaining costs are the per-batch data shuffling between rasterizer and shader and scalar texture sampling. Still to do: fused rasterizer/shader kernels, kernel worker threads, per-process contexts and async submit.
 - **System-call pointer checks done** (not in the original plan): every user pointer is checked before use; what is left is listed in `docs/syscall-pointers.md`.
 - Everything was tested in QEMU without KVM (`make ci-os0`); nothing has run on real hardware yet.
-- The SDK half waits in `patches/` until it is pushed to Minimal-OS-SDK.
+- The SDK half is on the branch of the same name in Minimal-OS-SDK; the submodule points at it.
 
 The items are listed in dependency order. File paths are verified.
 

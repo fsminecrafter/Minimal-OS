@@ -8,6 +8,8 @@ extern idt_handler_doublefault
 extern lapic_timer_irq_handler
 extern idt_handler_stray_vector
 extern smp_par_ipi_handler
+extern tlb_ipi_handler
+extern resched_ipi_handler
 %assign irq 2
 %rep 14
 extern idt_handler_pic_irq %+ irq
@@ -71,6 +73,8 @@ WRAPPED_HANDLER idt_handler_doublefault
 WRAPPED_HANDLER lapic_timer_irq_handler
 WRAPPED_HANDLER idt_handler_stray_vector
 WRAPPED_HANDLER smp_par_ipi_handler
+WRAPPED_HANDLER tlb_ipi_handler
+WRAPPED_HANDLER resched_ipi_handler
 
 ; IRQ2-15 on the legacy PIC (vectors 0x22-0x2F). They are masked, but the
 ; PIC still raises spurious IRQ7/IRQ15 and the CPU needs a gate for them.

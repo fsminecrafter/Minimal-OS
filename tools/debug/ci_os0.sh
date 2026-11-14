@@ -19,7 +19,9 @@
 #  * QEMU_EXTRA  extra QEMU arguments, appended to the command line (word split),
 #                e.g. QEMU_EXTRA="-cpu max -smp 4". The default CPU (qemu64) has no AVX.
 #  * GRUB_UP     number of 'up' presses after selecting the last GRUB entry; GRUB_UP=1
-#                picks "Minimal-OS (RamFS, noavx)", the entry above the RamFS one.
+#                picks "Minimal-OS (RamFS, noavx)", the entry above the RamFS one;
+#                GRUB_UP=4 picks "Minimal-OS (RamFS, threads1cpu)" (threads pinned).
+#  * TEST_TIMEOUT  seconds to wait for the verdict (default 600).
 #  * QEMU_BIN    the QEMU binary.
 set -euo pipefail
 
@@ -30,7 +32,7 @@ QEMU_EXTRA="${QEMU_EXTRA:-}"
 GRUB_UP="${GRUB_UP:-0}"
 ISO="$WORKDIR/dist/x86_64/kernel.iso"
 BOOT_TIMEOUT=120
-TEST_TIMEOUT=600
+TEST_TIMEOUT="${TEST_TIMEOUT:-600}"
 TEST_CMD="run 0:/programs/os0test.run"
 
 TMP=$(mktemp -d)

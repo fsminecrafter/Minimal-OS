@@ -2,6 +2,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "x86_64/allocator.h"
+#include "x86_64/tlb.h"
 #include "serial.h"
 #include "panic.h"
 #include "string.h"
@@ -79,7 +80,7 @@ static inline void irq_restore(uint64_t flags) {
 
 static inline uint64_t allocator_lock(void) {
     uint64_t flags = irq_save();
-    while (__sync_lock_test_and_set(&allocator_spin, 1)) { /* spin */ }
+    while (__sync_lock_test_and_set(&allocator_spin, 1)) { tlb_poll(); }
     return flags;
 }
 

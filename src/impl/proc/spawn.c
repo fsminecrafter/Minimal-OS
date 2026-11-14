@@ -682,8 +682,10 @@ uint64_t proc_spawn(const syscall_spawn_t* request) {
     launch.wait_record = true;
     launch.stack_size = r.stack_size;
     out_sink = err_sink = NULL;
-    process_t* child = run_launch_ex(&launch);
-    result = child ? child->pid : SYS_ERR_GENERIC;
+    uint64_t child_pid = 0;
+    launch.out_pid = &child_pid;
+    process_t* child = run_launch_ex(&launch);      // `child` may be gone already: use the pid
+    result = child ? child_pid : SYS_ERR_GENERIC;
 
 done:
     if (inherited_cwd) free_mem(inherited_cwd);
@@ -729,8 +731,10 @@ uint64_t proc_exec_inherit(const char* path, int extra_argc, const char** extra_
     launch.parent_pid = owner->pid;
     launch.wait_record = true;
     launch.terminal_foreground = true;   // what SYS_EXEC always did
-    process_t* child = run_launch_ex(&launch);
+    uint64_t child_pid = 0;
+    launch.out_pid = &child_pid;
+    process_t* child = run_launch_ex(&launch);      // `child` may be gone already: use the pid
     if (cwd) free_mem(cwd);
     free_mem((void*)argv);
-    return child ? child->pid : SYS_ERR_GENERIC;
+    return child ? child_pid : SYS_ERR_GENERIC;
 }

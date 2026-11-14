@@ -36,6 +36,9 @@ const char* run_normalize_path(const char* input, char* normalized, size_t norma
 // Returns the new process, or NULL on failure (bad path, malformed
 // archive/ELF, too many/too-long arguments, or OOM).
 process_t* run_launch_file(const char* run_path, int extra_argc, const char** extra_argv);
+// The same, with the new program's pid (see run_launch_t::out_pid).
+process_t* run_launch_file_pid(const char* run_path, int extra_argc, const char** extra_argv,
+                               uint64_t* out_pid);
 
 typedef struct stdio_sink stdio_sink_t;
 
@@ -53,6 +56,11 @@ typedef struct {
     bool wait_record;             // its parent may SYS_WAIT for it
     bool terminal_foreground;     // the terminal treats it as the program it runs
     uint64_t stack_size;          // main stack bytes; 0 = the default (8 MiB)
+    // Receives the new program's pid before it starts. Use this, not the
+    // returned pointer: the program may run, end and be freed on another CPU
+    // before the launcher gets its next instruction (the pointer only says
+    // "it started").
+    uint64_t* out_pid;
 } run_launch_t;
 
 // The general form of run_launch_file(), used by SYS_SPAWN and SYS_EXEC.

@@ -2,6 +2,7 @@
 #define SPINLOCK_H
 
 #include <stdint.h>
+#include "x86_64/tlb.h"
 
 /*
  * SMP-safe spinlock.
@@ -36,6 +37,10 @@ static inline uint64_t spinlock_acquire(spinlock_t* lock) {
     asm volatile("pushfq; pop %0; cli" : "=r"(flags) :: "memory");
 
     while (__sync_lock_test_and_set(&lock->locked, 1)) {
+        // A CPU waiting here with interrupts off must still take part in a
+        // TLB shootdown, or the CPU that holds the lock (and waits for
+        // everyone's acknowledgement) would never finish.
+        tlb_poll();
         asm volatile("pause" ::: "memory");
     }
     return flags;

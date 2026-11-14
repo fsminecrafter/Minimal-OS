@@ -52,6 +52,7 @@
 
 bool kernel_boot_no_disk;
 bool kernel_boot_ramfs;
+bool kernel_boot_threads_multicore = true;   // OS-3; see boot_options.h
 uint32_t kernel_boot_ramfs_mib;
 multiboot2_info_t* kernel_multiboot_info;
 bool kernel_boot_debug;
@@ -112,6 +113,9 @@ void kernel_main(uint64_t mb2_info_addr) {
     kernel_boot_debug = multiboot2_has_cmdline_token(mb_info, "--debug");
     kernel_boot_serial_echo = multiboot2_has_cmdline_token(mb_info, "serial-echo");
     kernel_boot_fgpuold = multiboot2_has_cmdline_token(mb_info, "fgpuold");
+    // Multicore user threads: on unless 'threads1cpu'; 'smpthreads' forces on.
+    kernel_boot_threads_multicore = !multiboot2_has_cmdline_token(mb_info, "threads1cpu") ||
+                                    multiboot2_has_cmdline_token(mb_info, "smpthreads");
     {
         char mib[12];
         bool sized = multiboot2_get_cmdline_value(mb_info, "ramfs=", mib, sizeof(mib));

@@ -90,9 +90,14 @@ static void lapic_send_ipi(uint32_t target_apic_id, uint32_t delivery_mode, uint
 
 void lapic_send_fixed_ipi(uint32_t target_apic_id, uint8_t vector) {
     if (!g_lapic_mmio) return;
+    // The two ICR writes must not be split by an interrupt handler that
+    // sends an IPI of its own (it would overwrite the destination).
+    uint64_t flags;
+    asm volatile("pushfq; pop %0; cli" : "=r"(flags) :: "memory");
     lapic_wait_icr_idle();
     lapic_write(LAPIC_REG_ICR_HIGH, target_apic_id << 24);
     lapic_write(LAPIC_REG_ICR_LOW, vector | LAPIC_ICR_LEVEL_ASSERT);   // fixed delivery
+    if (flags & 0x200) asm volatile("sti" ::: "memory");
 }
 
 void lapic_send_init_ipi(uint32_t target_apic_id) {

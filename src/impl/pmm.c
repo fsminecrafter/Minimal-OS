@@ -1,4 +1,5 @@
 #include "x86_64/pmm.h"
+#include "x86_64/tlb.h"
 #include "serial.h"
 #include "panic.h"
 #include "string.h"
@@ -46,7 +47,7 @@ static volatile int pmm_spin = 0;
 static inline uint64_t pmm_lock(void) {
     uint64_t flags;
     __asm__ volatile("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
-    while (__sync_lock_test_and_set(&pmm_spin, 1)) { /* spin */ }
+    while (__sync_lock_test_and_set(&pmm_spin, 1)) { tlb_poll(); }
     return flags;
 }
 

@@ -130,8 +130,72 @@ User `.run` programs are loaded as user processes. The loader maps the image,
 the main stack and the argument block into the new program's address space, then
 enters ring 3 through the process trampoline. See [user programs](user-programs.md).
 
-Threads are lightweight wrappers around kernel processes. `thread_join()` polls
-for process termination while yielding through `sleep()`.
+Kernel threads (`thread_create()`) are lightweight wrappers around kernel
+processes. `thread_join()` polls for process termination while yielding through
+`sleep()`.
+
+### User threads (`SYS_THREAD`)
+
+A user thread is a `process_t` whose `mem_owner` points at its program: it has
+its own kernel stack and registers but shares the owner's page tables, `uvm`
+space and SYS_HEAP allocation list. Threads of one program run in parallel on
+different CPUs (OS-3). The boot flag `threads1cpu` restores the old behaviour
+(every thread on its owner's CPU, no affinity), `smpthreads` forces multicore
+on; multicore is the default.
+
+- **Placement.** A new thread goes to the least loaded CPU its affinity allows
+  (running processes count as load), is woken on the CPU it last ran on, and
+  the periodic rebalance may move queued threads like any process. A CPU that
+  receives work while idle is sent a reschedule IPI (vector `0x35`) so it does
+  not wait for its next tick.
+- **Affinity and priority.** `SYS_THREAD_SET_AFFINITY/GET_AFFINITY` (mask of
+  CPUs, 0 = any) and `SYS_THREAD_SET_PRIORITY/GET_PRIORITY`, plus
+  `SYS_THREAD_GET_CPU` and `SYS_THREAD_INFO`. The CPU count is
+  `SYS_SYSINFO_CORE_COUNT`. Priority is the MLFQ floor (`sched_prio`): level 0
+  (default) starts interactive, 1 never above normal, 2 background only.
+  Affinity is enforced when a thread is queued, woken or dispatched
+  (`scheduler_cpu_allowed()`); a running thread outside its mask is kicked by
+  an IPI and leaves at once.
+- **TLB shootdown** (`tlb.c`, vector `0x34`). Each `uvm_space_t` keeps a mask of
+  CPUs that may have its page tables loaded; `switch_to()` sets a CPU's bit
+  before the CR3 load and clears the old space's bit (interrupts are off, and
+  no user memory is touched in between). `uvm_unmap/protect/decommit`, the
+  page-table pruning in `uvm_unmap` and the SYS_HEAP user-access changes call
+  `tlb_shootdown()` while holding the space (or heap) lock: the sender flushes
+  itself, posts one request (a single global slot under a lock), IPIs the
+  CPUs in the mask and waits for each to flush (`invlpg` per page up to 48
+  pages, else a CR3 reload) and acknowledge. Frames and page-table pages are
+  collected during the walk and handed back to the page pool only after the
+  flush. A CPU spinning on any kernel spinlock, the space lock or the request
+  slot services a pending request for itself (`tlb_poll()`), so two CPUs
+  shooting at each other cannot deadlock. A CPU with interrupts off in a
+  long system call acknowledges when it returns to user mode or opens a
+  window: frames are therefore never freed under a system call that is still
+  using them. Making a page more accessible needs no shootdown: a stale entry
+  produces a spurious protection fault that `uvm_handle_fault()` (SYS_VM
+  memory) and `proc_heap_stale_fault()` (SYS_HEAP memory) recognise, repair
+  with `invlpg` and retry.
+- **Exit and crash.** Whoever calls exit (owner) or crashes (any thread)
+  claims the program's end with `group_dying`; a second crasher just stops.
+  The group's other threads are marked dead under their run queue's lock
+  (`scheduler_mark_dead`: state change and dequeue as one step, the same lock
+  the dispatcher pops and starts processes under) and the CPUs running them
+  get a reschedule IPI; the scheduler tick also leaves a dead process. The
+  owner waits (answering shootdowns) until none of its threads has `on_cpu`
+  set before it unmaps its memory, and the reaper never frees a process that
+  is `on_cpu`, current anywhere or in a deferred-reap slot.
+- **Audited shared state.** `user_heap_allocations` and the SYS_HEAP
+  page-table writes: `heap_lock` (new). Thread creation versus exit:
+  `group_dying` and the thread count are checked under the scheduler lock, and
+  a thread created `PAUSED` is started with a compare-and-swap so a kill in
+  between wins. cwd/env: `g_cwd_lock`. stdio sinks: per-sink busy flag.
+  Futex queues: per-bucket spinlocks (waker and waiter on different CPUs; the
+  woken thread is queued on its own CPU's run queue and the dispatcher skips
+  a process another CPU is still switching away from). FS base: per CPU cache
+  in the scheduler, reloaded on every switch to a user thread. `in_syscall`:
+  only its own thread writes it and the fault handler reads it on that thread's
+  CPU. Page faults: two CPUs faulting on one page both take the space lock;
+  the second finds the frame in place. `thread_count`: scheduler lock.
 
 ## Scheduling And SMP
 

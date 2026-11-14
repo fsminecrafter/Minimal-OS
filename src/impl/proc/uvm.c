@@ -5,6 +5,8 @@
 #include "x86_64/pmm.h"
 #include "x86_64/allocator.h"
 #include "x86_64/syscall.h"
+#include "x86_64/tlb.h"
+#include "x86_64/smp.h"
 #include "string.h"
 #include "serial.h"
 
@@ -38,6 +40,9 @@ typedef struct uvm_space {
     uvm_area_t* areas;
     uint64_t* pml4;
     volatile int lock;
+    // CPUs that may have this space's page tables loaded (bit per CPU);
+    // see uvm_cpu_switch() and tlb.h.
+    volatile uint32_t loaded_cpus;
     uint64_t committed_pages;
     uint64_t mapped_pages;
 } uvm_space_t;
@@ -45,7 +50,7 @@ typedef struct uvm_space {
 static inline uint64_t space_lock(uvm_space_t* s) {
     uint64_t flags;
     __asm__ volatile("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
-    while (__sync_lock_test_and_set(&s->lock, 1)) { __asm__ volatile("pause"); }
+    while (__sync_lock_test_and_set(&s->lock, 1)) { tlb_poll(); __asm__ volatile("pause"); }
     return flags;
 }
 
@@ -72,8 +77,53 @@ static inline bool space_is_loaded(const uvm_space_t* s) {
     return (cr3 & PTE_ADDR) == (uint64_t)(uintptr_t)s->pml4;
 }
 
-static inline void flush_page(const uvm_space_t* s, uint64_t addr) {
-    if (space_is_loaded(s)) __asm__ volatile("invlpg (%0)" :: "r"(addr) : "memory");
+// Pages whose entries were removed or reduced under the space lock, and
+// the frames to give back once every CPU has flushed them (never before:
+// another CPU may still write through a stale entry).
+#define FLUSH_BATCH 128
+typedef struct {
+    uvm_space_t* s;
+    uint64_t lo, hi;                // address range touched
+    uint32_t n;
+    void* frames[FLUSH_BATCH];
+} flushctx_t;
+
+static void fc_init(flushctx_t* fc, uvm_space_t* s) {
+    fc->s = s; fc->lo = ~0ULL; fc->hi = 0; fc->n = 0;
+}
+
+static void fc_note(flushctx_t* fc, uint64_t addr) {
+    if (addr < fc->lo) fc->lo = addr;
+    if (addr + PAGE > fc->hi) fc->hi = addr + PAGE;
+}
+
+// Flushes the range on every CPU that has the space loaded, then frees the
+// collected frames. Called with the space lock held.
+static void fc_flush(flushctx_t* fc) {
+    if (fc->hi > fc->lo)
+        tlb_shootdown(&fc->s->loaded_cpus, (uint64_t)(uintptr_t)fc->s->pml4, fc->lo, fc->hi);
+    for (uint32_t i = 0; i < fc->n; i++) pmm_free_page_unscrubbed(fc->frames[i]);
+    fc->n = 0; fc->lo = ~0ULL; fc->hi = 0;
+}
+
+// Flushes [start, end) of the space on every CPU that may have it loaded
+// (also this one), for page-table changes made outside this file (SYS_HEAP).
+void uvm_flush_range(process_t* proc, uint64_t start, uint64_t end) {
+    uvm_space_t* s = space_of(proc);
+    if (s) tlb_shootdown(&s->loaded_cpus, (uint64_t)(uintptr_t)s->pml4, start, end);
+}
+
+// Called by the scheduler, interrupts off, around every address space
+// change on this CPU: sets the bit of the space about to be loaded before
+// its CR3 is, clears the bit of the one being left (no user memory is
+// touched in between, and the CR3 load flushes it).
+void uvm_cpu_switch(process_t* from, process_t* to) {
+    uvm_space_t* old = (from && from->privilege == PROC_PRIVILEGE_USER) ? space_of(from) : NULL;
+    uvm_space_t* now = (to && to->privilege == PROC_PRIVILEGE_USER) ? space_of(to) : NULL;
+    if (old == now) return;
+    uint32_t bit = 1u << smp_current_cpu_id();
+    if (now) __atomic_fetch_or(&now->loaded_cpus, bit, __ATOMIC_SEQ_CST);
+    if (old) __atomic_fetch_and(&old->loaded_cpus, ~bit, __ATOMIC_SEQ_CST);
 }
 
 static inline uint64_t leaf_flags(uint32_t prot) {
@@ -143,9 +193,9 @@ static uint8_t* frame_for(uvm_space_t* s, uint64_t addr, uint32_t prot) {
 
 // Calls fn for every entry of [start, end) that holds a frame, skipping
 // missing tables a whole table at a time.
-typedef void (*pte_fn)(uvm_space_t* s, uint64_t addr, uint64_t* pte, uint32_t arg);
+typedef void (*pte_fn)(uvm_space_t* s, uint64_t addr, uint64_t* pte, flushctx_t* fc, uint32_t arg);
 
-static void for_each_frame(uvm_space_t* s, uint64_t start, uint64_t end, pte_fn fn, uint32_t arg) {
+static void for_each_frame(uvm_space_t* s, uint64_t start, uint64_t end, pte_fn fn, flushctx_t* fc, uint32_t arg) {
     uint64_t addr = start;
     while (addr < end) {
         uint64_t* table = s->pml4;
@@ -164,25 +214,42 @@ static void for_each_frame(uvm_space_t* s, uint64_t start, uint64_t end, pte_fn 
             continue;
         }
         uint64_t* pte = &table[(addr >> 12) & 0x1FF];
-        if (pte_has_frame(*pte)) fn(s, addr, pte, arg);
+        if (pte_has_frame(*pte)) fn(s, addr, pte, fc, arg);
         addr += PAGE;
     }
 }
 
-static void release_frame(uvm_space_t* s, uint64_t addr, uint64_t* pte, uint32_t arg) {
+static void release_frame(uvm_space_t* s, uint64_t addr, uint64_t* pte, flushctx_t* fc, uint32_t arg) {
     (void)arg;
     void* frame = (void*)(uintptr_t)(*pte & PTE_ADDR);
     *pte = 0;
-    flush_page(s, addr);
-    pmm_free_page_unscrubbed(frame);
     s->committed_pages--;
+    fc_note(fc, addr);
+    fc->frames[fc->n++] = frame;
+    if (fc->n == FLUSH_BATCH) fc_flush(fc);
 }
 
 // Frees the page tables that lie wholly inside [start, end), once their
 // frames are gone, so that mapping and unmapping does not pile up tables.
 // Tables that the range only partly covers stay (other mappings may use
 // them); uvm_destroy frees those.
-static void prune_tables(uint64_t* table, int shift, uint64_t table_base,
+// Page-table pages that were unlinked, waiting for the flush: another CPU's
+// paging-structure cache may still point at them.
+#define PRUNE_BATCH 64
+typedef struct {
+    uvm_space_t* s;
+    uint32_t n;
+    void* pages[PRUNE_BATCH];
+} prunectx_t;
+
+static void prune_flush(prunectx_t* pc) {
+    if (!pc->n) return;
+    tlb_shootdown(&pc->s->loaded_cpus, (uint64_t)(uintptr_t)pc->s->pml4, 0, 0);
+    for (uint32_t i = 0; i < pc->n; i++) pmm_free_page_unscrubbed(pc->pages[i]);
+    pc->n = 0;
+}
+
+static void prune_tables(prunectx_t* pc, uint64_t* table, int shift, uint64_t table_base,
                          uint64_t start, uint64_t end) {
     uint64_t span = 1ULL << shift;              // what one entry of `table` covers
     for (int i = 0; i < 512; i++) {
@@ -195,18 +262,22 @@ static void prune_tables(uint64_t* table, int shift, uint64_t table_base,
         uint64_t* child = (uint64_t*)(uintptr_t)(entry & PTE_ADDR);
         if (lo >= start && hi <= end) {
             // Everything below is unmapped: page tables only, no frames.
-            if (shift > 21) prune_tables(child, shift - 9, lo, lo, hi);
+            if (shift > 21) prune_tables(pc, child, shift - 9, lo, lo, hi);
             table[i] = 0;
-            pmm_free_page_unscrubbed(child);
+            pc->pages[pc->n++] = child;
+            if (pc->n == PRUNE_BATCH) prune_flush(pc);
         } else if (shift > 21) {
-            prune_tables(child, shift - 9, lo, start, end);
+            prune_tables(pc, child, shift - 9, lo, start, end);
         }
     }
 }
 
-static void reprotect_frame(uvm_space_t* s, uint64_t addr, uint64_t* pte, uint32_t prot) {
-    *pte = (*pte & PTE_ADDR) | leaf_flags(prot);
-    flush_page(s, addr);
+static void reprotect_frame(uvm_space_t* s, uint64_t addr, uint64_t* pte, flushctx_t* fc, uint32_t prot) {
+    (void)s;
+    uint64_t old = *pte;
+    *pte = (old & PTE_ADDR) | leaf_flags(prot);
+    // Entries that do not change need no flush.
+    if (*pte != (old & (PTE_ADDR | PTE_P | PTE_W | PTE_U | PTE_NX | PTE_HELD))) fc_note(fc, addr);
 }
 
 static inline bool range_valid(uint64_t addr, uint64_t len) {
@@ -408,23 +479,27 @@ uint64_t uvm_unmap(process_t* proc, uint64_t addr, uint64_t len) {
         uint64_t piece_end = (at & ~(UVM_CHUNK - 1)) + UVM_CHUNK;
         if (piece_end > end) piece_end = end;
         spare = carve(s, at, piece_end, spare);
-        for_each_frame(s, at, piece_end, release_frame, 0);
+        flushctx_t fc;
+        fc_init(&fc, s);
+        for_each_frame(s, at, piece_end, release_frame, &fc, 0);
+        fc_flush(&fc);
         space_unlock(s, irq);
         let_interrupts_in();
         at = piece_end;
     }
 
     uint64_t irq = space_lock(s);
+    prunectx_t pc;
+    pc.s = s;
+    pc.n = 0;
     for (uint64_t slot = (addr >> 39) & 0x1FF; slot <= ((end - 1) >> 39) & 0x1FF; slot++) {
         uint64_t entry = s->pml4[slot];
         if (entry & PTE_P)
-            prune_tables((uint64_t*)(uintptr_t)(entry & PTE_ADDR), 30, slot << 39, addr, end);
+            prune_tables(&pc, (uint64_t*)(uintptr_t)(entry & PTE_ADDR), 30, slot << 39, addr, end);
     }
-    // The CPU may have cached the freed tables themselves.
-    if (space_is_loaded(s)) {
-        uint64_t cr3;
-        __asm__ volatile("mov %%cr3, %0; mov %0, %%cr3" : "=r"(cr3) :: "memory");
-    }
+    // CPUs may have cached the freed tables themselves: flush everywhere
+    // before the pages can be reused.
+    prune_flush(&pc);
     space_unlock(s, irq);
     if (spare) free_mem(spare);
     return SYS_SUCCESS;
@@ -457,13 +532,16 @@ uint64_t uvm_protect(process_t* proc, uint64_t addr, uint64_t len, uint32_t prot
         uint64_t piece_end = (at & ~(UVM_CHUNK - 1)) + UVM_CHUNK;
         if (piece_end > end) piece_end = end;
         irq = space_lock(s);
+        flushctx_t fc;
+        fc_init(&fc, s);
         // Only where the area still says so: it may have changed meanwhile.
         for (uvm_area_t* a = s->areas; a && a->start < piece_end; a = a->next) {
             if (a->end <= at) continue;
             uint64_t lo = a->start > at ? a->start : at;
             uint64_t hi = a->end < piece_end ? a->end : piece_end;
-            for_each_frame(s, lo, hi, reprotect_frame, a->prot);
+            for_each_frame(s, lo, hi, reprotect_frame, &fc, a->prot);
         }
+        fc_flush(&fc);
         space_unlock(s, irq);
         let_interrupts_in();
         at = piece_end;
@@ -485,7 +563,10 @@ uint64_t uvm_decommit(process_t* proc, uint64_t addr, uint64_t len) {
         uint64_t piece_end = (at & ~(UVM_CHUNK - 1)) + UVM_CHUNK;
         if (piece_end > end) piece_end = end;
         irq = space_lock(s);
-        for_each_frame(s, at, piece_end, release_frame, 0);
+        flushctx_t fc;
+        fc_init(&fc, s);
+        for_each_frame(s, at, piece_end, release_frame, &fc, 0);
+        fc_flush(&fc);
         space_unlock(s, irq);
         let_interrupts_in();
         at = piece_end;
@@ -568,11 +649,14 @@ bool uvm_copy_out(process_t* proc, uint64_t addr, void* dst, size_t len) {
 // -------------------------------------------------------------- page faults
 
 bool uvm_handle_fault(uint64_t fault_address, uint64_t error_code) {
-    if (fault_address < UVM_MIN || fault_address >= UVM_MAX) return false;
-    // A protection fault (the page is there, the access is not allowed)
-    // is the program's bug.
-    if (error_code & 1) return false;
     process_t* proc = current_process;
+    if (fault_address < UVM_MIN) {
+        // The kernel-heap range below 4 GiB: a stale TLB entry from before
+        // another thread's SYS_HEAP made the page user-accessible.
+        return proc && proc->privilege == PROC_PRIVILEGE_USER &&
+               proc_heap_stale_fault(proc, fault_address, error_code);
+    }
+    if (fault_address >= UVM_MAX) return false;
     if (!proc || proc->privilege != PROC_PRIVILEGE_USER) return false;
     uvm_space_t* s = space_of(proc);
     // Kernel code can run on a program's CPU with the kernel's own page
@@ -582,14 +666,31 @@ bool uvm_handle_fault(uint64_t fault_address, uint64_t error_code) {
     uint64_t page = fault_address & ~(PAGE - 1);
     uint32_t need = (error_code & 2) ? UVM_PROT_WRITE
                   : (error_code & 16) ? UVM_PROT_EXEC : 0u;
+    bool present = (error_code & 1) != 0;
 
     uint64_t irq = space_lock(s);
     uvm_area_t* a = area_at(s, page);
     bool ok = false;
     bool out_of_memory = false;
     if (a && a->prot != UVM_PROT_NONE && (a->prot & need) == need) {
-        ok = frame_for(s, page, a->prot) != NULL;
-        out_of_memory = !ok;
+        if (!present) {
+            ok = frame_for(s, page, a->prot) != NULL;
+            out_of_memory = !ok;
+        } else {
+            // The page is there and the area allows the access, so this CPU
+            // used an entry that is out of date: another thread changed the
+            // protection (made it more permissive) after this CPU cached it,
+            // or its uvm_protect() has not got to this page yet. Bring the
+            // entry up to the area's protection and run the access again.
+            uint64_t* pte = walk(s, page, false);
+            if (pte && (*pte & PTE_P)) {
+                uint64_t want = (*pte & PTE_ADDR) | leaf_flags(a->prot);
+                if ((*pte & (PTE_P | PTE_W | PTE_U | PTE_NX)) != (want & (PTE_P | PTE_W | PTE_U | PTE_NX)))
+                    *pte = want;
+                __asm__ volatile("invlpg (%0)" :: "r"(page) : "memory");
+                ok = true;
+            }
+        }
     }
     space_unlock(s, irq);
     if (out_of_memory) {

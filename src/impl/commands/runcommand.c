@@ -188,6 +188,7 @@ static char* run_dup_bytes(const char* data, size_t len) {
 
 process_t* run_launch_ex(const run_launch_t* launch) {
     if (!launch || !launch->path) return NULL;
+    uint64_t started_pid = 0;
     const char* run_path = launch->path;
     const char* default_argv[1] = { run_path };
     uint32_t argc = launch->argc ? launch->argc : 1;
@@ -281,7 +282,9 @@ process_t* run_launch_ex(const run_launch_t* launch) {
             proc->user_image_size = elf->image_size;
             proc->user_stack_address = stack_base;
             proc->user_stack_size = stack_size;
-            proc_start(proc);
+            started_pid = proc->pid;
+            if (launch->out_pid) *launch->out_pid = started_pid;
+            proc_start(proc);       // from here it may run and be freed on another CPU
         }
     } else {
         run_drop_sinks(launch);
@@ -292,12 +295,17 @@ process_t* run_launch_ex(const run_launch_t* launch) {
     minimafs_close(source.file);
     if (!proc) return NULL;
 
-    if (launch->terminal_foreground) command_set_last_user_pid(proc->pid);
+    if (launch->terminal_foreground) command_set_last_user_pid(started_pid);
 
     return proc;
 }
 
 process_t* run_launch_file(const char* run_path, int extra_argc, const char** extra_argv) {
+    return run_launch_file_pid(run_path, extra_argc, extra_argv, NULL);
+}
+
+process_t* run_launch_file_pid(const char* run_path, int extra_argc, const char** extra_argv,
+                               uint64_t* out_pid) {
     if (!run_path) return NULL;
     if (extra_argc < 0) extra_argc = 0;
     if ((uint32_t)extra_argc + 1u > ARGBLOCK_MAX_ARGS) return NULL;
@@ -315,6 +323,7 @@ process_t* run_launch_file(const char* run_path, int extra_argc, const char** ex
     launch.argc = (uint32_t)extra_argc + 1u;
     launch.argv = argv;
     launch.terminal_foreground = true;
+    launch.out_pid = out_pid;
     process_t* proc = run_launch_ex(&launch);
     free_mem(argv);
     return proc;

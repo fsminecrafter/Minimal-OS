@@ -23,6 +23,7 @@
 #include "string.h"
 
 #include "x86_64/smp.h"
+#include "x86_64/boot_options.h"
 #include "x86_64/allocator.h"
 #include "x86_64/pmm.h"
 #include "x86_64/globaldatatable.h"
@@ -1017,12 +1018,13 @@ static uint64_t sys_exec_impl(const char* path, const char** argv, uint64_t argc
         if ((int64_t)pid < 0) serial_write_str("SYS_EXEC: launch failed\n");
         return pid;
     }
-    process_t* proc = run_launch_file(normalized, (int)argc, argv);
+    uint64_t started_pid = 0;
+    process_t* proc = run_launch_file_pid(normalized, (int)argc, argv, &started_pid);
     if (!proc) {
         serial_write_str("SYS_EXEC: launch failed\n");
         return SYS_ERR_GENERIC;
     }
-    return proc->pid;
+    return started_pid;
 }
 
 static uint64_t sys_stat_impl(const char* path, syscall_stat_t* out) {
@@ -1217,6 +1219,57 @@ static uint64_t syscall_inout_struct(void* user, size_t size, syscall_struct_fn 
     return result;
 }
 
+// SYS_THREAD affinity / priority / CPU queries (see syscall.h).
+static uint64_t sys_thread_online_mask(void) {
+    uint64_t mask = 0;
+    for (uint32_t i = 0; i < g_cpu_count && i < MAX_CPUS; i++)
+        if (g_cpus[i].online) mask |= 1ull << i;
+    return mask ? mask : 1;
+}
+
+static uint64_t sys_thread_sched_op(process_t* self, uint64_t op, uint64_t tid, uint64_t arg) {
+    if (op == SYS_THREAD_GET_CPU) return smp_current_cpu_id();
+    if (op == SYS_THREAD_INFO) return kernel_boot_threads_multicore ? SYS_THREAD_INFO_MULTICORE : 0;
+    if (op == SYS_THREAD_SET_AFFINITY) {
+        if (!kernel_boot_threads_multicore) return SYS_ERR_PERM;
+        uint64_t online = sys_thread_online_mask();
+        if (arg && !(arg & online)) return SYS_ERR_INVAL;
+        arg &= online;
+        if (arg == online) arg = 0;             // everything: unrestricted
+    } else if (op == SYS_THREAD_SET_PRIORITY) {
+        if (arg > SYS_THREAD_PRIO_LOW) return SYS_ERR_INVAL;
+    }
+    // Looked up and changed under the scheduler lock (CPUs reap from the list).
+    process_t* owner = proc_mem_owner(self);
+    uint64_t result = SYS_ERR_NOTFOUND;
+    uint64_t flags = scheduler_lock();
+    process_t* p = NULL;
+    if (!tid || tid == self->pid) p = self;
+    else for (process_t* q = proc_list_head; q; q = q->next)
+        if (q->pid == tid) { p = q; break; }
+    if (p && proc_mem_owner(p) == owner &&
+        p->state != PROCESS_ZOMBIE && p->state != PROCESS_TERMINATED) {
+        switch (op) {
+            case SYS_THREAD_SET_AFFINITY: scheduler_set_affinity(p, arg); result = SYS_SUCCESS; break;
+            case SYS_THREAD_GET_AFFINITY: result = p->affinity ? p->affinity : sys_thread_online_mask(); break;
+            case SYS_THREAD_SET_PRIORITY: scheduler_set_priority(p, (uint32_t)arg); result = SYS_SUCCESS; break;
+            case SYS_THREAD_GET_PRIORITY: result = p->sched_prio; break;
+            default: result = SYS_ERR_INVAL; break;
+        }
+        if (result == SYS_SUCCESS && op == SYS_THREAD_SET_AFFINITY && p != self) {
+            // nothing more: scheduler_set_affinity moved or kicked it
+        }
+    } else if (p && proc_mem_owner(p) != owner) {
+        result = SYS_ERR_INVAL;
+    }
+    scheduler_unlock(flags);
+    // The caller itself on a CPU outside its new mask: off it (a short
+    // sleep wakes on an allowed CPU).
+    if (result == SYS_SUCCESS && op == SYS_THREAD_SET_AFFINITY && p == self)
+        for (int i = 0; i < 100 && !scheduler_cpu_allowed(self, smp_current_cpu_id()); i++) sleep(1);
+    return result;
+}
+
 static void syscall_dispatch_inner(syscall_regs_t* regs);
 
 void syscall_dispatch(syscall_regs_t* regs) {
@@ -1300,15 +1353,18 @@ static void syscall_dispatch_inner(syscall_regs_t* regs) {
                 syscall_thread_t tc;
                 if (!syscall_user_copy_in(&tc, (const void*)regs->rsi, sizeof(tc))) { regs->rax = SYS_ERR_INVAL; return; }
                 const syscall_thread_t* t = &tc;
-                process_t* thread = proc_create_thread(self, t->entry, t->stack_top, t->arg);
-                regs->rax = thread ? thread->pid : SYS_ERR_INVAL;
+                uint64_t tid = proc_create_thread(self, t->entry, t->stack_top, t->arg);
+                regs->rax = tid ? tid : SYS_ERR_INVAL;
                 return;
             }
             if (regs->rdi == SYS_THREAD_ALIVE) {
+                // Under the scheduler lock: other CPUs reap from the list.
+                uint64_t lf = scheduler_lock();
                 process_t* thread = findProcessByPID(regs->rsi);
-                regs->rax = thread && thread->mem_owner == proc_mem_owner(self) &&
-                            thread->state != PROCESS_ZOMBIE && thread->state != PROCESS_TERMINATED
-                                ? SYS_SUCCESS : SYS_ERR_NOTFOUND;
+                bool alive = thread && thread->mem_owner == proc_mem_owner(self) &&
+                             thread->state != PROCESS_ZOMBIE && thread->state != PROCESS_TERMINATED;
+                scheduler_unlock(lf);
+                regs->rax = alive ? SYS_SUCCESS : SYS_ERR_NOTFOUND;
                 return;
             }
             if (regs->rdi == SYS_THREAD_SET_FS) {
@@ -1322,12 +1378,16 @@ static void syscall_dispatch_inner(syscall_regs_t* regs) {
                 regs->rax = self->fs_base;
                 return;
             }
+            if (regs->rdi >= SYS_THREAD_SET_AFFINITY && regs->rdi <= SYS_THREAD_INFO) {
+                regs->rax = sys_thread_sched_op(self, regs->rdi, regs->rsi, regs->rdx);
+                return;
+            }
             if (regs->rdi == SYS_THREAD_CREATE_EX) {
                 syscall_thread_ex_t req;
                 if (!syscall_user_copy_in(&req, (const void*)regs->rsi, sizeof(req))) { regs->rax = SYS_ERR_INVAL; return; }
-                process_t* thread = proc_create_thread_ex(self, req.entry, req.stack_top, req.arg,
-                                                          req.fs_base, req.exit_futex);
-                regs->rax = thread ? thread->pid : SYS_ERR_INVAL;
+                uint64_t tid = proc_create_thread_ex(self, req.entry, req.stack_top, req.arg,
+                                                     req.fs_base, req.exit_futex);
+                regs->rax = tid ? tid : SYS_ERR_INVAL;
                 return;
             }
             regs->rax = SYS_ERR_INVAL;

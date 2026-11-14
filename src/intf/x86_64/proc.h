@@ -140,9 +140,11 @@ typedef struct process {
     // that process (NULL for an ordinary process). Heap tracking and user
     // pointer checks always go to the owner (proc_mem_owner()), the page
     // tables are the owner's, and the owner counts its live threads in
-    // thread_count. A group never migrates between CPUs (its page tables
-    // change without cross-CPU TLB shootdowns), and it lives and dies
-    // together: the owner exiting, or any member crashing, ends them all.
+    // thread_count. The threads of a group run on any CPU in parallel (TLB
+    // shootdown IPIs keep the shared tables coherent, tlb.h) unless the
+    // 'threads1cpu' boot flag pins them to the owner's CPU. A group lives
+    // and dies together: the owner exiting, or any member crashing, ends
+    // them all.
     struct process* mem_owner;
     volatile uint32_t thread_count;
 
@@ -176,6 +178,20 @@ typedef struct process {
     struct uvm_space* uvm;
     // Nonzero while this process is inside a system call (syscall.c).
     volatile uint32_t in_syscall;
+
+    // ---- multicore threads (OS-3) ----
+    // CPU affinity mask (bit n = CPU n); 0 = any CPU. A thread only runs on
+    // a CPU in its mask (scheduler.c).
+    uint64_t affinity;
+    // Best MLFQ level the process may sit at (SCHED_LEVEL_*): 0 = starts
+    // at interactive (the default), 2 = background only.
+    uint32_t sched_prio;
+    // Owner only: set by whichever thread claims the program's exit or
+    // crash; later ones just stop (process_exit_with_status).
+    volatile uint32_t group_dying;
+    // Owner only: guards user_heap_allocations and the SYS_HEAP page-table
+    // entries (proc.c); a spinlock_t.
+    volatile uint32_t heap_lock;
 } process_t;
 
 // The process whose address space `p` runs in: its owner for a thread.
@@ -236,17 +252,22 @@ void proc_destroy_address_space(process_t* proc);
 
 // A user thread in owner's address space, started at entry(arg) on the
 // stack ending at stack_top (memory the owner already has, e.g. its heap).
-// NULL when owner is not a user process or the arguments are invalid.
-process_t* proc_create_thread(process_t* owner, uint64_t entry,
-                              uint64_t stack_top, uint64_t arg);
+// Returns the thread's pid, 0 when owner is not a user process or the
+// arguments are invalid. (A pid, not a pointer: the thread may run, end and
+// be freed on another CPU before the caller looks at it.)
+uint64_t proc_create_thread(process_t* owner, uint64_t entry,
+                            uint64_t stack_top, uint64_t arg);
 // The same, with the thread's FS base (TLS pointer; canonical lower half)
 // and an exit futex (0, or an aligned uint32_t in owner's memory that is
 // set to 0 and woken when the thread ends). See SYS_THREAD_CREATE_EX.
-process_t* proc_create_thread_ex(process_t* owner, uint64_t entry,
-                                 uint64_t stack_top, uint64_t arg,
-                                 uint64_t fs_base, uint64_t exit_futex);
-// Ends every thread of `owner` (not owner itself).
+uint64_t proc_create_thread_ex(process_t* owner, uint64_t entry,
+                               uint64_t stack_top, uint64_t arg,
+                               uint64_t fs_base, uint64_t exit_futex);
+// Ends every thread of `owner` (not owner itself, not the caller).
 void proc_kill_threads(process_t* owner);
+// Waits until none of owner's threads is on a CPU (call after
+// proc_kill_threads, before freeing the address space).
+void proc_wait_threads_off_cpu(process_t* owner);
 // Ends p's whole group: its owner and all the owner's threads.
 void proc_kill_group(process_t* p);
 

@@ -12,6 +12,10 @@
 #include "x86_64/allocator.h"
 #include "x86_64/pmm.h"
 #include "x86_64/uvm.h"
+#include "x86_64/spinlock.h"
+#include "x86_64/boot_options.h"
+#include "x86_64/tlb.h"
+#include "x86_64/smp.h"
 #include "time.h"
 #include "panic.h"
 #include "x86_64/safeints.h"
@@ -78,7 +82,26 @@ static uint64_t clone_kernel_pml4(void) {
 	return (uint64_t)(uintptr_t)dst;
 }
 
+// The owner's heap lock guards its user_heap_allocations list and the
+// page-table entries SYS_HEAP flips between supervisor and user access
+// (several threads of a program may call SYS_HEAP on different CPUs).
+static inline spinlock_t* heap_lock_of(process_t* owner) {
+	return (spinlock_t*)&owner->heap_lock;
+}
+
+static int heap_map_locked(process_t* proc, void* address, size_t length);
+static int heap_unmap_locked(process_t* proc, void* address, size_t length, bool* changed);
+
 int proc_map_user_heap_range(process_t* proc, void* address, size_t length) {
+	proc = proc_mem_owner(proc);
+	if (!proc) return 0;
+	uint64_t flags = spinlock_acquire(heap_lock_of(proc));
+	int r = heap_map_locked(proc, address, length);
+	spinlock_release(heap_lock_of(proc), flags);
+	return r;
+}
+
+static int heap_map_locked(process_t* proc, void* address, size_t length) {
 	proc = proc_mem_owner(proc);
 	if (!proc || !address || length == 0) return 0;
 	uintptr_t start = (uintptr_t)address & ~0xFFFULL;
@@ -128,7 +151,24 @@ int proc_map_user_heap_range(process_t* proc, void* address, size_t length) {
 	return 1;
 }
 
+// Takes the pages' user access away and flushes it on every CPU that has the
+// program's page tables loaded (the memory goes back to the kernel heap).
 int proc_unmap_user_heap_range(process_t* proc, void* address, size_t length) {
+	proc = proc_mem_owner(proc);
+	if (!proc) return 0;
+	uint64_t flags = spinlock_acquire(heap_lock_of(proc));
+	bool changed = false;
+	int r = heap_unmap_locked(proc, address, length, &changed);
+	if (changed) {
+		uintptr_t start = (uintptr_t)address & ~0xFFFULL;
+		uintptr_t end = ((uintptr_t)address + length + 0xFFFULL) & ~0xFFFULL;
+		uvm_flush_range(proc, start, end);
+	}
+	spinlock_release(heap_lock_of(proc), flags);
+	return r;
+}
+
+static int heap_unmap_locked(process_t* proc, void* address, size_t length, bool* changed) {
 	proc = proc_mem_owner(proc);
 	if (!proc || !address || length == 0) return 0;
 	uintptr_t start = (uintptr_t)address & ~0xFFFULL;
@@ -150,10 +190,38 @@ int proc_unmap_user_heap_range(process_t* proc, void* address, size_t length) {
 		if (!(pde & 1) || (pde & (1ULL << 7))) continue;
 		uint64_t* pt = (uint64_t*)(uintptr_t)(pde & ~0xFFFULL);
 		uint64_t pt_index = (page >> 12) & 0x1FF;
+		if (pt[pt_index] & 0x4ULL) *changed = true;
 		pt[pt_index] &= ~(0x4ULL | (1ULL << 63));
-		__asm__ volatile("invlpg (%0)" :: "r"(page) : "memory");
 	}
 	return 1;
+}
+
+// A user-mode access to kernel-heap memory below 4 GiB faulted although the
+// page is present: the CPU used a translation cached before another thread
+// (on another CPU) made the page user-accessible with SYS_HEAP. Granting
+// access needs no shootdown; the first use on each CPU lands here, finds the
+// tables now allow it and drops the stale entry. A real violation (the
+// tables still forbid it) returns false.
+bool proc_heap_stale_fault(process_t* proc, uint64_t addr, uint64_t err) {
+	if (!(err & 1) || !(err & 4)) return false;
+	process_t* owner = proc_mem_owner(proc);
+	if (!owner || !owner->pml4 || addr >= (1ULL << 39)) return false;
+	uint64_t* pml4 = (uint64_t*)(uintptr_t)owner->pml4;
+	uint64_t e = pml4[0];
+	if ((e & 5) != 5) return false;
+	uint64_t* pdpt = (uint64_t*)(uintptr_t)(e & ~0xFFFULL);
+	e = pdpt[(addr >> 30) & 0x1FF];
+	if ((e & 5) != 5 || (e & (1ULL << 7))) return false;
+	uint64_t* pd = (uint64_t*)(uintptr_t)(e & ~0xFFFULL);
+	e = pd[(addr >> 21) & 0x1FF];
+	if ((e & 5) != 5 || (e & (1ULL << 7))) return false;
+	uint64_t* pt = (uint64_t*)(uintptr_t)(e & ~0xFFFULL);
+	e = pt[(addr >> 12) & 0x1FF];
+	if ((e & 5) != 5) return false;
+	if ((err & 2) && !(e & 2)) return false;
+	if ((err & 16) && (e & (1ULL << 63))) return false;
+	__asm__ volatile("invlpg (%0)" :: "r"(addr) : "memory");
+	return true;
 }
 
 static int proc_user_heap_valid_range(void* address, size_t size) {
@@ -165,11 +233,14 @@ static int proc_user_heap_valid_range(void* address, size_t size) {
 	return end <= UINTPTR_MAX - 0xFFFULL;
 }
 
+// Caller holds the heap lock.
 static void proc_user_heap_unmap_unused_pages(process_t* proc,
 						       uintptr_t start,
 						       uintptr_t end) {
 	uintptr_t first_page = start & ~0xFFFULL;
 	uintptr_t end_page = (end + 0xFFFULL) & ~0xFFFULL;
+	bool changed = false;
+	uintptr_t lo = (uintptr_t)-1, hi = 0;
 	for (uintptr_t page = first_page; page < end_page; page += 0x1000) {
 		bool still_owned = false;
 		for (struct user_heap_allocation* item = proc->user_heap_allocations;
@@ -181,18 +252,35 @@ static void proc_user_heap_unmap_unused_pages(process_t* proc,
 				break;
 			}
 		}
-		if (!still_owned) proc_unmap_user_heap_range(proc, (void*)page, 0x1000);
+		if (!still_owned) {
+			bool page_changed = false;
+			heap_unmap_locked(proc, (void*)page, 0x1000, &page_changed);
+			if (page_changed) {
+				changed = true;
+				if (page < lo) lo = page;
+				if (page + 0x1000 > hi) hi = page + 0x1000;
+			}
+		}
 	}
+	// One flush for the whole range, before the memory is reused.
+	if (changed) uvm_flush_range(proc, lo, hi);
 }
 
-int proc_user_heap_contains(process_t* proc, void* address) {
-	proc = proc_mem_owner(proc);
-	if (!proc || !address) return 0;
+static int heap_contains_locked(process_t* proc, void* address) {
 	for (struct user_heap_allocation* item = proc->user_heap_allocations;
 	     item; item = item->next) {
 		if (item->address == address) return 1;
 	}
 	return 0;
+}
+
+int proc_user_heap_contains(process_t* proc, void* address) {
+	proc = proc_mem_owner(proc);
+	if (!proc || !address) return 0;
+	uint64_t flags = spinlock_acquire(heap_lock_of(proc));
+	int r = heap_contains_locked(proc, address);
+	spinlock_release(heap_lock_of(proc), flags);
+	return r;
 }
 
 int proc_user_heap_contains_range(process_t* proc, const void* address,
@@ -202,14 +290,17 @@ int proc_user_heap_contains_range(process_t* proc, const void* address,
 	uintptr_t start = (uintptr_t)address;
 	if (length > UINTPTR_MAX - start) return 0;
 	uintptr_t end = start + length;
+	int found = 0;
+	uint64_t flags = spinlock_acquire(heap_lock_of(proc));
 	for (struct user_heap_allocation* item = proc->user_heap_allocations;
 	     item; item = item->next) {
 		uintptr_t allocation_start = (uintptr_t)item->address;
 		if (item->size > UINTPTR_MAX - allocation_start) continue;
 		uintptr_t allocation_end = allocation_start + item->size;
-		if (start >= allocation_start && end <= allocation_end) return 1;
+		if (start >= allocation_start && end <= allocation_end) { found = 1; break; }
 	}
-	return 0;
+	spinlock_release(heap_lock_of(proc), flags);
+	return found;
 }
 
 int proc_user_range_ok(process_t* proc, const void* address,
@@ -242,28 +333,39 @@ int proc_user_range_contains(process_t* proc, const void* address,
 
 int proc_user_heap_track(process_t* proc, void* address, size_t size) {
 	proc = proc_mem_owner(proc);
-	if (!proc || !proc_user_heap_valid_range(address, size) ||
-	    proc_user_heap_contains(proc, address)) return 0;
+	if (!proc || !proc_user_heap_valid_range(address, size)) return 0;
 	struct user_heap_allocation* item = alloc(sizeof(*item));
 	if (!item) return 0;
 	item->address = address;
 	item->size = size;
+	uint64_t flags = spinlock_acquire(heap_lock_of(proc));
+	if (heap_contains_locked(proc, address)) {
+		spinlock_release(heap_lock_of(proc), flags);
+		free_mem(item);
+		return 0;
+	}
 	item->next = proc->user_heap_allocations;
 	proc->user_heap_allocations = item;
+	spinlock_release(heap_lock_of(proc), flags);
 	return 1;
 }
 
 int proc_user_heap_untrack(process_t* proc, void* address) {
 	proc = proc_mem_owner(proc);
 	if (!proc || !address) return 0;
+	uint64_t flags = spinlock_acquire(heap_lock_of(proc));
 	struct user_heap_allocation** link = &proc->user_heap_allocations;
 	while (*link && (*link)->address != address) link = &(*link)->next;
-	if (!*link) return 0;
+	if (!*link) {
+		spinlock_release(heap_lock_of(proc), flags);
+		return 0;
+	}
 	struct user_heap_allocation* item = *link;
 	*link = item->next;
 	uintptr_t start = (uintptr_t)item->address - 64;
 	uintptr_t end = (uintptr_t)item->address + item->size + 64;
 	proc_user_heap_unmap_unused_pages(proc, start, end);
+	spinlock_release(heap_lock_of(proc), flags);
 	free_mem(item);
 	return 1;
 }
@@ -273,18 +375,21 @@ int proc_user_heap_resize(process_t* proc, void* old_address,
 	proc = proc_mem_owner(proc);
 	if (!proc || !proc_user_heap_valid_range(new_address, new_size)) return 0;
 	if (!old_address) return proc_user_heap_track(proc, new_address, new_size);
+	uint64_t flags = spinlock_acquire(heap_lock_of(proc));
 	for (struct user_heap_allocation* item = proc->user_heap_allocations;
 	     item; item = item->next) {
 		if (item->address != old_address) continue;
 		if (new_address != old_address &&
-		    proc_user_heap_contains(proc, new_address)) return 0;
+		    heap_contains_locked(proc, new_address)) break;
 		uintptr_t old_start = (uintptr_t)item->address - 64;
 		uintptr_t old_end = (uintptr_t)item->address + item->size + 64;
 		item->address = new_address;
 		item->size = new_size;
 		proc_user_heap_unmap_unused_pages(proc, old_start, old_end);
+		spinlock_release(heap_lock_of(proc), flags);
 		return 1;
 	}
+	spinlock_release(heap_lock_of(proc), flags);
 	return 0;
 }
 
@@ -603,54 +708,54 @@ process_t* proc_create(const char* file_name, void (*entry_point)()) {
 
 void kill(process_t* proc) {
 	if (!proc) return;
+	bool was_live = proc->state != PROCESS_ZOMBIE && proc->state != PROCESS_TERMINATED;
 	if (!proc->mem_owner && proc->thread_count) {
-		proc->state = PROCESS_ZOMBIE;     /* stops proc_kill_threads recursing into it */
+		/* Off every run queue first (stops proc_kill_threads recursing into it),
+		 * then its threads, which may be running on other CPUs. */
+		scheduler_mark_dead(proc, PROCESS_ZOMBIE);
 		proc_kill_threads(proc);
 	}
 	window_manager_process_exit(proc->pid);
 	fgpu_process_exit(proc->pid);
 	audio_streams_on_process_exit(proc->pid);
 	graphics_release_screen_for_pid(proc->pid);
-	if (proc->state != PROCESS_ZOMBIE && proc->state != PROCESS_TERMINATED &&
-	    !proc->crashed)                 /* ended because one of its threads crashed */
+	if (was_live && !proc->crashed)     /* ended because one of its threads crashed */
 		proc->killed = true;            /* SYS_WAIT reports it as killed */
-	proc->state = PROCESS_ZOMBIE;
-	// Pull it out of whatever per-CPU run queue it's sitting in so it
-	// can never be dispatched again, and so the zombie-cleanup pass in
-	// schedule() can safely free it later without racing a queue that
-	// still points at it.
-	scheduler_dequeue(proc);
+	// ZOMBIE, off whatever run queue it sits in (it can never be dispatched
+	// again, so the cleanup pass in schedule() can free it later), and a CPU
+	// that is running it right now is told to leave it.
+	scheduler_mark_dead(proc, PROCESS_ZOMBIE);
 }
 
 /* ------------------------------------------------------- user threads */
 
-process_t* proc_create_thread(process_t* owner, uint64_t entry,
-			      uint64_t stack_top, uint64_t arg) {
+uint64_t proc_create_thread(process_t* owner, uint64_t entry,
+			    uint64_t stack_top, uint64_t arg) {
 	return proc_create_thread_ex(owner, entry, stack_top, arg, 0, 0);
 }
 
-process_t* proc_create_thread_ex(process_t* owner, uint64_t entry,
-				 uint64_t stack_top, uint64_t arg,
-				 uint64_t fs_base, uint64_t exit_futex) {
+uint64_t proc_create_thread_ex(process_t* owner, uint64_t entry,
+			       uint64_t stack_top, uint64_t arg,
+			       uint64_t fs_base, uint64_t exit_futex) {
 	owner = proc_mem_owner(owner);
 	if (!owner || owner->privilege != PROC_PRIVILEGE_USER || !owner->pml4 ||
 	    owner->state == PROCESS_ZOMBIE || owner->state == PROCESS_TERMINATED)
-		return NULL;
+		return 0;
 	// FS base must be a canonical lower-half address (WRMSR faults on
 	// anything else); the exit futex an aligned word the program owns.
-	if (fs_base >= 0x0000800000000000ULL) return NULL;
+	if (fs_base >= 0x0000800000000000ULL) return 0;
 	if (exit_futex && ((exit_futex & 3u) ||
 	    !proc_user_range_contains(owner, (const void*)(uintptr_t)exit_futex, 4)))
-		return NULL;
+		return 0;
 	// The code must be executable memory of the program (its image or a
 	// SYS_VM mapping with SYS_VM_PROT_EXEC), the stack (its top 256 bytes
 	// at least) memory the program owns.
 	if (!uvm_is_executable(owner, entry))
-		return NULL;
+		return 0;
 	stack_top &= ~0xFULL;
 	if (stack_top < 0x1000 + 256 ||
 	    !proc_user_range_contains(owner, (const void*)(uintptr_t)(stack_top - 256), 256))
-		return NULL;
+		return 0;
 
 	char name[MAX_PROCESS_NAME_LEN];
 	size_t n = 0;
@@ -660,12 +765,29 @@ process_t* proc_create_thread_ex(process_t* owner, uint64_t entry,
 	name[n] = 0;
 
 	process_t* t = proc_create_ex(name, (void (*)())(uintptr_t)entry, PROC_PRIVILEGE_USER);
-	if (!t) return NULL;
+	if (!t) return 0;
+	uint64_t tid = t->pid;
 	// proc_create_ex() gave it page tables of its own; it uses the owner's.
 	proc_destroy_address_space(t);          /* mem_owner not set yet: frees them */
+	// Joins the group, unless the program is already ending (its exit has
+	// killed or is killing the threads: one created now would outlive it).
+	uint64_t gflags = scheduler_lock();
+	if (__atomic_load_n(&owner->group_dying, __ATOMIC_SEQ_CST) ||
+	    owner->state == PROCESS_ZOMBIE || owner->state == PROCESS_TERMINATED) {
+		scheduler_unlock(gflags);
+		t->state = PROCESS_ZOMBIE;          /* never started; reaped, no address space */
+		return 0;
+	}
 	t->mem_owner = owner;
 	t->pml4 = owner->pml4;
+	owner->thread_count++;
+	scheduler_unlock(gflags);
 	t->parent_pid = owner->pid;
+	process_t* creator = current_process;
+	if (creator && proc_mem_owner(creator) == owner) {
+		t->sched_prio = creator->sched_prio;    /* inherits priority and affinity */
+		t->affinity = creator->affinity;
+	}
 	// SysV: RSP % 16 == 8 at the entry, as if called.
 	t->user_stack = (uint64_t*)(uintptr_t)(stack_top - 8);
 	t->user_argc = arg;                     /* RDI: the thread's argument */
@@ -678,23 +800,70 @@ process_t* proc_create_thread_ex(process_t* owner, uint64_t entry,
 	t->user_image_size = owner->user_image_size;
 	t->cleanup_entry = NULL;
 
-	uint64_t flags = scheduler_lock();
-	owner->thread_count++;
-	scheduler_unlock(flags);
-	irq_restore(flags, __FILE__, __func__, __LINE__);
-
-	// Same CPU as the owner, and the scheduler never moves a group.
-	t->state = PROCESS_READY;
-	scheduler_enqueue_on_cpu(t, owner->sched_cpu);
-	return t;
+	// Spread over the CPUs like a process (or kept on the owner's CPU with
+	// the 'threads1cpu' boot flag); it may be killed before it starts.
+	scheduler_start_thread(t, owner);
+	return tid;                             /* t may be gone already */
 }
 
+// Marks every thread of `owner` dead (not the calling thread) and tells the
+// CPUs running them to stop. The list is walked under the scheduler lock
+// (other CPUs reap processes from it); only pids leave the lock.
 void proc_kill_threads(process_t* owner) {
 	if (!owner || owner->mem_owner || !owner->thread_count) return;
-	for (process_t* p = proc_list_head; p; p = p->next) {
-		if (p->mem_owner == owner && p != current_process &&
-		    p->state != PROCESS_ZOMBIE && p->state != PROCESS_TERMINATED)
-			kill(p);
+	for (;;) {
+		uint64_t pids[32];
+		uint32_t n = 0;
+		uint64_t flags = scheduler_lock();
+		for (process_t* p = proc_list_head; p && n < 32; p = p->next) {
+			if (p->mem_owner == owner && p != current_process &&
+			    p->state != PROCESS_ZOMBIE && p->state != PROCESS_TERMINATED) {
+				p->killed = true;
+				scheduler_mark_dead(p, PROCESS_ZOMBIE);
+				pids[n++] = p->pid;
+			}
+		}
+		scheduler_unlock(flags);
+		for (uint32_t i = 0; i < n; i++) {
+			window_manager_process_exit(pids[i]);
+			fgpu_process_exit(pids[i]);
+			audio_streams_on_process_exit(pids[i]);
+			graphics_release_screen_for_pid(pids[i]);
+		}
+		if (n < 32) break;
+	}
+}
+
+// Waits until no thread of `owner` is on a CPU any more (they were marked
+// dead: each leaves at its next interrupt, which the kick brings at once).
+// Needed before the owner frees its address space. Keeps answering TLB
+// shootdowns meanwhile.
+void proc_wait_threads_off_cpu(process_t* owner) {
+	if (!owner || owner->mem_owner || !owner->thread_count) return;
+	uint64_t began = time_get_uptime_ms();
+	bool warned = false;
+	for (;;) {
+		bool busy = false;
+		uint64_t flags = scheduler_lock();
+		for (process_t* p = proc_list_head; p; p = p->next) {
+			if (p->mem_owner != owner || p == current_process) continue;
+			if (p->on_cpu) {
+				busy = true;
+				scheduler_kick(p);
+			}
+		}
+		scheduler_unlock(flags);
+		if (!busy) return;
+		for (int i = 0; i < 200; i++) {
+			tlb_poll();
+			__asm__ volatile("pause" ::: "memory");
+		}
+		if (!warned && time_get_uptime_ms() - began > 3000) {
+			warned = true;
+			serial_write_str("[PROC] a thread did not leave its CPU: ");
+			serial_write_str(owner->name);
+			serial_write_str("\n");
+		}
 	}
 }
 

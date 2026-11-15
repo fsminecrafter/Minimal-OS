@@ -307,7 +307,13 @@ One streaming system serves all three. It reads only cooked paks (never `.mof` o
   - **Scripts on objects (editor side done in farcade-engine, see its `docs/scripting.md`):**
     - An object holds several scripts, run in Inspector order.
     - Each script declares inputs in `-- @prop` comments, which the editor reads without Lua. Types: number (optionally with a range), text, toggle, list, object link.
-    - Scripts on different objects reach each other through object links: `self.door:script("door")`, `obj:send(event, ...)`, `fe.broadcast`. These run-time calls arrive with the Lua VM.
+    - Scripts on different objects reach each other through object links: `self.door:script("door")`, `obj:send(event, ...)`, `fe.broadcast`.
+  - **Started (farcade-engine `engine/script`):**
+    - Lua 5.4.7 runs scripts in Play: one sandboxed instance per script, inputs in `self`, object handles, module fields through the ECS (including `camera.current`), events and physics callbacks.
+    - Errors are logged with `file:line` and a traceback.
+    - Generational GC.
+    - It runs in QEMU, with its own `setjmp`/`longjmp` for the OS runtime.
+    - Not yet: the C++ game module, hot reload, the debugger, and time limits for runaway scripts.
 - **Fast Lua 5.4:**
   - Generational GC stepped within about 0.5 ms per frame, and an engine allocator through `lua_Alloc`.
   - Entities as light userdata (the 64-bit flecs id, generation checked on use, no allocation). Multi-return accessors (`x,y,z = fe.pos(e)`).
@@ -325,6 +331,8 @@ One streaming system serves all three. It reads only cooked paks (never `.mof` o
 - **C++ debugging on the OS:** crash handler with stack traces (frame pointers + ELF symbols), asserts sent to the editor, serial log. The engine developer gets QEMU's gdbstub. A gdbserver-lite over TCP is a later stretch goal.
 
 ### C6. Other systems and libraries
+**Started:** a built-in physics step (`engine/physics`) stands in for Jolt until the engine can use Jolt's C++ standard library needs. It covers gravity, box and sphere colliders, bounce, friction, layers and triggers, and has no rotation from contacts.
+
 Every library here must build with GCC against mlibc, and the heavy ones live only inside `libfe.a`.
 
 | Area | Choice | Licence |

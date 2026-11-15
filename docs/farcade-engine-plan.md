@@ -163,6 +163,7 @@ farcade-engine/
 - On the PC it runs on a host copy of the FGPU CPU backend. In QEMU its smoke test gives the same checksum as the host.
 - A GPU tier (Settings > Graphics) adds a sun shadow map with PCF, GGX PBR, SSAO, bloom, FXAA and fog. It is on by default only when FGPU runs on a graphics card (FGPU_CAP_HW_3D); on the CPU backend it can be forced. Its QEMU smoke matches the host checksum too.
 - On the CPU backend the editor redraws only what changed. While the view moves it renders the viewport at a lower resolution with draft shaders, then refines in bands. In QEMU TCG a FarcadeGL orbit went from 3.4 s to about 0.2 s per frame.
+- Mesh objects have a material in the editor's Inspector: roughness, metal, unlit and shadows. Roughness, metal and shadows show in the GPU tier only.
 - CLOD, voxels, GI and the rest of C4 are not started.
 
 `gfx` is a thin layer over FarcadeGL:
@@ -354,6 +355,12 @@ Every library here must build with GCC against mlibc, and the heavy ones live on
 | Runtime | mlibc; GCC 15.1/binutils 2.45 (runtime exception, so proprietary games are fine on the GCC side) | MIT / GPL+RLE |
 
 ### C7. Editor (runs on Minimal-OS)
+**Started (farcade-engine `editor/`):**
+- The shell, panels, gizmos and Play exist on the userland 2D rasterizer. They run full screen on Minimal-OS.
+- Scenes save and open as text `.fscene` files. Module fields are written by name from the reflection tables, so older files load. The commands are File > Save scene (Ctrl+S), Save scene as, and double-click in Files.
+- In QEMU, `farcade-editor --scene-test` saves, overwrites and reopens the demo scene. This needed a fix to the editor's MinimaFS file writer: create a `.part` file, write it with `SYS_FWRITE`, then rename it over the target.
+- Undo/redo, prefabs, the material graph and autosave are not started.
+
 - **Shell:**
   - Dear ImGui docking in a mosWM window (or full screen). It is drawn through FarcadeGL with scissor and a 6-float vertex layout in ring buffers.
   - Fallback until scissor lands: a userland 2D rasterizer (fast quads and glyphs) blitted with `SYS_WINDOW`.

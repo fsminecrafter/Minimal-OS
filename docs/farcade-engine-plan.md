@@ -146,12 +146,23 @@ farcade-engine/
 
 ### C3. ECS, scene, world
 - **flecs v4** (MIT, C99), used through its C API inside the engine. Its meta addon is filled from engine reflection, and its `os_api` hooks run on engine jobs. Components from Lua and C++ live in one world.
+- **Started (farcade-engine `engine/ecs`):**
+  - flecs v4.1.6 behind `fe::World`, with its own single-threaded `os_api`; it runs in QEMU.
+  - Components: modules (Rigidbody 3D, Collider 3D, listener, audio stream and sampler, light) and scene-object settings (camera, sky, sky light, post processing), with flecs meta filled from the same field tables as the editor.
+  - The transform hierarchy runs as a system, and the "one current camera/sky/listener" rule is enforced in the world.
+  - The editor's Play runs the scene as a world.
 - Scenes are text for editing (diff-friendly) and cooked to binary. Prefabs use flecs prefabs.
 - A world-partition grid of 32 m streaming cells feeds the proxy hierarchy (C4.6).
 
 ### C4. Rendering (FarcadeGL only)
 
 #### C4.1 The `gfx` layer and feature levels
+**Started (farcade-engine `engine/gfx`):**
+- An FL0-style forward renderer on `farcadegl.h`: up to 8 lights, hemisphere ambient, a gradient sky with a sun, and post processing folded into the shaders.
+- It renders offscreen and reads the frames back for the editor viewport.
+- On the PC it runs on a host copy of the FGPU CPU backend. In QEMU its smoke test gives the same checksum as the host.
+- Shadows, bloom, CLOD and everything below are not started.
+
 `gfx` is a thin layer over FarcadeGL:
 - Resources are pooled and sub-allocated from FGPU buffers of at most 16 MiB until OS-6 lifts the limit, within handle budgets.
 - Uploads go through rings of 2–3 buffers, and passes are an ordered list.

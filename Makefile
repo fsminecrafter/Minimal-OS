@@ -457,10 +457,10 @@ doom-stage: $(doom_run) $(if $(DOOM_WAD),,$(FREEDOOM_ZIP))
 		echo "doom: game data Freedoom $(FREEDOOM_VERSION) (Doom/freedoom1.wad)"; \
 	fi
 
-# Called by build-x86_64: packs the stage with DOOM=1, removes the module
-# otherwise (so 'make mosdesk' after 'make mosdesk-doom' has no Doom).
+# Called by build-x86_64: packs the stage with DOOM=1 or FE=1, removes the
+# module otherwise (so 'make mosdesk' after 'make mosdesk-doom' has no Doom).
 games-payload:
-	@if [ "$(DOOM)" = 1 ]; then \
+	@if [ "$(DOOM)" = 1 ] || [ "$(FE)" = 1 ]; then \
 		$(MKPKG) build/games/stage $(games_mpkg) --store && \
 		echo "games: build/games/stage/ packed into the ISO as boot/mosgames.mpkg"; \
 	else \
@@ -484,6 +484,65 @@ mosdesk-doom: doom-sdk
 run-mosdesk-doom: doom-sdk
 	$(MAKE) doom-stage
 	$(MAKE) MOSDESK=1 DOOM=1 run
+
+# ---------------------------------------------------------------- Farcade Engine
+# The Farcade Engine editor for MOSdesk, built from the Farcade-Engine repo.
+#   make mosdesk-fe            the desktop ISO with the editor, like 'make mosdesk'
+#   make run-mosdesk-fe        the same in QEMU
+#   make mosdesk-fe DOOM=1     with Doom as well
+#   make mosdesk-fe FARCADE_REF=<branch, tag or commit>
+#   make mosdesk-fe FARCADE_DIR=/path/to/checkout FARCADE_USE_LOCAL=1
+# The engine is cloned into $(FARCADE_DIR) (with its SDK submodule) and
+# built with its own 'make os' and this tree's cross compiler. The editor
+# (FarcadeEditor.run, plus FarcadeEditor/ with its README and licence) goes
+# into the same "mosgames" boot module as Doom, which setup unpacks into
+# 0:/programs. Under MOSdesk the editor opens as a window; started without
+# the desktop it takes the whole screen.
+FE ?= 0
+FARCADE_REPO ?= https://github.com/fsminecrafter/Farcade-Engine.git
+FARCADE_REF ?= main
+FARCADE_DIR ?= build/farcade-engine
+FARCADE_USE_LOCAL ?= 0
+fe_editor_run = $(FARCADE_DIR)/build/os/bin/farcade-editor.run
+
+.PHONY: fe-fetch fe-build fe-stage fe-games-stage mosdesk-fe run-mosdesk-fe
+fe-fetch:
+	@if [ "$(FARCADE_USE_LOCAL)" = 1 ]; then \
+		[ -d "$(FARCADE_DIR)" ] || { echo "fe-fetch: FARCADE_DIR=$(FARCADE_DIR) does not exist" >&2; exit 1; }; \
+		exit 0; \
+	fi; \
+	if [ ! -e "$(FARCADE_DIR)/.git" ]; then \
+		mkdir -p "$(dir $(FARCADE_DIR))" && git clone "$(FARCADE_REPO)" "$(FARCADE_DIR)" || exit 1; \
+	fi; \
+	git -C "$(FARCADE_DIR)" fetch origin "$(FARCADE_REF)" && \
+	git -C "$(FARCADE_DIR)" checkout --detach FETCH_HEAD && \
+	git -C "$(FARCADE_DIR)" submodule update --init --recursive && \
+	echo "fe-fetch: Farcade Engine at $$(git -C "$(FARCADE_DIR)" rev-parse --short HEAD) ($(FARCADE_REF))"
+
+# The engine's own build, with this tree's cross tools (g++ and ar next to $(CC)).
+fe-build: fe-fetch
+	$(MAKE) -C "$(FARCADE_DIR)" os OS_CC=$(CC) OS_CXX=$(patsubst %-gcc,%-g++,$(CC)) OS_LD=$(LD) \
+		OS_AR=$(patsubst %-gcc,%-ar,$(CC))
+
+# Adds the editor to build/games/stage.
+fe-stage: fe-build
+	mkdir -p build/games/stage/FarcadeEditor
+	cp "$(fe_editor_run)" build/games/stage/FarcadeEditor.run
+	cp "$(FARCADE_DIR)/README.md" build/games/stage/FarcadeEditor/README.md
+	cp "$(FARCADE_DIR)/LICENSE" build/games/stage/FarcadeEditor/LICENSE
+	@echo "fe: FarcadeEditor.run ($$(stat -c %s "$(fe_editor_run)") bytes) staged for 0:/programs"
+
+# The stage from scratch: Doom first when DOOM=1 (doom-stage starts the
+# stage afresh), then the editor.
+fe-games-stage: doom-sdk
+	@if [ "$(DOOM)" = 1 ]; then $(MAKE) doom-stage; else rm -rf build/games/stage; fi
+	$(MAKE) fe-stage
+
+mosdesk-fe: fe-games-stage
+	$(MAKE) MOSDESK=1 FE=1 DOOM=$(DOOM) build-x86_64
+
+run-mosdesk-fe: fe-games-stage
+	$(MAKE) MOSDESK=1 FE=1 DOOM=$(DOOM) run
 
 # Serves the built ISO over the LAN so another PC can PXE boot it.
 # Needs root for the DHCP/TFTP ports; see docs/netboot.md.

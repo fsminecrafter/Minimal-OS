@@ -359,7 +359,10 @@ Every library here must build with GCC against mlibc, and the heavy ones live on
 - The shell, panels, gizmos and Play exist on the userland 2D rasterizer. They run full screen on Minimal-OS.
 - Scenes save and open as text `.fscene` files. Module fields are written by name from the reflection tables, so older files load. The commands are File > Save scene (Ctrl+S), Save scene as, and double-click in Files.
 - In QEMU, `farcade-editor --scene-test` saves, overwrites and reopens the demo scene. This needed a fix to the editor's MinimaFS file writer: create a `.part` file, write it with `SYS_FWRITE`, then rename it over the target.
-- Undo/redo, prefabs, the material graph and autosave are not started.
+- Undo and redo (Ctrl+Z, Ctrl+Y) keep whole-scene snapshots, taken when an edit settles; a drag counts as one step.
+- New scene, Open and Quit ask before unsaved changes are lost.
+- Scripts read and write the material through `obj.material`.
+- Prefabs, the material graph and autosave are not started.
 
 - **Shell:**
   - Dear ImGui docking in a mosWM window (or full screen). It is drawn through FarcadeGL with scissor and a 6-float vertex layout in ring buffers.

@@ -161,7 +161,9 @@ farcade-engine/
 - An FL0-style forward renderer on `farcadegl.h`: up to 8 lights, hemisphere ambient, a gradient sky with a sun, and post processing folded into the shaders.
 - It renders offscreen and reads the frames back for the editor viewport.
 - On the PC it runs on a host copy of the FGPU CPU backend. In QEMU its smoke test gives the same checksum as the host.
-- Shadows, bloom, CLOD and everything below are not started.
+- A GPU tier (Settings > Graphics) adds a sun shadow map with PCF, GGX PBR, SSAO, bloom, FXAA and fog. It is on by default only when FGPU runs on a graphics card (FGPU_CAP_HW_3D); on the CPU backend it can be forced. Its QEMU smoke matches the host checksum too.
+- On the CPU backend the editor redraws only what changed. While the view moves it renders the viewport at a lower resolution with draft shaders, then refines in bands. In QEMU TCG a FarcadeGL orbit went from 3.4 s to about 0.2 s per frame.
+- CLOD, voxels, GI and the rest of C4 are not started.
 
 `gfx` is a thin layer over FarcadeGL:
 - Resources are pooled and sub-allocated from FGPU buffers of at most 16 MiB until OS-6 lifts the limit, within handle budgets.

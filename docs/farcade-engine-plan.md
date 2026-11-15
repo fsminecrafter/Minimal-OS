@@ -146,12 +146,26 @@ farcade-engine/
 
 ### C3. ECS, scene, world
 - **flecs v4** (MIT, C99), used through its C API inside the engine. Its meta addon is filled from engine reflection, and its `os_api` hooks run on engine jobs. Components from Lua and C++ live in one world.
+- **Started (farcade-engine `engine/ecs`):**
+  - flecs v4.1.6 behind `fe::World`, with its own single-threaded `os_api`; it runs in QEMU.
+  - Components: modules (Rigidbody 3D, Collider 3D, listener, audio stream and sampler, light) and scene-object settings (camera, sky, sky light, post processing), with flecs meta filled from the same field tables as the editor.
+  - The transform hierarchy runs as a system, and the "one current camera/sky/listener" rule is enforced in the world.
+  - The editor's Play runs the scene as a world.
 - Scenes are text for editing (diff-friendly) and cooked to binary. Prefabs use flecs prefabs.
 - A world-partition grid of 32 m streaming cells feeds the proxy hierarchy (C4.6).
 
 ### C4. Rendering (FarcadeGL only)
 
 #### C4.1 The `gfx` layer and feature levels
+**Started (farcade-engine `engine/gfx`):**
+- An FL0-style forward renderer on `farcadegl.h`: up to 8 lights, hemisphere ambient, a gradient sky with a sun, and post processing folded into the shaders.
+- It renders offscreen and reads the frames back for the editor viewport.
+- On the PC it runs on a host copy of the FGPU CPU backend. In QEMU its smoke test gives the same checksum as the host.
+- A GPU tier (Settings > Graphics) adds a sun shadow map with PCF, GGX PBR, SSAO, bloom, FXAA and fog. It is on by default only when FGPU runs on a graphics card (FGPU_CAP_HW_3D); on the CPU backend it can be forced. Its QEMU smoke matches the host checksum too.
+- On the CPU backend the editor redraws only what changed. While the view moves it renders the viewport at a lower resolution with draft shaders, then refines in bands. In QEMU TCG a FarcadeGL orbit went from 3.4 s to about 0.2 s per frame.
+- Mesh objects have a material in the editor's Inspector: roughness, metal, unlit and shadows. Roughness, metal and shadows show in the GPU tier only.
+- CLOD, voxels, GI and the rest of C4 are not started.
+
 `gfx` is a thin layer over FarcadeGL:
 - Resources are pooled and sub-allocated from FGPU buffers of at most 16 MiB until OS-6 lifts the limit, within handle budgets.
 - Uploads go through rings of 2–3 buffers, and passes are an ordered list.
@@ -296,7 +310,13 @@ One streaming system serves all three. It reads only cooked paks (never `.mof` o
   - **Scripts on objects (editor side done in farcade-engine, see its `docs/scripting.md`):**
     - An object holds several scripts, run in Inspector order.
     - Each script declares inputs in `-- @prop` comments, which the editor reads without Lua. Types: number (optionally with a range), text, toggle, list, object link.
-    - Scripts on different objects reach each other through object links: `self.door:script("door")`, `obj:send(event, ...)`, `fe.broadcast`. These run-time calls arrive with the Lua VM.
+    - Scripts on different objects reach each other through object links: `self.door:script("door")`, `obj:send(event, ...)`, `fe.broadcast`.
+  - **Started (farcade-engine `engine/script`):**
+    - Lua 5.4.7 runs scripts in Play: one sandboxed instance per script, inputs in `self`, object handles, module fields through the ECS (including `camera.current`), events and physics callbacks.
+    - Errors are logged with `file:line` and a traceback.
+    - Generational GC.
+    - It runs in QEMU, with its own `setjmp`/`longjmp` for the OS runtime.
+    - Not yet: the C++ game module, hot reload, the debugger, and time limits for runaway scripts.
 - **Fast Lua 5.4:**
   - Generational GC stepped within about 0.5 ms per frame, and an engine allocator through `lua_Alloc`.
   - Entities as light userdata (the 64-bit flecs id, generation checked on use, no allocation). Multi-return accessors (`x,y,z = fe.pos(e)`).
@@ -314,6 +334,8 @@ One streaming system serves all three. It reads only cooked paks (never `.mof` o
 - **C++ debugging on the OS:** crash handler with stack traces (frame pointers + ELF symbols), asserts sent to the editor, serial log. The engine developer gets QEMU's gdbstub. A gdbserver-lite over TCP is a later stretch goal.
 
 ### C6. Other systems and libraries
+**Started:** a built-in physics step (`engine/physics`) stands in for Jolt until the engine can use Jolt's C++ standard library needs. It covers gravity, box and sphere colliders, bounce, friction, layers and triggers, and has no rotation from contacts.
+
 Every library here must build with GCC against mlibc, and the heavy ones live only inside `libfe.a`.
 
 | Area | Choice | Licence |
@@ -333,6 +355,12 @@ Every library here must build with GCC against mlibc, and the heavy ones live on
 | Runtime | mlibc; GCC 15.1/binutils 2.45 (runtime exception, so proprietary games are fine on the GCC side) | MIT / GPL+RLE |
 
 ### C7. Editor (runs on Minimal-OS)
+**Started (farcade-engine `editor/`):**
+- The shell, panels, gizmos and Play exist on the userland 2D rasterizer. They run full screen on Minimal-OS.
+- Scenes save and open as text `.fscene` files. Module fields are written by name from the reflection tables, so older files load. The commands are File > Save scene (Ctrl+S), Save scene as, and double-click in Files.
+- In QEMU, `farcade-editor --scene-test` saves, overwrites and reopens the demo scene. This needed a fix to the editor's MinimaFS file writer: create a `.part` file, write it with `SYS_FWRITE`, then rename it over the target.
+- Undo/redo, prefabs, the material graph and autosave are not started.
+
 - **Shell:**
   - Dear ImGui docking in a mosWM window (or full screen). It is drawn through FarcadeGL with scissor and a 6-float vertex layout in ring buffers.
   - Fallback until scissor lands: a userland 2D rasterizer (fast quads and glyphs) blitted with `SYS_WINDOW`.

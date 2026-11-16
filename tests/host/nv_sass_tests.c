@@ -189,6 +189,33 @@ static bool close_enough(float a, float b) {
     return d <= 2e-3f + 2e-3f * m;
 }
 
+static void test_storage_buffer_fallback(void) {
+    const char* vs = "attribute vec3 position; void main() { gl_Position = vec4(position, 1.0); }";
+    const char* fs =
+        "layout(binding = 0) buffer vec4 values[];\n"
+        "void main() { gl_FragColor = values[0.0]; }\n";
+    if (fglsl_compile(&comp, vs, fs) != 0) {
+        CHECK(false, "storage buffer shader compiles");
+        return;
+    }
+    const char* why = "";
+    if (!fgpu_program_check(comp.words, comp.size, &prog, &why)) {
+        CHECK(false, "storage buffer shader validates");
+        return;
+    }
+    if (!prog.h.storage_buffer_mask) return;
+    fgpu_ir_t ir = { .code = code, .capacity = CAP, .hash = hash_words };
+    if (!fgpu_ir_lower(&ir, &prog, true, &why)) {
+        CHECK(false, "storage buffer shader lowers to IR");
+        return;
+    }
+    fgpu_ir_allocate(&ir);
+    nv_sass_t sh = { .code = sass_words[1], .capacity = CAP * 8u };
+    CHECK(!nv_sass_encode(ir.code, ir.count, ir.reg_count, true, prog.h.varying_count, &sh, &why) &&
+          strstr(why, "storage buffer loads run on the CPU"),
+          "NVIDIA encoder refuses unsafe native storage loads");
+}
+
 // Compiles a shader pair and runs both stages on random inputs through
 // the CPU machine and the simulated machine code.
 static void compare(const char* name, const char* vs, const char* fs) {
@@ -472,6 +499,7 @@ int main(void) {
     test_encodings();
     test_pushbuffers();
     test_nvdec();
+    test_storage_buffer_fallback();
     compare("built-in color", NV_BUILTIN_VS_PLAIN, NV_BUILTIN_FS_PLAIN);
     compare("video NV12 to RGB", NV_VIDEO_VS, NV_VIDEO_NV12_FS);
     compare("built-in gouraud", NV_BUILTIN_VS_GOURAUD, NV_BUILTIN_FS_PLAIN);

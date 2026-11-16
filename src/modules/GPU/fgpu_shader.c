@@ -197,7 +197,7 @@ static const uint8_t k_op_sources[FGPU_SOP_COUNT] = {
     [FGPU_SOP_STEP] = 3, [FGPU_SOP_SSTEP] = 7, [FGPU_SOP_SLT] = 3, [FGPU_SOP_SLE] = 3,
     [FGPU_SOP_SEQ] = 3, [FGPU_SOP_SNE] = 3, [FGPU_SOP_SEL] = 7, [FGPU_SOP_MOD] = 3,
     [FGPU_SOP_SIGN] = 1, [FGPU_SOP_ATAN2] = 3, [FGPU_SOP_TEX] = 1, [FGPU_SOP_KILL] = 1,
-    [FGPU_SOP_JMP] = 0, [FGPU_SOP_JZ] = 1,
+    [FGPU_SOP_JMP] = 0, [FGPU_SOP_JZ] = 1, [FGPU_SOP_BUFFER_LOAD] = 1,
 };
 
 static inline uint32_t op_sources(uint32_t op) { return k_op_sources[op]; }
@@ -239,6 +239,11 @@ static bool check_stage(const fgpu_shader_header_t* h, const uint32_t* code, uin
             if (!check_src(h, in[2 + k], fragment)) { *why = "bad source register"; return false; }
         }
         if (op == FGPU_SOP_TEX && in[3] >= FGPU_MAX_TEXTURE_UNITS) { *why = "bad texture unit"; return false; }
+        if (op == FGPU_SOP_BUFFER_LOAD &&
+            (in[3] >= FGPU_MAX_STORAGE_BUFFERS || !(h->storage_buffer_mask & (1u << in[3])))) {
+            *why = "bad storage buffer binding";
+            return false;
+        }
     }
     return true;
 }
@@ -259,7 +264,8 @@ bool fgpu_program_check(const void* blob, uint32_t bytes, fgpu_program_t* out, c
     }
     if (h->temp_count > FGPU_SHADER_MAX_TEMPS || h->varying_count > FGPU_SHADER_MAX_VARYINGS ||
         h->uniform_count > FGPU_SHADER_MAX_UNIFORMS || h->const_count > FGPU_SHADER_MAX_CONSTANTS ||
-        (h->attrib_mask >> FGPU_MAX_ATTRIBS) || (h->texture_mask >> FGPU_MAX_TEXTURE_UNITS)) {
+        (h->attrib_mask >> FGPU_MAX_ATTRIBS) || (h->texture_mask >> FGPU_MAX_TEXTURE_UNITS) ||
+        (h->storage_buffer_mask >> FGPU_MAX_STORAGE_BUFFERS)) {
         *why = "limits exceeded"; return false;
     }
     uint32_t header_words = sizeof(fgpu_shader_header_t) / 4;
@@ -307,6 +313,7 @@ typedef struct {
     const float (*uniforms)[4];
     const float (*consts)[4];
     const fgpu_texture_t* textures;
+    const fgpu_storage_buffer_t* storage_buffers;
     row_t ops[3][4];            // materialized sources
     row_t res[4];               // result
 } vm_t;
@@ -557,6 +564,22 @@ static uint32_t run(vm_t* vm, const uint32_t* code, uint32_t count, uint32_t liv
                 store(vm, in[1], active);
                 break;
             }
+            case FGPU_SOP_BUFFER_LOAD: {
+                operand(vm, in[2], 1, vm->ops[0], a);
+                const fgpu_storage_buffer_t* buffer = vm->storage_buffers ? &vm->storage_buffers[in[3]] : NULL;
+                for (int l = 0; l < L; l++) {
+                    if (!(active & (1u << l))) continue;
+                    float index = a[0][l];
+                    for (int c = 0; c < 4; c++) vm->res[c][l] = 0.0f;
+                    if (buffer && buffer->data && index >= 0.0f &&
+                        index < (float)buffer->vec4_count && index < 16777216.0f) {
+                        const float* value = buffer->data[(uint32_t)index];
+                        for (int c = 0; c < 4; c++) vm->res[c][l] = value[c];
+                    }
+                }
+                store(vm, in[1], active);
+                break;
+            }
             default: {
                 uint32_t used = op_sources(op);
                 uint32_t mask = FGPU_DST_MASK(in[1]);
@@ -638,12 +661,13 @@ void fgpu_shader_batch_reset(fgpu_shader_batch_t* b, uint32_t temps) {
     for (size_t i = 0; i < (size_t)temps * 4 * L; i++) t[i] = 0.0f;
 }
 
-uint32_t fgpu_shader_run_batch(const fgpu_program_t* p, bool fragment, fgpu_shader_batch_t* b,
+uint32_t fgpu_shader_run_batch_buffers(const fgpu_program_t* p, bool fragment, fgpu_shader_batch_t* b,
                                uint32_t lanes, const float (*uniforms)[4],
-                               const fgpu_texture_t* textures) {
+                               const fgpu_texture_t* textures,
+                               const fgpu_storage_buffer_t* storage_buffers) {
 #ifdef FGPU_ENABLE_JIT
     // Compiled code (bit-identical results), if the program has any.
-    if (p->jit) {
+    if (p->jit && !p->h.storage_buffer_mask) {
         uint32_t kept;
         if (fgpu_jit_run_batch(p, fragment, b, lanes, uniforms, textures, &kept)) return kept;
     }
@@ -653,6 +677,7 @@ uint32_t fgpu_shader_run_batch(const fgpu_program_t* p, bool fragment, fgpu_shad
     vm.uniforms = uniforms;
     vm.consts = p->consts;
     vm.textures = textures;
+    vm.storage_buffers = storage_buffers;
     uint32_t outs = fragment ? 1u : 1u + p->h.varying_count;
     for (uint32_t o = 0; o < outs; o++) {
         for (int c = 0; c < 4; c++) {
@@ -662,6 +687,11 @@ uint32_t fgpu_shader_run_batch(const fgpu_program_t* p, bool fragment, fgpu_shad
     }
     lanes &= (1u << L) - 1;
     return fragment ? run(&vm, p->fs, p->h.fs_count, lanes) : run(&vm, p->vs, p->h.vs_count, lanes);
+}
+
+uint32_t fgpu_shader_run_batch(const fgpu_program_t* p, bool fragment, fgpu_shader_batch_t* b,
+                               uint32_t lanes, const float (*uniforms)[4], const fgpu_texture_t* textures) {
+    return fgpu_shader_run_batch_buffers(p, fragment, b, lanes, uniforms, textures, NULL);
 }
 
 /* One invocation at a time (tests, wireframe lines). */

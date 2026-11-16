@@ -239,7 +239,8 @@ static void shade_vertices(const fgpu_pipeline_t* p, const fgpu_layout_t* layout
         for (uint32_t i = 0; i < FGPU_MAX_ATTRIBS; i++)
             for (int c = 0; c < 4; c++) b->input[i][c][l] = attr[i][c];
     }
-    fgpu_shader_run_batch(p->shader, false, b, (1u << n) - 1, p->constants, p->textures);
+    fgpu_shader_run_batch_buffers(p->shader, false, b, (1u << n) - 1, p->constants, p->textures,
+                          p->storage_buffers);
     uint32_t nv = p->shader->h.varying_count;
     for (uint32_t l = 0; l < n; l++) {
         for (int c = 0; c < 4; c++) out[l].clip[c] = b->output[0][c][l];
@@ -258,7 +259,8 @@ static bool shade(const fgpu_pipeline_t* p, uint32_t worker, const float* var,
             for (int i = 0; i < 4; i++) b->input[v][i][0] = var[v * 4 + i];
         for (int k = 0; k < 2; k++)
             for (int i = 0; i < 4; i++) b->special[k][i][0] = special[k][i];
-        if (!(fgpu_shader_run_batch(p->shader, true, b, 1, p->constants, p->textures) & 1))
+        if (!(fgpu_shader_run_batch_buffers(p->shader, true, b, 1, p->constants, p->textures,
+                                    p->storage_buffers) & 1))
             return false;
         for (int i = 0; i < 4; i++) out[i] = b->output[0][i][0];
         return true;
@@ -282,8 +284,8 @@ static void flush_fragments(const fgpu_target_t* t, const fgpu_pipeline_t* p,
                             fgpu_shader_batch_t* b, frag_batch_t* fb,
                             bool late_depth, bool depth_write, bool blending) {
     if (!fb->n) return;
-    uint32_t kept = fgpu_shader_run_batch(p->shader, true, b, (1u << fb->n) - 1, p->constants,
-                                          p->textures);
+    uint32_t kept = fgpu_shader_run_batch_buffers(p->shader, true, b, (1u << fb->n) - 1, p->constants,
+                                          p->textures, p->storage_buffers);
     for (uint32_t l = 0; l < fb->n; l++) {
         if (!(kept & (1u << l))) continue;
         int32_t x = fb->x[l], y = fb->y[l];
@@ -971,8 +973,8 @@ static void shade_vertices_w(fgpu_pass_t* pass, worker_t* w, const bstate_t* s,
         for (uint32_t i = 0; i < FGPU_MAX_ATTRIBS; i++)
             for (int c = 0; c < 4; c++) b->input[i][c][l] = attr[i][c];
     }
-    fgpu_shader_run_batch(s->pipe.shader, false, b, (1u << n) - 1, (const float (*)[4])s->constants,
-                          s->pipe.textures);
+    fgpu_shader_run_batch_buffers(s->pipe.shader, false, b, (1u << n) - 1, (const float (*)[4])s->constants,
+                          s->pipe.textures, s->pipe.storage_buffers);
     uint32_t nv = s->pipe.shader->h.varying_count;
     for (uint32_t l = 0; l < n; l++) {
         for (int c = 0; c < 4; c++) out[l].clip[c] = b->output[0][c][l];
@@ -1289,8 +1291,9 @@ static void flush_frags(tctx_t* c) {
     fbatch_t* fb = &c->fb;
     if (!fb->n) return;
     const bstate_t* s = c->s;
-    uint32_t kept = fgpu_shader_run_batch(s->pipe.shader, true, c->fsb, (1u << fb->n) - 1,
-                                          (const float (*)[4])s->constants, s->pipe.textures);
+    uint32_t kept = fgpu_shader_run_batch_buffers(s->pipe.shader, true, c->fsb, (1u << fb->n) - 1,
+                                          (const float (*)[4])s->constants, s->pipe.textures,
+                                          s->pipe.storage_buffers);
     for (uint32_t l = 0; l < fb->n; l++) {
         if (!(kept & (1u << l))) continue;
         uint32_t idx = fb->idx[l];

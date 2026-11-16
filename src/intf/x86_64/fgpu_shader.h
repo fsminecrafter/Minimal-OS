@@ -16,6 +16,11 @@ typedef struct {
     uint32_t flags;             // FGPU_TEXTURE_*
 } fgpu_texture_t;
 
+typedef struct {
+    const float (*data)[4];
+    uint32_t vec4_count;
+} fgpu_storage_buffer_t;
+
 // A checked program. The pointers point into the blob it was made from.
 typedef struct {
     fgpu_shader_header_t h;
@@ -57,8 +62,10 @@ void fgpu_shader_batch_reset(fgpu_shader_batch_t* b, uint32_t temps);
 // (and specials) must be filled in. Returns the lanes that were not
 // discarded. Outputs start as (0, 0, 0, 1) for the position/color, 0 else.
 uint32_t fgpu_shader_run_batch(const fgpu_program_t* p, bool fragment, fgpu_shader_batch_t* b,
-                               uint32_t lanes, const float (*uniforms)[4],
-                               const fgpu_texture_t* textures);
+                               uint32_t lanes, const float (*uniforms)[4], const fgpu_texture_t* textures);
+uint32_t fgpu_shader_run_batch_buffers(const fgpu_program_t* p, bool fragment, fgpu_shader_batch_t* b,
+                               uint32_t lanes, const float (*uniforms)[4], const fgpu_texture_t* textures,
+                               const fgpu_storage_buffer_t* storage_buffers);
 
 /* One invocation at a time (uses a shared batch: not re-entrant). */
 

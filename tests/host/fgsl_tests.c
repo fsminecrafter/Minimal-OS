@@ -105,6 +105,38 @@ static void test_math(void) {
     CHECK(o[0] == 1.0f && o[1] == 1.0f && o[3] == 3.0f, "reflect/abs");
 }
 
+static void test_storage_buffer(void) {
+    static const char* fs =
+        "layout(binding = 0) buffer vec4 colors[];\n"
+        "uniform float index;\n"
+        "void main() { gl_FragColor = colors[index]; }\n";
+    CHECK(build(trivial_vs, fs), "storage buffer shader compiles");
+    if (!prog.h.storage_buffer_mask) return;
+    CHECK(prog.h.storage_buffer_mask == 1u, "storage buffer binding recorded");
+
+    const float values[1][4] = { { 0.25f, 0.5f, 0.75f, 1.0f } };
+    fgpu_storage_buffer_t buffers[FGPU_MAX_STORAGE_BUFFERS] = { 0 };
+    buffers[0] = (fgpu_storage_buffer_t){ values, 1 };
+    fgpu_shader_batch_t batch;
+    float index = 0.0f;
+    memset(uniforms, 0, sizeof uniforms);
+    set_uniform("index", &index, 1);
+    fgpu_shader_batch_reset(&batch, prog.h.temp_count);
+    fgpu_shader_run_batch_buffers(&prog, true, &batch, 1, (const float (*)[4])uniforms, NULL, buffers);
+    CHECK(NEAR(batch.output[0][0][0], 0.25f, 1e-6f) &&
+          NEAR(batch.output[0][1][0], 0.5f, 1e-6f) &&
+          NEAR(batch.output[0][2][0], 0.75f, 1e-6f) &&
+          NEAR(batch.output[0][3][0], 1.0f, 1e-6f), "storage buffer vec4 load");
+
+    index = 1.0f;
+    set_uniform("index", &index, 1);
+    fgpu_shader_batch_reset(&batch, prog.h.temp_count);
+    fgpu_shader_run_batch_buffers(&prog, true, &batch, 1, (const float (*)[4])uniforms, NULL, buffers);
+    CHECK(batch.output[0][0][0] == 0.0f && batch.output[0][1][0] == 0.0f &&
+          batch.output[0][2][0] == 0.0f && batch.output[0][3][0] == 0.0f,
+          "out-of-range storage buffer load returns zero");
+}
+
 static void test_swizzle_and_control(void) {
     float o[4];
     eval("", "vec4 v = vec4(1.0, 2.0, 3.0, 4.0); v.xz = v.zx; vec2 w = v.wy; gl_FragColor = vec4(w, v.xz);", o);
@@ -430,6 +462,7 @@ static void test_parallel(void) {
 
 int main(void) {
     test_math();
+    test_storage_buffer();
     test_swizzle_and_control();
     test_errors();
     test_validator();

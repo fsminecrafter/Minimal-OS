@@ -36,8 +36,7 @@ def test_workdir():
 
 
 class QMPClient:
-    def __init__(self, socket_path: Path, input_device: str,
-                 timeout: float = 10.0) -> None:
+    def __init__(self, socket_path: Path, timeout: float = 10.0) -> None:
         deadline = time.monotonic() + timeout
         self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.socket.settimeout(1.0)
@@ -52,7 +51,8 @@ class QMPClient:
 
         self.reader = self.socket.makefile("rb")
         self.next_id = 1
-        self.input_device = input_device
+        self.mouse_x = None
+        self.mouse_y = None
         greeting = json.loads(self.reader.readline())
         if "QMP" not in greeting:
             raise RuntimeError(f"Unexpected QMP greeting: {greeting}")
@@ -64,8 +64,6 @@ class QMPClient:
         request = {"execute": command, "id": command_id}
         if arguments is not None:
             request["arguments"] = arguments
-        if command == "input-send-event":
-            request.setdefault("arguments", {})["device"] = self.input_device
         self.socket.sendall((json.dumps(request) + "\n").encode("ascii"))
 
         while True:
@@ -77,49 +75,28 @@ class QMPClient:
             return response.get("return")
 
     def move_mouse(self, dx: int, dy: int) -> None:
-        self.execute(
-            "input-send-event",
-            {
-                "events": [
-                    {"type": "rel", "data": {"axis": "x", "value": dx}},
-                    {"type": "rel", "data": {"axis": "y", "value": dy}},
-                ]
-            },
-        )
+        self.execute("human-monitor-command", {
+            "command-line": f"mouse_move {dx} {dy}",
+        })
 
     def click_left(self) -> None:
-        for down in (True, False):
-            self.execute(
-                "input-send-event",
-                {
-                    "events": [
-                        {"type": "btn", "data": {"button": "left", "down": down}},
-                    ]
-                },
-            )
+        for state in (1, 0):
+            self.execute("human-monitor-command", {
+                "command-line": f"mouse_button {state}",
+            })
             time.sleep(0.1)
 
     def press_key(self, key: str) -> None:
-        for down in (True, False):
-            self.execute(
-                "input-send-event",
-                {
-                    "events": [
-                        {
-                            "type": "key",
-                            "data": {
-                                "key": {"type": "qcode", "data": key},
-                                "down": down,
-                            },
-                        },
-                    ]
-                },
-            )
-            time.sleep(0.03)
+        self.execute("human-monitor-command", {
+            "command-line": f"sendkey {key}",
+        })
+
+    def type_text(self, text: str) -> None:
+        for character in text:
+            self.press_key(character)
 
     def type_password(self, password: str) -> None:
-        for character in password:
-            self.press_key(character)
+        self.type_text(password)
 
     def screendump(self, path: Path):
         self.execute("screendump", {"filename": str(path)})
@@ -173,7 +150,7 @@ class QEMUInstance:
             stderr=self.stderr_file,
         )
         try:
-            self.qmp = QMPClient(self.qmp_path, "video0", timeout=timeout)
+            self.qmp = QMPClient(self.qmp_path, timeout=timeout)
         except Exception:
             self.stop()
             raise
@@ -292,6 +269,33 @@ def changed_pixels(before, after, region=None) -> int:
     return changed
 
 
+def active_screen_bounds(screen):
+    width, height, pixels = screen
+    top = 0
+    while top < height and not any(pixels[top * width * 3:(top + 1) * width * 3]):
+        top += 1
+    bottom = height
+    while bottom > top and not any(
+        pixels[(bottom - 1) * width * 3:bottom * width * 3]
+    ):
+        bottom -= 1
+
+    left = 0
+    while left < width and not any(
+        any(pixels[(y * width + left) * 3:(y * width + left) * 3 + 3])
+        for y in range(top, bottom)
+    ):
+        left += 1
+    right = width
+    while right > left and not any(
+        any(pixels[(y * width + right - 1) * 3:(y * width + right - 1) * 3 + 3])
+        for y in range(top, bottom)
+    ):
+        right -= 1
+
+    return left, top, right, bottom
+
+
 def dialog_bounds(width: int, height: int):
     dialog_width = 520 if width > 552 else width - 32
     dialog_height = 300 if height > 332 else height - 32
@@ -306,8 +310,14 @@ def wait_for_auth_screen(qmp: QMPClient, path: Path, timeout: float = 20.0):
     while time.monotonic() < deadline:
         latest = qmp.screendump(path)
         width, height, pixels = latest
-        x, y, dialog_width, _dialog_height = dialog_bounds(width, height)
-        sample = ((y + 80) * width + x + dialog_width // 2) * 3
+        left, top, right, bottom = active_screen_bounds(latest)
+        if right - left < 128 or bottom - top < 128:
+            time.sleep(0.2)
+            continue
+        x, y, dialog_width, _dialog_height = dialog_bounds(
+            right - left, bottom - top
+        )
+        sample = ((top + y + 80) * width + left + x + dialog_width // 2) * 3
         if min(pixels[sample:sample + 3]) > 200:
             return latest
         time.sleep(0.2)
@@ -316,7 +326,15 @@ def wait_for_auth_screen(qmp: QMPClient, path: Path, timeout: float = 20.0):
 
 def move_cursor_to(qmp: QMPClient, screen, x: int, y: int) -> None:
     width, height, _pixels = screen
-    qmp.move_mouse(x - width // 2, y - height // 2)
+    left, top, right, bottom = active_screen_bounds(screen)
+    if qmp.mouse_x is None or qmp.mouse_y is None:
+        qmp.mouse_x = left + (right - left) // 2
+        qmp.mouse_y = top + (bottom - top) // 2
+    dx = x - qmp.mouse_x
+    dy = y - qmp.mouse_y
+    qmp.move_mouse(dx, dy)
+    qmp.mouse_x = x
+    qmp.mouse_y = y
     time.sleep(0.2)
     moved = qmp.screendump(Path(tempfile.gettempdir()) / "mosdesk-cursor-moved.ppm")
     region = (max(0, x - 16), max(0, y - 16),
@@ -353,13 +371,24 @@ def run_test(args) -> None:
         with QEMUInstance(iso, source_drive, workdir, args.qemu,
                           args.timeout, "login") as vm:
             vm.wait_for_serial(MOSWM_STARTED, args.timeout)
-            first_choice_path = workdir / "first-choice.ppm"
-            choice_screen = wait_for_auth_screen(vm.qmp, first_choice_path)
-            width, height, _pixels = choice_screen
+            choice_screen = wait_for_auth_screen(
+                vm.qmp, workdir / "first-choice.ppm"
+            )
+            if args.username is not None:
+                vm.qmp.type_text(args.username)
+                vm.qmp.press_key("ret")
+                choice_screen = wait_for_screen_change(
+                    vm.qmp, workdir / "first-choice.ppm", choice_screen,
+                    minimum_pixels=1000,
+                )
+            _width, _height, _pixels = choice_screen
+            left, top, right, bottom = active_screen_bounds(choice_screen)
+            width, height = right - left, bottom - top
             x, y, dialog_width, dialog_height = dialog_bounds(width, height)
             button_width = (dialog_width - 84) // 2
-            set_password_x = x + 28 + button_width // 2
-            set_password_y = y + dialog_height - 58 + 18
+            dialog_x, dialog_y = left + x, top + y
+            set_password_x = dialog_x + 28 + button_width // 2
+            set_password_y = dialog_y + dialog_height - 58 + 18
 
             move_cursor_to(vm.qmp, choice_screen, set_password_x, set_password_y)
             vm.qmp.click_left()
@@ -368,9 +397,10 @@ def run_test(args) -> None:
                 minimum_pixels=1000,
             )
 
-            field_region = (x + 28, y + 140, x + dialog_width - 28, y + 178)
+            field_region = (dialog_x + 28, dialog_y + 140,
+                            dialog_x + dialog_width - 28, dialog_y + 178)
             move_cursor_to(vm.qmp, setup_screen,
-                           x + dialog_width // 2, y + 159)
+                           dialog_x + dialog_width // 2, dialog_y + 159)
             vm.qmp.click_left()
             setup_before_password = vm.qmp.screendump(
                 workdir / "setup-field-empty.ppm"
@@ -393,25 +423,32 @@ def run_test(args) -> None:
             print("[mosdesk-login] Rebooting to test sign-in")
             vm.qmp.execute("system_reset")
             vm.wait_for_serial_count(MOSWM_STARTED, 2, args.timeout)
+            vm.qmp.mouse_x = None
+            vm.qmp.mouse_y = None
             login_screen = wait_for_auth_screen(
                 vm.qmp, workdir / "login-screen.ppm"
             )
-            width, height, _pixels = login_screen
+            _width, _height, _pixels = login_screen
+            left, top, right, bottom = active_screen_bounds(login_screen)
+            width, height = right - left, bottom - top
             x, y, dialog_width, dialog_height = dialog_bounds(width, height)
-            login_text_region = (x + 24, y + 78, x + dialog_width - 24, y + 136)
+            dialog_x, dialog_y = left + x, top + y
+            login_text_region = (dialog_x + 24, dialog_y + 78,
+                                 dialog_x + dialog_width - 24, dialog_y + 136)
             setup_text_screen = read_ppm(workdir / "password-setup.ppm")
             if changed_pixels(setup_text_screen, login_screen,
                               login_text_region) < 50:
                 raise AssertionError("Second boot did not show the sign-in prompt")
 
             move_cursor_to(vm.qmp, login_screen,
-                           x + dialog_width // 2, y + 159)
+                           dialog_x + dialog_width // 2, dialog_y + 159)
             vm.qmp.click_left()
             empty_field = vm.qmp.screendump(workdir / "login-field-empty.ppm")
             vm.qmp.type_password(args.password)
             time.sleep(0.3)
             filled_field = vm.qmp.screendump(workdir / "login-field-filled.ppm")
-            field_region = (x + 28, y + 140, x + dialog_width - 28, y + 178)
+            field_region = (dialog_x + 28, dialog_y + 140,
+                            dialog_x + dialog_width - 28, dialog_y + 178)
             if changed_pixels(empty_field, filled_field, field_region) < 20:
                 raise AssertionError("Keyboard input did not appear in login password field")
             vm.qmp.press_key("ret")
@@ -429,9 +466,24 @@ def main() -> int:
     parser.add_argument("--qemu", default="qemu-system-x86_64")
     parser.add_argument("--timeout", type=int, default=120)
     parser.add_argument("--password", default=PASSWORD)
+    parser.add_argument(
+        "--username",
+        help="Type a username first when booting a fresh RamFS image",
+    )
     args = parser.parse_args()
     if len(args.password) < 4 or len(args.password) > 63 or not args.password.isalnum() or not args.password.isascii() or not args.password.islower():
         parser.error("--password must be 4-63 lowercase ASCII letters or digits")
+    if args.username is not None and (
+        not args.username
+        or not args.username.isascii()
+        or not all(
+            character.isalnum() or character in "-_"
+            for character in args.username
+        )
+    ):
+        parser.error(
+            "--username must contain only ASCII letters, digits, hyphens, or underscores"
+        )
 
     try:
         run_test(args)

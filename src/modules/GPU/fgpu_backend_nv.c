@@ -370,7 +370,6 @@ static bool nv_draw(const fgpu_hw_draw_t* d, uint32_t* triangles) {
         nd.tex_handle[u] = (u + 1u) | ((u + 1u) << 20);
         nd.textures_changed = true;
     }
-
     bool depth = d->target->cpu.depth && (pipe->state & (FGPU_STATE_DEPTH_TEST | FGPU_STATE_DEPTH_WRITE));
     if (depth) {
         nd.zeta = zeta_for(d->target);

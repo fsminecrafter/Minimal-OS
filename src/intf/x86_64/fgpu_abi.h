@@ -159,6 +159,7 @@ enum {
     FGPU_OP_SET_VERTEX_LAYOUT,  // stride in floats, count, then count words:
                                 //   FGPU_ATTRIB(offset in floats, components)
     FGPU_OP_BIND_TEXTURE,       // unit, color surface (0 = none), FGPU_TEXTURE_* flags
+    FGPU_OP_BIND_STORAGE_BUFFER,// unit, buffer handle (0 = none)
 };
 
 #define FGPU_CLEAR_COLOR (1u << 0)
@@ -189,6 +190,7 @@ enum {
 #define FGPU_TEXTURE_LINEAR (1u << 0)       // bilinear filtering (else nearest)
 #define FGPU_TEXTURE_CLAMP  (1u << 1)       // clamp to the edge (else repeat)
 #define FGPU_MAX_TEXTURE_UNITS 4u
+#define FGPU_MAX_STORAGE_BUFFERS 4u
 
 // Matrices are column-major (OpenGL style): m[col * 4 + row].
 typedef struct {
@@ -313,6 +315,7 @@ enum {
     FGPU_SOP_KILL,      // fragment stage: discard if a.x != 0
     FGPU_SOP_JMP,       // jump to instruction (destination word)
     FGPU_SOP_JZ,        // jump to instruction (destination word) if a.x == 0
+    FGPU_SOP_BUFFER_LOAD, // d = vec4(buffer[b], uint(a.x)); out-of-range reads return zero
     FGPU_SOP_COUNT
 };
 
@@ -331,7 +334,7 @@ typedef struct {
     uint32_t uniform_count;     // vec4 uniform registers used
     uint32_t texture_mask;      // texture units the shaders sample
     uint32_t temp_count;        // TEMP registers used (<= FGPU_SHADER_MAX_TEMPS)
-    uint32_t reserved;
+    uint32_t storage_buffer_mask;
 } fgpu_shader_header_t;
 
 #define FGPU_SHADER_INSTRUCTION_WORDS 5u

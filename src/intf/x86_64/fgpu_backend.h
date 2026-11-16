@@ -44,6 +44,7 @@ typedef struct {
     uint32_t count;             // indices, or vertices when not indexed
     fgpu_mem_t textures[FGPU_MAX_TEXTURE_UNITS];    // bound units (cpu NULL = none);
                                 // size and flags are in pipe->textures
+    fgpu_mem_t storage_buffers[FGPU_MAX_STORAGE_BUFFERS];
 } fgpu_hw_draw_t;
 
 typedef struct {

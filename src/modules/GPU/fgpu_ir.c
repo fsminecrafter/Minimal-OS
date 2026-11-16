@@ -423,6 +423,15 @@ static void lower_inst(lw_t* w, const uint32_t* in) {
             }
             break;
         }
+        case FGPU_SOP_BUFFER_LOAD:
+            for (uint32_t c = 0; c < 4; c++) {
+                fgpu_ir_inst_t load = {
+                    .op = FGPU_IR_BUFFER_LOAD, .nsrc = 1, .aux = in[3] * 4u + c
+                };
+                load.src[0] = read(w, in[2], 0);
+                res[c] = append(w, &load);
+            }
+            break;
         case FGPU_SOP_DP2:
         case FGPU_SOP_DP3:
         case FGPU_SOP_DP4: {
@@ -661,6 +670,7 @@ static const char* const k_names[FGPU_IR_OP_COUNT] = {
     [FGPU_IR_SIN] = "MUFU.SIN",     [FGPU_IR_COS] = "MUFU.COS",     [FGPU_IR_SLT] = "FSET.BF.LT",
     [FGPU_IR_SLE] = "FSET.BF.LE",   [FGPU_IR_SEQ] = "FSET.BF.EQ",   [FGPU_IR_SNE] = "FSET.BF.NEU",
     [FGPU_IR_SEL] = "FSEL",         [FGPU_IR_TEX] = "TEX",          [FGPU_IR_TEXC] = "",
+    [FGPU_IR_BUFFER_LOAD] = "LDG",
     [FGPU_IR_OUTPUT] = "",          [FGPU_IR_DISCARD] = "KIL",      [FGPU_IR_SUB] = "FADD.NEG",
     [FGPU_IR_DIV] = "FDIV",
 };
@@ -720,6 +730,16 @@ void fgpu_ir_print(const fgpu_ir_t* ir, void (*line)(void* ctx, const char* text
                 put_src(&b, ir, in->src[1]);
                 put(&b, ", tex");
                 put_uint(&b, in->aux, 10, 1);
+                break;
+            case FGPU_IR_BUFFER_LOAD:
+                put(&b, "LDG ");
+                put_src(&b, ir, (fgpu_ir_src_t){ i, 0 });
+                put(&b, ", buffer");
+                put_uint(&b, in->aux / 4u, 10, 1);
+                put(&b, "[");
+                put_src(&b, ir, in->src[0]);
+                put(&b, "].");
+                { char c[2] = { k_comp[in->aux % 4u], 0 }; put(&b, c); }
                 break;
             default:
                 put(&b, k_names[in->op]);

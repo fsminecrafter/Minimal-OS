@@ -447,6 +447,9 @@ bool nv_sass_encode(const fgpu_ir_inst_t* code, uint32_t count, uint32_t ir_regs
                 mov(&e, in->reg, &r, PRED_TRUE);
                 break;
             }
+            case FGPU_IR_BUFFER_LOAD:
+                *why = "storage buffer loads run on the CPU backend for NVIDIA safety";
+                return false;
             case FGPU_IR_OUTPUT: {
                 opnd_t v = source(&e, in, 0, true);
                 uint32_t reg = in->aux / 4u, comp = in->aux % 4u;

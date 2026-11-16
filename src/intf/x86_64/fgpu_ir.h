@@ -58,6 +58,7 @@ typedef enum {
     FGPU_IR_SEL,        // a != 0 ? b : c                  FSETP + FSEL
     FGPU_IR_TEX,        // sample unit aux at (a, b): red   TEX (writes up to 4 registers)
     FGPU_IR_TEXC,       // component aux (1-3) of the TEX in a: no code of its own
+    FGPU_IR_BUFFER_LOAD,// scalar component aux%4 of vec4 index src[0] from buffer aux/4
     FGPU_IR_OUTPUT,     // output aux = a (no value)       AST in VS, output registers in FS
     FGPU_IR_DISCARD,    // discard the fragment if a != 0  KIL
     // Only produced with FGPU_IR_EXACT (the CPU JIT; see below):

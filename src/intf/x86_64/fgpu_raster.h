@@ -40,6 +40,7 @@ typedef struct {
     const fgpu_program_t* shader;       // NULL = built-in program
     const float (*constants)[4];        // FGPU_SHADER_MAX_UNIFORMS registers
     fgpu_texture_t textures[FGPU_MAX_TEXTURE_UNITS];
+    fgpu_storage_buffer_t storage_buffers[FGPU_MAX_STORAGE_BUFFERS];
 } fgpu_pipeline_t;
 
 /* Several cores. The rasterizer splits a draw into parts (groups of

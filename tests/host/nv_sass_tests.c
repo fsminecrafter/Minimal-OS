@@ -331,6 +331,12 @@ static void test_pushbuffers(void) {
     static uint32_t words[4096];
     nv_push_t p;
     nv_push_init(&p, words, 4096);
+    nv3d_push_init(&p, 0x80000000ull, 0x80001000ull, 0x80002000ull);
+    CHECK(!p.overflow &&
+          find_method(&p, NVC597_SET_SHADER_LOCAL_MEMORY_WINDOW, 0) == (0xFFu << 24),
+          "shader local-memory window is initialized");
+
+    nv_push_init(&p, words, 4096);
     nv3d_zeta_t z;
     nv3d_zeta_size(100, 50, &z);
     z.va = 0x80200000ull;

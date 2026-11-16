@@ -97,6 +97,7 @@ void nv3d_push_init(nv_push_t* p, uint64_t tic_va, uint64_t tsc_va, uint64_t zer
     m1(p, NVC597_SET_RENDER_ENABLE_C, 1);           // always render
     m1(p, NVC597_SET_Z_COMPRESSION, 0);             // our buffers have no compression tags
     m1(p, NVC597_SET_COLOR_COMPRESSION(0), 0);
+    m1(p, NVC597_SET_SHADER_LOCAL_MEMORY_WINDOW, 0xFFu << 24);
     m1(p, NVC597_SET_CT_SELECT, (076543210u << 4) | 1u);
     m1(p, NVC597_SET_CT_MRT_ENABLE, 1);
     m1(p, NVC597_SET_SINGLE_CT_WRITE_CONTROL, 1);

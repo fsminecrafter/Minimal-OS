@@ -86,6 +86,7 @@ void nv3d_sampler(uint32_t out[8], uint32_t flags);
 #define NVC597_SET_API_MANDATED_EARLY_Z     0x0210u
 #define NVC597_SET_INDEX_BUFFER_SIZE_A      0x0238u
 #define NVC597_SET_VERTEX_STREAM_SIZE_A(j)  (0x0600u + (j) * 8u)
+#define NVC597_SET_SHADER_LOCAL_MEMORY_WINDOW 0x077Cu
 #define NVC597_SET_COLOR_TARGET_A(j)        (0x0800u + (j) * 64u)
 #define NVC597_SET_VIEWPORT_SCALE_X(j)      (0x0A00u + (j) * 32u)
 #define NVC597_SET_VIEWPORT_CLIP_HORIZONTAL(j) (0x0C00u + (j) * 16u)

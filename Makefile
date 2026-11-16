@@ -352,21 +352,14 @@ run: build-x86_64 $(INSTALL_DISK)
 
 .PHONY: mosdesk-build mosdesk-stage mosdesk-dlr run-mosdesk
 # MOSDESK_USE_LOCAL=1 builds the checkouts as they are (no submodule
-# fetching), e.g. when MOSdesk and the SDK have unpushed changes.
+# fetching), e.g. when MOSdesk and the SDK have unpushed changes. Otherwise
+# synchronize the pinned SDK so its headers match the kernel ABI.
 MOSDESK_USE_LOCAL ?= 0
 
 mosdesk-build:
 	mkdir -p $(dir $(MOSDESK_DIR))
-	# Submodules are only fetched when they are not checked out yet. One
-	# that is already there is built as it is: updating it would move it
-	# back to the commit pinned here and leave newer local commits (and
-	# their features) out of the build, which is how MOSdesk once lost its
-	# Aero theme. To pull upstream changes, update the submodule yourself.
-	@if [ "$(MOSDESK_USE_LOCAL)" = 1 ] || [ -e Minimal-OS-SDK/.git ]; then exit 0; fi; \
-	if ! git submodule update --init --recursive Minimal-OS-SDK; then \
-		git -C Minimal-OS-SDK fetch origin && \
-		git -C Minimal-OS-SDK checkout --detach FETCH_HEAD; \
-	fi
+	@if [ "$(MOSDESK_USE_LOCAL)" = 1 ]; then exit 0; fi; \
+	git submodule update --init --recursive Minimal-OS-SDK
 	@if [ "$(MOSDESK_USE_LOCAL)" = 1 ] || [ -e "$(MOSDESK_DIR)/.git" ]; then exit 0; fi; \
 	if ! git submodule update --init "$(MOSDESK_DIR)"; then \
 		echo "mosdesk-build: pinned MOSdesk commit is not on the remote; using its latest default branch" >&2; \
@@ -471,11 +464,8 @@ games-payload:
 # checked out (as mosdesk-build does), then stage in a fresh make that
 # sees its files.
 doom-sdk:
-	@if [ "$(MOSDESK_USE_LOCAL)" = 1 ] || [ -e Minimal-OS-SDK/.git ]; then exit 0; fi; \
-	if ! git submodule update --init --recursive Minimal-OS-SDK; then \
-		git -C Minimal-OS-SDK fetch origin && \
-		git -C Minimal-OS-SDK checkout --detach FETCH_HEAD; \
-	fi
+	@if [ "$(MOSDESK_USE_LOCAL)" = 1 ]; then exit 0; fi; \
+	git submodule update --init --recursive Minimal-OS-SDK
 
 mosdesk-doom: doom-sdk
 	$(MAKE) doom-stage

@@ -132,7 +132,7 @@ static bool pb_finish(const char** why) {
     h->varying_count = pb.varyings;
     h->uniform_count = FGPU_SHADER_MAX_UNIFORMS;
     h->temp_count = pb.temps;
-    h->texture_mask = 15;
+    h->texture_mask = 0xFFFF;
     h->attrib_mask = 0xFF;
     memcpy(pb.words + h->vs_offset, pb.vs, pb.nvs * 20);
     memcpy(pb.words + h->fs_offset, pb.fs, pb.nfs * 20);
@@ -149,8 +149,8 @@ static bool pb_finish(const char** why) {
 
 static fgpu_shader_batch_t ref_b, jit_b;
 static float g_uniforms[FGPU_SHADER_MAX_UNIFORMS][4];
-static fgpu_texture_t g_textures[FGPU_MAX_TEXTURE_UNITS];
-static uint32_t g_texels[FGPU_MAX_TEXTURE_UNITS][16 * 16];
+static fgpu_texture_t g_textures[FGPU_TEXTURE_UNITS];
+static uint32_t g_texels[FGPU_TEXTURE_UNITS][16 * 16 + 128];     // level 0 and the mip chain after it
 static const fgpu_jit_mode_t k_paths[2] = { FGPU_JIT_SSE41, FGPU_JIT_AVX2 };
 static const char* const k_path_names[2] = { "SSE4.1", "AVX2" };
 static bool g_have[2];
@@ -158,16 +158,27 @@ static uint64_t g_batches_run;
 
 static void setup_textures(void) {
     static const uint32_t sizes[4][2] = { { 16, 16 }, { 8, 4 }, { 1, 1 }, { 5, 7 } };
-    static const uint32_t flags[4] = { FGPU_TEXTURE_LINEAR, FGPU_TEXTURE_CLAMP, FGPU_TEXTURE_LINEAR | FGPU_TEXTURE_CLAMP, 0 };
-    for (int u = 0; u < 4; u++) {
-        for (int i = 0; i < 16 * 16; i++) g_texels[u][i] = rnd();
+    // OS-6.5: the units also have mip chains and mip filters; they only matter when a run
+    // sets the batch's `quad` flag (g_quad), otherwise level 0 is sampled as before.
+    static const uint32_t flags[4] = { FGPU_TEXTURE_LINEAR | FGPU_TEXTURE_MIP_LINEAR, FGPU_TEXTURE_CLAMP | FGPU_TEXTURE_MIP_NEAREST,
+                                       FGPU_TEXTURE_LINEAR | FGPU_TEXTURE_CLAMP | FGPU_TEXTURE_MIP_LINEAR, FGPU_TEXTURE_MIP_LINEAR };
+    for (int u = 0; u < (int)FGPU_TEXTURE_UNITS; u++) {
+        int k = u & 3;
+        for (int i = 0; i < 16 * 16 + 128; i++) g_texels[u][i] = rnd();
         g_textures[u].pixels = g_texels[u];
-        g_textures[u].width = sizes[u][0];
-        g_textures[u].height = sizes[u][1];
+        g_textures[u].width = sizes[k][0];
+        g_textures[u].height = sizes[k][1];
         g_textures[u].pitch = 16;
-        g_textures[u].flags = flags[u];
+        g_textures[u].flags = flags[k] & ((u & 4) ? ~(uint32_t)(FGPU_TEXTURE_MIP_NEAREST | FGPU_TEXTURE_MIP_LINEAR) : ~0u);
+        g_textures[u].mip_count = fgpu_mip_layout(sizes[k][0], sizes[k][1], 16, g_textures[u].mip_offset, NULL);
+        g_textures[u].lod_bias = (u & 8) ? frand(-1.0f, 2.0f) : 0.0f;
+        g_textures[u].min_lod = (u & 8) && (u & 2) ? frand(0.0f, 1.5f) : 0.0f;
+        g_textures[u].max_lod = (u & 8) && (u & 1) ? frand(0.5f, 3.0f) : 0.0f;
     }
 }
+
+// Set by run_compare for the batches that run on 2x2 quads.
+static uint32_t g_quad;
 
 static void fill_inputs(bool fragment, int mode) {
     memset(&ref_b, 0, sizeof ref_b);
@@ -200,8 +211,15 @@ static int g_reported;
 // Runs the stage through the interpreter and one JIT path; returns mismatches.
 static int run_compare(const fgpu_jit_code_t* code, bool fragment, uint32_t lanes, const char* ctx,
                        const fgpu_program_t* prog) {
+    // Every third batch runs as 2x2 quads (lane groups of 4 are asked for whole).
+    g_quad = g_batches_run % 3 == 1;
+    if (g_quad) {
+        lanes = ((lanes & 0x0Fu) ? 0x0Fu : 0u) | ((lanes & 0xF0u) ? 0xF0u : 0u);
+        if (!lanes) lanes = 0xFF;
+    }
     fgpu_shader_batch_reset(&ref_b, prog->h.temp_count);
     fgpu_shader_batch_reset(&jit_b, prog->h.temp_count);
+    ref_b.quad = jit_b.quad = g_quad;
     fgpu_shader_batch_t in_copy = jit_b;
     uint32_t kr = fgpu_shader_run_batch(prog, fragment, &ref_b, lanes, (const float (*)[4])g_uniforms, g_textures);
     uint32_t kj = fgpu_jit_run_code(code, &jit_b, lanes, (const float (*)[4])g_uniforms, g_textures);
@@ -586,7 +604,7 @@ static void gen_stage(bool fragment, uint32_t count, bool allow_tex) {
         } else if (op == FGPU_SOP_KILL) {
             pb_op(fragment, op, 0, rnd_src(fragment, 1), 0, 0);
         } else if (op == FGPU_SOP_TEX) {
-            pb_op(fragment, op, d, rnd_src(fragment, 1), rndn(4), 0);
+            pb_op(fragment, op, d, rnd_src(fragment, 1), rndn(FGPU_TEXTURE_UNITS), 0);
         } else {
             pb_op(fragment, op, d, rnd_src(fragment, 1), rnd_src(fragment, 2), rnd_src(fragment, 3));
         }

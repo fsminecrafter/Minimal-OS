@@ -29,7 +29,7 @@ Updated after OS-0 to OS-5 (see the status list under Part A). Everything in the
 
 | Area | Today | What it means for the engine |
 | --- | --- | --- |
-| 3D | FGPU (`SYS_GPU` 40) runs in the kernel, with one context per program and one render lock. The CPU backend has a tile-binning rasterizer, an x86 shader JIT (SSE4.1 and AVX2) and asynchronous submits with fences. Read-only shader storage buffers (4 slots, vec4 loads) were added on 2026-11-16. It still has **no MRT, mips, compute, writable SSBOs, scissor, instancing or integer formats** (OS-6 and OS-7), and only 4 texture units. | The CPU backend *is* the renderer on QEMU, Intel and AMD. The engine starts at FL0; mips, scissor and MRT wait for OS-6. |
+| 3D | FGPU (`SYS_GPU` 40) runs in the kernel, with one context per program and one render lock. The CPU backend has a tile-binning rasterizer, an x86 shader JIT (SSE4.1 and AVX2) and asynchronous submits with fences. Read-only shader storage buffers (4 slots, vec4 loads) were added on 2026-11-16. **Scissor, 2D mips with trilinear filtering and 16 texture units** were added on 2026-11-17 (ABI 4; the NVIDIA backend does the scissor, mips and units above 4 still run on the CPU backend). It still has **no MRT, compute, writable SSBOs, instancing or integer formats** (OS-6 and OS-7). | The CPU backend *is* the renderer on QEMU, Intel and AMD. The engine can use scissor and mips now; MRT waits for OS-6. |
 | NVIDIA | Turing GSP-RM and copy engine work on an RTX 2060. The 3D engine and SASS compiler aren't proven on a card yet. | A bonus path, not a dependency. |
 | CPU | **AVX and AVX2 work** (XSAVE state saving, OS-2; AVX-512 untested). **A program's threads run on all cores** (OS-3), with affinity and priority calls. One intermittent kernel crash in the thread tests is still open. | The job system can use every core. AVX2 code paths are picked by hand at startup (no ifunc). |
 | Memory | Programs live above 4 GiB with `SYS_VM` (map, unmap, protect, decommit; demand-zero pages, NX, guard pages). ELF files up to 256 MiB are streamed in, the main stack is 8 MiB (configurable), and the page pool is sized from RAM, including RAM above 4 GiB. The SDK's own `malloc` is still one syscall per call. | The engine's allocator sits on `SYS_VM`. GCC on the OS has the address space it needs. |
@@ -51,11 +51,11 @@ Updated after OS-0 to OS-5 (see the status list under Part A). Everything in the
 | --- | --- |
 | OS-0 to OS-4 | Done (QEMU only). |
 | OS-5 present and windows | Mostly done; mosWM compositing from shared frames is untested. |
-| OS-6 FGPU v3 graphics + FGSL v2 | Not started (scissor is the first, most urgent piece). |
+| OS-6 FGPU v3 graphics + FGSL v2 | Started: OS-6.1 scissor done, OS-6.5 2D mips + trilinear done, OS-6.2 16 texture units and the limits block done (2026-11-17). The rest not started. |
 | OS-7 compute + NVIDIA | Read-only SSBOs done; the rest not started. |
 | OS-8 input and storage | Not started. |
 | OS-9 audio | The queue query exists; the rest not started. |
-| Dev loop | Not done. |
+| Dev loop | Done (H5): `make run` picks `-cpu host` with KVM or `-cpu max`; `make run-engine`. |
 | S1 to S4 (mlibc, GCC target, `msdk` in C, native toolchain) | Not started. |
 | S5 FarcadeGL v3 + FGSL v2 SDK | Follows OS-6/OS-7. |
 | E0 core | Mostly open (only math exists). |
@@ -126,7 +126,7 @@ These are small and unblock other work. Each is one task.
   - (c) fix it;
   - (d) rerun the loop many times with no crash.
 - [ ] **H4** Run mosWM compositing from shared frames on a desktop in QEMU, then move the MOSdesk pin in Minimal-OS from 19ee8b0 to a tested commit.
-- [ ] **H5** Dev loop: add `-cpu max` (TCG) or `-cpu host` (KVM) and a `run-engine` target (`-smp 8 -m 8G`) to the Makefile.
+- [x] **H5** Dev loop: add `-cpu max` (TCG) or `-cpu host` (KVM) and a `run-engine` target (`-smp 8 -m 8G`) to the Makefile. Done 2026-11-17: `make run` uses `-accel kvm -cpu host` when `/dev/kvm` is usable, else `-cpu max`; `QEMU_CPU=`, `QEMU_ACCEL=`, `QEMU_SMP=` and `QEMU_MEM=` override; `make run-engine` is `QEMU_SMP=8 QEMU_MEM=8G run`.
 - [ ] **H6** Decide the licence for the runtime files (`farcadegl.h`, `fglsl.h`, `crt0.c`): MIT, or GPL plus a linking exception. Needed before release.
 - [ ] **H7** Settle C4.7: re-baseline the targets against the OS-4 measurements, or label the FL1/FL2 targets as real-GPU goals.
 - [ ] **H8** Run the OS on real hardware (an 8-core AVX2 desktop): real SMP, TSC and APIC timing, the 1.5 ms present budget, and AVX-512 if the CPU has it.
@@ -290,17 +290,17 @@ The items are listed in dependency order. File paths were rechecked on 2026-11-1
 | **OS-7** FGPU v3 compute + NVIDIA (FL2, stretch) | **Done (2026-11-16):** read-only SSBOs (4 slots, `FGPU_OP_BIND_STORAGE_BUFFER`, `FGPU_SOP_BUFFER_LOAD`, out-of-range reads return zero). **Left:** a compute stage on the CPU backend: workgroups spread across cores, 8 lanes per batch, barriers handled by splitting the branch-free IR, atomics via `lock cmpxchg`. Also writable SSBOs, image load/store, shared memory, 32/64-bit atomics and indirect dispatch. On NVIDIA: prove 3D on the card, batch one job per frame, compute class, real branches, proper SASS scheduling. | `fgpu_backend_nv.c`, `nv_3d.c`, `nv_sass.c`, `nv_rm_chan.c` |
 | **OS-8** input and storage | USB hubs, a HID report-descriptor parser (generic and Xbox/PlayStation USB gamepads), PS/2 mouse, input timestamps. Expose `fat32.c` through the storage syscalls and VFS; USB mass storage later (asset import). | `src/modules/USB/usb/*.c`, `src/intf/usb/usb_stack.h`, `src/impl/handlers/input.c`, `src/impl/storage/fat32.c`, `storage_syscall.c` |
 | **OS-9** audio | **Already there:** the query for how much of a stream is queued (`mos_audio_stream_query`: queued, capacity of 16384 frames, mix_rate, underruns). **Left:** smaller buffers for lower latency, float32/48 kHz input. | `src/modules/Audio/*` |
-| Dev loop | `make run` uses `qemu64` (no SSE4.1). Add `-cpu host` (KVM) or `-cpu max` (TCG), and a `run-engine` target with `-smp 8 -m 8G`. On Windows, run QEMU with KVM inside WSL2. **Status:** not done; `make run` still passes no `-cpu` and uses `-smp 2 -m 1024M`. | `Makefile:351`, `config.mk` |
+| Dev loop | `make run` uses `qemu64` (no SSE4.1). Add `-cpu host` (KVM) or `-cpu max` (TCG), and a `run-engine` target with `-smp 8 -m 8G`. On Windows, run QEMU with KVM inside WSL2. **Status:** done 2026-11-17 (H5): `make run` passes `-cpu host` with KVM, else `-cpu max`; `make run-engine` is `-smp 8 -m 8G`. | `Makefile:351`, `config.mk` |
 
 ### Remaining OS work in small steps
 Keep `fgpu_abi.h` identical in the kernel and the SDK in every step.
 
 **OS-6 FGPU v3 graphics + FGSL v2 (FL1)**
-- [ ] **OS-6.1** Scissor. Do this first: FL0 and the editor need it.
-- [ ] **OS-6.2** Limits: 16 texture units, 16 varyings, larger uniform blocks, buffers of 256 MiB+, and the v3 limits block in `syscall_gpu_info_t`.
+- [x] **OS-6.1** Scissor. Done 2026-11-17 (ABI 4): `FGPU_OP_SCISSOR`, top-left origin like the viewport, applied to draws (every path: clipped tile range and edge-setup bounds, no per-pixel cost) and clears (`fgpu_pass_clear_rect`); `FGPU_CAP_SCISSOR`; SDK `fglEnable(FGL_SCISSOR_TEST)` + `fglScissor`. The NVIDIA backend sets the hardware scissor for draws and clears (not yet run on a card).
+- [ ] **OS-6.2** Limits: ~~16 texture units~~ (done 2026-11-17: `FGPU_TEXTURE_UNITS` = 16 on the CPU backend, `FGPU_MAX_TEXTURE_UNITS` stays 4 for the NVIDIA backend; the limits block with `max_texture_units`, `max_mip_levels`, ... is at the end of `syscall_gpu_info_t`, `SYS_GPU_INFO` also accepts the old size), 16 varyings, larger uniform blocks, buffers of 256 MiB+ still to do.
 - [ ] **OS-6.3** Targets: MRT ×4, the formats (R32UI, RG32F, RGBA16F, R11G11B10F, RGBA32F), configurable depth/blend/write masks, depth bias.
 - [ ] **OS-6.4** Depth: depth textures, compare samplers, `gl_FragDepth`.
-- [ ] **OS-6.5** Textures: mips with trilinear filtering, `texelFetch`, 3D textures and 2D arrays.
+- [ ] **OS-6.5** Textures: ~~mips with trilinear filtering~~ (2D done 2026-11-17: `FGPU_SURFACE_MIPMAPS`, per-level `WRITE_SURFACE`, `FGPU_OP_GENERATE_MIPMAPS` box filter, `FGPU_TEXTURE_MIP_NEAREST/LINEAR`, lod bias and min/max clamps, level of detail from 2x2 pixel quads in the interpreter, the JIT and both rasterizer paths; no explicit-LOD `textureLod`, no `dFdx` in FGSL yet), `texelFetch`, 3D textures and 2D arrays still to do.
 - [ ] **OS-6.6** Draws: instancing, base vertex, (multi-)indirect draw, `gl_VertexID/InstanceID/PrimitiveID`, flat/int varyings.
 - [ ] **OS-6.7** Timestamp queries.
 - [ ] **OS-6.8** FGSL v2: ints/uints/bit ops, structs, mat3, functions, bounded `while`/`do`, `#include`.

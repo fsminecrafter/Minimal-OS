@@ -193,8 +193,26 @@ static void surface_clip(nv_push_t* p, uint32_t width, uint32_t height) {
     m2(p, NVC597_SET_SURFACE_CLIP_HORIZONTAL, width << 16, height << 16);
 }
 
+static void scissor0(nv_push_t* p, bool on, uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1) {
+    m1(p, NVC597_SET_SCISSOR_ENABLE(0), on ? 1 : 0);
+    if (on) m2(p, NVC597_SET_SCISSOR_HORIZONTAL(0), x0 | (x1 << 16), y0 | (y1 << 16));
+}
+
+static void push_clear(nv_push_t* p, const nv3d_color_t* color, const nv3d_zeta_t* zeta, uint32_t flags,
+                       uint32_t xrgb, float depth, bool rect, uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1);
+
 void nv3d_push_clear(nv_push_t* p, const nv3d_color_t* color, const nv3d_zeta_t* zeta,
                      uint32_t flags, uint32_t xrgb, float depth) {
+    push_clear(p, color, zeta, flags, xrgb, depth, false, 0, 0, 0, 0);
+}
+
+void nv3d_push_clear_rect(nv_push_t* p, const nv3d_color_t* color, const nv3d_zeta_t* zeta, uint32_t flags,
+                          uint32_t xrgb, float depth, uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1) {
+    push_clear(p, color, zeta, flags, xrgb, depth, true, x0, y0, x1, y1);
+}
+
+static void push_clear(nv_push_t* p, const nv3d_color_t* color, const nv3d_zeta_t* zeta, uint32_t flags,
+                       uint32_t xrgb, float depth, bool rect, uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1) {
     uint32_t what = 0;
     if (color) {
         color_target(p, color);
@@ -217,7 +235,11 @@ void nv3d_push_clear(nv_push_t* p, const nv3d_color_t* color, const nv3d_zeta_t*
         m1(p, NVC597_SET_Z_CLEAR_VALUE, fbits(depth));
         what |= 1u;
     }
-    if (what) m1(p, NVC597_CLEAR_SURFACE, what);
+    if (!what) return;
+    // A scissored clear (USE_SCISSOR0); otherwise the whole surface clip.
+    scissor0(p, rect, x0, y0, x1, y1);
+    m1(p, NVC597_SET_CLEAR_SURFACE_CONTROL, rect ? (1u << 8) : 0u);
+    m1(p, NVC597_CLEAR_SURFACE, what);
 }
 
 static void stage(nv_push_t* p, uint32_t slot, uint32_t group, const nv3d_stage_t* s) {
@@ -273,6 +295,7 @@ void nv3d_push_draw(nv_push_t* p, const nv3d_draw_t* d) {
     m1(p, NVC597_SET_FRONT_POLYGON_MODE, mode);
     m1(p, NVC597_SET_BACK_POLYGON_MODE, mode);
     m1(p, NVC597_SET_BLEND(0), (d->state & FGPU_STATE_BLEND) ? 1 : 0);
+    scissor0(p, d->scissor, d->sc_x0, d->sc_y0, d->sc_x1, d->sc_y1);
 
     // Vertex stream 0 and where each attribute location sits in it.
     m1(p, NVC597_SET_VERTEX_STREAM_A_FORMAT(0), (d->stride_bytes & 0xFFFu) | (1u << 12));

@@ -67,7 +67,7 @@ static void run(uint32_t width, uint32_t height, int kind) {
         int u = fglsl_find_uniform(&comp, names[t]);
         CHECK(u >= 0 && comp.uniforms[u].reg < FGPU_MAX_TEXTURE_UNITS, "video shader sampler");
         p.textures[comp.uniforms[u].reg] =
-            (fgpu_texture_t){ tex[t], t ? cw : w, t ? ch : h, t ? cw : w, FGPU_TEXTURE_CLAMP };
+            (fgpu_texture_t){ .pixels = tex[t], .width = t ? cw : w, .height = t ? ch : h, .pitch = t ? cw : w, .flags = FGPU_TEXTURE_CLAMP };
     }
     // One triangle over the whole target: clip position, pixel position.
     float W = (float)width, H = (float)height;
@@ -103,8 +103,8 @@ static void run(uint32_t width, uint32_t height, int kind) {
     p.shader = &prog12;
     p.constants = uniforms;
     int ty = fglsl_find_uniform(&nv12, "ty"), tc = fglsl_find_uniform(&nv12, "tc");
-    p.textures[nv12.uniforms[ty].reg] = (fgpu_texture_t){ tex[0], w, h, w, FGPU_TEXTURE_CLAMP };
-    p.textures[nv12.uniforms[tc].reg] = (fgpu_texture_t){ pairs, cw, ch, cw, FGPU_TEXTURE_CLAMP };
+    p.textures[nv12.uniforms[ty].reg] = (fgpu_texture_t){ .pixels = tex[0], .width = w, .height = h, .pitch = w, .flags = FGPU_TEXTURE_CLAMP };
+    p.textures[nv12.uniforms[tc].reg] = (fgpu_texture_t){ .pixels = pairs, .width = cw, .height = ch, .pitch = cw, .flags = FGPU_TEXTURE_CLAMP };
     memset(got, 0, width * height * 4);
     fgpu_raster_draw_layout(&t, &p, &layout, &tri[0][0], 3, NULL, 3);
     bad = 0;

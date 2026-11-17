@@ -349,7 +349,7 @@ static void test_pipeline(void) {
     p.vp_w = W; p.vp_h = H;
     p.shader = &prog;
     p.constants = (const float (*)[4])uniforms;
-    p.textures[0] = (fgpu_texture_t){ tex, 8, 8, 8, 0 };
+    p.textures[0] = (fgpu_texture_t){ .pixels = tex, .width = 8, .height = 8, .pitch = 8, .flags = 0 };
     fgpu_raster_clear(&t1, FGPU_CLEAR_COLOR, 0x123456, 1.0f);
     CHECK(fgpu_raster_draw_layout(&t1, &p, &layout, quad, 6, NULL, 6) == 2, "quad draws");
     // Texel (0,7) is at screen top-left (v grows upward): (0 ^ 7) & 1 = 1 -> white.

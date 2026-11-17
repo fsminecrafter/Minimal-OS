@@ -346,9 +346,27 @@ OVMF_VARS ?= /usr/share/OVMF/OVMF_VARS_4M.fd
 $(INSTALL_DISK):
 	truncate -s $(INSTALL_DISK_SIZE) $@
 
+# H5: the guest CPU. The default qemu64 has no SSE4.1/AVX2, so the shader JIT would stay
+# off. With KVM (usable /dev/kvm, also WSL2) the host CPU is passed through; under TCG
+# 'max' exposes SSE4.1 and AVX2. Override with QEMU_CPU= / QEMU_ACCEL= (e.g. QEMU_CPU="-cpu qemu64").
+ifeq ($(shell test -r /dev/kvm -a -w /dev/kvm && echo yes),yes)
+QEMU_ACCEL ?= -accel kvm
+QEMU_CPU ?= -cpu host
+else
+QEMU_ACCEL ?=
+QEMU_CPU ?= -cpu max
+endif
+QEMU_SMP ?= 2
+QEMU_MEM ?= 1024M
+
 .PHONY: run
 run: build-x86_64 $(INSTALL_DISK)
-	qemu-system-x86_64 -smp 2 -cdrom dist/x86_64/kernel.iso -m 1024M $(QEMU_VGA) -boot d -d guest_errors,int,cpu_reset,unimp -D qemu.log -serial stdio -device piix3-usb-uhci,id=uhci -device usb-kbd,bus=uhci.0,port=1 -device usb-mouse,bus=uhci.0,port=2 -audiodev $(QEMU_AUDIO_DRIVER),id=speaker -machine pcspk-audiodev=speaker  -audiodev $(QEMU_AUDIO_DRIVER),id=audio0 $(QEMU_SOUND_DEVICE) -device ahci,id=ahci -drive id=disk0,file=sata256.img,if=none,format=raw -device ide-hd,drive=disk0,bus=ahci.0 $(QEMU_INSTALL_DISK) -netdev $(QEMU_NETDEV) -device rtl8139,netdev=net0,mac=52:54:00:12:34:56
+	qemu-system-x86_64 $(QEMU_ACCEL) $(QEMU_CPU) -smp $(QEMU_SMP) -cdrom dist/x86_64/kernel.iso -m $(QEMU_MEM) $(QEMU_VGA) -boot d -d guest_errors,int,cpu_reset,unimp -D qemu.log -serial stdio -device piix3-usb-uhci,id=uhci -device usb-kbd,bus=uhci.0,port=1 -device usb-mouse,bus=uhci.0,port=2 -audiodev $(QEMU_AUDIO_DRIVER),id=speaker -machine pcspk-audiodev=speaker  -audiodev $(QEMU_AUDIO_DRIVER),id=audio0 $(QEMU_SOUND_DEVICE) -device ahci,id=ahci -drive id=disk0,file=sata256.img,if=none,format=raw -device ide-hd,drive=disk0,bus=ahci.0 $(QEMU_INSTALL_DISK) -netdev $(QEMU_NETDEV) -device rtl8139,netdev=net0,mac=52:54:00:12:34:56
+
+# The Farcade Engine dev loop: 8 CPUs (the CPU backend renders on every core) and 8 GiB.
+.PHONY: run-engine
+run-engine:
+	$(MAKE) QEMU_SMP=8 QEMU_MEM=8G run
 
 .PHONY: mosdesk-build mosdesk-stage mosdesk-dlr run-mosdesk
 # MOSDESK_USE_LOCAL=1 builds the checkouts as they are (no submodule
@@ -645,12 +663,13 @@ ci-os0:
 
 .PHONY: test-host
 test-host: build/tests/host/gfx_blit_tests build/tests/host/fgpu_raster_tests build/tests/host/fgsl_tests \
-		build/tests/host/fgpu_bin_tests build/tests/host/fgpu_ir_tests build/tests/host/fgpu_jit_tests build/tests/host/nv_hw_tests build/tests/host/nv_sass_tests \
+		build/tests/host/fgpu_bin_tests build/tests/host/fgpu_mip_tests build/tests/host/fgpu_ir_tests build/tests/host/fgpu_jit_tests build/tests/host/nv_hw_tests build/tests/host/nv_sass_tests \
 		build/tests/host/video_gpu_tests build/tests/host/audio_stream_tests build/tests/host/hid_mouse_tests \
 		build/tests/host/media_tests build/tests/host/media_parallel_tests build/tests/host/os0_tests
 	./build/tests/host/gfx_blit_tests
 	./build/tests/host/fgpu_raster_tests
 	./build/tests/host/fgpu_bin_tests
+	./build/tests/host/fgpu_mip_tests
 	./build/tests/host/fgsl_tests
 	./build/tests/host/fgpu_ir_tests
 	./build/tests/host/fgpu_jit_tests
@@ -700,6 +719,11 @@ build/tests/host/fgpu_ir_tests: tests/host/fgpu_ir_tests.c src/modules/GPU/fgpu_
 
 # The shader JIT (x86-64 SSE4.1 / AVX2) against the interpreter, bit for bit.
 JIT_SRC := src/modules/GPU/fgpu_jit_x64.c src/modules/GPU/fgpu_ir.c src/modules/GPU/fgpu_shader.c
+# Mip chains, level selection, 2x2 quad lod in the rasterizer (interpreter and JIT), 16 texture units.
+build/tests/host/fgpu_mip_tests: tests/host/fgpu_mip_tests.c src/modules/GPU/fgpu_raster.c src/modules/GPU/fgpu_shader.c $(JIT_SRC) Minimal-OS-SDK/include/fglsl.h $(header_files)
+	mkdir -p $(dir $@)
+	$(HOSTCC) $(HOST_CFLAGS) -O1 -DFGPU_ENABLE_JIT -idirafter Minimal-OS-SDK/include $(filter %.c,$^) -lm -lpthread -o $@
+
 build/tests/host/fgpu_jit_tests: tests/host/fgpu_jit_tests.c $(JIT_SRC) Minimal-OS-SDK/include/fglsl.h Minimal-OS-SDK/include/fgpu_abi.h $(header_files)
 	mkdir -p $(dir $@)
 	$(HOSTCC) $(HOST_CFLAGS) -O1 -DFGPU_ENABLE_JIT -idirafter Minimal-OS-SDK/include $(filter %.c,$^) -lm -o $@

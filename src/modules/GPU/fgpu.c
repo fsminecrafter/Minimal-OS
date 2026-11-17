@@ -39,6 +39,7 @@ typedef struct {
     uint64_t owner;             // the program (group owner) it belongs to
     uint32_t width, height, format, flags;
     uint32_t pitch;             // in pixels / floats
+    uint32_t mip_count;         // levels of a FGPU_SURFACE_MIPMAPS chain, else 1
     void* mem;
     bool in_vram;
     uint64_t vram_offset;
@@ -671,7 +672,7 @@ typedef struct {
     fgpu_layout_t layout;
     float constants[FGPU_SHADER_MAX_UNIFORMS][4];
     void* hw_program;           // compiled form of pipe.shader, NULL if none
-    fgpu_surface_t* textures[FGPU_MAX_TEXTURE_UNITS];
+    fgpu_surface_t* textures[FGPU_TEXTURE_UNITS];
     fgpu_buffer_t* storage_buffers[FGPU_MAX_STORAGE_BUFFERS];
     uint64_t owner;
     uint32_t triangles;
@@ -681,6 +682,11 @@ static void make_hw_target(exec_state_t* st, const fgpu_target_t* t, fgpu_hw_tar
     hw->cpu = *t;
     hw->color = surface_mem(st->color);
     hw->depth = surface_mem(st->depth);
+    hw->scissor = st->pipe.scissor != 0;
+    hw->sc_x = st->pipe.sc_x;
+    hw->sc_y = st->pipe.sc_y;
+    hw->sc_w = st->pipe.sc_w;
+    hw->sc_h = st->pipe.sc_h;
 }
 
 static bool make_target(exec_state_t* st, fgpu_target_t* t) {
@@ -748,6 +754,15 @@ static uint64_t execute(exec_state_t* st, const uint32_t* cmd, uint32_t words) {
                         break;
                     }
                 }
+                if (st->pipe.scissor) {
+                    // CPU draws recorded earlier land first (fgpu_pass_clear_rect flushes them).
+                    hw_sync();
+                    if (g_pass) fgpu_pass_clear_rect(g_pass, &t, arg[0], arg[1], depth, st->pipe.sc_x,
+                                                     st->pipe.sc_y, st->pipe.sc_w, st->pipe.sc_h);
+                    else fgpu_raster_clear_rect(&t, arg[0], arg[1], depth, st->pipe.sc_x, st->pipe.sc_y,
+                                                st->pipe.sc_w, st->pipe.sc_h);
+                    break;
+                }
                 if (g_pass) fgpu_pass_clear(g_pass, &t, arg[0], arg[1], depth);
                 else { hw_sync(); fgpu_raster_clear(&t, arg[0], arg[1], depth); }
                 break;
@@ -794,7 +809,7 @@ static uint64_t execute(exec_state_t* st, const uint32_t* cmd, uint32_t words) {
                 break;
             }
             case FGPU_OP_BIND_TEXTURE: {
-                if (n < 3 || arg[0] >= FGPU_MAX_TEXTURE_UNITS) return SYS_ERR_INVAL;
+                if (n < 3 || arg[0] >= FGPU_TEXTURE_UNITS) return SYS_ERR_INVAL;
                 fgpu_texture_t* tex = &st->pipe.textures[arg[0]];
                 memset(tex, 0, sizeof(*tex));
                 st->textures[arg[0]] = NULL;
@@ -806,7 +821,44 @@ static uint64_t execute(exec_state_t* st, const uint32_t* cmd, uint32_t words) {
                 tex->width = s->width;
                 tex->height = s->height;
                 tex->pitch = s->pitch;
-                tex->flags = arg[2] & (FGPU_TEXTURE_LINEAR | FGPU_TEXTURE_CLAMP);
+                tex->flags = arg[2] & FGPU_TEXTURE_FLAGS_KNOWN;
+                if (s->mip_count > 1) {
+                    tex->mip_count = fgpu_mip_layout(s->width, s->height, s->pitch, tex->mip_offset, NULL);
+                } else {
+                    tex->flags &= ~(uint32_t)(FGPU_TEXTURE_MIP_NEAREST | FGPU_TEXTURE_MIP_LINEAR);
+                }
+                // Optional ABI 4 words: lod bias, min lod, max lod (floats).
+                float extra[3] = { 0.0f, 0.0f, 0.0f };
+                for (uint32_t i = 0; i < 3 && 3 + i < n; i++) memcpy(&extra[i], &arg[3 + i], sizeof(float));
+                // Not-a-number and absurd values mean "none".
+                if (!(extra[0] > -64.0f && extra[0] < 64.0f)) extra[0] = 0.0f;
+                if (!(extra[1] > 0.0f && extra[1] < 64.0f)) extra[1] = 0.0f;
+                if (!(extra[2] > 0.0f && extra[2] < 64.0f)) extra[2] = 0.0f;
+                tex->lod_bias = extra[0];
+                tex->min_lod = extra[1];
+                tex->max_lod = extra[2];
+                break;
+            }
+            case FGPU_OP_SCISSOR: {
+                if (n < 5) return SYS_ERR_INVAL;
+                int32_t sx = (int32_t)arg[1], sy = (int32_t)arg[2], sw = (int32_t)arg[3], sh = (int32_t)arg[4];
+                if (sw < 0 || sh < 0) return SYS_ERR_INVAL;
+                st->pipe.scissor = arg[0] ? 1u : 0u;
+                st->pipe.sc_x = sx;
+                st->pipe.sc_y = sy;
+                st->pipe.sc_w = sw;
+                st->pipe.sc_h = sh;
+                break;
+            }
+            case FGPU_OP_GENERATE_MIPMAPS: {
+                if (n < 1) return SYS_ERR_INVAL;
+                fgpu_surface_t* s = find_surface(arg[0], st->owner);
+                if (!s || s->format != FGPU_FORMAT_XRGB8888) return SYS_ERR_NOTFOUND;
+                if (s->mip_count <= 1) return SYS_ERR_INVAL;
+                // Draws recorded so far (maybe into this surface) must land first.
+                st->triangles += pass_flush();
+                hw_sync();
+                fgpu_mip_generate((uint32_t*)s->mem, s->width, s->height, s->pitch);
                 break;
             }
             case FGPU_OP_BIND_STORAGE_BUFFER: {
@@ -855,8 +907,15 @@ static uint64_t execute(exec_state_t* st, const uint32_t* cmd, uint32_t words) {
                     if (d.first_index > icount || d.index_count > icount - d.first_index)
                         return SYS_ERR_INVAL;
                 }
-                // A shader the backend could not compile runs on the CPU.
-                if (g_hw && (!st->pipe.shader || st->hw_program)) {
+                // A shader the backend could not compile runs on the CPU. So do draws that use
+                // state it does not know (ABI 4): mipmapped textures, units >= 4.
+                // TODO(nv): drop these checks as the backend learns each feature.
+                bool cpu_only = false;
+                for (uint32_t u = 0; u < FGPU_TEXTURE_UNITS && !cpu_only; u++) {
+                    const fgpu_texture_t* tx = &st->pipe.textures[u];
+                    if (tx->pixels && (tx->mip_count > 1 || u >= FGPU_MAX_TEXTURE_UNITS)) cpu_only = true;
+                }
+                if (g_hw && !cpu_only && (!st->pipe.shader || st->hw_program)) {
                     st->triangles += pass_flush();      // CPU draws recorded earlier come first
                     fgpu_hw_target_t ht;
                     make_hw_target(st, &t, &ht);
@@ -906,11 +965,16 @@ static uint64_t execute(exec_state_t* st, const uint32_t* cmd, uint32_t words) {
 
 static uint64_t op_info(syscall_gpu_request_t* r) {
     syscall_gpu_info_t* out = (syscall_gpu_info_t*)r->out;
-    if (!out || !syscall_user_range_ok(out, sizeof(*out), true) ||
-        out->size != sizeof(*out)) return SYS_ERR_INVAL;
+    if (!out) return SYS_ERR_INVAL;
+    // Programs built before ABI 4 pass the size without the limits block.
+    uint32_t want = 0;
+    if (syscall_user_range_ok(out, SYS_GPU_INFO_SIZE_BASE, true) &&
+        (out->size == sizeof(syscall_gpu_info_t) || out->size == SYS_GPU_INFO_SIZE_BASE))
+        want = out->size;
+    if (!want || !syscall_user_range_ok(out, want, true)) return SYS_ERR_INVAL;
     syscall_gpu_info_t info;
     memset(&info, 0, sizeof(info));
-    info.size = sizeof(info);
+    info.size = want;
     info.version = SYS_GPU_ABI_VERSION;
     if (g_hw) {
         strncpy(info.backend, g_hw->name, sizeof(info.backend) - 1);
@@ -929,11 +993,20 @@ static uint64_t op_info(syscall_gpu_request_t* r) {
     } else {
         strcpy(info.name, "no GPU");
     }
-    info.caps |= FGPU_CAP_SHADERS | FGPU_CAP_ASYNC | FGPU_CAP_SCALED_PRESENT | FGPU_CAP_PACED_PRESENT;
+    // Scissor, mipmaps and 16 units are drawn by the CPU backend whatever the adapter is.
+    info.caps |= FGPU_CAP_SHADERS | FGPU_CAP_ASYNC | FGPU_CAP_SCALED_PRESENT | FGPU_CAP_PACED_PRESENT |
+                 FGPU_CAP_SCISSOR | FGPU_CAP_MIPMAPS | FGPU_CAP_TEXTURE_UNITS16;
     if (g_hw) info.caps |= g_hw->caps;
     info.screen_width = graphics_get_width();
     info.screen_height = graphics_get_height();
-    *out = info;
+    info.max_texture_units = FGPU_TEXTURE_UNITS;
+    info.max_mip_levels = FGPU_MAX_MIP_LEVELS;
+    info.max_varyings = FGPU_SHADER_MAX_VARYINGS;
+    info.max_uniform_vec4 = FGPU_SHADER_MAX_UNIFORMS;
+    info.max_storage_buffers = FGPU_MAX_STORAGE_BUFFERS;
+    info.max_surface_size = FGPU_MAX_SURFACE_SIZE;
+    info.max_buffer_bytes = FGPU_MAX_BUFFER_BYTES;
+    if (!syscall_user_copy_out(out, &info, want)) return SYS_ERR_INVAL;
     return SYS_SUCCESS;
 }
 
@@ -958,10 +1031,20 @@ static uint64_t op_create_surface(syscall_gpu_request_t* r, uint64_t owner) {
     fgpu_surface_t* s = (fgpu_surface_t*)alloc(sizeof(fgpu_surface_t));
     if (!s) return SYS_ERR_NOMEM;
     uint64_t bytes = (uint64_t)pitch * r->height * 4;
+    // ABI 4: a mip chain after level 0. Such surfaces stay in system memory (the
+    // hardware backends do not sample them).
+    bool mips = r->version >= 4 && (r->flags & FGPU_SURFACE_MIPMAPS) != 0;
+    uint32_t mip_count = 1;
+    if (mips) {
+        if (!color || scanout) return SYS_ERR_INVAL;
+        uint64_t total;
+        mip_count = fgpu_mip_layout(r->width, r->height, pitch, NULL, &total);
+        bytes = total * 4;
+    }
     // Depth buffers are read for every pixel: keep them in system memory
     // unless VRAM reads are cheap. Scanout surfaces must be in VRAM.
     bool cpu_reads = !scanout;
-    bool allow_vram = !(r->flags & FGPU_SURFACE_SYSTEM_MEMORY);
+    bool allow_vram = !(r->flags & FGPU_SURFACE_SYSTEM_MEMORY) && !mips;
     s->mem = place(bytes, cpu_reads, allow_vram || scanout, color, owner,
                    &s->in_vram, &s->vram_offset, &s->adapter);
     if (!s->mem) { free_mem(s); return SYS_ERR_NOMEM; }
@@ -976,6 +1059,7 @@ static uint64_t op_create_surface(syscall_gpu_request_t* r, uint64_t owner) {
     s->format = r->format;
     s->flags = r->flags;
     s->pitch = pitch;
+    s->mip_count = mip_count;
     s->id = table_insert(OBJ_SURFACE, s, owner);
     if (!s->id) { surface_free(s); return SYS_ERR_NOMEM; }
     r->handle = s->id;
@@ -1153,12 +1237,28 @@ static uint64_t op_create_program(syscall_gpu_request_t* r, uint64_t owner) {
 static uint64_t op_write_surface(syscall_gpu_request_t* r, uint64_t owner) {
     fgpu_surface_t* s = find_surface(r->handle, owner);
     if (!s) return SYS_ERR_NOTFOUND;
-    uint64_t row = (uint64_t)s->width * 4;
+    // ABI 4: `offset` is the mip level (0 = the surface itself).
+    uint32_t level = 0;
+    if (r->version >= 4) {
+        if (r->offset >= s->mip_count) return SYS_ERR_INVAL;
+        level = (uint32_t)r->offset;
+    }
+    uint32_t width = s->width, height = s->height, pitch = s->pitch;
+    uint8_t* dst = (uint8_t*)s->mem;
+    if (level) {
+        uint32_t offsets[FGPU_MAX_MIP_LEVELS];
+        fgpu_mip_layout(s->width, s->height, s->pitch, offsets, NULL);
+        width = s->width >> level; if (!width) width = 1;
+        height = s->height >> level; if (!height) height = 1;
+        pitch = width;
+        dst += (size_t)offsets[level] * 4;
+    }
+    uint64_t row = (uint64_t)width * 4;
     if (!r->data || r->pitch < row ||
-        !syscall_user_range_ok(r->data, (size_t)r->pitch * (s->height - 1) + row, false))
+        !syscall_user_range_ok(r->data, (size_t)r->pitch * (height - 1) + row, false))
         return SYS_ERR_INVAL;
-    for (uint32_t y = 0; y < s->height; y++) {
-        memcpy((uint8_t*)s->mem + (size_t)y * s->pitch * 4,
+    for (uint32_t y = 0; y < height; y++) {
+        memcpy(dst + (size_t)y * pitch * 4,
                (const uint8_t*)r->data + (size_t)y * r->pitch, (size_t)row);
     }
     return SYS_SUCCESS;
@@ -1193,6 +1293,8 @@ static uint64_t run_commands(uint64_t owner, const uint32_t* cmd, uint32_t words
     st->owner = owner;
     st->pipe.program = FGPU_PROGRAM_COLOR;
     st->pipe.constants = (const float (*)[4])st->constants;
+    // Scissor off; the rectangle covers any target (ABI 4).
+    st->pipe.sc_w = st->pipe.sc_h = 0x7FFFFFFF;
     fgpu_layout_default(&st->layout);
     if (!g_pass) g_pass = fgpu_pass_create();     // NULL: draws run immediately
     uint64_t result = execute(st, cmd, words);

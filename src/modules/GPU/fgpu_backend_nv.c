@@ -407,11 +407,26 @@ static uint32_t float_bits(float f) {
     return u;
 }
 
+// The FGPU scissor rectangle clamped to a width x height target:
+// pixels x0 <= x < x1, y0 <= y < y1. False when nothing is left.
+static bool clamp_scissor(int32_t x, int32_t y, int32_t w, int32_t h, uint32_t width, uint32_t height,
+                          uint32_t* x0, uint32_t* y0, uint32_t* x1, uint32_t* y1) {
+    int64_t a = x < 0 ? 0 : x, b = y < 0 ? 0 : y;
+    int64_t c = (int64_t)x + (w < 0 ? 0 : w), d = (int64_t)y + (h < 0 ? 0 : h);
+    if (c > (int64_t)width) c = width;
+    if (d > (int64_t)height) d = height;
+    if (c <= a || d <= b) return false;
+    *x0 = (uint32_t)a; *y0 = (uint32_t)b; *x1 = (uint32_t)c; *y1 = (uint32_t)d;
+    return true;
+}
+
 // Clears of surfaces in VRAM: on the 3D engine when it is up (color and
 // the GPU depth buffer together), else on the copy engine. Synchronous,
-// so finish() has nothing to wait for.
+// so finish() has nothing to wait for. With the scissor on, only the
+// rectangle (x0, y0)-(x1, y1) is cleared.
 static bool nv_clear_3d(const fgpu_hw_target_t* t, uint32_t flags, uint32_t color, float depth,
-                        bool want_color, bool want_depth) {
+                        bool want_color, bool want_depth, bool rect, uint32_t x0, uint32_t y0, uint32_t x1,
+                        uint32_t y1) {
     nv3d_color_t c;
     if (!color_ok(t, &c)) return false;
     const nv3d_zeta_t* z = want_depth ? zeta_for(t) : NULL;
@@ -419,19 +434,26 @@ static bool nv_clear_3d(const fgpu_hw_target_t* t, uint32_t flags, uint32_t colo
     int ti = tiled_find(t->color.cpu);
     // Color cleared together with depth, or a surface whose pixels live in
     // its block-linear copy: clear that copy (a pitch-linear target cannot
-    // sit next to a depth buffer). Depth alone binds no color target.
+    // sit next to a depth buffer). Depth alone binds no color target. A
+    // partial clear keeps the rest of the copy, so it must hold the pixels.
+    bool whole = !rect || (x0 == 0 && y0 == 0 && x1 == t->cpu.width && y1 == t->cpu.height);
     if (want_color && (z || ti >= 0)) {
-        ti = tiled_for(t, true);
+        ti = tiled_for(t, whole);
         if (ti < 0) return false;
         tiled_color(ti, &c);
     }
     nv_push_t* p = begin_job();
     if (!p) return false;
-    nv3d_push_clear(p, want_color ? &c : NULL, z, flags, color, depth);
+    if (rect) nv3d_push_clear_rect(p, want_color ? &c : NULL, z, flags, color, depth, x0, y0, x1, y1);
+    else nv3d_push_clear(p, want_color ? &c : NULL, z, flags, color, depth);
     if (!end_job(p)) return false;
     if (want_color && c.block_linear) g.tiled[ti].valid = g.tiled[ti].dirty = true;
     // The CPU's depth buffer follows the clears, for draws that fall back.
-    if (want_depth) fgpu_raster_clear(&t->cpu, FGPU_CLEAR_DEPTH, 0, depth);
+    if (want_depth) {
+        if (rect) fgpu_raster_clear_rect(&t->cpu, FGPU_CLEAR_DEPTH, 0, depth, (int32_t)x0, (int32_t)y0,
+                                         (int32_t)(x1 - x0), (int32_t)(y1 - y0));
+        else fgpu_raster_clear(&t->cpu, FGPU_CLEAR_DEPTH, 0, depth);
+    }
     g.clears++;
     return true;
 }
@@ -440,8 +462,12 @@ static bool nv_clear(const fgpu_hw_target_t* t, uint32_t flags, uint32_t color, 
     bool want_color = (flags & FGPU_CLEAR_COLOR) && t->cpu.color;
     bool want_depth = (flags & FGPU_CLEAR_DEPTH) && t->cpu.depth;
     if (!want_color && !want_depth) return false;
+    uint32_t x0 = 0, y0 = 0, x1 = t->cpu.width, y1 = t->cpu.height;
+    bool rect = t->scissor;
+    if (rect && !clamp_scissor(t->sc_x, t->sc_y, t->sc_w, t->sc_h, t->cpu.width, t->cpu.height, &x0, &y0, &x1, &y1))
+        return true;                            // an empty rectangle: nothing to clear
     if (g.hw3d) {
-        if (nv_clear_3d(t, flags, color, depth, want_color, want_depth)) return true;
+        if (nv_clear_3d(t, flags, color, depth, want_color, want_depth, rect, x0, y0, x1, y1)) return true;
         // The copy engine or the CPU clears instead: the surface itself
         // must hold the pixels then.
         if (want_color) tiled_release(t->color.cpu);
@@ -451,11 +477,12 @@ static bool nv_clear(const fgpu_hw_target_t* t, uint32_t flags, uint32_t color, 
     }
     if (want_color) tiled_release(t->color.cpu);
     if ((want_color && !t->color.in_vram) || (want_depth && !t->depth.in_vram)) return false;
-    if (want_color && !nv_rm_ce_fill(g.a, t->color.vram_offset, t->cpu.width, t->cpu.height,
-                                     t->cpu.color_pitch * 4u, color | 0xFF000000u))
+    uint64_t cpitch = (uint64_t)t->cpu.color_pitch * 4u, dpitch = (uint64_t)t->cpu.depth_pitch * 4u;
+    if (want_color && !nv_rm_ce_fill(g.a, t->color.vram_offset + y0 * cpitch + x0 * 4u, x1 - x0, y1 - y0,
+                                     (uint32_t)cpitch, color | 0xFF000000u))
         return false;
-    if (want_depth && !nv_rm_ce_fill(g.a, t->depth.vram_offset, t->cpu.width, t->cpu.height,
-                                     t->cpu.depth_pitch * 4u, float_bits(depth))) {
+    if (want_depth && !nv_rm_ce_fill(g.a, t->depth.vram_offset + y0 * dpitch + x0 * 4u, x1 - x0, y1 - y0,
+                                     (uint32_t)dpitch, float_bits(depth))) {
         // The color part is done; the CPU redoing it is harmless.
         return false;
     }
@@ -474,6 +501,11 @@ static bool nv_draw(const fgpu_hw_draw_t* d, uint32_t* triangles) {
 
 static bool nv_draw_3d(const fgpu_hw_draw_t* d, uint32_t* triangles) {
     const fgpu_pipeline_t* pipe = d->pipe;
+    // TODO(nv): state this backend does not implement yet runs on the CPU backend:
+    // mipmapped textures (mip_count > 1), texture units >= FGPU_MAX_TEXTURE_UNITS. (fgpu.c
+    // does not offer such draws either.)
+    for (uint32_t u = 0; u < FGPU_TEXTURE_UNITS; u++)
+        if (pipe->textures[u].pixels && (pipe->textures[u].mip_count > 1 || u >= FGPU_MAX_TEXTURE_UNITS)) return false;
     nv3d_draw_t nd;
     memset(&nd, 0, sizeof(nd));
     if (!color_ok(d->target, &nd.color)) return false;
@@ -515,6 +547,14 @@ static bool nv_draw_3d(const fgpu_hw_draw_t* d, uint32_t* triangles) {
         if (!nd.zeta) return false;
     }
     if (count == 0) { *triangles = 0; return true; }
+    if (pipe->scissor) {
+        nd.scissor = true;
+        if (!clamp_scissor(pipe->sc_x, pipe->sc_y, pipe->sc_w, pipe->sc_h, d->target->cpu.width,
+                           d->target->cpu.height, &nd.sc_x0, &nd.sc_y0, &nd.sc_x1, &nd.sc_y1)) {
+            *triangles = 0;                     // everything is cut away
+            return true;
+        }
+    }
     // With depth, or when the surface's pixels already live there: draw
     // into the block-linear copy.
     int ti = tiled_find(d->target->color.cpu);

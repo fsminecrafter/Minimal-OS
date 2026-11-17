@@ -663,12 +663,13 @@ ci-os0:
 
 .PHONY: test-host
 test-host: build/tests/host/gfx_blit_tests build/tests/host/fgpu_raster_tests build/tests/host/fgsl_tests \
-		build/tests/host/fgpu_bin_tests build/tests/host/fgpu_ir_tests build/tests/host/fgpu_jit_tests build/tests/host/nv_hw_tests build/tests/host/nv_sass_tests \
+		build/tests/host/fgpu_bin_tests build/tests/host/fgpu_mip_tests build/tests/host/fgpu_ir_tests build/tests/host/fgpu_jit_tests build/tests/host/nv_hw_tests build/tests/host/nv_sass_tests \
 		build/tests/host/video_gpu_tests build/tests/host/audio_stream_tests build/tests/host/hid_mouse_tests \
 		build/tests/host/media_tests build/tests/host/media_parallel_tests build/tests/host/os0_tests
 	./build/tests/host/gfx_blit_tests
 	./build/tests/host/fgpu_raster_tests
 	./build/tests/host/fgpu_bin_tests
+	./build/tests/host/fgpu_mip_tests
 	./build/tests/host/fgsl_tests
 	./build/tests/host/fgpu_ir_tests
 	./build/tests/host/fgpu_jit_tests
@@ -718,6 +719,11 @@ build/tests/host/fgpu_ir_tests: tests/host/fgpu_ir_tests.c src/modules/GPU/fgpu_
 
 # The shader JIT (x86-64 SSE4.1 / AVX2) against the interpreter, bit for bit.
 JIT_SRC := src/modules/GPU/fgpu_jit_x64.c src/modules/GPU/fgpu_ir.c src/modules/GPU/fgpu_shader.c
+# Mip chains, level selection, 2x2 quad lod in the rasterizer (interpreter and JIT), 16 texture units.
+build/tests/host/fgpu_mip_tests: tests/host/fgpu_mip_tests.c src/modules/GPU/fgpu_raster.c src/modules/GPU/fgpu_shader.c $(JIT_SRC) Minimal-OS-SDK/include/fglsl.h $(header_files)
+	mkdir -p $(dir $@)
+	$(HOSTCC) $(HOST_CFLAGS) -O1 -DFGPU_ENABLE_JIT -idirafter Minimal-OS-SDK/include $(filter %.c,$^) -lm -lpthread -o $@
+
 build/tests/host/fgpu_jit_tests: tests/host/fgpu_jit_tests.c $(JIT_SRC) Minimal-OS-SDK/include/fglsl.h Minimal-OS-SDK/include/fgpu_abi.h $(header_files)
 	mkdir -p $(dir $@)
 	$(HOSTCC) $(HOST_CFLAGS) -O1 -DFGPU_ENABLE_JIT -idirafter Minimal-OS-SDK/include $(filter %.c,$^) -lm -o $@

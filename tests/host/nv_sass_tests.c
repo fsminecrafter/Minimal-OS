@@ -494,7 +494,7 @@ int main(void) {
             rng = rng * 1664525u + 1013904223u;
             texels[t][i] = rng;
         }
-        textures[t] = (fgpu_texture_t){ texels[t], 8, 8, 8, t ? FGPU_TEXTURE_LINEAR : 0 };
+        textures[t] = (fgpu_texture_t){ .pixels = texels[t], .width = 8, .height = 8, .pitch = 8, .flags = t ? FGPU_TEXTURE_LINEAR : 0 };
     }
     test_encodings();
     test_pushbuffers();

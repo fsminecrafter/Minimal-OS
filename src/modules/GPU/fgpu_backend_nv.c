@@ -304,6 +304,8 @@ static uint32_t float_bits(float f) {
 // Clears of surfaces in VRAM: on the 3D engine when it is up (color and
 // the GPU depth buffer together), else on the copy engine. Synchronous,
 // so finish() has nothing to wait for.
+// TODO(nv): the clear callback has no scissor parameter; fgpu.c keeps scissored clears on the CPU
+// backend. Add one (and drop that check in fgpu.c) when this backend can clear a rectangle.
 static bool nv_clear(const fgpu_hw_target_t* t, uint32_t flags, uint32_t color, float depth) {
     bool want_color = (flags & FGPU_CLEAR_COLOR) && t->cpu.color;
     bool want_depth = (flags & FGPU_CLEAR_DEPTH) && t->cpu.depth;
@@ -338,6 +340,12 @@ static bool nv_clear(const fgpu_hw_target_t* t, uint32_t flags, uint32_t color, 
 static bool nv_draw(const fgpu_hw_draw_t* d, uint32_t* triangles) {
     if (!g.hw3d) return false;
     const fgpu_pipeline_t* pipe = d->pipe;
+    // TODO(nv): state this backend does not implement yet runs on the CPU backend: scissor,
+    // mipmapped textures (mip_count > 1), texture units >= FGPU_MAX_TEXTURE_UNITS. (fgpu.c
+    // does not offer such draws either; scissored clears never reach nv_clear.)
+    if (pipe->scissor) return false;
+    for (uint32_t u = 0; u < FGPU_TEXTURE_UNITS; u++)
+        if (pipe->textures[u].pixels && (pipe->textures[u].mip_count > 1 || u >= FGPU_MAX_TEXTURE_UNITS)) return false;
     nv3d_draw_t nd;
     memset(&nd, 0, sizeof(nd));
     if (!color_ok(d->target, &nd.color)) return false;

@@ -18,7 +18,7 @@ static uint32_t hash_words[FGPU_IR_HASH_WORDS(CAP)];
 static fglsl_program_t comp;
 static fgpu_program_t prog;
 static float uniforms[FGPU_SHADER_MAX_UNIFORMS][4];
-static fgpu_texture_t textures[FGPU_MAX_TEXTURE_UNITS];
+static fgpu_texture_t textures[FGPU_TEXTURE_UNITS];
 static uint32_t texels[2][8 * 8];
 static fgpu_shader_batch_t batch;
 
@@ -392,8 +392,8 @@ static void setup_textures(void) {
             rng = rng * 1664525u + 1013904223u;
             texels[t][i] = rng;
         }
-    textures[0] = (fgpu_texture_t){ texels[0], 8, 8, 8, 0 };
-    textures[1] = (fgpu_texture_t){ texels[1], 8, 8, 8, FGPU_TEXTURE_LINEAR | FGPU_TEXTURE_CLAMP };
+    textures[0] = (fgpu_texture_t){ .pixels = texels[0], .width = 8, .height = 8, .pitch = 8, .flags = 0 };
+    textures[1] = (fgpu_texture_t){ .pixels = texels[1], .width = 8, .height = 8, .pitch = 8, .flags = FGPU_TEXTURE_LINEAR | FGPU_TEXTURE_CLAMP };
 }
 
 int main(void) {

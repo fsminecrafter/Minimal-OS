@@ -364,6 +364,9 @@ static fb_t fb_new(uint32_t w, uint32_t h) {
 }
 static void fb_free(fb_t* f) { free(f->color); free(f->depth); }
 
+// OS-6.1: a scissor rectangle applied to every draw and clear of render() when .on.
+static struct { int on; int32_t x, y, w, h; } g_sc;
+
 // Draws the scene; returns the triangle count. `deferred`: through a pass, with
 // random flush points and recorded-state scribbling.
 static uint32_t render(const scene_t* sc, fb_t* fb, fgpu_raster_mode_t mode, bool deferred, uint32_t seed) {
@@ -379,17 +382,23 @@ static uint32_t render(const scene_t* sc, fb_t* fb, fgpu_raster_mode_t mode, boo
     for (int i = 0; i < sc->nops; i++) {
         const op_t* op = &sc->op[i];
         if (op->is_clear) {
-            if (deferred) fgpu_pass_clear(pass, &t, op->cflags, op->ccolor, op->cdepth);
+            if (g_sc.on) {
+                if (deferred) fgpu_pass_clear_rect(pass, &t, op->cflags, op->ccolor, op->cdepth, g_sc.x, g_sc.y, g_sc.w, g_sc.h);
+                else fgpu_raster_clear_rect(&t, op->cflags, op->ccolor, op->cdepth, g_sc.x, g_sc.y, g_sc.w, g_sc.h);
+            } else if (deferred) fgpu_pass_clear(pass, &t, op->cflags, op->ccolor, op->cdepth);
             else fgpu_raster_clear(&t, op->cflags, op->ccolor, op->cdepth);
             continue;
         }
         if (!deferred) {
-            tris += fgpu_raster_draw_layout(&t, &op->p, &op->layout, op->verts, op->nverts, op->idx, op->count);
+            fgpu_pipeline_t pp = op->p;
+            if (g_sc.on) { pp.scissor = 1; pp.sc_x = g_sc.x; pp.sc_y = g_sc.y; pp.sc_w = g_sc.w; pp.sc_h = g_sc.h; }
+            tris += fgpu_raster_draw_layout(&t, &pp, &op->layout, op->verts, op->nverts, op->idx, op->count);
             continue;
         }
         // Everything the draw depends on is handed over in scratch copies that are
         // destroyed right after the call.
         fgpu_pipeline_t p = op->p;
+        if (g_sc.on) { p.scissor = 1; p.sc_x = g_sc.x; p.sc_y = g_sc.y; p.sc_w = g_sc.w; p.sc_h = g_sc.h; }
         float consts[FGPU_SHADER_MAX_UNIFORMS][4];
         memcpy(consts, op->consts, sizeof(consts));
         p.constants = (const float (*)[4])consts;
@@ -533,6 +542,84 @@ static void fuzz(int iters, uint64_t seed) {
            " (hostile %u ppm), mean %.0f ppm\n",
            iters, exact_scenes, general_scenes, hostile_scenes, worst_ppm, worst_hostile_ppm,
            total_px ? total_diff * 1e6 / total_px : 0.0);
+}
+
+/* ----------------------------------------------------------------- scissor */
+
+// OS-6.1. With one scissor rectangle R for every draw and clear of a scene:
+//   - pixels outside R keep their initial color and depth,
+//   - pixels inside R are exactly what the unscissored scene gives (exact scenes: both
+//     paths evaluate every edge exactly; general scenes: the tolerant comparison),
+//   - the scissored immediate and binned paths agree, on any number of workers.
+static void rand_scissor(const scene_t* sc) {
+    g_sc.on = 1;
+    int w = (int)sc->w, h = (int)sc->h;
+    switch (rndn(6)) {
+        case 0: g_sc.x = 0; g_sc.y = 0; g_sc.w = w; g_sc.h = h; break;                         // whole target
+        case 1: g_sc.x = (int32_t)rndn((uint32_t)w); g_sc.y = (int32_t)rndn((uint32_t)h); g_sc.w = 0; g_sc.h = 5; break;   // empty
+        case 2: g_sc.x = -(int32_t)rndn(20); g_sc.y = -(int32_t)rndn(20); g_sc.w = w / 2 + 20; g_sc.h = h / 2 + 20; break;  // off the top-left
+        case 3: g_sc.x = w - (int32_t)rndn(30); g_sc.y = h - (int32_t)rndn(30); g_sc.w = 100; g_sc.h = 100; break;           // off the bottom-right
+        case 4: g_sc.x = (int32_t)rndn((uint32_t)w); g_sc.y = (int32_t)rndn((uint32_t)h); g_sc.w = 1 + (int32_t)rndn(3); g_sc.h = 1 + (int32_t)rndn(3); break;  // a few pixels
+        default: g_sc.x = (int32_t)rndn((uint32_t)w); g_sc.y = (int32_t)rndn((uint32_t)h);
+                 g_sc.w = 1 + (int32_t)rndn((uint32_t)w); g_sc.h = 1 + (int32_t)rndn((uint32_t)h); break;
+    }
+}
+
+static void test_scissor(int iters, uint64_t seed) {
+    uint32_t checked = 0;
+    for (int it = 0; it < iters; it++) {
+        bool general = (it % 3) == 2;
+        g_hostile = 0;
+        rng_state = seed * 0x9E3779B97F4A7C15ull + (uint64_t)it * 104729 + 7;
+        scene_t sc;
+        gen_scene(&sc, general);
+        fb_t plain = fb_new(sc.w, sc.h), a = fb_new(sc.w, sc.h), b = fb_new(sc.w, sc.h), c = fb_new(sc.w, sc.h);
+        g_sc.on = 0;
+        set_threads(1);
+        render(&sc, &plain, FGPU_RASTER_BINNED, false, 0);
+        rand_scissor(&sc);
+        render(&sc, &a, FGPU_RASTER_IMMEDIATE, false, 0);
+        render(&sc, &b, FGPU_RASTER_BINNED, (it & 1) != 0, (uint32_t)it);
+        set_threads(3);
+        render(&sc, &c, FGPU_RASTER_BINNED, (it & 1) == 0, (uint32_t)it * 5);
+        set_threads(1);
+        diff_t dc = compare(&b, &c);
+        CHECK(dc.color_diff == 0 && dc.depth_diff == 0, "scissor scene %d: binned result depends on workers (%u)", it, dc.color_diff);
+        diff_t dab = general ? compare_tol(&a, &b) : compare(&a, &b);
+        CHECK(!(dab.color_diff || dab.depth_diff) || (general && (double)dab.color_diff <= GENERAL_BOUND * dab.pixels && (double)dab.depth_diff <= GENERAL_BOUND * dab.pixels),
+              "scissor scene %d (%s): immediate and binned differ (%u color, %u depth)", it, general ? "general" : "exact", dab.color_diff, dab.depth_diff);
+        // Inside / outside the rectangle.
+        int64_t x1 = (int64_t)g_sc.x + g_sc.w, y1 = (int64_t)g_sc.y + g_sc.h;
+        uint32_t bad_out = 0, bad_in = 0;
+        for (uint32_t y = 0; y < sc.h; y++)
+            for (uint32_t x = 0; x < sc.w; x++) {
+                uint32_t i = y * sc.w + x;
+                bool inside = (int64_t)x >= g_sc.x && (int64_t)x < x1 && (int64_t)y >= g_sc.y && (int64_t)y < y1;
+                for (int k = 0; k < 2; k++) {
+                    const fb_t* f = k ? &b : &a;
+                    if (!inside) {
+                        bad_out += f->color[i] != 0xFF123456u || f->depth[i] != 0.75f;
+                    } else if (!general) {
+                        bad_in += f->color[i] != plain.color[i] || memcmp(&f->depth[i], &plain.depth[i], 4) != 0;
+                    } else {
+                        int dr = (int)((f->color[i] >> 16) & 255) - (int)((plain.color[i] >> 16) & 255);
+                        int dg = (int)((f->color[i] >> 8) & 255) - (int)((plain.color[i] >> 8) & 255);
+                        int db = (int)(f->color[i] & 255) - (int)(plain.color[i] & 255);
+                        bad_in += dr > 3 || dr < -3 || dg > 3 || dg < -3 || db > 3 || db < -3;
+                    }
+                }
+                checked++;
+            }
+        CHECK(bad_out == 0, "scissor scene %d (seed %llu, rect %d,%d %dx%d, %ux%u): %u pixels outside the rectangle changed",
+              it, (unsigned long long)seed, g_sc.x, g_sc.y, g_sc.w, g_sc.h, sc.w, sc.h, bad_out);
+        CHECK(general ? (double)bad_in <= GENERAL_BOUND * 2 * sc.w * sc.h : bad_in == 0,
+              "scissor scene %d (seed %llu, rect %d,%d %dx%d, %s): %u pixels inside differ from the unscissored picture",
+              it, (unsigned long long)seed, g_sc.x, g_sc.y, g_sc.w, g_sc.h, general ? "general" : "exact", bad_in);
+        g_sc.on = 0;
+        fb_free(&plain); fb_free(&a); fb_free(&b); fb_free(&c);
+        scene_free(&sc);
+    }
+    printf("  scissor: %d scenes, %u pixels checked\n", iters, checked);
 }
 
 /* ---------------------------------------------------------- watertightness */
@@ -778,6 +865,7 @@ int main(int argc, char** argv) {
     test_watertight(24);
     test_resources();
     fuzz(iters, seed);
+    test_scissor(iters / 2, seed);
     if (failures) { printf("%d failures\n", failures); return 1; }
     printf("fgpu binning tests passed\n");
     return 0;

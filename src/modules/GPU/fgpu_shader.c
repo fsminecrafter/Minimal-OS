@@ -129,19 +129,43 @@ static inline float clamp01(float x) { return x < 0.0f ? 0.0f : (x > 1.0f ? 1.0f
 
 /* ------------------------------------------------------------ textures */
 
-static inline void texel(const fgpu_texture_t* t, int32_t x, int32_t y, float out[4]) {
-    if (t->flags & FGPU_TEXTURE_CLAMP) {
+// One level of a texture: level 0 is the texture itself, level k > 0 sits at
+// mip_offset[k] with tightly packed rows (see fgpu_abi.h, "Mipmaps").
+typedef struct {
+    const uint32_t* px;
+    int32_t w, h;
+    size_t pitch;
+    bool clamp;
+} level_t;
+
+static inline level_t level_of(const fgpu_texture_t* t, uint32_t k) {
+    level_t l;
+    l.clamp = (t->flags & FGPU_TEXTURE_CLAMP) != 0;
+    if (k == 0) {
+        l.px = t->pixels; l.w = (int32_t)t->width; l.h = (int32_t)t->height; l.pitch = t->pitch;
+    } else {
+        int32_t w = (int32_t)(t->width >> k), h = (int32_t)(t->height >> k);
+        l.w = w ? w : 1;
+        l.h = h ? h : 1;
+        l.px = t->pixels + t->mip_offset[k];
+        l.pitch = (size_t)l.w;
+    }
+    return l;
+}
+
+static inline void texel(const level_t* t, int32_t x, int32_t y, float out[4]) {
+    if (t->clamp) {
         if (x < 0) x = 0;
         if (y < 0) y = 0;
-        if (x >= (int32_t)t->width) x = (int32_t)t->width - 1;
-        if (y >= (int32_t)t->height) y = (int32_t)t->height - 1;
+        if (x >= t->w) x = t->w - 1;
+        if (y >= t->h) y = t->h - 1;
     } else {
-        x %= (int32_t)t->width;
-        y %= (int32_t)t->height;
-        if (x < 0) x += (int32_t)t->width;
-        if (y < 0) y += (int32_t)t->height;
+        x %= t->w;
+        y %= t->h;
+        if (x < 0) x += t->w;
+        if (y < 0) y += t->h;
     }
-    uint32_t p = t->pixels[(size_t)y * t->pitch + (size_t)x];
+    uint32_t p = t->px[(size_t)y * t->pitch + (size_t)x];
     const float k = 1.0f / 255.0f;
     out[0] = (float)((p >> 16) & 255u) * k;
     out[1] = (float)((p >> 8) & 255u) * k;
@@ -149,17 +173,10 @@ static inline void texel(const fgpu_texture_t* t, int32_t x, int32_t y, float ou
     out[3] = (float)(p >> 24) * k;
 }
 
-void fgpu_texture_sample(const fgpu_texture_t* t, float u, float v, float out[4]) {
-    if (!t || !t->pixels || !t->width || !t->height) {
-        out[0] = out[1] = out[2] = 0.0f;
-        out[3] = 1.0f;
-        return;
-    }
-    // Keep coordinates in a range the int conversions below can hold.
-    if (!(m_abs(u) < 65536.0f)) u = 0.0f;
-    if (!(m_abs(v) < 65536.0f)) v = 0.0f;
-    float x = u * (float)t->width, y = v * (float)t->height;
-    if (!(t->flags & FGPU_TEXTURE_LINEAR)) {
+// u, v are already range checked.
+static inline void sample_level(const level_t* t, float u, float v, bool linear, float out[4]) {
+    float x = u * (float)t->w, y = v * (float)t->h;
+    if (!linear) {
         texel(t, (int32_t)m_floor(x), (int32_t)m_floor(y), out);
         return;
     }
@@ -177,6 +194,152 @@ void fgpu_texture_sample(const fgpu_texture_t* t, float u, float v, float out[4]
         float top = a[i] + (b[i] - a[i]) * ax;
         float bottom = c[i] + (d[i] - c[i]) * ax;
         out[i] = top + (bottom - top) * ay;
+    }
+}
+
+void fgpu_texture_sample(const fgpu_texture_t* t, float u, float v, float out[4]) {
+    if (!t || !t->pixels || !t->width || !t->height) {
+        out[0] = out[1] = out[2] = 0.0f;
+        out[3] = 1.0f;
+        return;
+    }
+    // Keep coordinates in a range the int conversions below can hold.
+    if (!(m_abs(u) < 65536.0f)) u = 0.0f;
+    if (!(m_abs(v) < 65536.0f)) v = 0.0f;
+    level_t l = level_of(t, 0);
+    sample_level(&l, u, v, (t->flags & FGPU_TEXTURE_LINEAR) != 0, out);
+}
+
+// Does sampling this texture depend on the level of detail?
+static inline bool texture_uses_lod(const fgpu_texture_t* t) {
+    return t && t->pixels && t->mip_count > 1 &&
+           (t->flags & (FGPU_TEXTURE_MIP_NEAREST | FGPU_TEXTURE_MIP_LINEAR));
+}
+
+bool fgpu_texture_has_mips(const fgpu_texture_t* t) { return texture_uses_lod(t); }
+
+void fgpu_texture_sample_lod(const fgpu_texture_t* t, float u, float v, float lod, float out[4]) {
+    if (!texture_uses_lod(t) || t->width == 0 || t->height == 0) {
+        fgpu_texture_sample(t, u, v, out);
+        return;
+    }
+    if (!(m_abs(u) < 65536.0f)) u = 0.0f;
+    if (!(m_abs(v) < 65536.0f)) v = 0.0f;
+    bool linear = (t->flags & FGPU_TEXTURE_LINEAR) != 0;
+    lod += t->lod_bias;
+    if (!(lod == lod)) lod = 0.0f;                  // NaN
+    if (lod < t->min_lod) lod = t->min_lod;
+    if (t->max_lod > 0.0f && lod > t->max_lod) lod = t->max_lod;
+    float last = (float)(t->mip_count - 1);
+    if (!(lod > 0.0f)) {                            // magnification: the base level
+        level_t l = level_of(t, 0);
+        sample_level(&l, u, v, linear, out);
+        return;
+    }
+    if (lod > last) lod = last;
+    if (t->flags & FGPU_TEXTURE_MIP_LINEAR) {
+        uint32_t k0 = (uint32_t)m_floor(lod);
+        if (k0 >= t->mip_count - 1) {
+            level_t l = level_of(t, t->mip_count - 1);
+            sample_level(&l, u, v, linear, out);
+            return;
+        }
+        float f = lod - (float)k0;
+        level_t l0 = level_of(t, k0), l1 = level_of(t, k0 + 1);
+        float a[4], b[4];
+        sample_level(&l0, u, v, linear, a);
+        sample_level(&l1, u, v, linear, b);
+        for (int i = 0; i < 4; i++) out[i] = a[i] + (b[i] - a[i]) * f;
+        return;
+    }
+    uint32_t k = (uint32_t)m_floor(lod + 0.5f);
+    if (k > t->mip_count - 1) k = t->mip_count - 1;
+    level_t l = level_of(t, k);
+    sample_level(&l, u, v, linear, out);
+}
+
+// lod = log2 of the longest side of the pixel's footprint in texels, from the
+// coordinate differences to the neighbours in the 2x2 quad (lane = 2 * row + column).
+static inline float quad_lod(const fgpu_texture_t* t, const float* u, const float* v, uint32_t l) {
+    uint32_t row = l & 2u, col = l & 1u, base = l & ~3u;
+    float dudx = u[base + row + 1] - u[base + row], dvdx = v[base + row + 1] - v[base + row];
+    float dudy = u[base + 2 + col] - u[base + col], dvdy = v[base + 2 + col] - v[base + col];
+    float w = (float)t->width, h = (float)t->height;
+    float ax = dudx * w, ay = dvdx * h, bx = dudy * w, by = dvdy * h;
+    float rx = ax * ax + ay * ay, ry = bx * bx + by * by;
+    float r2 = rx > ry ? rx : ry;
+    if (!(r2 > 0.0f)) return -126.0f;
+    if (!(r2 < 3.0e38f)) return 126.0f;
+    return 0.5f * m_log2(r2);
+}
+
+void fgpu_texture_sample_batch(const fgpu_texture_t* t, const float* u, const float* v,
+                               uint32_t lanes, bool quads, float* out) {
+    // out is [4][FGPU_LANES]; lanes = how many lanes to fill (from 0).
+    bool lod = quads && texture_uses_lod(t);
+    for (uint32_t l = 0; l < lanes; l++) {
+        float px[4];
+        if (lod) fgpu_texture_sample_lod(t, u[l], v[l], quad_lod(t, u, v, l), px);
+        else fgpu_texture_sample(t, u[l], v[l], px);
+        for (int c = 0; c < 4; c++) out[c * FGPU_LANES + l] = px[c];
+    }
+}
+
+/* ------------------------------------------------------- mip chains */
+
+uint32_t fgpu_mip_layout(uint32_t width, uint32_t height, uint32_t pitch,
+                         uint32_t offsets[FGPU_MAX_MIP_LEVELS], uint64_t* total_pixels) {
+    uint32_t levels = 1;
+    uint32_t m = width > height ? width : height;
+    while ((m >> levels) && levels < FGPU_MAX_MIP_LEVELS) levels++;
+    uint64_t at = (uint64_t)pitch * height;
+    if (offsets) offsets[0] = 0;
+    for (uint32_t k = 1; k < levels; k++) {
+        uint32_t w = width >> k, h = height >> k;
+        if (!w) w = 1;
+        if (!h) h = 1;
+        if (offsets) offsets[k] = (uint32_t)at;
+        at += (uint64_t)w * h;
+    }
+    if (total_pixels) *total_pixels = at;
+    return levels;
+}
+
+static inline uint32_t box4(uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
+    uint32_t out = 0;
+    for (int shift = 0; shift < 32; shift += 8)
+        out |= ((((a >> shift) & 255u) + ((b >> shift) & 255u) + ((c >> shift) & 255u) +
+                 ((d >> shift) & 255u) + 2u) >> 2) << shift;
+    return out;
+}
+
+void fgpu_mip_generate(uint32_t* pixels, uint32_t width, uint32_t height, uint32_t pitch) {
+    uint32_t offsets[FGPU_MAX_MIP_LEVELS];
+    uint32_t levels = fgpu_mip_layout(width, height, pitch, offsets, NULL);
+    const uint32_t* src = pixels;
+    uint32_t sw = width, sh = height;
+    size_t spitch = pitch;
+    for (uint32_t k = 1; k < levels; k++) {
+        uint32_t dw = sw >> 1, dh = sh >> 1;
+        if (!dw) dw = 1;
+        if (!dh) dh = 1;
+        uint32_t* dst = pixels + offsets[k];
+        for (uint32_t y = 0; y < dh; y++) {
+            uint32_t y0 = 2 * y, y1 = 2 * y + 1;
+            if (y0 > sh - 1) y0 = sh - 1;
+            if (y1 > sh - 1) y1 = sh - 1;
+            for (uint32_t x = 0; x < dw; x++) {
+                uint32_t x0 = 2 * x, x1 = 2 * x + 1;
+                if (x0 > sw - 1) x0 = sw - 1;
+                if (x1 > sw - 1) x1 = sw - 1;
+                dst[(size_t)y * dw + x] = box4(src[y0 * spitch + x0], src[y0 * spitch + x1],
+                                               src[y1 * spitch + x0], src[y1 * spitch + x1]);
+            }
+        }
+        src = dst;
+        sw = dw;
+        sh = dh;
+        spitch = dw;
     }
 }
 
@@ -238,7 +401,7 @@ static bool check_stage(const fgpu_shader_header_t* h, const uint32_t* code, uin
             if (!(used & (1u << k))) continue;
             if (!check_src(h, in[2 + k], fragment)) { *why = "bad source register"; return false; }
         }
-        if (op == FGPU_SOP_TEX && in[3] >= FGPU_MAX_TEXTURE_UNITS) { *why = "bad texture unit"; return false; }
+        if (op == FGPU_SOP_TEX && in[3] >= FGPU_TEXTURE_UNITS) { *why = "bad texture unit"; return false; }
         if (op == FGPU_SOP_BUFFER_LOAD &&
             (in[3] >= FGPU_MAX_STORAGE_BUFFERS || !(h->storage_buffer_mask & (1u << in[3])))) {
             *why = "bad storage buffer binding";
@@ -264,7 +427,7 @@ bool fgpu_program_check(const void* blob, uint32_t bytes, fgpu_program_t* out, c
     }
     if (h->temp_count > FGPU_SHADER_MAX_TEMPS || h->varying_count > FGPU_SHADER_MAX_VARYINGS ||
         h->uniform_count > FGPU_SHADER_MAX_UNIFORMS || h->const_count > FGPU_SHADER_MAX_CONSTANTS ||
-        (h->attrib_mask >> FGPU_MAX_ATTRIBS) || (h->texture_mask >> FGPU_MAX_TEXTURE_UNITS) ||
+        (h->attrib_mask >> FGPU_MAX_ATTRIBS) || (h->texture_mask >> FGPU_TEXTURE_UNITS) ||
         (h->storage_buffer_mask >> FGPU_MAX_STORAGE_BUFFERS)) {
         *why = "limits exceeded"; return false;
     }
@@ -555,6 +718,17 @@ static uint32_t run(vm_t* vm, const uint32_t* code, uint32_t count, uint32_t liv
             case FGPU_SOP_TEX: {
                 operand(vm, in[2], 3, vm->ops[0], a);
                 const fgpu_texture_t* t = vm->textures ? &vm->textures[in[3]] : NULL;
+                if (vm->b->quad && texture_uses_lod(t)) {
+                    // Level of detail from the 2x2 quad: every lane's coordinate counts.
+                    float px[4];
+                    for (int l = 0; l < L; l++) {
+                        if (!(active & (1u << l))) continue;
+                        fgpu_texture_sample_lod(t, a[0][l], a[1][l], quad_lod(t, a[0], a[1], (uint32_t)l), px);
+                        for (int c = 0; c < 4; c++) vm->res[c][l] = px[c];
+                    }
+                    store(vm, in[1], active);
+                    break;
+                }
                 for (int l = 0; l < L; l++) {
                     if (!(active & (1u << l))) continue;
                     float px[4];

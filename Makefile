@@ -502,9 +502,9 @@ run-mosdesk-doom: doom-sdk
 #   make mosdesk-fe FARCADE_DIR=/path/to/checkout FARCADE_USE_LOCAL=1
 # The engine is cloned into $(FARCADE_DIR) (with its SDK submodule) and
 # built with its own 'make os' and this tree's cross compiler. The editor
-# (FarcadeEditor.run, plus FarcadeEditor/ with its README and licence) goes
-# into the same "mosgames" boot module as Doom, which setup unpacks into
-# 0:/programs. Under MOSdesk the editor opens as a window; started without
+# (FarcadeEditor.run, plus FarcadeEditor/ with its README and licence) and
+# the game player its exports use (feplayer.run) go into the same
+# "mosgames" boot module as Doom, which setup unpacks into 0:/programs. Under MOSdesk the editor opens as a window; started without
 # the desktop it takes the whole screen.
 FE ?= 0
 FARCADE_REPO ?= https://github.com/fsminecrafter/Farcade-Engine.git
@@ -512,6 +512,7 @@ FARCADE_REF ?= main
 FARCADE_DIR ?= build/farcade-engine
 FARCADE_USE_LOCAL ?= 0
 fe_editor_run = $(FARCADE_DIR)/build/os/bin/farcade-editor.run
+fe_player_run = $(FARCADE_DIR)/build/os/bin/feplayer.run
 
 .PHONY: fe-fetch fe-build fe-stage fe-games-stage mosdesk-fe run-mosdesk-fe
 fe-fetch:
@@ -536,6 +537,8 @@ fe-build: fe-fetch
 fe-stage: fe-build
 	mkdir -p build/games/stage/FarcadeEditor
 	cp "$(fe_editor_run)" build/games/stage/FarcadeEditor.run
+	# The game player: File > Export game copies it from 0:/programs/feplayer.run.
+	if [ -f "$(fe_player_run)" ]; then cp "$(fe_player_run)" build/games/stage/feplayer.run; fi
 	cp "$(FARCADE_DIR)/README.md" build/games/stage/FarcadeEditor/README.md
 	cp "$(FARCADE_DIR)/LICENSE" build/games/stage/FarcadeEditor/LICENSE
 	@echo "fe: FarcadeEditor.run ($$(stat -c %s "$(fe_editor_run)") bytes) staged for 0:/programs"

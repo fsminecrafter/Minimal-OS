@@ -491,16 +491,20 @@ uint64_t window_manager_syscall(const syscall_window_request_t* request,
                    sizeof(window->info.title));
             break;
         case SYS_WINDOW_SET_FLAGS: {
-            if (request->flags & ~WINDOW_FLAG_MASK ||
-                (!is_manager && (request->flags &
-                                 SYSCALL_WINDOW_FOCUSED)) ||
+            // Programs often write back the flags they read: the focus
+            // bit is the window manager's, so it is ignored from them
+            // (it used to fail the whole request, e.g. F11 in a focused
+            // window) and kept as it is below.
+            uint32_t requested_flags = request->flags;
+            if (!is_manager) requested_flags &= ~SYSCALL_WINDOW_FOCUSED;
+            if (requested_flags & ~WINDOW_FLAG_MASK ||
                 ((request->flags & SYSCALL_WINDOW_FULLSCREEN) &&
                  (request->flags & SYSCALL_WINDOW_MAXIMIZED))) {
                 result = SYS_ERR_INVAL;
                 break;
             }
             if (is_manager) {
-                if (request->flags & SYSCALL_WINDOW_FOCUSED) {
+                if (requested_flags & SYSCALL_WINDOW_FOCUSED) {
                     if (!set_focus(window)) {
                         result = SYS_ERR_BUSY;
                         break;
@@ -511,7 +515,7 @@ uint64_t window_manager_syscall(const syscall_window_request_t* request,
                 }
             }
             window->info.flags =
-                (request->flags & ~SYSCALL_WINDOW_FOCUSED) |
+                (requested_flags & ~SYSCALL_WINDOW_FOCUSED) |
                 (window->info.flags & SYSCALL_WINDOW_FOCUSED);
             break;
         }

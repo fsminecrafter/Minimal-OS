@@ -2,7 +2,7 @@
 
 ## Context
 
-You want a real game engine for Minimal-OS, in its own repository (to be created later):
+Farcade Engune:
 - It compiles and exports games to Minimal-OS and includes a Minimal-OS port of the SDK.
 - Its editor is easy to use but capable.
 - Gameplay code can be Lua and C++, mixed in one project.

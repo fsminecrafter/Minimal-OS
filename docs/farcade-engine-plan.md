@@ -1,6 +1,10 @@
 # Farcade Engine (working name): a high-performance game engine for Minimal-OS
 
-## Context
+> **How to read this plan.** *Overview* says what is being built and the four decisions. *Where things stand* is the current state. *Architecture* is the layer diagram. *Roadmap* has the milestones, a short list of small fixes to do first, and every milestone cut into small steps. Parts A, B and C give the detail for the OS track, the SDK/toolchain track and the engine. *Risks*, *Verification* and *After approval* close the plan. Step IDs (H1, OS-6.1, S1.2, E0.3 ...) are used in the roadmap. A step is meant to be about one pull request.
+
+## Overview: goals and decisions
+
+### Goals
 
 Farcade Engine:
 - It compiles and exports games to Minimal-OS and includes a Minimal-OS port of the SDK.
@@ -9,13 +13,17 @@ Farcade Engine:
 - It has modern graphics: CLOD virtual geometry with voxels as the far representation (no impostors), a screen-space + voxel hybrid GI (no ray tracing), and far-away proxies that carry no instance data.
 - It is fast.
 
-decisions:
+### Decisions
 1. **The editor and toolchain run on Minimal-OS only.** Game makers never need a PC. The engine developer (you) still builds the engine and editor on the PC (WSL/Docker) and tests them in QEMU.
 2. **All rendering goes through FarcadeGL.** It already falls back between the kernel's CPU backend and the NVIDIA Turing backend, so speed work goes into FGPU itself.
 3. **Scripting is Lua 5.4.**
 4. **Kernel and SDK changes run as a parallel OS track.**
 
-### Where Minimal-OS stands today (the facts that shape this plan)
+---
+
+## Where things stand
+
+### Minimal-OS today (the facts that shape this plan)
 
 Updated after OS-0 to OS-5 (see the status list under Part A). Everything in the "Today" column has only run in QEMU, not on real hardware.
 
@@ -37,6 +45,23 @@ Updated after OS-0 to OS-5 (see the status list under Part A). Everything in the
 - **MOSdesk:** `main` has the mosWM shared-frame compositing (untested). Minimal-OS still pins the older commit 19ee8b0.
 - **Farcade-Engine:** builds with a `Makefile` and `mk/*.mk` fragments. It has the editor, the ECS, the Lua runtime, physics, the audio mixer, `.mof` models and the FarcadeGL renderer. Its `external/fgpu` (a copy of the kernel's FGPU CPU backend) is pinned to Minimal-OS a00577e, which is behind the kernel.
 - **Toolchain (Part B):** not started. There is no mlibc, the GCC target is still the freestanding `x86_64-elf`, and `msdk` is a 5-line wrapper around `build.sh`.
+
+### Status at a glance (2026-11-17)
+| Item | State |
+| --- | --- |
+| OS-0 to OS-4 | Done (QEMU only). |
+| OS-5 present and windows | Mostly done; mosWM compositing from shared frames is untested. |
+| OS-6 FGPU v3 graphics + FGSL v2 | Not started (scissor is the first, most urgent piece). |
+| OS-7 compute + NVIDIA | Read-only SSBOs done; the rest not started. |
+| OS-8 input and storage | Not started. |
+| OS-9 audio | The queue query exists; the rest not started. |
+| Dev loop | Not done. |
+| S1 to S4 (mlibc, GCC target, `msdk` in C, native toolchain) | Not started. |
+| S5 FarcadeGL v3 + FGSL v2 SDK | Follows OS-6/OS-7. |
+| E0 core | Mostly open (only math exists). |
+| E1 FL0 Lua player | Partly done. |
+| E3 editor on the OS | Partly done. |
+| E2, E4 to E9 | Not started. |
 
 ---
 
@@ -61,6 +86,161 @@ The work runs in three tracks:
 - **OS track:** the Minimal-OS repo.
 - **SDK track:** the Minimal-OS-SDK repo, plus the native toolchain.
 - **Engine track:** the new repo.
+
+---
+
+## Roadmap: milestones and small steps
+
+Dependencies are in brackets. OS and engine lanes run in parallel.
+
+| # | Milestone | Depends on | Exit criteria |
+| --- | --- | --- | --- |
+| E0 | Engine core + headless CI: allocator, jobs (single-thread fallback), SSE4.1 math, VFS/pak, profiler, reflection | none | Unit tests pass in CI; "hello pak" runs in QEMU |
+| E1 | FL0 Lua player: `gfx`, forward renderer, flecs, Lua 5.4 bindings, mixer, cooker CLI | none (scissor helps) | A Lua-scripted level runs on today's kernel |
+| E2 | **Native toolchain (critical path):** mlibc, cross GCC, Canadian cross, native `msdk` | OS-0, OS-1 | A 10-file C++ sample builds into a `.run` on the OS, each translation unit in under 3 s under KVM |
+| E3 | Editor v0 on the OS, Lua only | scissor (OS-6 subset); runs alongside E2 | A Lua game is created, imported, edited and exported entirely on the OS |
+| E4 | C++ gameplay: module loader, hot reload, standalone launch | E2, OS-1 PROT_EXEC | From a C++ edit to a reloaded game in under 5 s, with state kept |
+| E5 | CLOD + voxel far LOD + cell proxies on FL0 (algorithms built earlier in host tests) | OS-4; OS-3 for a parallel cut and cook | A 2 km view from ≥50 M source triangles at 60 fps (desktop) or 30 fps (2-core VM) |
+| E6 | FL0 hybrid GI (CPU voxels + probes) | OS-3; OS-2 recommended | Dynamic time of day with multi-bounce lighting within 8 userland core-ms |
+| E7 | FL1: visibility buffer, TAA/upscale, screen probes + voxel GI, SSR, GTAO, ray-marched bricks | OS-6, OS-5 | The FL1 desktop budget in C4.7 met on the CPU backend |
+| E8 | FL2 GPU-driven pipeline (stretch) | OS-7, NVIDIA proven on a card | Same scenes running natively on an RTX 2060 |
+| E9 | Shipping polish: gamepads, Deliver packaging, templates, docs, performance CI | OS-8, OS-9 | A template game installs with `dlr install` on a second machine |
+
+**Status (2026-11-17):**
+- **E0:** mostly open. `engine/core` has only math; the allocator, jobs, profiler, reflection and VFS/pak are not there.
+- **E1:** partly done: renderer, flecs, Lua 5.4 and the audio mixer exist; the pak reader and a cooker CLI beyond `mofconv` do not.
+- **E2:** not started (see Repository status).
+- **E3:** partly done: the editor runs on the OS (full screen and as a window), with scenes, undo/redo and Lua scripts. It cannot yet create, import and export a game on the OS.
+- **E4 to E9:** not started.
+
+**OS track order:** OS-0, then OS-1, then OS-4 alongside OS-2 (the SSE4.1 JIT doesn't wait for AVX), then OS-3, OS-5, OS-6, OS-7, OS-8/OS-9.
+**Minimum lovable product:** E0–E6 (FL0, Lua and C++, the on-OS editor, CLOD + voxels + proxies, CPU GI). FL2, NVIDIA, virtual shadow maps and gamepads are stretch goals.
+
+### Do first: small fixes
+These are small and unblock other work. Each is one task.
+- [ ] **H1** Merge the SDK branch `farcade-engine/shader-storage-buffers-584f118` into Minimal-OS-SDK `main`, then re-pin Minimal-OS and Farcade-Engine to the merged commit.
+- [ ] **H2** Refresh `external/fgpu` in Farcade-Engine from the current kernel (after H1) and rerun the host and QEMU golden checks.
+- [ ] **H3** Find the OS-3 crash:
+  - (a) repeat os0test's `smp_priority` join check in a loop at `-smp 1` and `-smp 2` until it reproduces;
+  - (b) capture the state at the jump to address 3 (empty kernel stack);
+  - (c) fix it;
+  - (d) rerun the loop many times with no crash.
+- [ ] **H4** Run mosWM compositing from shared frames on a desktop in QEMU, then move the MOSdesk pin in Minimal-OS from 19ee8b0 to a tested commit.
+- [ ] **H5** Dev loop: add `-cpu max` (TCG) or `-cpu host` (KVM) and a `run-engine` target (`-smp 8 -m 8G`) to the Makefile.
+- [ ] **H6** Decide the licence for the runtime files (`farcadegl.h`, `fglsl.h`, `crt0.c`): MIT, or GPL plus a linking exception. Needed before release.
+- [ ] **H7** Settle C4.7: re-baseline the targets against the OS-4 measurements, or label the FL1/FL2 targets as real-GPU goals.
+- [ ] **H8** Run the OS on real hardware (an 8-core AVX2 desktop): real SMP, TSC and APIC timing, the 1.5 ms present budget, and AVX-512 if the CPU has it.
+
+### Work breakdown by milestone
+Legend: `[x]` done, `[~]` partly done, `[ ]` open. "Needs" lists what must come first.
+
+#### E0 Engine core + headless CI
+- [ ] **E0.1** Allocator: size-class pools carved from 64 MiB `SYS_HEAP` chunks, per-frame linear allocators, per-thread caches (later backed by `SYS_VM` reserve/commit).
+- [ ] **E0.2** Allocator hooks for Lua (`lua_Alloc`) and flecs (Jolt later).
+- [ ] **E0.3** Jobs, single-thread fallback first: the job-graph API running on one thread.
+- [ ] **E0.4** Jobs on all cores: work stealing, one worker per core (OS-3 is done).
+- [ ] **E0.5** SSE4.1 math wrappers (extending `engine/core/math`) and the by-hand AVX2 dispatch at startup.
+- [ ] **E0.6** Containers, strings and log.
+- [ ] **E0.7** Reflection: `FE_REFLECT` X-macros, starting from the existing field tables in `engine/scene/modules.cpp`.
+- [ ] **E0.8** Serialization driven by reflection (text scenes, cooked binary). Needs E0.7.
+- [ ] **E0.9** VFS and `.fepak` reader (zstd, parts of at most 2 GiB, 64-bit index).
+- [ ] **E0.10** Profiler: an rdtsc ring buffer per thread.
+- [~] **E0.11** Unit tests in headless CI: host tests (`make test`) exist; doctest is not added yet.
+- [ ] **E0.12** Exit: "hello pak" runs in QEMU.
+
+#### E1 FL0 Lua player
+- [x] Done so far: flecs behind `fe::World`, Lua 5.4.7 running scripts in Play, the FL0-style forward renderer and GPU tier, an audio mixer.
+- [ ] **E1.1** `gfx` resource pools: sub-allocation from FGPU buffers of at most 16 MiB, within handle budgets.
+- [ ] **E1.2** Upload rings (2 to 3 buffers) and an ordered pass list.
+- [ ] **E1.3** Pick the feature level from `fglGetDeviceInfo` caps.
+- [ ] **E1.4** Packed 20-byte vertices for FL0.
+- [ ] **E1.5** FGSL compiled at cook time and cached in paks. Needs E0.9.
+- [~] **E1.6** Lua bindings generated from reflection (bindings exist; generation needs E0.7).
+- [~] **E1.7** Audio mixer features from C6: buses, 3D pan/attenuation/doppler, low-pass, reverb (a mixer exists in `engine/audio/mixer.cpp`).
+- [~] **E1.8** Cooker CLI: `tools/mofconv` converts models; add textures, audio, Lua bytecode, FGSL and scenes, writing paks.
+- [ ] **E1.9** Pak reader and asynchronous loader on an I/O thread. Needs E0.9.
+- [ ] **E1.10** Exit: a Lua-scripted level runs on today's kernel.
+
+#### E2 Native toolchain (critical path)
+- [ ] **E2.1** S1 mlibc port (steps S1.1 to S1.6 in Part B).
+- [ ] **E2.2** S2 GCC target `x86_64-minimalos` (S2.1 to S2.6).
+- [ ] **E2.3** S3 `msdk` in C (S3.1 to S3.6); this can run alongside E2.1 and E2.2.
+- [ ] **E2.4** S4 Canadian cross (S4.1 to S4.7). Needs E2.1 and E2.2.
+- [ ] **E2.5** Exit: a 10-file C++ sample builds into a `.run` on the OS, each translation unit in under 3 s under KVM.
+
+#### E3 Editor v0 on the OS, Lua only
+- [x] Done so far: shell, panels, gizmos, Play, `.fscene` save/open, undo/redo, the unsaved-changes prompt, scripts on objects, running full screen and as a window.
+- [ ] **E3.1** Draw ImGui through FarcadeGL with scissor and a 6-float vertex layout in ring buffers. Needs OS-6.1.
+- [ ] **E3.2** Project format: `project.fe`, templates (empty, first-person, third-person, top-down).
+- [ ] **E3.3** Asset import: "Import from URL" (`SYS_NET` + minimaSSL), Deliver packages, `.mpkg` modules.
+- [ ] **E3.4** Prefabs on flecs prefabs.
+- [ ] **E3.5** Autosave.
+- [ ] **E3.6** Export of Lua-only games with the prebuilt `feplayer`, then packaging as a `.run` + paks (C8). Needs E1.8 and E1.9.
+- [ ] **E3.7** Exit: a Lua game is created, imported, edited and exported entirely on the OS.
+
+#### E4 C++ gameplay
+- [ ] **E4.1** The light `fe.h`/`fe.hpp` header (under 3k lines).
+- [ ] **E4.2** Module ABI: `fe_game_entry(const fe_api_v1*)` and the function table.
+- [ ] **E4.3** The engine's own ELF loader (about 1k lines: RELATIVE/64/GLOB_DAT/JUMP_SLOT). Needs OS-1 `PROT_EXEC` (done).
+- [ ] **E4.4** Build a module with the native `msdk` and load it. Needs E2.
+- [ ] **E4.5** `FE_COMPONENT`/`FE_SYSTEM`/`FE_FUNCTION` and Lua calls both ways, on one event bus.
+- [ ] **E4.6** Hot reload with a reflection-driven ECS snapshot and restore.
+- [ ] **E4.7** Crash handler with stack traces, asserts sent to the editor, serial log.
+- [ ] **E4.8** Standalone launch: spawn the exported game as its own process.
+- [ ] **E4.9** Lua side: hot reload (swap function tables, keep state), `lua_sethook` debugger, time limits for runaway scripts.
+- [ ] **E4.10** Exit: from a C++ edit to a reloaded game in under 5 s, with state kept.
+
+#### E5 CLOD + voxel far LOD + cell proxies on FL0
+Algorithms are built first in host tests. Needs OS-4 (done) and OS-3 (done) for the parallel cut and cook.
+- [ ] **E5.1** Offline DAG build with meshoptimizer (clusters, groups, monotonic errors, locked borders), with the invariant tests.
+- [ ] **E5.2** Page format: 64 KiB pages, quantized positions, octahedral normals, delta/byte-plane transform plus zstd.
+- [ ] **E5.3** Runtime cut as parallel jobs (`err_px` test, τ = 2 px at FL0).
+- [ ] **E5.4** 8-wide BVH, frustum and normal-cone tests, then two-pass Masked Occlusion Culling.
+- [ ] **E5.5** CLOD page streaming with the fixed pool budget, priority by projected error and an I/O thread.
+- [ ] **E5.6** Voxel switch rule and 8³ bricks, with the parent downsampling.
+- [ ] **E5.7** FL0 far LOD: greedy-meshed quads with the 2.5 px switch and hysteresis.
+- [ ] **E5.8** World cells (32 m) with the cell states and the always-loaded layer.
+- [ ] **E5.9** Proxy baker (steps 1 to 5 of C4.4) for ring L1, then L2 to L4.
+- [ ] **E5.10** FL0 texture streaming in whole steps (64, 256, 1024).
+- [ ] **E5.11** Streaming overlay and the "keep loaded" flag in the editor.
+- [ ] **E5.12** Exit: a 2 km view from at least 50 M source triangles at 60 fps (desktop) or 30 fps (2-core VM) (see C4.7 for the open target decision).
+
+#### E6 FL0 hybrid GI (CPU voxels + probes)
+Needs OS-3 (done); OS-2 recommended (done).
+- [ ] **E6.1** Camera-centred voxel clipmap built from the cooked bricks, with toroidal scrolling and 10 Hz re-splatting of dynamic objects.
+- [ ] **E6.2** Light injection: sun (CSM, then voxel shadow ray), local lights and emissives, last frame's irradiance.
+- [ ] **E6.3** Probe update: 3 levels of L1-SH probes, 32 rays, 1/16 per frame, hysteresis 0.93, with the back-face and move-out rules.
+- [ ] **E6.4** Probe atlas upload (ARGB8) and the 4-tap sampling.
+- [ ] **E6.5** Specular: probe SH plus the octahedral sky atlas with 5 roughness bands.
+- [ ] **E6.6** Exit: dynamic time of day with multi-bounce lighting within 8 userland core-ms.
+
+#### E7 FL1
+Needs OS-6 and OS-5.
+- [ ] **E7.1** Visibility buffer (R32UI + depth).
+- [ ] **E7.2** Material resolve (material-ID depth, one quad per material with depth EQUAL).
+- [ ] **E7.3** TAA at internal resolution with scaled present, dynamic resolution.
+- [ ] **E7.4** Screen probes and the voxel clipmap on the GPU (4×64³ RGBA16F).
+- [ ] **E7.5** Screen-probe ray march (depth mips, then clipmap) and denoising into L1 SH.
+- [ ] **E7.6** SSR and GTAO.
+- [ ] **E7.7** Ray-marched voxel bricks with the dithered cross-fade.
+- [ ] **E7.8** Per-mip texture streaming.
+- [ ] **E7.9** Exit: the FL1 desktop budget in C4.7 is met on the CPU backend (see C4.7).
+
+#### E8 FL2 GPU-driven pipeline (stretch)
+Needs OS-7 and NVIDIA proven on a card.
+- [ ] **E8.1** GPU-driven culling and LOD.
+- [ ] **E8.2** Compute micro-triangle raster and voxel splatting into a 64-bit visibility buffer.
+- [ ] **E8.3** Compute GI and cached virtual shadow maps.
+- [ ] **E8.4** Sparse virtual textures.
+- [ ] **E8.5** Exit: the same scenes run natively on an RTX 2060.
+
+#### E9 Shipping polish
+Needs OS-8 and OS-9.
+- [ ] **E9.1** Gamepad support in the engine's input.
+- [ ] **E9.2** Deliver packaging (`.mpkg` / `dlr`) with a MOSdesk icon.
+- [ ] **E9.3** Templates and docs.
+- [ ] **E9.4** Performance CI on the fixed scenes.
+- [ ] **E9.5** Exit: a template game installs with `dlr install` on a second machine.
 
 ---
 
@@ -109,8 +289,43 @@ The items are listed in dependency order. File paths were rechecked on 2026-11-1
 | **OS-6** FGPU v3 graphics + FGSL v2 (FL1) | Scissor (also needed early, for FL0), MRT ×4, formats (R32UI, RG32F, RGBA16F, R11G11B10F, RGBA32F), mips + trilinear, depth textures + compare samplers, `gl_FragDepth`, flat/int varyings, `gl_VertexID/InstanceID/PrimitiveID`, `texelFetch`, 3D textures + 2D arrays, instancing, base vertex, (multi-)indirect draw, 16 texture units and 16 varyings, larger uniform blocks, buffers of 256 MiB+, configurable depth/blend/write masks, depth bias, timestamp queries, and a v3 limits block in `syscall_gpu_info_t`. FGSL v2: real ints/uints/bit ops, structs, mat3, functions, bounded `while`/`do`, `#include`. | `src/intf/x86_64/fgpu_abi.h` + `Minimal-OS-SDK/include/fgpu_abi.h` (keep identical), `fgpu.c`, `fgpu_raster.c`, `fgpu_ir.c`, `farcadegl.h`, `fglsl.h` |
 | **OS-7** FGPU v3 compute + NVIDIA (FL2, stretch) | **Done (2026-11-16):** read-only SSBOs (4 slots, `FGPU_OP_BIND_STORAGE_BUFFER`, `FGPU_SOP_BUFFER_LOAD`, out-of-range reads return zero). **Left:** a compute stage on the CPU backend: workgroups spread across cores, 8 lanes per batch, barriers handled by splitting the branch-free IR, atomics via `lock cmpxchg`. Also writable SSBOs, image load/store, shared memory, 32/64-bit atomics and indirect dispatch. On NVIDIA: prove 3D on the card, batch one job per frame, compute class, real branches, proper SASS scheduling. | `fgpu_backend_nv.c`, `nv_3d.c`, `nv_sass.c`, `nv_rm_chan.c` |
 | **OS-8** input and storage | USB hubs, a HID report-descriptor parser (generic and Xbox/PlayStation USB gamepads), PS/2 mouse, input timestamps. Expose `fat32.c` through the storage syscalls and VFS; USB mass storage later (asset import). | `src/modules/USB/usb/*.c`, `src/intf/usb/usb_stack.h`, `src/impl/handlers/input.c`, `src/impl/storage/fat32.c`, `storage_syscall.c` |
-| **OS-9** audio | A query for how much of the stream buffer is queued, smaller buffers for lower latency, float32/48 kHz input. | `src/modules/Audio/*` |
+| **OS-9** audio | **Already there:** the query for how much of a stream is queued (`mos_audio_stream_query`: queued, capacity of 16384 frames, mix_rate, underruns). **Left:** smaller buffers for lower latency, float32/48 kHz input. | `src/modules/Audio/*` |
 | Dev loop | `make run` uses `qemu64` (no SSE4.1). Add `-cpu host` (KVM) or `-cpu max` (TCG), and a `run-engine` target with `-smp 8 -m 8G`. On Windows, run QEMU with KVM inside WSL2. **Status:** not done; `make run` still passes no `-cpu` and uses `-smp 2 -m 1024M`. | `Makefile:351`, `config.mk` |
+
+### Remaining OS work in small steps
+Keep `fgpu_abi.h` identical in the kernel and the SDK in every step.
+
+**OS-6 FGPU v3 graphics + FGSL v2 (FL1)**
+- [ ] **OS-6.1** Scissor. Do this first: FL0 and the editor need it.
+- [ ] **OS-6.2** Limits: 16 texture units, 16 varyings, larger uniform blocks, buffers of 256 MiB+, and the v3 limits block in `syscall_gpu_info_t`.
+- [ ] **OS-6.3** Targets: MRT ×4, the formats (R32UI, RG32F, RGBA16F, R11G11B10F, RGBA32F), configurable depth/blend/write masks, depth bias.
+- [ ] **OS-6.4** Depth: depth textures, compare samplers, `gl_FragDepth`.
+- [ ] **OS-6.5** Textures: mips with trilinear filtering, `texelFetch`, 3D textures and 2D arrays.
+- [ ] **OS-6.6** Draws: instancing, base vertex, (multi-)indirect draw, `gl_VertexID/InstanceID/PrimitiveID`, flat/int varyings.
+- [ ] **OS-6.7** Timestamp queries.
+- [ ] **OS-6.8** FGSL v2: ints/uints/bit ops, structs, mat3, functions, bounded `while`/`do`, `#include`.
+- [ ] **OS-6.9** SDK side (S5): `farcadegl.h`, `fglsl.h` and docs.
+
+**OS-7 FGPU v3 compute + NVIDIA (FL2, stretch)**
+- [x] **OS-7.1** Read-only SSBOs (4 slots).
+- [ ] **OS-7.2** Writable SSBOs and image load/store.
+- [ ] **OS-7.3** A compute stage on the CPU backend: workgroups across cores, 8 lanes per batch.
+- [ ] **OS-7.4** Barriers by splitting the branch-free IR, shared memory, 32/64-bit atomics via `lock cmpxchg`, indirect dispatch.
+- [ ] **OS-7.5** NVIDIA: prove 3D on the card.
+- [ ] **OS-7.6** NVIDIA: batch one job per frame, the compute class, real branches, proper SASS scheduling.
+
+**OS-8 input and storage**
+- [ ] **OS-8.1** USB hubs.
+- [ ] **OS-8.2** HID report-descriptor parser.
+- [ ] **OS-8.3** Generic and Xbox/PlayStation USB gamepads.
+- [ ] **OS-8.4** PS/2 mouse and input timestamps.
+- [ ] **OS-8.5** Expose `fat32.c` through the storage syscalls and VFS.
+- [ ] **OS-8.6** USB mass storage (later, for asset import).
+
+**OS-9 audio**
+- [x] **OS-9.1** The queued-amount query.
+- [ ] **OS-9.2** Smaller buffers for lower latency.
+- [ ] **OS-9.3** float32 and 48 kHz input.
 
 ---
 
@@ -131,6 +346,43 @@ The items are listed in dependency order. File paths were rechecked on 2026-11-1
    - It ships as an `msdk-native` package installed to `0:/sdk/`, built in CI.
    - Needs OS-0 and OS-1 (big ELFs, stacks, spawn/wait), and a VM with 4–8 GiB of RAM.
 5. **S5 FarcadeGL v3 + FGSL v2** in the SDK, with docs (follows OS-6/OS-7).
+
+### Steps
+**S1 mlibc port**
+- [ ] **S1.1** Build mlibc with a Minimal-OS sysdeps skeleton.
+- [ ] **S1.2** Memory, threads and time sysdeps: `tcb_set`, `futex_wait/wake`, `anon_allocate/free`, `vm_map`, `clock_get`.
+- [ ] **S1.3** File sysdeps: open/read/write/seek/close/stat, with the `/` ↔ `0:/` translation.
+- [ ] **S1.4** Process sysdeps: spawn/wait and exit.
+- [ ] **S1.5** Produce `libc.a`, `libm.a` and pthreads.
+- [ ] **S1.6** Test with a hello program and a threads program.
+
+**S2 GCC target `x86_64-minimalos`**
+- [ ] **S2.1** `config.gcc` entry.
+- [ ] **S2.2** `gcc/config/minimalos.h`: LINK_SPEC, the `__minimalos__` define, gthr-posix through mlibc.
+- [ ] **S2.3** libgcc t-files and the binutils alias to `elf_x86_64`.
+- [ ] **S2.4** libstdc++ with `--disable-shared`.
+- [ ] **S2.5** CMake toolchain file for the PC build.
+- [ ] **S2.6** Cross-build a hello C++ program with it.
+
+**S3 `msdk` rewritten in C**
+- [ ] **S3.1** Same name and CLI as today's `MOSdesk/msdk` and `build.sh`.
+- [ ] **S3.2** Compile driver for C/C++ with `-MD` dependency files.
+- [ ] **S3.3** Incremental builds by content hash (xxh3 over the dependency list plus flags).
+- [ ] **S3.4** Outputs: MINIRUN1 `.run`, `.slib`, `.mpkg` and Deliver packages (replacing `mkrun.sh`/`runbundle.py`).
+- [ ] **S3.5** `msdk --freestanding` for old programs; hosted mode uses mlibc.
+- [ ] **S3.6** Runs on the PC and on the OS.
+
+**S4 Canadian cross**
+- [ ] **S4.1** binutils hosted on Minimal-OS.
+- [ ] **S4.2** GMP, MPFR and MPC built static.
+- [ ] **S4.3** GCC with `cc1plus` using the configure flags above.
+- [ ] **S4.4** libiberty `pex` through `posix_spawn`, no `-pipe`.
+- [ ] **S4.5** libstdc++ hosted on the OS.
+- [ ] **S4.6** Package as `msdk-native`, installed to `0:/sdk/`, built in CI.
+- [ ] **S4.7** Test in a VM with 4 to 8 GiB of RAM.
+
+**S5 FarcadeGL v3 + FGSL v2**
+- [ ] Same work as OS-6.9; follows OS-6/OS-7.
 
 ---
 
@@ -435,35 +687,6 @@ MyGame/
 5. "Run standalone" spawns the exported game as its own process.
 
 **The runtime.** There is one engine runtime, `libfe` (renderer, ECS, physics, audio, Lua, streaming). It is not installed separately on the player's machine: every exported game carries it inside its own `.run`. A Lua-only game is the prebuilt player (`feplayer`, which is `libfe` plus a `main`) next to the game's paks; a game with C++ code is linked with `libfe.a` into its own binary. The editor links the same library, which is what "Play" runs.
-
----
-
-## Milestones
-
-Dependencies are in brackets. OS and engine lanes run in parallel.
-
-| # | Milestone | Depends on | Exit criteria |
-| --- | --- | --- | --- |
-| E0 | Engine core + headless CI: allocator, jobs (single-thread fallback), SSE4.1 math, VFS/pak, profiler, reflection | none | Unit tests pass in CI; "hello pak" runs in QEMU |
-| E1 | FL0 Lua player: `gfx`, forward renderer, flecs, Lua 5.4 bindings, mixer, cooker CLI | none (scissor helps) | A Lua-scripted level runs on today's kernel |
-| E2 | **Native toolchain (critical path):** mlibc, cross GCC, Canadian cross, native `msdk` | OS-0, OS-1 | A 10-file C++ sample builds into a `.run` on the OS, each translation unit in under 3 s under KVM |
-| E3 | Editor v0 on the OS, Lua only | scissor (OS-6 subset); runs alongside E2 | A Lua game is created, imported, edited and exported entirely on the OS |
-| E4 | C++ gameplay: module loader, hot reload, standalone launch | E2, OS-1 PROT_EXEC | From a C++ edit to a reloaded game in under 5 s, with state kept |
-| E5 | CLOD + voxel far LOD + cell proxies on FL0 (algorithms built earlier in host tests) | OS-4; OS-3 for a parallel cut and cook | A 2 km view from ≥50 M source triangles at 60 fps (desktop) or 30 fps (2-core VM) |
-| E6 | FL0 hybrid GI (CPU voxels + probes) | OS-3; OS-2 recommended | Dynamic time of day with multi-bounce lighting within 8 userland core-ms |
-| E7 | FL1: visibility buffer, TAA/upscale, screen probes + voxel GI, SSR, GTAO, ray-marched bricks | OS-6, OS-5 | The FL1 desktop budget in C4.7 met on the CPU backend |
-| E8 | FL2 GPU-driven pipeline (stretch) | OS-7, NVIDIA proven on a card | Same scenes running natively on an RTX 2060 |
-| E9 | Shipping polish: gamepads, Deliver packaging, templates, docs, performance CI | OS-8, OS-9 | A template game installs with `dlr install` on a second machine |
-
-**Status (2026-11-17):**
-- **E0:** mostly open. `engine/core` has only math; the allocator, jobs, profiler, reflection and VFS/pak are not there.
-- **E1:** partly done: renderer, flecs, Lua 5.4 and the audio mixer exist; the pak reader and a cooker CLI beyond `mofconv` do not.
-- **E2:** not started (see Repository status).
-- **E3:** partly done: the editor runs on the OS (full screen and as a window), with scenes, undo/redo and Lua scripts. It cannot yet create, import and export a game on the OS.
-- **E4 to E9:** not started.
-
-**OS track order:** OS-0, then OS-1, then OS-4 alongside OS-2 (the SSE4.1 JIT doesn't wait for AVX), then OS-3, OS-5, OS-6, OS-7, OS-8/OS-9.
-**Minimum lovable product:** E0–E6 (FL0, Lua and C++, the on-OS editor, CLOD + voxels + proxies, CPU GI). FL2, NVIDIA, virtual shadow maps and gamepads are stretch goals.
 
 ---
 

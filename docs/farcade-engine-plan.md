@@ -21,15 +21,22 @@ Updated after OS-0 to OS-5 (see the status list under Part A). Everything in the
 
 | Area | Today | What it means for the engine |
 | --- | --- | --- |
-| 3D | FGPU (`SYS_GPU` 40) runs in the kernel with a context per program and one render lock. The CPU backend has a tile-binning rasterizer, an x86 shader JIT (SSE4.1 and AVX2) and asynchronous submits with fences. It still has **no MRT, mips, compute, SSBOs, scissor, instancing or integer formats** (OS-6 and OS-7). | The CPU backend *is* the renderer on QEMU, Intel and AMD. The engine starts at FL0; mips, scissor and MRT wait for OS-6. |
+| 3D | FGPU (`SYS_GPU` 40) runs in the kernel, with one context per program and one render lock. The CPU backend has a tile-binning rasterizer, an x86 shader JIT (SSE4.1 and AVX2) and asynchronous submits with fences. Read-only shader storage buffers (4 slots, vec4 loads) were added on 2026-11-16. It still has **no MRT, mips, compute, writable SSBOs, scissor, instancing or integer formats** (OS-6 and OS-7), and only 4 texture units. | The CPU backend *is* the renderer on QEMU, Intel and AMD. The engine starts at FL0; mips, scissor and MRT wait for OS-6. |
 | NVIDIA | Turing GSP-RM and copy engine work on an RTX 2060. The 3D engine and SASS compiler aren't proven on a card yet. | A bonus path, not a dependency. |
 | CPU | **AVX and AVX2 work** (XSAVE state saving, OS-2; AVX-512 untested). **A program's threads run on all cores** (OS-3), with affinity and priority calls. One intermittent kernel crash in the thread tests is still open. | The job system can use every core. AVX2 code paths are picked by hand at startup (no ifunc). |
 | Memory | Programs live above 4 GiB with `SYS_VM` (map, unmap, protect, decommit; demand-zero pages, NX, guard pages). ELF files up to 256 MiB are streamed in, the main stack is 8 MiB (configurable), and the page pool is sized from RAM, including RAM above 4 GiB. The SDK's own `malloc` is still one syscall per call. | The engine's allocator sits on `SYS_VM`. GCC on the OS has the address space it needs. |
 | Runtime | TLS, futex, clocks, spawn/wait and the environment exist (OS-0). The SDK's C library is still tiny: no libm, STL or `operator new`. Static PIE with RELATIVE relocations only (so no ifunc). | Until mlibc is ported, the engine carries a small C/C++ runtime of its own (`runtime/minimalos` in the engine repo). |
 | On-OS tools | Nothing compiles or interprets on the OS except the FGSL compiler and Mxplorer's JS. | The native toolchain is on the critical path. |
-| Display/input/audio | Full-screen present is one copy, straight to the framebuffer, scaled 1x to 3x and paced by a timer (no vsync). Window frames can be shared with the window manager (OS-5), but mosWM's use of them is untested. USB HID boot keyboard and mouse only, no hubs or gamepads. 8 PCM16 kernel-mixed streams. | The editor runs full screen first and in a window after the desktop test. Gamepads are on the OS track (OS-8). |
+| Display/input/audio | Full-screen present is one copy straight to the framebuffer, scaled 1x to 3x and paced by a timer (no vsync). Programs and the window manager can share window frames (OS-5), but mosWM's use of them is untested. Only the USB HID boot keyboard and mouse work: no hubs or gamepads. 8 PCM16 kernel-mixed streams. | The editor runs full screen and as a window under MOSdesk (copy path for now). Gamepads are on the OS track (OS-8). |
 | Files | MinimaFS: 32-bit offsets, no modification times. `stat`, `rename`, `chdir` and `/` paths exist (OS-0). File reads are synchronous. | Content-hash builds; pak parts of at most 2 GiB; streaming reads on their own thread. |
 | Licence | OS, SDK, MOSdesk and the engine repository are GPLv3. `farcadegl.h`, `fglsl.h` and `crt0.c` get compiled into every game. | **Decide before release:** relicense the runtime files (MIT, or GPL plus a linking exception). |
+
+### Repository status (checked 2026-11-17)
+- **Minimal-OS:** `main` has OS-0 to OS-5 (the work branch was merged as PR #13). Recent changes: read-only shader storage buffers (see OS-7), a Turing shader local-memory fix, and a Makefile change that syncs the pinned SDK before MOSdesk builds. This plan is `docs/farcade-engine-plan.md` there.
+- **Minimal-OS-SDK:** `main` is at 4eb00ba. The SSBO header changes are only on the branch `farcade-engine/shader-storage-buffers-584f118` (584f118), which both Minimal-OS and Farcade-Engine pin. Merge it into `main`, or SDK `main` and the kernel ABI will not match.
+- **MOSdesk:** `main` has the mosWM shared-frame compositing (untested). Minimal-OS still pins the older commit 19ee8b0.
+- **Farcade-Engine:** builds with a `Makefile` and `mk/*.mk` fragments. It has the editor, the ECS, the Lua runtime, physics, the audio mixer, `.mof` models and the FarcadeGL renderer. Its `external/fgpu` (a copy of the kernel's FGPU CPU backend) is pinned to Minimal-OS a00577e, which is behind the kernel.
+- **Toolchain (Part B):** not started. There is no mlibc, the GCC target is still the freestanding `x86_64-elf`, and `msdk` is a 5-line wrapper around `build.sh`.
 
 ---
 
@@ -59,18 +66,37 @@ The work runs in three tracks:
 
 ## Part A: OS track (Minimal-OS)
 
-**Status (branch `claude/os0-process-basics-bq26wb`):**
+**Status (merged into `main` through PR #13; it was branch `claude/os0-process-basics-bq26wb`):**
 - **OS-0 done.** TLS, futex, clocks, stat/rename/chdir, spawn/wait, environment.
 - **OS-1 done.** Program memory above 4 GiB with demand-zero pages (`SYS_VM`), NX, guard pages, a streaming ELF loader, 8 MiB stacks, a page pool sized from RAM, and RAM above 4 GiB used for program pages.
 - **OS-2 done, AVX-512 untested.** XSAVE-based state saving, AVX/AVX2 usable, `noavx` flag, CPU features in SYSINFO. QEMU's emulation has no AVX-512, so that path has never run.
-- **OS-3 done, QEMU only**. Threads of one program run on different CPUs by default (`threads1cpu` pins them as before; `smpthreads` forces it on): TLB shootdown IPIs with a per-space mask of CPUs that have it loaded, a reschedule IPI so idle cores start work at once, thread placement and migration like processes, affinity and priority in `SYS_THREAD` (`thread.h`: `mos_thread_set_affinity/priority`, `mos_cpu_count`), a group exit/crash that stops threads running on other CPUs, and the shared state audited (`docs/boot-and-kernel.md`, Processes And Threads). Thread entry points outside the image were already allowed in OS-1. Tested at `-smp 1/2/4/8` in TCG only; real SMP hardware (including TSC and APIC timing) has not been tried. **Known bug:** an intermittent kernel crash (a jump to address 3 with an empty kernel stack, the CPU then idles) right after os0test's `smp_priority` checks, around joining a low-priority thread. Seen twice in about ten runs (once on 1 CPU, once on 2, the second before the OS-4/OS-5 changes); reruns of the same build pass. Not yet diagnosed.
-- **OS-4 done, QEMU only.** The tile-binning rasterizer (binning, hierarchical Z, small-triangle path; default, `fgpuold` selects the previous one), the shader JIT (`fgpu_jit_x64.c`: SSE4.1 and AVX2 code, checked against the interpreter by a fuzzer; `nojit` turns it off), per-program GPU contexts (objects shared by a program's threads, grown tables with O(1) handles and quotas of 1024/4096/1024, a per-program lock plus one render lock instead of `g_busy`), asynchronous submit with fences (ABI 3: `FGPU_SUBMIT_ASYNC`, `SYS_GPU_WAIT`, run by the `fgpu-worker` kernel process), and preemptible `smp-par` helper processes instead of IPI handlers (`smpparipi` brings the IPI helpers back). Measured on one 2.1 GHz core the CPU backend reaches about 8 M small triangles/s (C4.7 target 30 M/s) and 7 G lane-instructions/s at best (target 16 G). The engine targets a real GPU, so these targets are no longer pursued; fused rasterizer/shader kernels and SIMD texture sampling are dropped from OS-4 and remain possible later work.
-- **OS-5 mostly done, QEMU only.** Scaled present (1x/2x/3x, nearest) straight into the framebuffer with non-temporal stores, one copy instead of two (`FGPU_PRESENT_SCALE2/3`); frame pacing per program on the monotonic clock (`FGPU_PRESENT_PACED`, `SYS_GPU_SET_PACE`, no vblank on the adapters here); window frames shared between a program and the window manager (reference-counted shared memory in user VM, `SYS_WINDOW_MAP_FRAME`, `PRESENT_SHARED` with damage rectangles, `TAKE_DAMAGE`), and FGPU presents into a window's shared back buffer. Left: mosWM compositing from the mapped frames is on the MOSdesk branch `claude/os5-mosWM-shared-frames` but has not been run on a desktop, so the submodule still points at the copy-path mosWM; the 1.5 ms present budget is unmeasured on real hardware.
+- **OS-3 done, QEMU only.** Threads of one program run on different CPUs by default (`threads1cpu` pins them as before; `smpthreads` forces it on). It includes:
+  - TLB shootdown IPIs, with a per-space mask of the CPUs that have the space loaded;
+  - a reschedule IPI so idle cores start work at once;
+  - thread placement and migration like processes;
+  - affinity and priority in `SYS_THREAD` (`thread.h`: `mos_thread_set_affinity/priority`, `mos_cpu_count`);
+  - a group exit/crash that stops threads running on other CPUs;
+  - an audit of the shared state (`docs/boot-and-kernel.md`, Processes And Threads).
+
+  Thread entry points outside the image were already allowed in OS-1. Tested at `-smp 1/2/4/8` in TCG only; real SMP hardware (including TSC and APIC timing) has not been tried.
+  - **Known bug (open, not diagnosed):** an intermittent kernel crash (a jump to address 3 with an empty kernel stack, then the CPU idles) right after os0test's `smp_priority` checks, around joining a low-priority thread. Seen twice in about ten runs (once on 1 CPU, once on 2, the second before the OS-4/OS-5 changes); reruns of the same build pass.
+- **OS-4 done, QEMU only.**
+  - Rasterizer: tile binning, hierarchical Z and a small-triangle path (default; `fgpuold` selects the previous one).
+  - Shader JIT (`fgpu_jit_x64.c`): SSE4.1 and AVX2 code, checked against the interpreter by a fuzzer (`nojit` turns it off).
+  - Per-program GPU contexts: objects shared by a program's threads, grown tables with O(1) handles and quotas of 1024/4096/1024, and a per-program lock plus one render lock instead of `g_busy`.
+  - Asynchronous submit with fences (ABI 3: `FGPU_SUBMIT_ASYNC`, `SYS_GPU_WAIT`), run by the `fgpu-worker` kernel process.
+  - Preemptible `smp-par` helper processes instead of IPI handlers (`smpparipi` brings the IPI helpers back).
+  - Measured on one 2.1 GHz core: about 8 M small triangles/s (C4.7 target 30 M/s) and 7 G lane-instructions/s at best (target 16 G). The engine targets a real GPU, so these targets are no longer pursued. Fused rasterizer/shader kernels and SIMD texture sampling were dropped from OS-4 and remain possible later work.
+- **OS-5 mostly done, QEMU only.**
+  - Scaled present (1x/2x/3x, nearest) straight into the framebuffer with non-temporal stores: one copy instead of two (`FGPU_PRESENT_SCALE2/3`).
+  - Frame pacing per program on the monotonic clock (`FGPU_PRESENT_PACED`, `SYS_GPU_SET_PACE`; the adapters here have no vblank).
+  - Window frames shared between a program and the window manager (reference-counted shared memory in user VM, `SYS_WINDOW_MAP_FRAME`, `PRESENT_SHARED` with damage rectangles, `TAKE_DAMAGE`). FGPU presents into a window's shared back buffer.
+  - **Left:** mosWM compositing from the mapped frames is on MOSdesk `main` (commit 7b3bf89, marked untested) but has not been run on a desktop, so the Minimal-OS submodule still pins the older copy-path mosWM (19ee8b0). The 1.5 ms present budget is unmeasured on real hardware.
 - **System-call pointer checks done** (not in the original plan): every user pointer is checked before use; what is left is listed in `docs/syscall-pointers.md`.
 - Everything was tested in QEMU without KVM (`make ci-os0`); nothing has run on real hardware yet.
-- The SDK half is on the branch of the same name in Minimal-OS-SDK; the submodule points at it.
+- The SDK half is merged into Minimal-OS-SDK `main` (4eb00ba). The Minimal-OS submodule now pins 584f118, which is ahead of `main` (see Repository status).
 
-The items are listed in dependency order. File paths are verified.
+The items are listed in dependency order. File paths were rechecked on 2026-11-17.
 
 | ID | Work | Main files |
 | --- | --- | --- |
@@ -81,10 +107,10 @@ The items are listed in dependency order. File paths are verified.
 | **OS-4** FGPU CPU backend v2 (the renderer's speed) | (1) **Binning:** one parallel phase per render-target pass instead of a barrier per draw. Geometry (vertex shading, clipping, culling, 16.8 fixed-point setup) bins into 64×64 tiles; tiles are rasterized by work stealing, with tile-local color+depth (32 KB) and hierarchical Z (min/max per 8×8). (2) A small-triangle path (bounding box ≤2×2 px, one triangle per SIMD lane). (3) **A JIT** from the branch-free SSA IR in `fgpu_ir.c` to x86 code with fused vertex/fragment kernels: **SSE4.1 first** (doesn't wait on OS-2), AVX2 later. The interpreter stays as reference, with differential fuzzing. (4) Preemptible kernel worker threads instead of interrupt-driven `smp_par`. Per-process contexts and handle quotas instead of `g_busy` and the shared 64/128/64 object limits. Asynchronous submit with fences (`SYS_GPU_WAIT`). | `src/modules/GPU/fgpu.c:29-31,167-183,723,771`, `fgpu_raster.c:633-645`, `fgpu_shader.c`, `fgpu_ir.c`, new `fgpu_jit_x64.c`, `src/impl/kernel/smp_par.c`, `tests/host/fgpu_*_tests.c` |
 | **OS-5** present and windows | Scaled present (2×/3× with non-temporal stores into the write-combining framebuffer). Window frames shared between the process and mosWM (no copies), damage rectangles, frame pacing (timer-based where there's no vblank). | `src/impl/handlers/graphics.c`, `gfx_blit.c:148`, `src/impl/kernel/window_manager.c`, `mmio.c:222`, `MOSdesk/mosWM/main.c` |
 | **OS-6** FGPU v3 graphics + FGSL v2 (FL1) | Scissor (also needed early, for FL0), MRT ×4, formats (R32UI, RG32F, RGBA16F, R11G11B10F, RGBA32F), mips + trilinear, depth textures + compare samplers, `gl_FragDepth`, flat/int varyings, `gl_VertexID/InstanceID/PrimitiveID`, `texelFetch`, 3D textures + 2D arrays, instancing, base vertex, (multi-)indirect draw, 16 texture units and 16 varyings, larger uniform blocks, buffers of 256 MiB+, configurable depth/blend/write masks, depth bias, timestamp queries, and a v3 limits block in `syscall_gpu_info_t`. FGSL v2: real ints/uints/bit ops, structs, mat3, functions, bounded `while`/`do`, `#include`. | `src/intf/x86_64/fgpu_abi.h` + `Minimal-OS-SDK/include/fgpu_abi.h` (keep identical), `fgpu.c`, `fgpu_raster.c`, `fgpu_ir.c`, `farcadegl.h`, `fglsl.h` |
-| **OS-7** FGPU v3 compute + NVIDIA (FL2, stretch) | A compute stage on the CPU backend: workgroups spread across cores, 8 lanes per batch, barriers handled by splitting the branch-free IR, atomics via `lock cmpxchg`. Also SSBOs, image load/store, shared memory, 32/64-bit atomics and indirect dispatch. On NVIDIA: prove 3D on the card, batch one job per frame, compute class, real branches, proper SASS scheduling. | `fgpu_backend_nv.c`, `nv_3d.c`, `nv_sass.c`, `nv_rm_chan.c` |
+| **OS-7** FGPU v3 compute + NVIDIA (FL2, stretch) | **Done (2026-11-16):** read-only SSBOs (4 slots, `FGPU_OP_BIND_STORAGE_BUFFER`, `FGPU_SOP_BUFFER_LOAD`, out-of-range reads return zero). **Left:** a compute stage on the CPU backend: workgroups spread across cores, 8 lanes per batch, barriers handled by splitting the branch-free IR, atomics via `lock cmpxchg`. Also writable SSBOs, image load/store, shared memory, 32/64-bit atomics and indirect dispatch. On NVIDIA: prove 3D on the card, batch one job per frame, compute class, real branches, proper SASS scheduling. | `fgpu_backend_nv.c`, `nv_3d.c`, `nv_sass.c`, `nv_rm_chan.c` |
 | **OS-8** input and storage | USB hubs, a HID report-descriptor parser (generic and Xbox/PlayStation USB gamepads), PS/2 mouse, input timestamps. Expose `fat32.c` through the storage syscalls and VFS; USB mass storage later (asset import). | `src/modules/USB/usb/*.c`, `src/intf/usb/usb_stack.h`, `src/impl/handlers/input.c`, `src/impl/storage/fat32.c`, `storage_syscall.c` |
 | **OS-9** audio | A query for how much of the stream buffer is queued, smaller buffers for lower latency, float32/48 kHz input. | `src/modules/Audio/*` |
-| Dev loop | `make run` uses `qemu64` (no SSE4.1). Add `-cpu host` (KVM) or `-cpu max` (TCG), and a `run-engine` target with `-smp 8 -m 8G`. On Windows, run QEMU with KVM inside WSL2. | `Makefile:332`, `config.mk` |
+| Dev loop | `make run` uses `qemu64` (no SSE4.1). Add `-cpu host` (KVM) or `-cpu max` (TCG), and a `run-engine` target with `-smp 8 -m 8G`. On Windows, run QEMU with KVM inside WSL2. **Status:** not done; `make run` still passes no `-cpu` and uses `-smp 2 -m 1024M`. | `Makefile:351`, `config.mk` |
 
 ---
 
@@ -111,6 +137,9 @@ The items are listed in dependency order. File paths are verified.
 ## Part C: The engine (new repository)
 
 ### C1. Repository layout
+**Current state:** the repo builds with a `Makefile` and one `mk/*.mk` fragment per part (no CMake yet). It has `engine/{core,ecs,gfx,script,physics,scene,audio,mof}`, `editor/`, `runtime/minimalos/`, `tools/`, `tests/` and `external/` (imgui, imguizmo, stb, cgltf, fast_obj, flecs, lua, dr_libs, the FGPU copy and the SDK submodule). `engine/mof` is a `.mof` model format with glTF and OBJ importers, which the layout below does not list. `engine/core` has only the math code so far.
+
+**Target layout:**
 ```
 farcade-engine/
   cmake/toolchains/minimalos-x86_64.cmake   # developer's PC build; headless-host.cmake for CI
@@ -158,13 +187,13 @@ farcade-engine/
 
 #### C4.1 The `gfx` layer and feature levels
 **Started (farcade-engine `engine/gfx`):**
-- An FL0-style forward renderer on `farcadegl.h`: up to 8 lights, hemisphere ambient, a gradient sky with a sun, and post processing folded into the shaders.
-- It renders offscreen and reads the frames back for the editor viewport.
-- On the PC it runs on a host copy of the FGPU CPU backend. In QEMU its smoke test gives the same checksum as the host.
-- A GPU tier (Settings > Graphics) adds a sun shadow map with PCF, GGX PBR, SSAO, bloom, FXAA and fog. It is on by default only when FGPU runs on a graphics card (FGPU_CAP_HW_3D); on the CPU backend it can be forced. Its QEMU smoke matches the host checksum too.
+- An FL0-style forward renderer on `farcadegl.h`: up to 8 lights, hemisphere ambient, a gradient sky with a sun, and post processing folded into the shaders. It renders offscreen and reads the frames back for the editor viewport.
+- On the PC it runs on a host copy of the FGPU CPU backend (`external/fgpu`). In QEMU its smoke test gives the same checksum as the host.
+- A GPU tier (Settings > Graphics) adds a sun shadow map with PCF, point and spot light shadows from a shadow atlas, GGX PBR, SSAO, bloom, FXAA and fog. It is on by default only when FGPU runs on a graphics card (FGPU_CAP_HW_3D) and can be forced on the CPU backend. Its QEMU smoke test also matches the host checksum.
 - On the CPU backend the editor redraws only what changed. While the view moves it renders the viewport at a lower resolution with draft shaders, then refines in bands. In QEMU TCG a FarcadeGL orbit went from 3.4 s to about 0.2 s per frame.
 - Mesh objects have a material in the editor's Inspector: roughness, metal, unlit and shadows. Roughness, metal and shadows show in the GPU tier only.
-- CLOD, voxels, GI and the rest of C4 are not started.
+- Not started: CLOD, voxels, GI and the rest of C4.
+- The host FGPU copy is pinned to Minimal-OS a00577e, so it lacks later kernel changes (read-only SSBOs). Update it when the kernel changes.
 
 `gfx` is a thin layer over FarcadeGL:
 - Resources are pooled and sub-allocated from FGPU buffers of at most 16 MiB until OS-6 lifts the limit, within handle budgets.
@@ -256,6 +285,8 @@ For distant rings, each world cell has a **baked proxy**: one merged voxel/clust
 - The kernel compiles FGSL bytecode to x86 (OS-4 JIT) or to SASS, so there is one material path for CPU and GPU.
 
 #### C4.7 Performance contract
+> **Status (open decision):** OS-4 measured about 8 M small triangles/s and 7 G lane-instructions/s on one 2.1 GHz core, and the CPU-backend targets are no longer pursued (the engine targets a real GPU). The tables below stay as the reference for what the CPU path would need. The FL1/FL2 frame budgets and the E5/E7 exit criteria assume that speed, so either re-baseline them against measured numbers or treat them as real-GPU goals (NVIDIA path, OS-7).
+
 **What the kernel CPU backend must reach (OS-4)**, per core, AVX2 at about 4 GHz (the SSE4.1 JIT reaches about 0.6× of this):
 
 | Stage | Target |
@@ -334,7 +365,9 @@ One streaming system serves all three. It reads only cooked paks (never `.mof` o
 - **C++ debugging on the OS:** crash handler with stack traces (frame pointers + ELF symbols), asserts sent to the editor, serial log. The engine developer gets QEMU's gdbstub. A gdbserver-lite over TCP is a later stretch goal.
 
 ### C6. Other systems and libraries
-**Started:** a built-in physics step (`engine/physics`) stands in for Jolt until the engine can use Jolt's C++ standard library needs. It covers gravity, box and sphere colliders, bounce, friction, layers and triggers, and has no rotation from contacts.
+**Started:** a built-in physics step (`engine/physics`) stands in for Jolt until the engine can meet Jolt's C++ standard library needs. It covers gravity, box, sphere, capsule, cylinder and convex-hull mesh colliders (GJK/EPA, contact manifolds of up to 4 points, sequential impulses with warm starting), rotation from contacts, friction, bounciness, layers, triggers and an upright-capsule character controller. Concave triangle meshes are not done.
+
+**Vendored so far** (`external/VERSIONS.md`): Dear ImGui (docking), ImGuizmo, stb, cgltf, fast_obj, flecs 4.1.6, Lua 5.4.7, dr_libs and the FGPU copy. The other libraries in the table are not added yet.
 
 Every library here must build with GCC against mlibc, and the heavy ones live only inside `libfe.a`.
 
@@ -356,7 +389,7 @@ Every library here must build with GCC against mlibc, and the heavy ones live on
 
 ### C7. Editor (runs on Minimal-OS)
 **Started (farcade-engine `editor/`):**
-- The shell, panels, gizmos and Play exist on the userland 2D rasterizer. They run full screen on Minimal-OS.
+- The shell, panels, gizmos and Play exist and are drawn by a software rasterizer (`SwRenderer`, the fallback described below), not yet through FarcadeGL with scissor. On Minimal-OS the editor runs full screen, and as a resizable "Farcade Editor" window under MOSdesk (changed regions go through `mos_window_present`; F11 toggles borderless fullscreen).
 - Scenes save and open as text `.fscene` files. Module fields are written by name from the reflection tables, so older files load. The commands are File > Save scene (Ctrl+S), Save scene as, and double-click in Files.
 - In QEMU, `farcade-editor --scene-test` saves, overwrites and reopens the demo scene. This needed a fix to the editor's MinimaFS file writer: create a `.part` file, write it with `SYS_FWRITE`, then rename it over the target.
 - Undo and redo (Ctrl+Z, Ctrl+Y) keep whole-scene snapshots, taken when an edit settles; a drag counts as one step.
@@ -422,6 +455,13 @@ Dependencies are in brackets. OS and engine lanes run in parallel.
 | E8 | FL2 GPU-driven pipeline (stretch) | OS-7, NVIDIA proven on a card | Same scenes running natively on an RTX 2060 |
 | E9 | Shipping polish: gamepads, Deliver packaging, templates, docs, performance CI | OS-8, OS-9 | A template game installs with `dlr install` on a second machine |
 
+**Status (2026-11-17):**
+- **E0:** mostly open. `engine/core` has only math; the allocator, jobs, profiler, reflection and VFS/pak are not there.
+- **E1:** partly done: renderer, flecs, Lua 5.4 and the audio mixer exist; the pak reader and a cooker CLI beyond `mofconv` do not.
+- **E2:** not started (see Repository status).
+- **E3:** partly done: the editor runs on the OS (full screen and as a window), with scenes, undo/redo and Lua scripts. It cannot yet create, import and export a game on the OS.
+- **E4 to E9:** not started.
+
 **OS track order:** OS-0, then OS-1, then OS-4 alongside OS-2 (the SSE4.1 JIT doesn't wait for AVX), then OS-3, OS-5, OS-6, OS-7, OS-8/OS-9.
 **Minimum lovable product:** E0–E6 (FL0, Lua and C++, the on-OS editor, CLOD + voxels + proxies, CPU GI). FL2, NVIDIA, virtual shadow maps and gamepads are stretch goals.
 
@@ -436,6 +476,8 @@ Dependencies are in brackets. OS and engine lanes run in parallel.
 6. **Editor latency (4 copies per frame through mosWM).** Mitigation: redraw only on change, damage rectangles, OS-5 shared surfaces.
 7. **GPLv3 SDK headers compiled into every game.** Mitigation: relicense the SDK runtime files before release.
 8. **Scope.** Mitigation: strict tiers, FL0-first, stretch goals labelled.
+9. **The open intermittent kernel crash in the thread tests (OS-3).** E5 and E6 depend on multicore threads. Mitigation: diagnose it before building on OS-3, and keep `threads1cpu` as the fallback.
+10. **Version drift between repos.** The SDK branch pinned by Minimal-OS and Farcade-Engine is ahead of SDK `main`, and the engine's FGPU copy is behind the kernel. Mitigation: merge the SSBO branch, and refresh `external/fgpu` whenever the kernel's FGPU changes.
 
 ## Verification
 - **Headless host CI (Linux):**
@@ -449,4 +491,4 @@ Dependencies are in brackets. OS and engine lanes run in parallel.
 - **Real hardware:** an 8-core AVX2 desktop for the CPU path; an RTX 2060 for the NVIDIA path (`gpu nvidia` self-tests).
 
 ## After approval
-No code changes yet. This plan gets saved as `docs/farcade-engine-plan.md` in Minimal-OS, and it moves to the engine repo once you create it. The suggested first implementation step, when you say go, is **OS-0** in Minimal-OS (TLS, futex, ns clock, spawn/wait), alongside **E0** in the new engine repo.
+The plan is saved as `docs/farcade-engine-plan.md` in Minimal-OS. The engine repository (fsminecrafter/Farcade-Engine) now exists and points to it; the plan can move there when you choose. OS-0 to OS-5 are done and E1 and E3 have started. Still open: the rest of E0 (allocator, jobs, profiler, reflection, VFS/pak), the toolchain (E2), the OS-3 crash and the SDK branch merge.

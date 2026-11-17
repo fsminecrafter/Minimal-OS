@@ -67,6 +67,36 @@ per program; a fifth `SUBMIT` waits for room. `FGPU_CAP_ASYNC` in
 flag. A kernel process, `fgpu-worker`, runs the queued buffers; it is
 preemptible like any process.
 
+ABI version 4 (OS-6, first part) adds the scissor test, mipmapped
+textures with trilinear filtering and 16 texture units, all drawn by the
+CPU backend whatever the adapter:
+
+- `FGPU_OP_SCISSOR` (enable, x, y, w, h): draws and clears only touch the
+  rectangle, clipped to the target. The origin is the top-left pixel (y
+  down), like `FGPU_OP_VIEWPORT`. The state belongs to the command buffer
+  (every `SUBMIT` starts with it off). See "Scissor" below.
+- `FGPU_SURFACE_MIPMAPS` (create flag, color only): the surface is
+  allocated with a whole mip chain after level 0 (level k is max(1, w >> k)
+  by max(1, h >> k), tightly packed, `fgpu_mip_layout`), in system memory.
+  `WRITE_SURFACE` takes the level in `offset` (version 4 requests only);
+  `FGPU_OP_GENERATE_MIPMAPS` rebuilds levels 1.. with a 2x2 box filter in
+  command order (pending draws land first). `BIND_TEXTURE` flags
+  `FGPU_TEXTURE_MIP_NEAREST` / `FGPU_TEXTURE_MIP_LINEAR` select the filter and
+  three optional words add a level-of-detail bias and min/max clamps. See
+  "Mipmaps and quads" below.
+- `FGPU_TEXTURE_UNITS` (16) texture units. `FGPU_MAX_TEXTURE_UNITS` stays at
+  4: it is the number of units the NVIDIA backend can sample (its constant
+  buffer and texture pools are laid out for four), and draws that use a
+  higher unit, a mip chain or the scissor are not offered to a hardware
+  backend (`fgpu.c`, and a second guard in `nv_draw`, both marked `TODO(nv)`).
+  Shaders that sample a unit above 3 do not compile for the NVIDIA backend
+  either, so they run on the CPU.
+- `SYS_GPU_INFO` accepts the shorter structure of version 3
+  (`SYS_GPU_INFO_SIZE_BASE`) and the full one, which ends with a limits block
+  (`max_texture_units`, `max_mip_levels`, `max_varyings`, `max_uniform_vec4`,
+  `max_storage_buffers`, `max_surface_size`, `max_buffer_bytes`). Capability
+  bits: `FGPU_CAP_SCISSOR`, `FGPU_CAP_MIPMAPS`, `FGPU_CAP_TEXTURE_UNITS16`.
+
 **Objects and contexts.** Objects belong to a program, not a thread: all
 threads of a program share its surfaces, buffers and shaders, and a thread
 that ends frees nothing. They live in one table per type (grown on
@@ -91,6 +121,57 @@ perspective-correct rasterization with the top-left rule, depth test,
 back/front face culling, wireframe, fragment stage and alpha blending.
 The built-in programs (vertex color, Gouraud, per-pixel Phong with
 Blinn-Phong highlights) are hard-wired C code.
+
+#### Scissor
+
+The rectangle (`fgpu_pipeline_t.scissor, sc_x .. sc_h`) only shrinks the
+area a draw can touch: the binned path intersects it with the viewport and
+the target when it records the draw (`bstate_t.cx0..cy1`), so triangle setup
+clips its bounding box to it, the tile lists only hold the tiles it reaches
+and no pixel test is added; the immediate path (`fgpuold`) intersects its
+clip rectangle, its bands and the wireframe line plotter the same way. A
+clear with a scissor cannot be merged into a pass (that merge is for
+whole-target clears): `fgpu_pass_clear_rect` renders what is pending and then
+clears the rectangle in parallel bands. A full-target rectangle takes the
+normal merged path. `host tests`: `fgpu_bin_tests` checks, on exact and
+general scenes, that pixels outside the rectangle keep their contents, pixels
+inside equal the unscissored picture, and the immediate and binned paths
+agree on any worker count.
+
+#### Mipmaps and quads
+
+`fgpu_texture_t` carries the chain (`mip_count`, `mip_offset[]`, bias and
+clamps). `fgpu_texture_sample()` is unchanged (level 0, the no-mip path costs
+what it did); `fgpu_texture_sample_lod()` picks the level (`MIP_NEAREST`:
+nearest; `MIP_LINEAR`: two levels blended; the in-level filter is the `LINEAR`
+flag, so `LINEAR | MIP_LINEAR` is trilinear; `lod <= 0` is magnification and
+uses level 0).
+
+The level of detail needs screen-space derivatives of whatever coordinate the
+shader computes, so a fragment stage that samples a texture with a chain and a
+mip flag runs on **2x2 pixel quads** (`fgpu_shader_batch_t.quad` = 1; lane 4q +
+2 * row + column; `shader_uses_mips()` decides per draw, everything else keeps
+one pixel per lane). The rasterizer collects the pixels a triangle covers
+(early depth test and depth writes as before), then shades every touched quad
+with all four pixels: pixels the triangle does not cover (or that lie outside
+the clip rectangle, the band or the tile) are *helper* pixels whose varyings
+come from the triangle's plane equations at their centers; they are shaded
+but never written. So a pixel's level does not depend on which neighbours are
+covered, which keeps tile and band splits, worker counts and triangle seams
+invisible. The binned path does this in `quad_flush` after each triangle
+(a bit per pixel in the tile's `qmask`); the immediate path has the same loop
+in `raster_triangle`. `TEX` takes the differences inside the quad (fine
+derivatives: `u[lane | 1] - u[lane & ~1]`, `u[(lane & 1) + 2] - u[lane & 1]`),
+`lod = 0.5 * log2(max(|d/dx|^2, |d/dy|^2))` with the derivative of each
+coordinate scaled by the level-0 size. The JIT calls the same C code
+(`fgpu_texture_sample_batch`) for such samples and learns about quads through
+bit 0 of its `textures` argument, so both agree bit for bit; the vertex stage
+and single-lane runs sample level 0. `fgpu_jit_tests` runs every third batch
+as quads on textures with chains, bias and clamps; `fgpu_mip_tests` checks
+layout and box filter, level selection and blending against hand computed
+references, quads drawn at known scales (nearest and trilinear, diagonal
+seams, 1 and 3 workers, interpreter and JIT), a receding plane (the level
+grows toward the horizon) and 16 texture units.
 
 #### Binned rasterizer (default)
 

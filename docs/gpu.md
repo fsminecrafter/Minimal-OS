@@ -67,6 +67,40 @@ per program; a fifth `SUBMIT` waits for room. `FGPU_CAP_ASYNC` in
 flag. A kernel process, `fgpu-worker`, runs the queued buffers; it is
 preemptible like any process.
 
+ABI version 4 (OS-6, first part) adds the scissor test, mipmapped
+textures with trilinear filtering and 16 texture units, all drawn by the
+CPU backend whatever the adapter:
+
+- `FGPU_OP_SCISSOR` (enable, x, y, w, h): draws and clears only touch the
+  rectangle, clipped to the target. The origin is the top-left pixel (y
+  down), like `FGPU_OP_VIEWPORT`. The state belongs to the command buffer
+  (every `SUBMIT` starts with it off). See "Scissor" below.
+- `FGPU_SURFACE_MIPMAPS` (create flag, color only): the surface is
+  allocated with a whole mip chain after level 0 (level k is max(1, w >> k)
+  by max(1, h >> k), tightly packed, `fgpu_mip_layout`), in system memory.
+  `WRITE_SURFACE` takes the level in `offset` (version 4 requests only);
+  `FGPU_OP_GENERATE_MIPMAPS` rebuilds levels 1.. with a 2x2 box filter in
+  command order (pending draws land first). `BIND_TEXTURE` flags
+  `FGPU_TEXTURE_MIP_NEAREST` / `FGPU_TEXTURE_MIP_LINEAR` select the filter and
+  three optional words add a level-of-detail bias and min/max clamps. See
+  "Mipmaps and quads" below.
+- `FGPU_TEXTURE_UNITS` (16) texture units. `FGPU_MAX_TEXTURE_UNITS` stays at
+  4: it is the number of units the NVIDIA backend can sample (its constant
+  buffer and texture pools are laid out for four), and draws that use a
+  higher unit or a mip chain are not offered to a hardware backend
+  (`fgpu.c`, and a second guard in `nv_draw`, both marked `TODO(nv)`). The
+  scissor reaches the NVIDIA backend: draws set the hardware's scissor 0,
+  clears get the rectangle in `fgpu_hw_target_t` and use
+  `SET_CLEAR_SURFACE_CONTROL.USE_SCISSOR0` on the 3D engine, or fill just
+  the rectangle on the copy engine.
+  Shaders that sample a unit above 3 do not compile for the NVIDIA backend
+  either, so they run on the CPU.
+- `SYS_GPU_INFO` accepts the shorter structure of version 3
+  (`SYS_GPU_INFO_SIZE_BASE`) and the full one, which ends with a limits block
+  (`max_texture_units`, `max_mip_levels`, `max_varyings`, `max_uniform_vec4`,
+  `max_storage_buffers`, `max_surface_size`, `max_buffer_bytes`). Capability
+  bits: `FGPU_CAP_SCISSOR`, `FGPU_CAP_MIPMAPS`, `FGPU_CAP_TEXTURE_UNITS16`.
+
 **Objects and contexts.** Objects belong to a program, not a thread: all
 threads of a program share its surfaces, buffers and shaders, and a thread
 that ends frees nothing. They live in one table per type (grown on
@@ -91,6 +125,57 @@ perspective-correct rasterization with the top-left rule, depth test,
 back/front face culling, wireframe, fragment stage and alpha blending.
 The built-in programs (vertex color, Gouraud, per-pixel Phong with
 Blinn-Phong highlights) are hard-wired C code.
+
+#### Scissor
+
+The rectangle (`fgpu_pipeline_t.scissor, sc_x .. sc_h`) only shrinks the
+area a draw can touch: the binned path intersects it with the viewport and
+the target when it records the draw (`bstate_t.cx0..cy1`), so triangle setup
+clips its bounding box to it, the tile lists only hold the tiles it reaches
+and no pixel test is added; the immediate path (`fgpuold`) intersects its
+clip rectangle, its bands and the wireframe line plotter the same way. A
+clear with a scissor cannot be merged into a pass (that merge is for
+whole-target clears): `fgpu_pass_clear_rect` renders what is pending and then
+clears the rectangle in parallel bands. A full-target rectangle takes the
+normal merged path. `host tests`: `fgpu_bin_tests` checks, on exact and
+general scenes, that pixels outside the rectangle keep their contents, pixels
+inside equal the unscissored picture, and the immediate and binned paths
+agree on any worker count.
+
+#### Mipmaps and quads
+
+`fgpu_texture_t` carries the chain (`mip_count`, `mip_offset[]`, bias and
+clamps). `fgpu_texture_sample()` is unchanged (level 0, the no-mip path costs
+what it did); `fgpu_texture_sample_lod()` picks the level (`MIP_NEAREST`:
+nearest; `MIP_LINEAR`: two levels blended; the in-level filter is the `LINEAR`
+flag, so `LINEAR | MIP_LINEAR` is trilinear; `lod <= 0` is magnification and
+uses level 0).
+
+The level of detail needs screen-space derivatives of whatever coordinate the
+shader computes, so a fragment stage that samples a texture with a chain and a
+mip flag runs on **2x2 pixel quads** (`fgpu_shader_batch_t.quad` = 1; lane 4q +
+2 * row + column; `shader_uses_mips()` decides per draw, everything else keeps
+one pixel per lane). The rasterizer collects the pixels a triangle covers
+(early depth test and depth writes as before), then shades every touched quad
+with all four pixels: pixels the triangle does not cover (or that lie outside
+the clip rectangle, the band or the tile) are *helper* pixels whose varyings
+come from the triangle's plane equations at their centers; they are shaded
+but never written. So a pixel's level does not depend on which neighbours are
+covered, which keeps tile and band splits, worker counts and triangle seams
+invisible. The binned path does this in `quad_flush` after each triangle
+(a bit per pixel in the tile's `qmask`); the immediate path has the same loop
+in `raster_triangle`. `TEX` takes the differences inside the quad (fine
+derivatives: `u[lane | 1] - u[lane & ~1]`, `u[(lane & 1) + 2] - u[lane & 1]`),
+`lod = 0.5 * log2(max(|d/dx|^2, |d/dy|^2))` with the derivative of each
+coordinate scaled by the level-0 size. The JIT calls the same C code
+(`fgpu_texture_sample_batch`) for such samples and learns about quads through
+bit 0 of its `textures` argument, so both agree bit for bit; the vertex stage
+and single-lane runs sample level 0. `fgpu_jit_tests` runs every third batch
+as quads on textures with chains, bias and clamps; `fgpu_mip_tests` checks
+layout and box filter, level selection and blending against hand computed
+references, quads drawn at known scales (nearest and trilinear, diagonal
+seams, 1 and 3 workers, interpreter and JIT), a receding plane (the level
+grows toward the horizon) and 16 texture units.
 
 #### Binned rasterizer (default)
 
@@ -670,15 +755,41 @@ evaluator) and the CPU shader machine, and checks that they agree.
 4. `gpu nvidia boot` goes on by itself. **Step 4a** (3D channel) prints
    `golden context recorded`, the channel, and `first 3D clear: reads
    back 0xffff8000 (ok)`. **Step 4b** compiles the built-in shader, then
-   clears a 64x64 surface and draws two triangles with depth test and
-   back-face culling, and prints three pixels:
+   draws in two stages: first the near triangle alone, without depth,
+   into a pitch-linear 64x64 surface; then both triangles with depth test
+   and back-face culling into a **block-linear** target, which the copy
+   engine copies back to the surface before three pixels are checked:
 
    ```text
    Step 4b: FarcadeGL draws on the 3D engine
      shaders: vertex and pixel stage compiled (19 + 13 registers)
+     without depth: centre 0xff4080bf, corner 0xff102030 (ok)
      clockwise front: centre 0xff4080bf, left 0xffff0000, corner 0xff102030
      ok: triangles, shaders, depth test and culling work on the 3D engine.
    ```
+
+   First run on an RTX 2060 (2026-11-17): the clears of step 4a worked,
+   but the first job of step 4b failed with `GSP-RM: channel error (RC)
+   on engine 0x1, channel 8, exception 69` (69 =
+   `ROBUST_CHANNEL_GR_CLASS_ERROR`, Xid 69: the graphics engine refused a
+   method or its data). That job cleared and drew into a **pitch-linear**
+   color target with a depth buffer bound, which the hardware does not
+   allow (nouveau's data error name: `RT_LINEAR_WITH_ZETA`; NVK renders
+   linear images through a tiled shadow for the same reason). Changes:
+   - draws with depth (and clears of color with depth) go to a
+     block-linear copy of the color surface that the backend keeps
+     (`tiled` in `fgpu_backend_nv.c`); the copy engine brings it back to
+     the FGPU surface (`nv_rm_ce_copy_surface`, block-linear to pitch)
+     in `finish()`, before a read, before a draw samples that surface,
+     and before a draw falls back to the CPU; a depth-only clear binds no
+     color target;
+   - vertex attributes that come from no stream now carry a valid format
+     (R32 float, as nouveau's nvc0 does) instead of 0, which is no value
+     of `COMPONENT_BIT_WIDTHS` or `NUMERICAL_TYPE`;
+   - when a 3D job fails, the log shows what PGRAPH trapped:
+     `PGRAPH trap: status ..., subchannel S method 0xMMMM data 0x...,
+     error 0xE NAME` (from 0x400100/0x400704/0x400708/0x400110, as
+     nouveau's gf100_gr_intr reads them), which names the method.
 
    The centre is inside both triangles (the near, blue-ish one must win),
    `left` only inside the far red one, `corner` in neither. If the first
@@ -687,7 +798,7 @@ evaluator) and the CPU shader machine, and checks that they agree.
 
    | Result | Look at |
    | --- | --- |
-   | `the test draw did not finish`, with `channel error (RC)` or `GPU page fault` above it | a method or address the engine rejects: `nv3d_push_init` / `nv3d_push_draw` in `nv_3d.c` (the error names the method offset) |
+   | `the draw without depth did not finish` or `the test draw did not finish`, with `channel error (RC)` or `GPU page fault` above it | a method or address the engine rejects: `nv3d_push_init` / `nv3d_push_draw` in `nv_3d.c`; the `PGRAPH trap` line names the method offset and the error |
    | all three pixels are the clear color with both windings | nothing was rasterized: vertex stream/attribute setup, the vertex stage's code or header (`nv_sass.c`), or the viewport |
    | centre and left have a color, but the wrong one | the pixel stage: interpolation (`IPA`), the output registers, or the constant buffer |
    | centre is red | the depth buffer: block-linear layout or depth state |
@@ -698,9 +809,16 @@ evaluator) and the CPU shader machine, and checks that they agree.
    and rendering continues on the CPU.
 
 5. **Step 5a** (video decoder): a channel on NVDEC with the decoder
-   class (`NVC4B0_VIDEO_DECODER`); GSP-RM runs NVDEC's firmware itself.
-   It prints `channel N on NVDEC (runlist R)` and `ok: the video
-   decoder's channel runs.` after an empty first job. `gpu nvidia` then
+   class (`NVC4B0_VIDEO_DECODER`); GSP-RM runs NVDEC's firmware itself,
+   but like every falcon engine NVDEC needs an engine context buffer from
+   the driver, promoted to the channel before the class is allocated
+   (nouveau `fifo/r535.c`: `r535_fifo_ectx_size`, `r535_flcn_ctor`). The
+   size comes from RM's internal `GET_CONSTRUCTED_FALCON_INFO` for NVDEC's
+   engine descriptor (`engine context: N KiB`). Without it the first run
+   on an RTX 2060 got `video decoder object (class 0xC4B0): RM error 0x1F`
+   (`NV_ERR_INVALID_ARGUMENT`). Then it prints `channel N on NVDEC
+   (runlist R)` and `ok: the video decoder's channel runs.` after an
+   empty first job. `gpu nvidia` then
    shows step 5 with the number of H.264 pictures NVDEC decoded, or that
    it was switched off because its pictures differed from the CPU
    decoder's (see docs/media.md for how files are checked). A failed

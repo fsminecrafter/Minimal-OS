@@ -249,11 +249,22 @@ static void shade_vertices(const fgpu_pipeline_t* p, const fgpu_layout_t* layout
     }
 }
 
+// Does the fragment stage sample a mipmapped texture with a mip filter? Then it runs
+// on 2x2 pixel quads (fgpu_shader_batch_t::quad) so the level of detail can come from
+// differences between neighbouring pixels. Everything else keeps the one-pixel-per-lane path.
+static bool shader_uses_mips(const fgpu_pipeline_t* p) {
+    if (!p->shader || !p->shader->h.texture_mask) return false;
+    for (uint32_t u = 0; u < FGPU_TEXTURE_UNITS; u++)
+        if (((p->shader->h.texture_mask >> u) & 1u) && fgpu_texture_has_mips(&p->textures[u])) return true;
+    return false;
+}
+
 static bool shade(const fgpu_pipeline_t* p, uint32_t worker, const float* var,
                   const float special[2][4], float out[4]) {
     if (p->shader) {
         // One lane of the worker's batch.
         fgpu_shader_batch_t* b = batch_for(p, worker, true);
+        b->quad = 0;
         uint32_t n = p->shader->h.varying_count;
         for (uint32_t v = 0; v < n; v++)
             for (int i = 0; i < 4; i++) b->input[v][i][0] = var[v * 4 + i];
@@ -278,6 +289,8 @@ typedef struct {
     uint32_t n;
     int32_t x[FGPU_LANES], y[FGPU_LANES];
     float z[FGPU_LANES];
+    uint32_t cov;               // quad mode: lanes that are covered pixels (the others are helpers)
+    bool quad;
 } frag_batch_t;
 
 static void flush_fragments(const fgpu_target_t* t, const fgpu_pipeline_t* p,
@@ -288,6 +301,7 @@ static void flush_fragments(const fgpu_target_t* t, const fgpu_pipeline_t* p,
                                           p->textures, p->storage_buffers);
     for (uint32_t l = 0; l < fb->n; l++) {
         if (!(kept & (1u << l))) continue;
+        if (fb->quad && !(fb->cov & (1u << l))) continue;
         int32_t x = fb->x[l], y = fb->y[l];
         if (late_depth && depth_write) t->depth[(size_t)y * t->depth_pitch + x] = fb->z[l];
         if (!t->color) continue;
@@ -296,6 +310,7 @@ static void flush_fragments(const fgpu_target_t* t, const fgpu_pipeline_t* p,
         *px = blending ? blend(out, *px) : pack_color(out);
     }
     fb->n = 0;
+    fb->cov = 0;
 }
 
 // Draws the rows band_y0 <= y < band_y1 of a triangle.
@@ -324,6 +339,13 @@ static void raster_triangle(const fgpu_target_t* t, const fgpu_pipeline_t* p, ui
     int32_t clip_y1 = p->vp_y + p->vp_h;
     if (clip_x1 > (int32_t)t->width) clip_x1 = (int32_t)t->width;
     if (clip_y1 > (int32_t)t->height) clip_y1 = (int32_t)t->height;
+    if (p->scissor) {
+        int64_t sx1 = (int64_t)p->sc_x + p->sc_w, sy1 = (int64_t)p->sc_y + p->sc_h;
+        if (clip_x0 < p->sc_x) clip_x0 = p->sc_x;
+        if (clip_y0 < p->sc_y) clip_y0 = p->sc_y;
+        if (clip_x1 > sx1) clip_x1 = (int32_t)sx1;
+        if (clip_y1 > sy1) clip_y1 = (int32_t)sy1;
+    }
     if (clip_y0 < band_y0) clip_y0 = band_y0;
     if (clip_y1 > band_y1) clip_y1 = band_y1;
 
@@ -351,10 +373,65 @@ static void raster_triangle(const fgpu_target_t* t, const fgpu_pipeline_t* p, ui
     special[1][0] = special[1][1] = special[1][2] = special[1][3] = front ? 1.0f : 0.0f;
     frag_batch_t fb;
     fb.n = 0;
+    fb.cov = 0;
+    fb.quad = shader_uses_mips(p);
     fgpu_shader_batch_t* sb = p->shader ? batch_for(p, worker, true) : NULL;
     if (p->shader) {
+        sb->quad = fb.quad ? 1u : 0u;
         for (int c = 0; c < 4; c++)
             for (int l = 0; l < FGPU_LANES; l++) sb->special[1][c][l] = special[1][0];
+    }
+    if (fb.quad) {
+        // 2x2 quads aligned to even pixel coordinates. Pixels of a quad that the triangle
+        // does not cover (or that lie outside this band or the clip rectangle) still run,
+        // from the triangle's plane equations, as helpers: they only give the neighbours'
+        // coordinates for the level of detail and are never written.
+        for (int32_t qy = y0 & ~1; qy < y1; qy += 2) {
+            for (int32_t qx = x0 & ~1; qx < x1; qx += 2) {
+                float lz[4], liw[4], ll0[4], ll1[4], ll2[4];
+                uint32_t cov = 0;
+                for (int k = 0; k < 4; k++) {
+                    int32_t px = qx + (k & 1), py = qy + (k >> 1);
+                    float fx = (float)px + 0.5f, fy = (float)py + 0.5f;
+                    float w0 = edge(b->x, b->y, c->x, c->y, fx, fy);
+                    float w1 = edge(c->x, c->y, a->x, a->y, fx, fy);
+                    float w2 = edge(a->x, a->y, b->x, b->y, fx, fy);
+                    ll0[k] = w0 * inv_area; ll1[k] = w1 * inv_area; ll2[k] = w2 * inv_area;
+                    lz[k] = ll0[k] * a->z + ll1[k] * b->z + ll2[k] * c->z;
+                    liw[k] = ll0[k] * a->inv_w + ll1[k] * b->inv_w + ll2[k] * c->inv_w;
+                    if (px < x0 || px >= x1 || py < y0 || py >= y1) continue;
+                    if (w0 < 0.0f || w1 < 0.0f || w2 < 0.0f) continue;
+                    if ((w0 == 0.0f && !own0) || (w1 == 0.0f && !own1) || (w2 == 0.0f && !own2)) continue;
+                    float* dp = t->depth ? t->depth + (size_t)py * t->depth_pitch + px : NULL;
+                    if (depth_test && lz[k] >= *dp) continue;
+                    if (depth_write && !late_depth) *dp = lz[k];
+                    if (!t->color && !late_depth) continue;
+                    cov |= 1u << k;
+                }
+                if (!cov) continue;
+                uint32_t base = fb.n;
+                for (int k = 0; k < 4; k++) {
+                    uint32_t lane = base + (uint32_t)k;
+                    float wpix = liw[k] != 0.0f ? 1.0f / liw[k] : 0.0f;
+                    for (uint32_t v = 0; v < nvar; v++)
+                        sb->input[v >> 2][v & 3][lane] =
+                            (ll0[k] * a->var[v] + ll1[k] * b->var[v] + ll2[k] * c->var[v]) * wpix;
+                    int32_t px = qx + (k & 1), py = qy + (k >> 1);
+                    sb->special[0][0][lane] = (float)px + 0.5f;
+                    sb->special[0][1][lane] = (float)py + 0.5f;
+                    sb->special[0][2][lane] = lz[k];
+                    sb->special[0][3][lane] = liw[k];
+                    fb.x[lane] = px;
+                    fb.y[lane] = py;
+                    fb.z[lane] = lz[k];
+                }
+                fb.cov |= cov << base;
+                fb.n += 4;
+                if (fb.n == FGPU_LANES) flush_fragments(t, p, sb, &fb, late_depth, depth_write, blending);
+            }
+        }
+        flush_fragments(t, p, sb, &fb, late_depth, depth_write, blending);
+        return;
     }
 
     // Edge function steps per pixel in x.
@@ -436,8 +513,10 @@ static void plot_line(const fgpu_target_t* t, const fgpu_pipeline_t* p, uint32_t
     int32_t dx = x1 > x0 ? x1 - x0 : x0 - x1, sx = x0 < x1 ? 1 : -1;
     int32_t dy = y1 > y0 ? y0 - y1 : y1 - y0, sy = y0 < y1 ? 1 : -1;
     int32_t err = dx + dy;
+    int64_t sc_x1 = (int64_t)p->sc_x + p->sc_w, sc_y1 = (int64_t)p->sc_y + p->sc_h;
     for (int guard = 0; guard < 16384; guard++) {
         if (y0 >= band_y0 && y0 < band_y1 &&
+            (!p->scissor || (x0 >= p->sc_x && y0 >= p->sc_y && x0 < sc_x1 && y0 < sc_y1)) &&
             x0 >= p->vp_x && y0 >= p->vp_y && x0 < p->vp_x + p->vp_w && y0 < p->vp_y + p->vp_h &&
             x0 >= 0 && y0 >= 0 && x0 < (int32_t)t->width && y0 < (int32_t)t->height) {
             uint32_t* px = &t->color[(size_t)y0 * t->color_pitch + x0];
@@ -524,6 +603,33 @@ static void clear_part(void* ctx, uint32_t part, uint32_t worker) {
         if ((j->flags & FGPU_CLEAR_DEPTH) && t->depth) {
             float* row = t->depth + (size_t)y * t->depth_pitch;
             for (uint32_t x = 0; x < t->width; x++) row[x] = j->depth;
+        }
+    }
+}
+
+typedef struct {
+    const fgpu_target_t* t;
+    uint32_t flags, color;
+    float depth;
+    int32_t x0, y0, x1, y1;
+    uint32_t band_h;
+} rect_clear_job_t;
+
+static void rect_clear_part(void* ctx, uint32_t part, uint32_t worker) {
+    (void)worker;
+    const rect_clear_job_t* j = ctx;
+    const fgpu_target_t* t = j->t;
+    int32_t y0 = j->y0 + (int32_t)(part * j->band_h), y1 = y0 + (int32_t)j->band_h;
+    if (y1 > j->y1) y1 = j->y1;
+    uint32_t opaque = j->color | 0xFF000000u;
+    for (int32_t y = y0; y < y1; y++) {
+        if ((j->flags & FGPU_CLEAR_COLOR) && t->color) {
+            uint32_t* row = t->color + (size_t)y * t->color_pitch;
+            for (int32_t x = j->x0; x < j->x1; x++) row[x] = opaque;
+        }
+        if ((j->flags & FGPU_CLEAR_DEPTH) && t->depth) {
+            float* row = t->depth + (size_t)y * t->depth_pitch;
+            for (int32_t x = j->x0; x < j->x1; x++) row[x] = j->depth;
         }
     }
 }
@@ -637,6 +743,11 @@ static uint32_t old_draw_layout(const fgpu_target_t* t, const fgpu_pipeline_t* p
     j.y0 = p->vp_y < 0 ? 0 : p->vp_y;
     j.y1 = p->vp_y + p->vp_h;
     if (j.y1 > (int32_t)t->height) j.y1 = (int32_t)t->height;
+    if (p->scissor) {
+        int64_t sy1 = (int64_t)p->sc_y + p->sc_h;
+        if (j.y0 < p->sc_y) j.y0 = p->sc_y;
+        if (j.y1 > sy1) j.y1 = (int32_t)sy1;
+    }
     uint32_t rows = j.y1 > j.y0 ? (uint32_t)(j.y1 - j.y0) : 0;
     j.band_h = band_rows(rows);
     uint32_t bands = rows ? (rows + j.band_h - 1) / j.band_h : 0;
@@ -731,6 +842,7 @@ typedef struct {
     int32_t cx0, cy0, cx1, cy1; // viewport clipped to the target
     uint32_t mode;              // 0 shader, 1 color/gouraud, 2 phong
     uint32_t nv;                // floats per vertex kept after the vertex stage
+    uint32_t quad;              // the fragment stage runs on 2x2 quads (shader_uses_mips)
 } bstate_t;
 
 typedef struct {
@@ -765,6 +877,7 @@ typedef struct {
     uint32_t n;
     uint32_t idx[FGPU_LANES];
     float z[FGPU_LANES];
+    uint32_t cov;               // quad mode: lanes that are covered pixels (the others are helpers)
 } fbatch_t;
 
 typedef struct {
@@ -772,6 +885,9 @@ typedef struct {
     float dep[TILE * TILE];
     float bmin[NBLK], bmax[NBLK];
     uint64_t stale;
+    // Quad mode: pixels the current triangle covers, one bit per pixel of each
+    // 2x2 quad (bit 2 * (y & 1) + (x & 1)); shaded after the triangle (quad_flush).
+    uint8_t qmask[(TILE / 2) * (TILE / 2)];
 } tile_t;
 
 typedef struct {
@@ -1254,7 +1370,7 @@ typedef struct {
     int32_t tx0, ty0;
     uint32_t state_idx;
     const bstate_t* s;
-    bool depth_test, depth_write, blending, late, color_on;
+    bool depth_test, depth_write, blending, late, color_on, quad;
     uint32_t mode;
     fgpu_shader_batch_t* fsb;
     fbatch_t fb;
@@ -1296,6 +1412,7 @@ static void flush_frags(tctx_t* c) {
                                           s->pipe.storage_buffers);
     for (uint32_t l = 0; l < fb->n; l++) {
         if (!(kept & (1u << l))) continue;
+        if (c->quad && !(fb->cov & (1u << l))) continue;
         uint32_t idx = fb->idx[l];
         if (c->late && c->depth_write) {
             c->T->dep[idx] = fb->z[l];
@@ -1308,6 +1425,7 @@ static void flush_frags(tctx_t* c) {
         *px = c->blending ? blend(out, *px) : pack_color(out);
     }
     fb->n = 0;
+    fb->cov = 0;
 }
 
 static void set_state(tctx_t* c, uint32_t idx) {
@@ -1322,7 +1440,11 @@ static void set_state(tctx_t* c, uint32_t idx) {
     c->late = s->pipe.shader && (s->pipe.shader->h.flags & FGPU_SHADER_FLAG_DISCARD);
     c->color_on = c->t->color != NULL;
     c->mode = s->mode;
-    if (s->mode == 0) c->fsb = worker_batch(c->F->pass, c->W, s, true);
+    c->quad = s->mode == 0 && s->quad;
+    if (s->mode == 0) {
+        c->fsb = worker_batch(c->F->pass, c->W, s, true);
+        c->fsb->quad = c->quad ? 1u : 0u;
+    }
 }
 
 // The fragment stage for one covered pixel (e0..e2: exact edge values).
@@ -1347,6 +1469,11 @@ static inline void frag(tctx_t* c, const tri_rec_t* r, int32_t lx, int32_t ly,
     const float* vb = va + nv;
     const float* vc = vb + nv;
     if (c->mode == 0) {
+        if (c->quad) {      // shaded after the triangle, four pixels at a time (quad_flush)
+            c->T->qmask[(uint32_t)(ly >> 1) * (TILE / 2) + (uint32_t)(lx >> 1)] |=
+                (uint8_t)(1u << (((ly & 1) << 1) | (lx & 1)));
+            return;
+        }
         fgpu_shader_batch_t* sb = c->fsb;
         fbatch_t* fb = &c->fb;
         uint32_t lane = fb->n++;
@@ -1382,6 +1509,57 @@ static inline void frag(tctx_t* c, const tri_rec_t* r, int32_t lx, int32_t ly,
     }
     uint32_t* px = &T->col[idx];
     *px = c->blending ? blend(out, *px) : pack_color(out);
+}
+
+// Quad mode: shades the quads the triangle covered in this tile. Every quad runs all four
+// pixels (the uncovered ones are helpers whose varyings come from the triangle's plane
+// equations at their centers) so texture sampling can difference neighbours; only
+// covered pixels are written.
+static void quad_flush(tctx_t* c, const tri_rec_t* r) {
+    int32_t x0 = imax(r->x0, c->tx0), x1 = imin(r->x1, c->tx0 + TILE);
+    int32_t y0 = imax(r->y0, c->ty0), y1 = imin(r->y1, c->ty0 + TILE);
+    if (x0 >= x1 || y0 >= y1) return;
+    tile_t* T = c->T;
+    fgpu_shader_batch_t* sb = c->fsb;
+    fbatch_t* fb = &c->fb;
+    uint32_t nv = c->s->nv;
+    const float* va = r->var;
+    const float* vb = va + nv;
+    const float* vc = vb + nv;
+    for (int32_t qy = (y0 - c->ty0) >> 1; qy <= (y1 - 1 - c->ty0) >> 1; qy++) {
+        for (int32_t qx = (x0 - c->tx0) >> 1; qx <= (x1 - 1 - c->tx0) >> 1; qx++) {
+            uint8_t* mp = &T->qmask[(uint32_t)qy * (TILE / 2) + (uint32_t)qx];
+            uint32_t m = *mp;
+            if (!m) continue;
+            *mp = 0;
+            uint32_t base = fb->n;
+            for (int k = 0; k < 4; k++) {
+                int32_t lx = 2 * qx + (k & 1), ly = 2 * qy + (k >> 1);
+                int64_t X = (int64_t)(c->tx0 + lx) * 256 + 128, Y = (int64_t)(c->ty0 + ly) * 256 + 128;
+                int64_t e0 = r->A[0] * X + r->B[0] * Y + r->C[0];
+                int64_t e1 = r->A[1] * X + r->B[1] * Y + r->C[1];
+                int64_t e2 = r->A[2] * X + r->B[2] * Y + r->C[2];
+                float l0 = (float)e0 * W_K * r->inv_area, l1 = (float)e1 * W_K * r->inv_area,
+                      l2 = (float)e2 * W_K * r->inv_area;
+                float z = l0 * r->z[0] + l1 * r->z[1] + l2 * r->z[2];
+                float iw = l0 * r->inv_w[0] + l1 * r->inv_w[1] + l2 * r->inv_w[2];
+                float wpix = iw != 0.0f ? 1.0f / iw : 0.0f;
+                uint32_t lane = base + (uint32_t)k;
+                for (uint32_t v = 0; v < nv; v++)
+                    sb->input[v >> 2][v & 3][lane] = (l0 * va[v] + l1 * vb[v] + l2 * vc[v]) * wpix;
+                sb->special[0][0][lane] = (float)(c->tx0 + lx) + 0.5f;
+                sb->special[0][1][lane] = (float)(c->ty0 + ly) + 0.5f;
+                sb->special[0][2][lane] = z;
+                sb->special[0][3][lane] = iw;
+                for (int q = 0; q < 4; q++) sb->special[1][q][lane] = r->front ? 1.0f : 0.0f;
+                fb->idx[lane] = (uint32_t)ly * TILE + (uint32_t)lx;
+                fb->z[lane] = z;
+            }
+            fb->cov |= m << base;
+            fb->n += 4;
+            if (fb->n == FGPU_LANES) flush_frags(c);
+        }
+    }
 }
 
 // Pixels of a small triangle (rect up to DIRECT_PIXELS): edge functions at
@@ -1495,6 +1673,7 @@ static void tri_big(tctx_t* c, const tri_rec_t* r) {
 static void tri_draw(tctx_t* c, const tri_rec_t* r) {
     if (r->state != c->state_idx) set_state(c, r->state);
     if ((r->x1 - r->x0) * (r->y1 - r->y0) <= DIRECT_PIXELS) tri_direct(c, r); else tri_big(c, r);
+    if (c->quad) quad_flush(c, r);
     if (c->late) flush_frags(c);
 }
 
@@ -1528,6 +1707,7 @@ static void tile_run(flush_t* F, worker_t* W, uint32_t tile) {
     }
 
     tile_t* T = W->tile;
+    __builtin_memset(T->qmask, 0, sizeof(T->qmask));
     if (t->color) {
         if (clr_c) {
             for (int i = 0; i < TILE * TILE; i++) T->col[i] = opaque;
@@ -1807,6 +1987,27 @@ void fgpu_pass_clear(fgpu_pass_t* pass, const fgpu_target_t* t, uint32_t flags, 
     pass->clear_flags |= flags;
 }
 
+void fgpu_pass_clear_rect(fgpu_pass_t* pass, const fgpu_target_t* t, uint32_t flags, uint32_t color,
+                          float depth, int32_t x, int32_t y, int32_t w, int32_t h) {
+    if (!t || !t->height || !t->width) return;
+    int64_t x0 = x < 0 ? 0 : x, y0 = y < 0 ? 0 : y;
+    int64_t x1 = (int64_t)x + (w < 0 ? 0 : w), y1 = (int64_t)y + (h < 0 ? 0 : h);
+    if (x1 > (int64_t)t->width) x1 = t->width;
+    if (y1 > (int64_t)t->height) y1 = t->height;
+    if (x0 >= x1 || y0 >= y1) return;
+    if (x0 == 0 && y0 == 0 && x1 == (int64_t)t->width && y1 == (int64_t)t->height) {
+        fgpu_pass_clear(pass, t, flags, color, depth);
+        return;
+    }
+    // Draws and clears recorded earlier land first; this one is not merged into the pass.
+    if (pass && g_mode != FGPU_RASTER_IMMEDIATE && (pass->ndraws || pass->clear_flags)) pass_flush_impl(pass);
+    flags &= FGPU_CLEAR_COLOR | FGPU_CLEAR_DEPTH;
+    if (!flags) return;
+    rect_clear_job_t j = { t, flags, color, depth, (int32_t)x0, (int32_t)y0, (int32_t)x1, (int32_t)y1,
+                           band_rows((uint32_t)(y1 - y0)) };
+    run_parts(rect_clear_part, &j, ((uint32_t)(y1 - y0) + j.band_h - 1) / j.band_h);
+}
+
 void fgpu_pass_draw_layout(fgpu_pass_t* pass, const fgpu_target_t* t, const fgpu_pipeline_t* p,
                            const fgpu_layout_t* layout, const float* vertices, uint32_t vertex_count,
                            const uint32_t* indices, uint32_t count, uint32_t flags) {
@@ -1821,7 +2022,7 @@ void fgpu_pass_draw_layout(fgpu_pass_t* pass, const fgpu_target_t* t, const fgpu
     if (!tris) return;
     bool feedback = false;
     if (p->shader)
-        for (uint32_t u = 0; u < FGPU_MAX_TEXTURE_UNITS; u++)
+        for (uint32_t u = 0; u < FGPU_TEXTURE_UNITS; u++)
             if (p->textures[u].pixels && (p->textures[u].pixels == t->color)) feedback = true;
     if ((p->state & FGPU_STATE_WIREFRAME) || feedback) {
         // Lines, and draws that read what they write, run in submission order.
@@ -1849,11 +2050,19 @@ void fgpu_pass_draw_layout(fgpu_pass_t* pass, const fgpu_target_t* t, const fgpu
         int64_t cx1 = (int64_t)p->vp_x + p->vp_w, cy1 = (int64_t)p->vp_y + p->vp_h;
         if (cx1 > (int64_t)t->width) cx1 = t->width;
         if (cy1 > (int64_t)t->height) cy1 = t->height;
+        if (p->scissor) {
+            // The scissor only shrinks the area the rasterizer visits: no per-pixel cost.
+            if (cx0 < p->sc_x) cx0 = p->sc_x;
+            if (cy0 < p->sc_y) cy0 = p->sc_y;
+            if (cx1 > (int64_t)p->sc_x + p->sc_w) cx1 = (int64_t)p->sc_x + p->sc_w;
+            if (cy1 > (int64_t)p->sc_y + p->sc_h) cy1 = (int64_t)p->sc_y + p->sc_h;
+        }
         if (cx0 > cx1) cx0 = cx1;
         if (cy0 > cy1) cy0 = cy1;
         c->cx0 = (int32_t)cx0; c->cy0 = (int32_t)cy0; c->cx1 = (int32_t)cx1; c->cy1 = (int32_t)cy1;
         c->mode = mode_of(p);
         c->nv = nv_of(p);
+        c->quad = shader_uses_mips(p) ? 1u : 0u;
         int32_t found = -1;
         for (uint32_t k = 0; k < STATE_LOOKBACK && k < pass->nstates; k++) {
             uint32_t i = pass->nstates - 1 - k;
@@ -1933,6 +2142,13 @@ void fgpu_raster_clear(const fgpu_target_t* t, uint32_t flags, uint32_t color, f
     if (!pass) { if (t && t->height) old_clear(t, flags, color, depth); return; }
     fgpu_pass_clear(pass, t, flags, color, depth);
     fgpu_pass_flush(pass);
+}
+
+void fgpu_raster_clear_rect(const fgpu_target_t* t, uint32_t flags, uint32_t color, float depth,
+                            int32_t x, int32_t y, int32_t w, int32_t h) {
+    fgpu_pass_t* pass = g_mode == FGPU_RASTER_IMMEDIATE ? NULL : default_pass();
+    fgpu_pass_clear_rect(pass, t, flags, color, depth, x, y, w, h);
+    if (pass) fgpu_pass_flush(pass);
 }
 
 uint32_t fgpu_raster_draw_layout(const fgpu_target_t* t, const fgpu_pipeline_t* p,

@@ -602,6 +602,9 @@ static inline uint32_t nv_gmmu_index(uint64_t va, int level) {
 #define NVC5B5_LINE_COUNT           0x041Cu
 #define NVC5B5_SET_REMAP_CONST_A    0x0700u
 #define NVC5B5_SET_REMAP_COMPONENTS 0x0708u
+#define NVC5B5_SET_DST_BLOCK_SIZE   0x070Cu     // then DST_WIDTH, HEIGHT, DEPTH, LAYER, ORIGIN
+#define NVC5B5_SET_SRC_BLOCK_SIZE   0x0728u     // then SRC_WIDTH, HEIGHT, DEPTH, LAYER, ORIGIN
+#define   NVC5B5_BLOCK_GOB_HEIGHT_FERMI_8 (1u << 12)
 
 #define NV_CE_SUBCHANNEL 4u
 
@@ -649,6 +652,27 @@ typedef struct {                // NV2080_CTRL_INTERNAL_STATIC_GR_GET_CONTEXT_BU
     nv_ctxbuf_info_t engine[8][25];   // [GR engine][NV0080 ENGINE_ID]
 } nv_ctxbuf_infos_t;
 _Static_assert(sizeof(nv_ctxbuf_infos_t) == 1600, "GET_CONTEXT_BUFFERS_INFO_PARAMS");
+
+/* Falcon engines (NVDEC, NVENC, NVJPG, OFA) need an engine context buffer
+ * of the driver's own, promoted to the channel before the engine's class
+ * is allocated (nouveau fifo/r535.c: r535_fifo_ectx_size, r535_flcn_ctor).
+ * RM's internal client tells its size per engine descriptor. */
+#define NV2080_CTRL_CMD_INTERNAL_GET_CONSTRUCTED_FALCON_INFO 0x20800A42u
+#define NV_MAX_CONSTRUCTED_FALCONS 0x40u
+
+typedef struct {                // NV2080_CTRL_INTERNAL_CONSTRUCTED_FALCON_INFO
+    uint32_t engDesc;           // = the device info table's ENG_DESC
+    uint32_t ctxAttr;
+    uint32_t ctxBufferSize;
+    uint32_t addrSpaceList;
+    uint32_t registerBase;
+} nv_falcon_info_t;
+
+typedef struct {                // NV2080_CTRL_INTERNAL_GET_CONSTRUCTED_FALCON_INFO_PARAMS
+    uint32_t numConstructedFalcons;
+    nv_falcon_info_t table[NV_MAX_CONSTRUCTED_FALCONS];
+} nv_falcon_infos_t;
+_Static_assert(sizeof(nv_falcon_infos_t) == 1284, "GET_CONSTRUCTED_FALCON_INFO_PARAMS");
 
 // NV0080_CTRL_FIFO_GET_ENGINE_CONTEXT_PROPERTIES_ENGINE_ID_*
 #define NV_CTX_ENGINE_GRAPHICS          0x00u
@@ -702,3 +726,23 @@ void nv_push_host_semaphore(nv_push_t* p, uint64_t sem, uint32_t payload);
 // the copy engine, then releases the semaphore.
 void nv_push_ce_copy(nv_push_t* p, uint64_t src, uint32_t src_pitch, uint64_t dst, uint32_t dst_pitch,
                      uint32_t row_bytes, uint32_t rows, uint64_t sem, uint32_t payload);
+
+// A surface for nv_push_ce_copy_2d: pitch-linear (pitch in bytes) or
+// block-linear with blocks one GOB wide, one deep and 2^block_log2 GOBs
+// high (GOBs of 64 bytes x 8 rows); `width_bytes` and `height` are then
+// the whole surface's, as its 3D or texture binding describes it.
+typedef struct {
+    uint64_t va;
+    bool block_linear;
+    uint32_t pitch;             // pitch-linear: bytes per row
+    uint32_t width_bytes;       // block-linear: surface width in bytes
+    uint32_t height;            // block-linear: surface height in rows
+    uint32_t block_log2;        // block-linear: block height in GOBs, log2
+} nv_ce_surface_t;
+
+// Copies a row_bytes x rows rectangle from the top-left corner of `src`
+// to the top-left corner of `dst`, either layout on either side (the
+// copy engine swizzles), then releases `payload` at `sem`.
+void nv_push_ce_copy_2d(nv_push_t* p, const nv_ce_surface_t* src, const nv_ce_surface_t* dst,
+                        uint32_t row_bytes, uint32_t rows, uint64_t sem, uint32_t payload);
+

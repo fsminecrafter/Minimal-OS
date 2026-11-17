@@ -39,8 +39,13 @@ typedef struct {
     // ABI 2
     const fgpu_program_t* shader;       // NULL = built-in program
     const float (*constants)[4];        // FGPU_SHADER_MAX_UNIFORMS registers
-    fgpu_texture_t textures[FGPU_MAX_TEXTURE_UNITS];
+    fgpu_texture_t textures[FGPU_TEXTURE_UNITS];
     fgpu_storage_buffer_t storage_buffers[FGPU_MAX_STORAGE_BUFFERS];
+    // ABI 4: scissor rectangle (FGPU_OP_SCISSOR), top-left origin like the
+    // viewport. Applies to draws (the clip bounds of every path) and, through
+    // fgpu_raster_clear_rect() / fgpu_pass_clear_rect(), to clears.
+    uint32_t scissor;                   // 0 = off
+    int32_t sc_x, sc_y, sc_w, sc_h;
 } fgpu_pipeline_t;
 
 /* Several cores. The rasterizer splits a draw into parts (groups of
@@ -70,6 +75,11 @@ void fgpu_layout_default(fgpu_layout_t* layout);
 bool fgpu_layout_valid(const fgpu_layout_t* layout);
 
 void fgpu_raster_clear(const fgpu_target_t* t, uint32_t flags, uint32_t color, float depth);
+
+// Clears only the pixels of the rectangle x, y, w, h (top-left origin, clipped to the
+// target). A rectangle covering the whole target is the same as fgpu_raster_clear().
+void fgpu_raster_clear_rect(const fgpu_target_t* t, uint32_t flags, uint32_t color, float depth,
+                            int32_t x, int32_t y, int32_t w, int32_t h);
 
 // Draws triangles. vertices: FGPU_VERTEX_P3N3C4 data, vertex_count of
 // them. indices: NULL for 0,1,2,...; otherwise index_count uint32 indices
@@ -132,6 +142,10 @@ void fgpu_pass_draw_layout(fgpu_pass_t* pass, const fgpu_target_t* t, const fgpu
                            const fgpu_layout_t* layout, const float* vertices,
                            uint32_t vertex_count, const uint32_t* indices, uint32_t count,
                            uint32_t flags);
+// A clear limited to a rectangle. Pending draws are rendered first (a partial clear
+// cannot be merged into the pass), then the rectangle is cleared right away.
+void fgpu_pass_clear_rect(fgpu_pass_t* pass, const fgpu_target_t* t, uint32_t flags, uint32_t color,
+                          float depth, int32_t x, int32_t y, int32_t w, int32_t h);
 // Renders what is pending. Returns the triangles drawn (the value
 // fgpu_raster_draw_layout() returns) by everything since the last flush.
 uint32_t fgpu_pass_flush(fgpu_pass_t* pass);

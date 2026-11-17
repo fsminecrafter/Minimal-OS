@@ -397,6 +397,38 @@ void nv_push_ce_copy(nv_push_t* p, uint64_t src, uint32_t src_pitch, uint64_t ds
     nv_push_1(p, s, NVC5B5_LAUNCH_DMA, launch);
 }
 
+// One side of a 2D copy: a block-linear surface's description (block
+// size, size in bytes and rows, one layer, origin 0,0).
+static void ce_block_surface(nv_push_t* p, uint32_t method, const nv_ce_surface_t* s) {
+    uint32_t v[6] = {
+        NVC5B5_BLOCK_GOB_HEIGHT_FERMI_8 | ((s->block_log2 & 7u) << 4),     // 1 GOB wide and deep
+        s->width_bytes, s->height, 1, 0, 0,
+    };
+    nv_push_method(p, NV_CE_SUBCHANNEL, method, v, 6);
+}
+
+void nv_push_ce_copy_2d(nv_push_t* p, const nv_ce_surface_t* src, const nv_ce_surface_t* dst,
+                        uint32_t row_bytes, uint32_t rows, uint64_t sem, uint32_t payload) {
+    const uint32_t s = NV_CE_SUBCHANNEL;
+    nv_push_1(p, s, NV_3D_SET_OBJECT, NV_CLASS_TURING_DMA_COPY_A);
+    if (src->block_linear) ce_block_surface(p, NVC5B5_SET_SRC_BLOCK_SIZE, src);
+    if (dst->block_linear) ce_block_surface(p, NVC5B5_SET_DST_BLOCK_SIZE, dst);
+    uint32_t geom[8] = {
+        (uint32_t)(src->va >> 32) & 0x1FFFFu, (uint32_t)src->va,  // OFFSET_IN_UPPER/LOWER
+        (uint32_t)(dst->va >> 32) & 0x1FFFFu, (uint32_t)dst->va,  // OFFSET_OUT_UPPER/LOWER
+        src->block_linear ? 0u : src->pitch, dst->block_linear ? 0u : dst->pitch,
+        row_bytes, rows,                                          // LINE_LENGTH_IN (bytes), LINE_COUNT
+    };
+    nv_push_method(p, s, NVC5B5_OFFSET_OUT_UPPER - 8u, geom, 8);
+    uint32_t semv[3] = { (uint32_t)(sem >> 32) & 0x1FFFFu, (uint32_t)sem, payload };
+    nv_push_method(p, s, NVC5B5_SET_SEMAPHORE_A, semv, 3);
+    // NON_PIPELINED | FLUSH | one-word semaphore | layouts | multi-line.
+    uint32_t launch = 2u | (1u << 2) | (1u << 3) | (1u << 9);
+    if (!src->block_linear) launch |= 1u << 7;
+    if (!dst->block_linear) launch |= 1u << 8;
+    nv_push_1(p, s, NVC5B5_LAUNCH_DMA, launch);
+}
+
 void nv_push_host_semaphore(nv_push_t* p, uint64_t sem, uint32_t payload) {
     uint32_t v[5] = { (uint32_t)sem, (uint32_t)(sem >> 32) & 0xFFu, payload, 0, NVC46F_SEM_RELEASE_WFI };
     nv_push_method(p, 0, NVC46F_SEM_ADDR_LO, v, 5);

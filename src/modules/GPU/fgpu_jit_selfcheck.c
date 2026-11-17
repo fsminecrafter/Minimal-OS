@@ -172,8 +172,8 @@ bool fgpu_jit_selfcheck(void (*say)(const char* line)) {
     }
     rng_t g0 = { 0x1234567887654321ull };
     for (int i = 0; i < 16 * 16; i++) texels[i] = rnd(&g0);
-    fgpu_texture_t tex[FGPU_MAX_TEXTURE_UNITS];
-    for (int u = 0; u < (int)FGPU_MAX_TEXTURE_UNITS; u++) {
+    fgpu_texture_t tex[FGPU_TEXTURE_UNITS];
+    for (int u = 0; u < (int)FGPU_TEXTURE_UNITS; u++) {
         tex[u].pixels = texels;
         tex[u].width = 16;
         tex[u].height = 16;

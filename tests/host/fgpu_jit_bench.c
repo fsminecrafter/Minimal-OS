@@ -25,7 +25,7 @@ static float frand(float lo, float hi) {
 static fgpu_shader_batch_t batch;
 static float uniforms[FGPU_SHADER_MAX_UNIFORMS][4];
 static uint32_t texels[64 * 64];
-static fgpu_texture_t tex[FGPU_MAX_TEXTURE_UNITS];
+static fgpu_texture_t tex[FGPU_TEXTURE_UNITS];
 static fglsl_program_t comp;
 static uint32_t blob[FGLSL_MAX_BLOB_WORDS];
 

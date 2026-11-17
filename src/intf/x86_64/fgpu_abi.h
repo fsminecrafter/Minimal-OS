@@ -2,6 +2,7 @@
 #define FGPU_ABI_H
 
 #include <stdint.h>
+#include <stddef.h>
 
 /*
  * FGPU: the Farcade GPU interface (SYS_GPU).
@@ -23,8 +24,9 @@
  *            or a shader program (ABI version 2): FGPU bytecode for a
  *            vertex and a fragment stage, made by the SDK's FGSL compiler
  *            (fglsl.h) from GLSL-style source. See "Shader programs" below.
- *   texture  any color surface, bound to one of FGPU_MAX_TEXTURE_UNITS
- *            units and sampled by shaders.
+ *   texture  any color surface, bound to one of FGPU_TEXTURE_UNITS
+ *            units and sampled by shaders. A surface made with
+ *            FGPU_SURFACE_MIPMAPS carries a mip chain (see "Mipmaps").
  *
  * Command encoding: 32-bit words. Each command starts with a header word
  * (opcode << 16) | total length in words (header included), followed by
@@ -34,8 +36,11 @@
 #define SYS_GPU 40
 // Version 2 adds shader programs, vertex layouts, textures and blending.
 // Version 3 adds asynchronous submits with fences (FGPU_SUBMIT_ASYNC,
-// SYS_GPU_WAIT). The kernel still accepts version-1 and -2 requests.
-#define SYS_GPU_ABI_VERSION 3u
+// SYS_GPU_WAIT). Version 4 adds scissor (FGPU_OP_SCISSOR), mipmapped
+// textures with trilinear filtering (FGPU_SURFACE_MIPMAPS, FGPU_OP_GENERATE_MIPMAPS,
+// FGPU_TEXTURE_MIP_*), 16 texture units and a limits block in
+// syscall_gpu_info_t. The kernel still accepts version-1, -2 and -3 requests.
+#define SYS_GPU_ABI_VERSION 4u
 #define SYS_GPU_ABI_VERSION_MIN 1u
 
 enum {
@@ -78,6 +83,8 @@ enum {
 // Surface flags
 #define FGPU_SURFACE_SYSTEM_MEMORY (1u << 0)   // never place in VRAM
 #define FGPU_SURFACE_SCANOUT       (1u << 1)   // screen-sized, can be flipped to
+#define FGPU_SURFACE_MIPMAPS       (1u << 2)   // color only (ABI 4): allocate a full mip chain
+                                               // (see "Mipmaps"); lives in system memory
 
 // Present flags
 #define FGPU_PRESENT_FLIP   (1u << 0)  // page flip if possible (screen only)
@@ -124,6 +131,9 @@ typedef struct {
 #define FGPU_CAP_ASYNC          (1u << 7)   // FGPU_SUBMIT_ASYNC and SYS_GPU_WAIT (ABI 3)
 #define FGPU_CAP_SCALED_PRESENT (1u << 8)   // PRESENT SCALE2/SCALE3 flags
 #define FGPU_CAP_PACED_PRESENT  (1u << 9)   // PRESENT_PACED, SYS_GPU_SET_PACE
+#define FGPU_CAP_SCISSOR        (1u << 10)  // FGPU_OP_SCISSOR (ABI 4)
+#define FGPU_CAP_MIPMAPS        (1u << 11)  // FGPU_SURFACE_MIPMAPS, FGPU_TEXTURE_MIP_*, FGPU_OP_GENERATE_MIPMAPS
+#define FGPU_CAP_TEXTURE_UNITS16 (1u << 12) // FGPU_TEXTURE_UNITS (16) texture units usable
 
 typedef struct {
     uint32_t size;              // sizeof(syscall_gpu_info_t), set by caller
@@ -139,7 +149,19 @@ typedef struct {
     uint32_t screen_width;
     uint32_t screen_height;
     uint32_t reserved;
+    // Limits block (ABI 4). SYS_GPU_INFO also accepts the shorter size
+    // SYS_GPU_INFO_SIZE_BASE (everything above this block) and then leaves
+    // the block out, so programs built before ABI 4 keep working.
+    uint32_t max_texture_units;     // FGPU_TEXTURE_UNITS the CPU backend offers
+    uint32_t max_mip_levels;        // FGPU_MAX_MIP_LEVELS (0 = no mipmaps)
+    uint32_t max_varyings;
+    uint32_t max_uniform_vec4;
+    uint32_t max_storage_buffers;
+    uint32_t max_surface_size;
+    uint32_t max_buffer_bytes;
+    uint32_t limits_reserved;
 } syscall_gpu_info_t;
+#define SYS_GPU_INFO_SIZE_BASE offsetof(syscall_gpu_info_t, max_texture_units)
 
 /* ------------------------------------------------------------ commands */
 
@@ -158,9 +180,57 @@ enum {
     FGPU_OP_SET_CONSTANTS,      // first register, count, then count * 4 floats
     FGPU_OP_SET_VERTEX_LAYOUT,  // stride in floats, count, then count words:
                                 //   FGPU_ATTRIB(offset in floats, components)
-    FGPU_OP_BIND_TEXTURE,       // unit, color surface (0 = none), FGPU_TEXTURE_* flags
+    FGPU_OP_BIND_TEXTURE,       // unit < FGPU_TEXTURE_UNITS, color surface (0 = none), FGPU_TEXTURE_* flags,
+                                //   optional (ABI 4): lod bias (float), min lod (float), max lod (float)
     FGPU_OP_BIND_STORAGE_BUFFER,// unit, buffer handle (0 = none)
+    // ABI version 4
+    FGPU_OP_SCISSOR,            // enable (0/1), x, y, width, height (int32): see "Scissor"
+    FGPU_OP_GENERATE_MIPMAPS,   // color surface made with FGPU_SURFACE_MIPMAPS
 };
+
+/*
+ * Scissor (ABI 4)
+ *
+ * FGPU_OP_SCISSOR turns the scissor test on or off and sets its rectangle.
+ * While it is on, draws and clears (FGPU_OP_CLEAR, both color and depth)
+ * only touch pixels inside the rectangle, further clipped to the bound
+ * target. The origin is the TOP-LEFT pixel of the target with y pointing
+ * down, the same as FGPU_OP_VIEWPORT (so a viewport and a scissor of the
+ * same numbers cover the same pixels). A rectangle with width or height 0
+ * (or entirely outside the target) draws nothing; negative sizes are
+ * SYS_ERR_INVAL. x and y may be negative (the rectangle is clipped). The
+ * state belongs to the command buffer: every SUBMIT starts with the
+ * scissor off and a rectangle that covers any target; BIND_TARGET does not
+ * change it. The test costs nothing per pixel: the rectangle only shrinks
+ * the area the rasterizer visits. Hardware backends that do not implement
+ * it are not offered scissored work (the CPU backend draws it).
+ */
+
+/*
+ * Mipmaps (ABI 4)
+ *
+ * A color surface created with FGPU_SURFACE_MIPMAPS holds a chain of
+ * levels: level 0 is the surface itself (width x height), level k is
+ * max(1, width >> k) x max(1, height >> k), down to 1 x 1 (at most
+ * FGPU_MAX_MIP_LEVELS). Levels > 0 are tightly packed. Render targets
+ * and readbacks only see level 0.
+ *
+ * Fill levels with SYS_GPU_WRITE_SURFACE (the request's `offset` is the
+ * level; 0 before ABI 4; data/pitch are that level's pixels) or let
+ * FGPU_OP_GENERATE_MIPMAPS rebuild levels 1.. from level 0 with a 2x2 box
+ * filter (in command order, so it can follow drawing into level 0).
+ *
+ * Sampling picks a level from the screen-space derivatives of the texture
+ * coordinate: lod = log2(longest side of the pixel footprint in texels).
+ * The fragment stage is run on 2x2 pixel quads for this (fine
+ * differences inside the quad); sampling in the vertex stage uses level 0.
+ * The filter comes from the flags of FGPU_OP_BIND_TEXTURE:
+ *   neither MIP flag     level 0 only (NEAREST or LINEAR, as before)
+ *   MIP_NEAREST          the nearest level (+ LINEAR: bilinear inside it)
+ *   MIP_LINEAR           blend the two nearest levels (+ LINEAR: trilinear)
+ * With lod <= 0 (magnification) level 0 is used with the LINEAR flag.
+ * A texture without a chain ignores the MIP flags.
+ */
 
 #define FGPU_CLEAR_COLOR (1u << 0)
 #define FGPU_CLEAR_DEPTH (1u << 1)
@@ -189,6 +259,16 @@ enum {
 // Texture flags
 #define FGPU_TEXTURE_LINEAR (1u << 0)       // bilinear filtering (else nearest)
 #define FGPU_TEXTURE_CLAMP  (1u << 1)       // clamp to the edge (else repeat)
+#define FGPU_TEXTURE_MIP_NEAREST (1u << 2)  // ABI 4: pick the nearest mip level
+#define FGPU_TEXTURE_MIP_LINEAR  (1u << 3)  // ABI 4: blend the two nearest mip levels
+#define FGPU_TEXTURE_FLAGS_KNOWN 0x0Fu
+#define FGPU_MAX_MIP_LEVELS 13u             // 4096 x 4096 down to 1 x 1
+// Texture units programs may bind (ABI 4). Older programs and the hardware
+// backends only know FGPU_MAX_TEXTURE_UNITS.
+#define FGPU_TEXTURE_UNITS 16u
+// The units the NVIDIA backend can sample (its constant buffer and pools are
+// laid out for them): draws that use a higher unit run on the CPU backend.
+// TODO(nv): raise to FGPU_TEXTURE_UNITS once the backend lays out 16 units.
 #define FGPU_MAX_TEXTURE_UNITS 4u
 #define FGPU_MAX_STORAGE_BUFFERS 4u
 

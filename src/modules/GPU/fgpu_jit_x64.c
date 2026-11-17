@@ -566,9 +566,19 @@ static void emit_call_prologue_live(g_t* g, uint32_t i, bool save) {
 }
 
 // The texture helper: samples the unit for `n` lanes, out is [4][8] floats.
+// Bit 0 of `textures` says the lanes are 2x2 quads (fgpu_shader_batch_t::quad):
+// fgpu_jit_run_code() sets it, it is never a real pointer bit (the array is
+// at least 8-byte aligned). The level of detail comes from the quad's
+// neighbours, in the same C code the interpreter calls, so both agree.
 static void jit_tex_helper(const fgpu_texture_t* textures, uint32_t unit, const float* u,
                            const float* v, float* out, uint32_t n) {
+    bool quads = ((uintptr_t)textures & 1u) != 0;
+    textures = (const fgpu_texture_t*)((uintptr_t)textures & ~(uintptr_t)1u);
     const fgpu_texture_t* t = textures ? &textures[unit] : NULL;
+    if (quads && fgpu_texture_has_mips(t)) {
+        fgpu_texture_sample_batch(t, u, v, n, true, out);       // out is [4][FGPU_LANES] too
+        return;
+    }
     for (uint32_t l = 0; l < n; l++) {
         float px[4];
         fgpu_texture_sample(t, u[l], v[l], px);
@@ -703,7 +713,7 @@ static void gen_inst(g_t* g, uint32_t i) {
             return;
         }
         case FGPU_IR_TEX: {
-            if (in->aux >= FGPU_MAX_TEXTURE_UNITS) { efail(e, "texture unit out of range"); return; }
+            if (in->aux >= FGPU_TEXTURE_UNITS) { efail(e, "texture unit out of range"); return; }
             if (g->ntex >= MAX_TEX || g->tex_slot_next < 4 + 1) { efail(e, "too many texture samples"); return; }
             uint32_t base = g->tex_slot_next - 4;
             g->tex_slot_next = base;
@@ -902,6 +912,8 @@ uint32_t fgpu_jit_run_code(const fgpu_jit_code_t* c, fgpu_shader_batch_t* b, uin
     lanes &= 0xFFu;
     if (!uniforms) uniforms = g_zero_uniforms;
     uint32_t alive = 0;
+    // Tell the texture helper the lanes are quads (see jit_tex_helper).
+    if (b->quad) textures = (const fgpu_texture_t*)((uintptr_t)textures | 1u);
     if (c->width == 8) {
         if (lanes) alive = c->fn((char*)b, &uniforms[0][0], textures);
     } else {

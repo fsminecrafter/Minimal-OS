@@ -390,8 +390,39 @@ static void test_pushbuffers(void) {
     CHECK(sy == -25.0f, "the viewport flips y");
     CHECK(find_method(&p, 0x1160, 0) == ((0u << 7) | (0x02u << 21) | (7u << 27)) &&
           find_method(&p, 0x1168, 0) == ((24u << 7) | (0x01u << 21) | (7u << 27)) &&
-          find_method(&p, 0x116C, 0) == (1u << 6), "vertex attributes");
+          find_method(&p, 0x116C, 0) == ((1u << 6) | (0x12u << 21) | (7u << 27)), "vertex attributes");
     CHECK(find_method(&p, 0x1C00, 0) == (40u | (1u << 12)) && find_method(&p, 0x0604, 0) == 1440, "vertex stream");
+    {
+        // A draw with depth goes to a block-linear color target: width and
+        // height in pixels (rounded to GOBs), block-linear layout, layer size.
+        uint32_t bw, bh, bytes;
+        nv3d_color_bl_size(100, 50, &bw, &bh, &bytes);
+        CHECK(bw == 112 && bh == 56 && bytes == 112u * 56u * 4u, "block-linear color rounded to GOBs");
+        static uint32_t words2[4096];
+        nv_push_t p2;
+        nv_push_init(&p2, words2, 4096);
+        nv3d_draw_t d2 = d;
+        d2.color = (nv3d_color_t){ 0x80500000ull, 0, 100, 50, true, bw, bh };
+        nv3d_push_draw(&p2, &d2);
+        CHECK(find_method(&p2, 0x0E00, 0) == 0, "scissor off by default");
+        nv3d_draw_t d3 = d;
+        d3.scissor = true;
+        d3.sc_x0 = 10; d3.sc_y0 = 5; d3.sc_x1 = 60; d3.sc_y1 = 40;
+        nv_push_init(&p2, words2, 4096);
+        nv3d_push_draw(&p2, &d3);
+        CHECK(find_method(&p2, 0x0E00, 0) == 1 && find_method(&p2, 0x0E04, 0) == (10u | (60u << 16)) &&
+              find_method(&p2, 0x0E08, 0) == (5u | (40u << 16)), "draw scissor");
+        nv_push_init(&p2, words2, 4096);
+        nv3d_push_clear_rect(&p2, &d2.color, &z, FGPU_CLEAR_COLOR | FGPU_CLEAR_DEPTH, 0x123456, 1.0f, 2, 3, 30, 20);
+        CHECK(find_method(&p2, 0x0E00, 0) == 1 && find_method(&p2, 0x0E04, 0) == (2u | (30u << 16)) &&
+              find_method(&p2, 0x10F8, 0) == (1u << 8) && find_method(&p2, 0x19D0, 0) == 0x3Du, "scissored clear");
+        nv_push_init(&p2, words2, 4096);
+        nv3d_push_draw(&p2, &d2);
+        CHECK(!p2.overflow && find_method(&p2, 0x0804, 0) == 0x80500000u && find_method(&p2, 0x0808, 0) == 112 &&
+              find_method(&p2, 0x080C, 0) == 56 && find_method(&p2, 0x0814, 0) == 0 &&
+              find_method(&p2, 0x081C, 0) == (112u * 56u * 4u) / 4u && find_method(&p2, 0x0FF4, 0) == (100u << 16),
+              "block-linear color target");
+    }
     CHECK(find_method(&p, 0x2040, 0) == 0x11 && find_method(&p, 0x2058, 0) == 0x80300000u &&
           find_method(&p, 0x204C, 0) == 12 && find_method(&p, 0x2050, 0) == 0, "vertex stage bound");
     CHECK(find_method(&p, 0x2140, 0) == 0x51 && find_method(&p, 0x2158, 0) == 0x80301000u &&
@@ -494,7 +525,7 @@ int main(void) {
             rng = rng * 1664525u + 1013904223u;
             texels[t][i] = rng;
         }
-        textures[t] = (fgpu_texture_t){ texels[t], 8, 8, 8, t ? FGPU_TEXTURE_LINEAR : 0 };
+        textures[t] = (fgpu_texture_t){ .pixels = texels[t], .width = 8, .height = 8, .pitch = 8, .flags = t ? FGPU_TEXTURE_LINEAR : 0 };
     }
     test_encodings();
     test_pushbuffers();

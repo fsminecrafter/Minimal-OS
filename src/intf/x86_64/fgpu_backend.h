@@ -29,6 +29,11 @@ typedef struct {
     fgpu_target_t cpu;          // the same target as CPU pointers
     fgpu_mem_t color;           // XRGB8888, pitch cpu.color_pitch pixels
     fgpu_mem_t depth;           // float32, pitch cpu.depth_pitch floats
+    // ABI 4 scissor (FGPU_OP_SCISSOR) for clears: when set, a clear only
+    // covers this rectangle (top-left origin; not clamped to the target).
+    // Draws read the same rectangle from their pipeline.
+    bool scissor;
+    int32_t sc_x, sc_y, sc_w, sc_h;
 } fgpu_hw_target_t;
 
 typedef struct {
@@ -59,7 +64,8 @@ typedef struct {
     void* (*program_create)(const fgpu_program_t* program);
     void (*program_destroy)(void* program);
 
-    // Return true if the work was queued on the GPU.
+    // Return true if the work was queued on the GPU. Clears honour
+    // target->scissor; draws honour pipe->scissor (or return false).
     bool (*clear)(const fgpu_hw_target_t* target, uint32_t flags, uint32_t color, float depth);
     bool (*draw)(const fgpu_hw_draw_t* draw, uint32_t* triangles);
 

@@ -16,17 +16,31 @@
  *
  * Addresses are GPU virtual addresses. Color targets and textures are
  * pitch-linear XRGB8888 / ARGB8888 (address and pitch multiples of 128
- * bytes for a target, 32 for a texture). Depth is a block-linear ZF32
- * buffer of the backend's own: the hardware has no pitch-linear depth.
+ * bytes for a target, 32 for a texture), or block-linear color targets
+ * the backend keeps for draws with depth (the hardware refuses a
+ * pitch-linear color target together with a depth buffer). Depth is a
+ * block-linear ZF32 buffer of the backend's own: the hardware has no
+ * pitch-linear depth.
  */
 
 #define NV3D_POOL_ENTRIES 16u       // texture headers / samplers (32 bytes each)
 
 typedef struct {
     uint64_t va;
-    uint32_t pitch_bytes;
+    uint32_t pitch_bytes;           // pitch-linear only
     uint32_t width, height;
+    // Block-linear (blocks of one GOB: 64 bytes x 8 rows), laid out for
+    // bl_width x bl_height pixels (nv3d_color_bl_size). The hardware only
+    // renders with a depth buffer into block-linear color targets
+    // (DATA_ERROR RT_LINEAR_WITH_ZETA, a "graphics class error" otherwise).
+    bool block_linear;
+    uint32_t bl_width, bl_height;
 } nv3d_color_t;
+
+// Layout of a block-linear color target for width x height pixels:
+// the padded size (GOB multiples) and the bytes it takes.
+void nv3d_color_bl_size(uint32_t width, uint32_t height, uint32_t* bl_width, uint32_t* bl_height,
+                        uint32_t* bytes);
 
 typedef struct {
     uint64_t va;
@@ -60,6 +74,10 @@ typedef struct {
     bool indexed;
     uint64_t ib_va, ib_bytes;       // uint32 indices
     uint32_t count;                 // vertices or indices, a multiple of 3
+    // FGPU scissor (ABI 4), clamped to the target: pixels x0 <= x < x1,
+    // y0 <= y < y1, row 0 at the top like the window origin.
+    bool scissor;
+    uint32_t sc_x0, sc_y0, sc_x1, sc_y1;
 } nv3d_draw_t;
 
 // State that never changes: once per channel, before anything else.
@@ -67,6 +85,9 @@ void nv3d_push_init(nv_push_t* p, uint64_t tic_va, uint64_t tsc_va, uint64_t zer
 // Clears (FGPU_CLEAR_*) the whole color target and/or depth buffer.
 void nv3d_push_clear(nv_push_t* p, const nv3d_color_t* color, const nv3d_zeta_t* zeta,
                      uint32_t flags, uint32_t xrgb, float depth);
+// The same, limited to pixels x0 <= x < x1, y0 <= y < y1 (scissor 0).
+void nv3d_push_clear_rect(nv_push_t* p, const nv3d_color_t* color, const nv3d_zeta_t* zeta, uint32_t flags,
+                          uint32_t xrgb, float depth, uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1);
 void nv3d_push_draw(nv_push_t* p, const nv3d_draw_t* d);
 
 // A texture header (8 words) for an image the backend samples:
@@ -99,6 +120,8 @@ void nv3d_sampler(uint32_t out[8], uint32_t flags);
 #define NVC597_SET_BACK_POLYGON_MODE        0x0DB0u
 #define NVC597_SET_WINDOW_OFFSET_X          0x0DF8u
 #define NVC597_SET_SCISSOR_ENABLE(j)        (0x0E00u + (j) * 16u)
+#define NVC597_SET_SCISSOR_HORIZONTAL(j)    (0x0E04u + (j) * 16u)     // xmin | xmax << 16
+#define NVC597_SET_SCISSOR_VERTICAL(j)      (0x0E08u + (j) * 16u)     // ymin | ymax << 16
 #define NVC597_SET_VERTEX_STREAM_SUBSTITUTE_A 0x0F84u
 #define NVC597_SET_SINGLE_CT_WRITE_CONTROL  0x0F90u
 #define NVC597_SET_CT_MRT_ENABLE            0x0FACu

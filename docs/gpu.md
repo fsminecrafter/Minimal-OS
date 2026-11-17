@@ -670,15 +670,41 @@ evaluator) and the CPU shader machine, and checks that they agree.
 4. `gpu nvidia boot` goes on by itself. **Step 4a** (3D channel) prints
    `golden context recorded`, the channel, and `first 3D clear: reads
    back 0xffff8000 (ok)`. **Step 4b** compiles the built-in shader, then
-   clears a 64x64 surface and draws two triangles with depth test and
-   back-face culling, and prints three pixels:
+   draws in two stages: first the near triangle alone, without depth,
+   into a pitch-linear 64x64 surface; then both triangles with depth test
+   and back-face culling into a **block-linear** target, which the copy
+   engine copies back to the surface before three pixels are checked:
 
    ```text
    Step 4b: FarcadeGL draws on the 3D engine
      shaders: vertex and pixel stage compiled (19 + 13 registers)
+     without depth: centre 0xff4080bf, corner 0xff102030 (ok)
      clockwise front: centre 0xff4080bf, left 0xffff0000, corner 0xff102030
      ok: triangles, shaders, depth test and culling work on the 3D engine.
    ```
+
+   First run on an RTX 2060 (2026-11-17): the clears of step 4a worked,
+   but the first job of step 4b failed with `GSP-RM: channel error (RC)
+   on engine 0x1, channel 8, exception 69` (69 =
+   `ROBUST_CHANNEL_GR_CLASS_ERROR`, Xid 69: the graphics engine refused a
+   method or its data). That job cleared and drew into a **pitch-linear**
+   color target with a depth buffer bound, which the hardware does not
+   allow (nouveau's data error name: `RT_LINEAR_WITH_ZETA`; NVK renders
+   linear images through a tiled shadow for the same reason). Changes:
+   - draws with depth (and clears of color with depth) go to a
+     block-linear copy of the color surface that the backend keeps
+     (`tiled` in `fgpu_backend_nv.c`); the copy engine brings it back to
+     the FGPU surface (`nv_rm_ce_copy_surface`, block-linear to pitch)
+     in `finish()`, before a read, before a draw samples that surface,
+     and before a draw falls back to the CPU; a depth-only clear binds no
+     color target;
+   - vertex attributes that come from no stream now carry a valid format
+     (R32 float, as nouveau's nvc0 does) instead of 0, which is no value
+     of `COMPONENT_BIT_WIDTHS` or `NUMERICAL_TYPE`;
+   - when a 3D job fails, the log shows what PGRAPH trapped:
+     `PGRAPH trap: status ..., subchannel S method 0xMMMM data 0x...,
+     error 0xE NAME` (from 0x400100/0x400704/0x400708/0x400110, as
+     nouveau's gf100_gr_intr reads them), which names the method.
 
    The centre is inside both triangles (the near, blue-ish one must win),
    `left` only inside the far red one, `corner` in neither. If the first
@@ -687,7 +713,7 @@ evaluator) and the CPU shader machine, and checks that they agree.
 
    | Result | Look at |
    | --- | --- |
-   | `the test draw did not finish`, with `channel error (RC)` or `GPU page fault` above it | a method or address the engine rejects: `nv3d_push_init` / `nv3d_push_draw` in `nv_3d.c` (the error names the method offset) |
+   | `the draw without depth did not finish` or `the test draw did not finish`, with `channel error (RC)` or `GPU page fault` above it | a method or address the engine rejects: `nv3d_push_init` / `nv3d_push_draw` in `nv_3d.c`; the `PGRAPH trap` line names the method offset and the error |
    | all three pixels are the clear color with both windings | nothing was rasterized: vertex stream/attribute setup, the vertex stage's code or header (`nv_sass.c`), or the viewport |
    | centre and left have a color, but the wrong one | the pixel stage: interpolation (`IPA`), the output registers, or the constant buffer |
    | centre is red | the depth buffer: block-linear layout or depth state |
@@ -698,9 +724,16 @@ evaluator) and the CPU shader machine, and checks that they agree.
    and rendering continues on the CPU.
 
 5. **Step 5a** (video decoder): a channel on NVDEC with the decoder
-   class (`NVC4B0_VIDEO_DECODER`); GSP-RM runs NVDEC's firmware itself.
-   It prints `channel N on NVDEC (runlist R)` and `ok: the video
-   decoder's channel runs.` after an empty first job. `gpu nvidia` then
+   class (`NVC4B0_VIDEO_DECODER`); GSP-RM runs NVDEC's firmware itself,
+   but like every falcon engine NVDEC needs an engine context buffer from
+   the driver, promoted to the channel before the class is allocated
+   (nouveau `fifo/r535.c`: `r535_fifo_ectx_size`, `r535_flcn_ctor`). The
+   size comes from RM's internal `GET_CONSTRUCTED_FALCON_INFO` for NVDEC's
+   engine descriptor (`engine context: N KiB`). Without it the first run
+   on an RTX 2060 got `video decoder object (class 0xC4B0): RM error 0x1F`
+   (`NV_ERR_INVALID_ARGUMENT`). Then it prints `channel N on NVDEC
+   (runlist R)` and `ok: the video decoder's channel runs.` after an
+   empty first job. `gpu nvidia` then
    shows step 5 with the number of H.264 pictures NVDEC decoded, or that
    it was switched off because its pictures differed from the CPU
    decoder's (see docs/media.md for how files are checked). A failed

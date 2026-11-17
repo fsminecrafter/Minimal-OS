@@ -16,17 +16,31 @@
  *
  * Addresses are GPU virtual addresses. Color targets and textures are
  * pitch-linear XRGB8888 / ARGB8888 (address and pitch multiples of 128
- * bytes for a target, 32 for a texture). Depth is a block-linear ZF32
- * buffer of the backend's own: the hardware has no pitch-linear depth.
+ * bytes for a target, 32 for a texture), or block-linear color targets
+ * the backend keeps for draws with depth (the hardware refuses a
+ * pitch-linear color target together with a depth buffer). Depth is a
+ * block-linear ZF32 buffer of the backend's own: the hardware has no
+ * pitch-linear depth.
  */
 
 #define NV3D_POOL_ENTRIES 16u       // texture headers / samplers (32 bytes each)
 
 typedef struct {
     uint64_t va;
-    uint32_t pitch_bytes;
+    uint32_t pitch_bytes;           // pitch-linear only
     uint32_t width, height;
+    // Block-linear (blocks of one GOB: 64 bytes x 8 rows), laid out for
+    // bl_width x bl_height pixels (nv3d_color_bl_size). The hardware only
+    // renders with a depth buffer into block-linear color targets
+    // (DATA_ERROR RT_LINEAR_WITH_ZETA, a "graphics class error" otherwise).
+    bool block_linear;
+    uint32_t bl_width, bl_height;
 } nv3d_color_t;
+
+// Layout of a block-linear color target for width x height pixels:
+// the padded size (GOB multiples) and the bytes it takes.
+void nv3d_color_bl_size(uint32_t width, uint32_t height, uint32_t* bl_width, uint32_t* bl_height,
+                        uint32_t* bytes);
 
 typedef struct {
     uint64_t va;

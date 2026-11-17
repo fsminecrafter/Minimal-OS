@@ -127,6 +127,13 @@ uint64_t nv_rm_vram_mapped(gpu_adapter_t* a);
 // staging memory (BAR1 reads are uncached and very slow).
 bool nv_rm_ce_read(gpu_adapter_t* a, uint64_t vram_offset, uint32_t row_bytes, uint32_t rows,
                    uint32_t src_pitch, void* dst, uint32_t dst_pitch);
+// Copies a row_bytes x rows rectangle between a pitch-linear surface and
+// a block-linear one (blocks of one GOB, laid out as bl_width_bytes x
+// bl_height) in VRAM with the copy engine; the side with pitch 0 is the
+// block-linear one. Waits. The 3D backend's color shadows use it.
+bool nv_rm_ce_copy_surface(gpu_adapter_t* a, uint64_t src_off, uint32_t src_pitch, uint64_t dst_off,
+                           uint32_t dst_pitch, uint32_t bl_width_bytes, uint32_t bl_height, uint32_t row_bytes,
+                           uint32_t rows);
 // Prints a line where the bring-up messages go.
 void nv_rm_say(const char* text);
 // Step 3c: draws a test pattern on the screen with the copy engine

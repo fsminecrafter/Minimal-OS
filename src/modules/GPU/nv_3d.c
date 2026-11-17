@@ -144,13 +144,34 @@ void nv3d_push_init(nv_push_t* p, uint64_t tic_va, uint64_t tsc_va, uint64_t zer
     nv_push_method(p, S, NVC597_SET_TEX_SAMPLER_POOL_A, tsc, 3);
 }
 
+void nv3d_color_bl_size(uint32_t width, uint32_t height, uint32_t* bl_width, uint32_t* bl_height,
+                        uint32_t* bytes) {
+    // GOBs are 64 bytes (16 pixels) wide and 8 rows high; blocks are one GOB.
+    *bl_width = (width + 15u) & ~15u;
+    *bl_height = (height + 7u) & ~7u;
+    *bytes = *bl_width * *bl_height * 4u;
+}
+
 static void color_target(nv_push_t* p, const nv3d_color_t* c) {
-    // Address, pitch (the "width" of a pitch-linear target), height,
-    // format, pitch layout, one layer.
-    uint32_t rt[9] = {
-        (uint32_t)(c->va >> 32) & 0xFFu, (uint32_t)c->va, c->pitch_bytes, c->height,
-        NV_RT_FORMAT_BGRA8_UNORM, 1u << 12, 1, 0, 0,
-    };
+    uint32_t rt[9];
+    if (c->block_linear) {
+        // Address, width and height in pixels, format, block-linear with
+        // blocks of one GOB, one layer, layer size / 4.
+        uint32_t layer = c->bl_width * c->bl_height * 4u;
+        uint32_t v[9] = {
+            (uint32_t)(c->va >> 32) & 0xFFu, (uint32_t)c->va, c->bl_width, c->bl_height,
+            NV_RT_FORMAT_BGRA8_UNORM, 0, 1, layer >> 2, 0,
+        };
+        for (int i = 0; i < 9; i++) rt[i] = v[i];
+    } else {
+        // Address, pitch (the "width" of a pitch-linear target), height,
+        // format, pitch layout, one layer.
+        uint32_t v[9] = {
+            (uint32_t)(c->va >> 32) & 0xFFu, (uint32_t)c->va, c->pitch_bytes, c->height,
+            NV_RT_FORMAT_BGRA8_UNORM, 1u << 12, 1, 0, 0,
+        };
+        for (int i = 0; i < 9; i++) rt[i] = v[i];
+    }
     nv_push_method(p, S, NVC597_SET_COLOR_TARGET_A(0), rt, 9);
     m1(p, NVC597_SET_CT_SELECT, (076543210u << 4) | 1u);
 }
@@ -262,7 +283,10 @@ void nv3d_push_draw(nv_push_t* p, const nv3d_draw_t* d) {
         static const uint8_t format[5] = { 0, 0x12, 0x04, 0x02, 0x01 };    // R32 .. R32G32B32A32
         uint32_t a = i < d->attrib_count ? d->attrib[i] : 0;
         uint32_t comps = (a >> 16) & 0xFFFFu, offset = (a & 0xFFFFu) * 4u;
-        if (comps == 0 || comps > 4) attr[i] = 1u << 6;                    // not from a stream
+        // An attribute not from a stream still needs a valid format: 0 is
+        // no COMPONENT_BIT_WIDTHS / NUMERICAL_TYPE value, and the engine
+        // checks them (nouveau's nvc0 uses R32 float + INACTIVE).
+        if (comps == 0 || comps > 4) attr[i] = (1u << 6) | (0x12u << 21) | (7u << 27);
         else attr[i] = (offset << 7) | ((uint32_t)format[comps] << 21) | (7u << 27);    // float
     }
     nv_push_method(p, S, NVC597_SET_VERTEX_ATTRIBUTE_A(0), attr, FGPU_MAX_ATTRIBS);

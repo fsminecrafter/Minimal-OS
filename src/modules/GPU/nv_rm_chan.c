@@ -110,6 +110,8 @@ static struct {
     bool gr_tried;
     bool dec_ready, dec_tried;          // NVDEC channel works
     uint32_t dec_runlist;
+    uint32_t dec_engdesc;               // its engine descriptor (falcon context size lookup)
+    uint64_t dec_ctx;                   // VRAM: NVDEC's engine context, 0 = none
     uint32_t jobs_dec;
     bool client, device, subdevice, vaspace, pdes;
 
@@ -287,8 +289,10 @@ static uint32_t find_copy_engines(ce_t* out, uint32_t cap) {
             // firmware number the types differently.
             const char* nm = r->entries[i].engineName;
             if (c.dec_runlist == 0xFFFFFFFFu &&
-                (type == NV_RM_ENGINE_NVDEC0 || (nm[0] == 'N' && nm[1] == 'V' && nm[2] == 'D' && nm[3] == 'E' && nm[4] == 'C')))
+                (type == NV_RM_ENGINE_NVDEC0 || (nm[0] == 'N' && nm[1] == 'V' && nm[2] == 'D' && nm[3] == 'E' && nm[4] == 'C'))) {
                 c.dec_runlist = d[NV_ENGINE_INFO_RUNLIST];
+                c.dec_engdesc = d[NV_ENGINE_INFO_ENG_DESC];
+            }
             if (type >= NV_ENGINE_COPY0 && type <= NV_ENGINE_COPY9 && n < 32)
                 all[n++] = (ce_t){ type, d[NV_ENGINE_INFO_RUNLIST] };
         }
@@ -505,6 +509,27 @@ static volatile uint32_t* semaphore(chan_t* ch) { return (volatile uint32_t*)(ch
 static uint32_t* push_words(chan_t* ch) { return (uint32_t*)(ch->sys + SYS_PUSH * 4096u); }
 static uint64_t sem_va(chan_t* ch) { return chan_va_sys(ch) + SYS_SEM * 4096ull; }
 
+// After the 3D engine refused a job: what PGRAPH trapped (nouveau
+// gf100_gr_intr). GSP-RM handles the interrupt, but the trap registers
+// usually still hold the method, its data and the data-error code.
+static void report_gr_trap(void) {
+    static const struct { uint8_t code; const char* name; } k_codes[] = {
+        { 0x03, "INVALID_OPERATION" }, { 0x04, "INVALID_VALUE" }, { 0x05, "INVALID_ENUM" },
+        { 0x08, "INVALID_OBJECT" }, { 0x0B, "INVALID_ADDRESS_ALIGNMENT" }, { 0x0C, "INVALID_BITFIELD" },
+        { 0x0D, "BEGIN_END_ACTIVE" }, { 0x10, "RT_DOUBLE_BIND" }, { 0x11, "RT_TYPES_MISMATCH" },
+        { 0x12, "RT_LINEAR_WITH_ZETA" }, { 0x15, "FP_TOO_FEW_REGS" }, { 0x17, "RT_LINEAR_WITH_MSAA" },
+        { 0x1A, "RT_INVALID_ALIGNMENT" }, { 0x1B, "SAMPLER_OVER_LIMIT" }, { 0x1C, "TEXTURE_OVER_LIMIT" },
+        { 0x21, "Z_OUT_OF_BOUNDS" }, { 0x23, "XY_OUT_OF_BOUNDS" }, { 0x24, "VP_ZERO_INPUTS" },
+    };
+    uint32_t stat = nv_rd32(c.a, 0x400100), addr = nv_rd32(c.a, 0x400704);
+    uint32_t data = nv_rd32(c.a, 0x400708), code = nv_rd32(c.a, 0x400110);
+    const char* name = "";
+    for (uint32_t i = 0; i < sizeof(k_codes) / sizeof(k_codes[0]); i++)
+        if (k_codes[i].code == (code & 0xFFu)) name = k_codes[i].name;
+    say("  PGRAPH trap: status 0x%08x, subchannel %u method 0x%04x data 0x%08x, error 0x%x %s\n", stat,
+        (addr >> 16) & 7u, addr & 0x3FFCu, data, code, name);
+}
+
 static bool submit_and_wait(chan_t* ch, uint32_t words, uint32_t payload, uint32_t timeout_ms) {
     uint32_t* ring = (uint32_t*)(ch->sys + SYS_GPFIFO * 4096u);
     nv_gpfifo_entry(chan_va_sys(ch) + SYS_PUSH * 4096ull, words, &ring[ch->gp_put * 2u]);
@@ -523,6 +548,7 @@ static bool submit_and_wait(chan_t* ch, uint32_t words, uint32_t payload, uint32
             say("  %s: no semaphore after %u ms (got 0x%x, want 0x%x); GP_GET %u, GP_PUT %u\n", ch->name,
                 timeout_ms, *semaphore(ch), payload, vram_rd32(ch->userd + NV_USERD_GP_GET), ch->gp_put);
             nv_gsp_rm_poll(c.a);
+            if (ch == &g_gr) report_gr_trap();
             return false;
         }
         if (now >= next_poll) {     // GSP-RM reports channel errors as events
@@ -673,6 +699,36 @@ bool nv_rm_ce_read(gpu_adapter_t* a, uint64_t vram_offset, uint32_t row_bytes, u
     } else if (!p.overflow) {
         c.ready = false;
         say("  copy engine channel disabled after a failed read\n");
+    }
+    unlock();
+    return ok;
+}
+
+// Copies between a pitch-linear surface and a block-linear one (blocks
+// of one GOB) in VRAM with the copy engine, and waits. A pitch of 0
+// marks the block-linear side, laid out as bl_width_bytes x bl_height.
+bool nv_rm_ce_copy_surface(gpu_adapter_t* a, uint64_t src_off, uint32_t src_pitch, uint64_t dst_off,
+                           uint32_t dst_pitch, uint32_t bl_width_bytes, uint32_t bl_height, uint32_t row_bytes,
+                           uint32_t rows) {
+    if (!c.ready || c.a != a || !row_bytes || !rows) return false;
+    nv_ce_surface_t src = { VA_VRAM + src_off, src_pitch == 0, src_pitch, bl_width_bytes, bl_height, 0 };
+    nv_ce_surface_t dst = { VA_VRAM + dst_off, dst_pitch == 0, dst_pitch, bl_width_bytes, bl_height, 0 };
+    uint64_t bl_bytes = (uint64_t)bl_width_bytes * bl_height;
+    uint64_t src_end = src.block_linear ? src_off + bl_bytes : src_off + (uint64_t)(rows - 1u) * src_pitch + row_bytes;
+    uint64_t dst_end = dst.block_linear ? dst_off + bl_bytes : dst_off + (uint64_t)(rows - 1u) * dst_pitch + row_bytes;
+    if (src_end > c.vram_mapped || dst_end > c.vram_mapped) return false;
+    if ((src.block_linear || dst.block_linear) && (row_bytes > bl_width_bytes || rows > bl_height)) return false;
+    if (!lock()) return false;
+    nv_bar1_keep_physical(a);
+    nv_push_t p;
+    nv_push_init(&p, push_words(&g_ce), PUSH_WORDS);
+    uint32_t payload = ++g_ce.payload;
+    nv_push_ce_copy_2d(&p, &src, &dst, row_bytes, rows, sem_va(&g_ce), payload);
+    wc_flush();
+    bool ok = !p.overflow && submit_and_wait(&g_ce, p.count, payload, 2000);
+    if (!ok && !p.overflow) {
+        c.ready = false;
+        say("  copy engine channel disabled after a failed surface copy\n");
     }
     unlock();
     return ok;
@@ -835,17 +891,68 @@ static bool make_3d(void) {
 
 /* ------------------------------------------------------- video decoder */
 
+// The size of a falcon engine's context buffer (RM's internal client
+// knows it per engine descriptor); 0 if RM does not say.
+static uint32_t falcon_ctx_size(uint32_t engdesc) {
+    uint32_t iclient, isub;
+    if (!nv_gsp_rm_internal_handles(c.a, &iclient, &isub)) return 0;
+    static nv_falcon_infos_t req;
+    memset(&req, 0, sizeof(req));
+    nv_falcon_infos_t* r = (nv_falcon_infos_t*)rm_control_as(
+        iclient, isub, NV2080_CTRL_CMD_INTERNAL_GET_CONSTRUCTED_FALCON_INFO, &req, sizeof(req), "falcon engine info");
+    if (!r) return 0;
+    uint32_t n = r->numConstructedFalcons < NV_MAX_CONSTRUCTED_FALCONS ? r->numConstructedFalcons
+                                                                     : NV_MAX_CONSTRUCTED_FALCONS;
+    for (uint32_t i = 0; i < n; i++)
+        if (r->table[i].engDesc == engdesc) return r->table[i].ctxBufferSize;
+    return 0;
+}
+
+// nouveau's r535_flcn_ctor / r535_flcn_bind: the engine context in VRAM
+// (zeroed), mapped in our VA space, promoted to the channel. Without it
+// RM refuses the decoder class (NV_ERR_INVALID_ARGUMENT, 0x1F).
+static bool promote_falcon_ctx(chan_t* ch, uint32_t engine, uint32_t engdesc, uint64_t* ctx_out) {
+    uint32_t size = falcon_ctx_size(engdesc);
+    if (!size) {
+        say("  RM did not tell the engine context size (engine descriptor 0x%x)\n", engdesc);
+        return false;
+    }
+    ctxbuf_t b = { 0, size, 12, false, true, 0 };
+    uint64_t mem;
+    if (!ctxbuf_alloc(&b, &mem)) return false;
+    static nv_promote_ctx_t p;
+    memset(&p, 0, sizeof(p));
+    p.engineType = engine;
+    p.hClient = H_CLIENT;
+    p.ChID = ch->chid;
+    p.hChanClient = H_CLIENT;
+    p.hObject = ch->handle;
+    p.virtAddress = VA_VRAM + mem;
+    p.size = size;
+    if (!rm_control(H_SUBDEV, NV2080_CTRL_CMD_GPU_PROMOTE_CTX, &p, sizeof(p), "promote engine context")) {
+        gpu_vram_free(c.a, mem);
+        return false;
+    }
+    say("  engine context: %u KiB at VRAM 0x%llx\n", size >> 10, (unsigned long long)mem);
+    *ctx_out = mem;
+    return true;
+}
+
 // Step 5a: a channel on NVDEC with the decoder class. GSP-RM runs the
-// engine's firmware itself; like a copy engine it needs no context from
-// us (nouveau: nvkm/engine/nvdec/r535.c).
+// engine's firmware itself, but like every falcon engine it needs an
+// engine context buffer from us first (nouveau: fifo/r535.c r535_flcn,
+// nvkm/engine/nvdec/r535.c).
 static bool make_nvdec(void) {
     say("\nStep 5a: video decoder (NVDEC)\n");
     if (c.dec_runlist == 0xFFFFFFFFu) { say("  no video decoder in the device info table\n"); return false; }
     if (!chan_open(&g_dec, NV_ENGINE_NVDEC0, c.dec_runlist, true)) { say("  no channel for the video decoder\n"); return false; }
+    if (!c.dec_ctx && !promote_falcon_ctx(&g_dec, NV_ENGINE_NVDEC0, c.dec_engdesc, &c.dec_ctx))
+        say("  trying the decoder object without an engine context\n");
     // NV_BSP_ALLOCATION_PARAMETERS: size, prohibitMultipleInstances, engineInstance.
     uint32_t params[3] = { sizeof(params), 0, 0 };
     if (rm_alloc(g_dec.handle, H_NVDEC, NV_CLASS_NVDEC_TURING, params, sizeof(params), "video decoder object")) {
         chan_close(&g_dec);
+        if (c.dec_ctx) { gpu_vram_free(c.a, c.dec_ctx); c.dec_ctx = 0; }
         return false;
     }
     say("  channel %u on NVDEC (runlist %u), doorbell token 0x%x\n", g_dec.chid, g_dec.runlist, g_dec.token);
@@ -858,7 +965,12 @@ static bool make_nvdec(void) {
     while (!lock()) __asm__ volatile("pause");
     bool ok = submit_and_wait(&g_dec, p.count, payload, 2000);
     unlock();
-    if (!ok) { say("  the first video decoder job did not finish\n"); chan_close(&g_dec); return false; }
+    if (!ok) {
+        say("  the first video decoder job did not finish\n");
+        chan_close(&g_dec);
+        if (c.dec_ctx) { gpu_vram_free(c.a, c.dec_ctx); c.dec_ctx = 0; }
+        return false;
+    }
     say("  ok: the video decoder's channel runs.\n");
     return true;
 }

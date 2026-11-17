@@ -61,6 +61,41 @@ static void test_push(void) {
     CHECK(e[0] == 0x45678900u && e[1] == (0x123u | (256u << 10)), "GPFIFO entry");
 }
 
+// The value of the last write to `method` on subchannel `subc` (INC
+// methods only, which is all the copy engine pushes use).
+static int64_t last_value(const uint32_t* w, uint32_t count, uint32_t subc, uint32_t method) {
+    int64_t found = -1;
+    for (uint32_t i = 0; i < count;) {
+        uint32_t h = w[i], n = (h >> 16) & 0x1FFFu, m = (h & 0x1FFFu) << 2, sc = (h >> 13) & 7u;
+        if ((h >> 29) == 4u) { if (sc == subc && m == method) found = n; i++; continue; }   // IMMD
+        for (uint32_t k = 0; k < n; k++)
+            if (sc == subc && m + 4u * k == method) found = w[i + 1 + k];
+        i += 1 + n;
+    }
+    return found;
+}
+
+static void test_ce_copy_2d(void) {
+    static uint32_t words[256];
+    nv_push_t p;
+    nv_push_init(&p, words, 256);
+    nv_ce_surface_t bl = { 0x80400000ull, true, 0, 448, 56, 0 };
+    nv_ce_surface_t lin = { 0x80100000ull, false, 512, 0, 0, 0 };
+    nv_push_ce_copy_2d(&p, &bl, &lin, 400, 50, 0x40005000ull, 7);
+    CHECK(!p.overflow, "2D copy fits");
+    const uint32_t s = NV_CE_SUBCHANNEL;
+    CHECK(last_value(words, p.count, s, NVC5B5_SET_SRC_BLOCK_SIZE) == 0x1000 &&
+          last_value(words, p.count, s, NVC5B5_SET_SRC_BLOCK_SIZE + 4) == 448 &&
+          last_value(words, p.count, s, NVC5B5_SET_SRC_BLOCK_SIZE + 8) == 56 &&
+          last_value(words, p.count, s, NVC5B5_SET_SRC_BLOCK_SIZE + 12) == 1, "block-linear source described");
+    CHECK(last_value(words, p.count, s, NVC5B5_SET_DST_BLOCK_SIZE) == -1, "pitch destination not described");
+    CHECK(last_value(words, p.count, s, NVC5B5_PITCH_OUT) == 512 && last_value(words, p.count, s, NVC5B5_LINE_LENGTH_IN) == 400 &&
+          last_value(words, p.count, s, NVC5B5_LINE_COUNT) == 50, "copy geometry");
+    int64_t launch = last_value(words, p.count, s, NVC5B5_LAUNCH_DMA);
+    CHECK(launch >= 0 && !(launch & (1 << 7)) && (launch & (1 << 8)) && !(launch & (1 << 10)),
+          "source block-linear, destination pitch, no remap");
+}
+
 static void test_bin(void) {
     uint8_t f[128];
     memset(f, 0, sizeof f);
@@ -434,6 +469,7 @@ int main(void) {
     test_gsp_layout();
     test_rpc();
     test_push();
+    test_ce_copy_2d();
     test_bin();
     test_elf();
     test_manifest();

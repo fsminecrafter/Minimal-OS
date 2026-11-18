@@ -668,7 +668,8 @@ ci-os0:
 test-host: build/tests/host/gfx_blit_tests build/tests/host/fgpu_raster_tests build/tests/host/fgsl_tests \
 		build/tests/host/fgpu_bin_tests build/tests/host/fgpu_mip_tests build/tests/host/fgpu_ir_tests build/tests/host/fgpu_jit_tests build/tests/host/nv_hw_tests build/tests/host/nv_sass_tests \
 		build/tests/host/video_gpu_tests build/tests/host/audio_stream_tests build/tests/host/hid_mouse_tests \
-		build/tests/host/media_tests build/tests/host/media_parallel_tests build/tests/host/os0_tests
+		build/tests/host/media_tests build/tests/host/media_parallel_tests build/tests/host/vimg_tests build/tests/host/vimg_tests_asan \
+		build/tools/mosmedia build/tests/host/os0_tests
 	./build/tests/host/gfx_blit_tests
 	./build/tests/host/fgpu_raster_tests
 	./build/tests/host/fgpu_bin_tests
@@ -682,6 +683,8 @@ test-host: build/tests/host/gfx_blit_tests build/tests/host/fgpu_raster_tests bu
 	./build/tests/host/audio_stream_tests
 	./build/tests/host/media_tests
 	./build/tests/host/media_parallel_tests
+	./build/tests/host/vimg_tests build/tools/mosmedia
+	./build/tests/host/vimg_tests_asan
 	./build/tests/host/hid_mouse_tests
 	./build/tests/host/os0_tests
 
@@ -766,6 +769,25 @@ build/tests/host/media_tests: tests/host/media_tests.c Minimal-OS-SDK/include/mo
 	mkdir -p $(dir $@)
 	$(HOSTCC) $(HOST_CFLAGS) -idirafter Minimal-OS-SDK/include tests/host/media_tests.c -o $@
 
+# Vector .img: coverage, strokes, gradients, damaged files, the SVG converter end to end.
+# The second build runs the same checks under AddressSanitizer and UBSan.
+build/tests/host/vimg_tests: tests/host/vimg_tests.c Minimal-OS-SDK/include/mosmedia.h Minimal-OS-SDK/include/mosmedia_motion.h Minimal-OS-SDK/include/mosmedia_h264.h
+	mkdir -p $(dir $@)
+	$(HOSTCC) $(HOST_CFLAGS) -idirafter Minimal-OS-SDK/include tests/host/vimg_tests.c -o $@ -lm
+
+build/tests/host/vimg_tests_asan: tests/host/vimg_tests.c Minimal-OS-SDK/include/mosmedia.h Minimal-OS-SDK/include/mosmedia_motion.h Minimal-OS-SDK/include/mosmedia_h264.h
+	mkdir -p $(dir $@)
+	$(HOSTCC) $(HOST_CFLAGS) -O1 -g -fsanitize=address,undefined,float-cast-overflow -fno-sanitize-recover=all -idirafter Minimal-OS-SDK/include tests/host/vimg_tests.c -o $@ -lm
+
+# Vector rendering speed (not part of test-host): icon sizes and a big logo.
+.PHONY: bench-vimg
+bench-vimg: tests/host/vimg_bench.c Minimal-OS-SDK/include/mosmedia.h build/tools/mosmedia
+	mkdir -p build/tests/host
+	build/tools/mosmedia vimg docs/examples/sample-icon.svg build/tests/host/sample-icon.img 2>/dev/null
+	build/tools/mosmedia vimg docs/examples/sample-logo.svg build/tests/host/sample-logo.img 2>/dev/null
+	$(HOSTCC) -std=c11 -O2 -Wall -Wextra -idirafter Minimal-OS-SDK/include tests/host/vimg_bench.c -o build/tests/host/vimg_bench -lm
+	./build/tests/host/vimg_bench
+
 build/tests/host/media_parallel_tests: tests/host/media_parallel_tests.c \
 		src/modules/Media/vid_decode.c Minimal-OS-SDK/include/mosmedia.h \
 		Minimal-OS-SDK/include/mosmedia_motion.h Minimal-OS-SDK/include/media_abi.h \
@@ -780,13 +802,13 @@ build/tests/host/media_parallel_tests: tests/host/media_parallel_tests.c \
 test-h264:
 	HOSTCC=$(HOSTCC) sh tools/media/h264_check.sh
 
-build/tools/mosmedia: tools/media/mosmedia.c Minimal-OS-SDK/include/mosmedia.h Minimal-OS-SDK/include/mosmedia_motion.h Minimal-OS-SDK/include/mosmedia_h264.h
+build/tools/mosmedia: tools/media/mosmedia.c tools/media/mosmedia_svg.h Minimal-OS-SDK/include/mosmedia.h Minimal-OS-SDK/include/mosmedia_motion.h Minimal-OS-SDK/include/mosmedia_h264.h
 	mkdir -p $(dir $@)
-	$(HOSTCC) -std=c11 -O2 -Wall -Wextra -pthread -idirafter Minimal-OS-SDK/include tools/media/mosmedia.c -o $@
+	$(HOSTCC) -std=c11 -O2 -Wall -Wextra -pthread -idirafter Minimal-OS-SDK/include tools/media/mosmedia.c -o $@ -lm
 
 # The same converter for Windows (needs MinGW-w64; ffmpeg and ffprobe in PATH there).
 MINGW_CC ?= x86_64-w64-mingw32-gcc
-build/tools/mosmedia.exe: tools/media/mosmedia.c Minimal-OS-SDK/include/mosmedia.h Minimal-OS-SDK/include/mosmedia_motion.h
+build/tools/mosmedia.exe: tools/media/mosmedia.c tools/media/mosmedia_svg.h Minimal-OS-SDK/include/mosmedia.h Minimal-OS-SDK/include/mosmedia_motion.h
 	mkdir -p $(dir $@)
 	$(MINGW_CC) -std=c11 -O2 -Wall -Wextra -static -idirafter Minimal-OS-SDK/include tools/media/mosmedia.c -o $@
 

@@ -110,7 +110,7 @@ Dependencies are in brackets. OS and engine lanes run in parallel.
 - **E0:** mostly open. `engine/core` has only math; the allocator, jobs, profiler, reflection and VFS/pak are not there.
 - **E1:** mostly done: renderer (feature levels, post stack, cascades, probe GI, graphics settings as named choices), flecs, Lua 5.4, the audio mixer, the `.fepak` reader/VFS and the `feplayer` runtime exist; a cooker CLI beyond `mofconv`/export and asynchronous loading do not.
 - **E2:** not started (see Repository status).
-- **E3:** mostly done: the editor runs on the OS (full screen and as a window, F11 fixed), with scenes, undo/redo, Lua scripts, project settings, model import (glTF/OBJ to .mof) and File > Export game (`.run` + `.fepak` + optional `.mpkg`, graphics settings exported); export runs on the OS in QEMU. Templates and prefabs are open.
+- **E3:** mostly done: the editor runs on the OS (full screen and as a window, F11 fixed), with scenes, undo/redo, Lua scripts, project settings, model import (glTF/OBJ to .mof) and File > Export game (`.run` + `.fepak` + optional `.mpkg`, graphics settings exported); export runs on the OS in QEMU. Templates and prefabs are open. The UI was redesigned on 2026-11-18: floating windows with border and shadow, borderless docked panels, a sidebar in Settings, and 102 vector icons drawn from the `.img` format's new vector mode (SDK `mosmedia.h`, `mosmedia vimg`).
 - **E4 to E9:** not started.
 
 **OS track order:** OS-0, then OS-1, then OS-4 alongside OS-2 (the SSE4.1 JIT doesn't wait for AVX), then OS-3, OS-5, OS-6, OS-7, OS-8/OS-9.

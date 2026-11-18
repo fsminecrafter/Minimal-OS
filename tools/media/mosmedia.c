@@ -4,6 +4,12 @@
  *
  *   mosmedia img   <picture> <out.img>        PNG, JPEG, ... -> .img (keeps transparency)
  *   mosmedia png   <in.img> <out.png>         .img -> PNG
+ *         --size N     vector .img: draw N pixels on the longer side (default: the
+ *                      natural size); a raster .img is scaled to it too
+ *         --color C    vector .img: RRGGBB or AARRGGBB (hex) for "current color" paints
+ *                      (default 000000)
+ *   mosmedia vimg  <in.svg> <out.img> [--shift N]   SVG -> vector .img (version 2: icons and
+ *                                             logos that stay sharp at any size; needs no ffmpeg)
  *   mosmedia vid   <video> <out.vid> [options] MP4, MKV, GIF, ... -> .vid with sound
  *         --width N    scale to N pixels wide (keeps the shape)
  *         --fps N      frames per second (default: the source's, at most 60)
@@ -34,6 +40,7 @@
 #include <string.h>
 #include <stdatomic.h>
 #include "mosmedia.h"
+#include "mosmedia_svg.h"
 
 /* ------------------------------------------------- platform: Windows/POSIX */
 #ifdef _WIN32
@@ -184,21 +191,139 @@ static void cmd_img(const char* in, const char* out) {
            100.0 * (double)n / ((double)w * h * (alpha ? 4 : 3)));
 }
 
-static void cmd_png(const char* in, const char* out) {
+// A PNG without a compressor: 8-bit RGBA, stored (uncompressed) deflate blocks. Big, but it
+// needs nothing else, and any PNG reader takes it.
+static uint32_t crc32_update(uint32_t crc, const uint8_t* d, size_t n) {
+    static uint32_t table[256];
+    if (!table[1])
+        for (uint32_t i = 0; i < 256; i++) {
+            uint32_t c = i;
+            for (int k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+            table[i] = c;
+        }
+    for (size_t i = 0; i < n; i++) crc = table[(crc ^ d[i]) & 255u] ^ (crc >> 8);
+    return crc;
+}
+static void png_chunk(FILE* f, const char* type, const uint8_t* d, size_t n) {
+    uint8_t head[8] = { (uint8_t)(n >> 24), (uint8_t)(n >> 16), (uint8_t)(n >> 8), (uint8_t)n };
+    memcpy(head + 4, type, 4);
+    uint32_t crc = crc32_update(0xFFFFFFFFu, (const uint8_t*)type, 4);
+    if (n) crc = crc32_update(crc, d, n);
+    crc = ~crc;
+    uint8_t tail[4] = { (uint8_t)(crc >> 24), (uint8_t)(crc >> 16), (uint8_t)(crc >> 8), (uint8_t)crc };
+    if (fwrite(head, 1, 8, f) != 8 || (n && fwrite(d, 1, n, f) != n) || fwrite(tail, 1, 4, f) != 4) die("cannot write", "png");
+}
+static void write_png(const char* path, const uint32_t* px, uint32_t w, uint32_t h) {
+    size_t row = (size_t)w * 4 + 1, raw = row * h;
+    uint8_t* z = malloc(raw + raw / 65535 * 5 + 64);
+    uint8_t* data = malloc(raw);
+    if (!z || !data) die("out of memory", NULL);
+    for (uint32_t y = 0; y < h; y++) {
+        uint8_t* r = data + y * row;
+        r[0] = 0;
+        for (uint32_t x = 0; x < w; x++) {
+            uint32_t v = px[(size_t)y * w + x];
+            r[1 + x * 4] = (uint8_t)(v >> 16); r[2 + x * 4] = (uint8_t)(v >> 8); r[3 + x * 4] = (uint8_t)v; r[4 + x * 4] = (uint8_t)(v >> 24);
+        }
+    }
+    size_t n = 0;
+    z[n++] = 0x78; z[n++] = 0x01;
+    for (size_t at = 0; at < raw || at == 0;) {
+        size_t len = raw - at > 65535 ? 65535 : raw - at;
+        z[n++] = at + len >= raw;
+        z[n++] = (uint8_t)len; z[n++] = (uint8_t)(len >> 8); z[n++] = (uint8_t)~len; z[n++] = (uint8_t)(~len >> 8);
+        memcpy(z + n, data + at, len);
+        n += len; at += len;
+        if (!len) break;
+    }
+    uint32_t a = 1, b = 0;
+    for (size_t i = 0; i < raw; i++) { a = (a + data[i]) % 65521u; b = (b + a) % 65521u; }
+    z[n++] = (uint8_t)(b >> 8); z[n++] = (uint8_t)b; z[n++] = (uint8_t)(a >> 8); z[n++] = (uint8_t)a;
+    FILE* f = fopen(path, "wb");
+    if (!f) die("cannot write", path);
+    static const uint8_t sig[8] = { 0x89, 'P', 'N', 'G', 13, 10, 26, 10 };
+    uint8_t ihdr[13] = { (uint8_t)(w >> 24), (uint8_t)(w >> 16), (uint8_t)(w >> 8), (uint8_t)w,
+                         (uint8_t)(h >> 24), (uint8_t)(h >> 16), (uint8_t)(h >> 8), (uint8_t)h, 8, 6, 0, 0, 0 };
+    fwrite(sig, 1, 8, f);
+    png_chunk(f, "IHDR", ihdr, 13);
+    png_chunk(f, "IDAT", z, n);
+    png_chunk(f, "IEND", NULL, 0);
+    if (fclose(f) != 0) die("cannot write", path);
+    free(z);
+    free(data);
+}
+
+static void cmd_png(int argc, char** argv) {
+    const char* in = argv[2];
+    const char* out = argv[3];
+    uint32_t want = 0, color = 0xFF000000u;
+    for (int i = 4; i < argc; i++) {
+        if (!strcmp(argv[i], "--size") && i + 1 < argc) want = (uint32_t)atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--color") && i + 1 < argc) {
+            const char* c = argv[++i];
+            if (*c == '#') c++;
+            uint32_t v = (uint32_t)strtoul(c, NULL, 16);
+            color = strlen(c) > 6 ? v : (0xFF000000u | v);
+        } else die("unknown option", argv[i]);
+    }
     size_t size;
     uint8_t* d = read_file(in, &size);
     mimg_info_t info;
     if (!mimg_info(d, size, &info)) die("not an .img file", in);
-    uint32_t* px = malloc((size_t)info.width * info.height * 4);
-    if (!mimg_decode(d, size, px, info.width)) die("damaged .img file", in);
-    char cmd[8192];
-    snprintf(cmd, sizeof cmd, "ffmpeg -v error -y -f rawvideo -pix_fmt bgra -s %ux%u -i - -frames:v 1 %s",
-             info.width, info.height, q(out));
-    FILE* p = popen(cmd, PIPE_WRITE);
-    if (!p || fwrite(px, 4, (size_t)info.width * info.height, p) != (size_t)info.width * info.height)
-        die("ffmpeg failed", out);
-    if (pclose(p) != 0) die("ffmpeg failed", out);
-    printf("%s: %ux%u\n", out, info.width, info.height);
+    uint32_t w = info.width, h = info.height;
+    if (want) {
+        double nw = info.vector ? info.vb_w : (double)info.width, nh = info.vector ? info.vb_h : (double)info.height;
+        double k = (double)want / (nw > nh ? nw : nh);
+        w = (uint32_t)(nw * k + 0.5);
+        h = (uint32_t)(nh * k + 0.5);
+        if (w < 1) w = 1;
+        if (h < 1) h = 1;
+        if (w > MMEDIA_MAX_SIDE || h > MMEDIA_MAX_SIDE) die("--size is too large", NULL);
+    }
+    uint32_t* px = malloc((size_t)w * h * 4);
+    if (!px) die("out of memory", NULL);
+    mimg_render_opts_t o;
+    mimg_render_opts_init(&o);
+    o.current_color = color;
+    o.alloc = malloc;
+    o.free = free;
+    if (!mimg_render_ex(d, size, px, w, h, w, &o)) die("damaged .img file", in);
+    if (info.vector) {
+        write_png(out, px, w, h);
+    } else {
+        char cmd[8192];
+        snprintf(cmd, sizeof cmd, "ffmpeg -v error -y -f rawvideo -pix_fmt bgra -s %ux%u -i - -frames:v 1 %s", w, h, q(out));
+        FILE* p = popen(cmd, PIPE_WRITE);
+        if (!p || fwrite(px, 4, (size_t)w * h, p) != (size_t)w * h) die("ffmpeg failed", out);
+        if (pclose(p) != 0) die("ffmpeg failed", out);
+    }
+    printf("%s: %ux%u\n", out, w, h);
+}
+
+// SVG -> vector .img
+static void cmd_vimg(int argc, char** argv) {
+    int shift = -1;
+    for (int i = 4; i < argc; i++) {
+        if (!strcmp(argv[i], "--shift") && i + 1 < argc) {
+            shift = atoi(argv[++i]);
+            if (shift < 0 || shift > (int)MIMG_VEC_MAX_SHIFT) die("--shift must be 0 to 12", NULL);
+        } else die("unknown option", argv[i]);
+    }
+    size_t size;
+    uint8_t* raw = read_file(argv[2], &size);
+    char* text = malloc(size + 1);
+    if (!text) die("out of memory", NULL);
+    memcpy(text, raw, size);
+    text[size] = 0;
+    size_t n = 0;
+    uint8_t* enc = svg_to_img(text, size, shift, &n);
+    if (!enc) exit(1);
+    FILE* f = fopen(argv[3], "wb");
+    if (!f || fwrite(enc, 1, n, f) != n) die("cannot write", argv[3]);
+    fclose(f);
+    mimg_info_t info;
+    mimg_info(enc, n, &info);
+    printf("%s: %ux%u vector, %zu bytes\n", argv[3], info.width, info.height, n);
 }
 
 static bool file_write(void* ctx, uint64_t off, const void* d, size_t n) {
@@ -568,7 +693,13 @@ static void cmd_info(const char* in) {
     uint8_t* d = read_file(in, &size);
     mimg_info_t img;
     mvid_info_t vid;
-    if (mimg_info(d, size, &img)) {
+    if (mimg_info(d, size, &img) && img.vector) {
+        mvg_doc_t doc;
+        mvg_open(d, size, &doc);
+        printf("%s: vector image %ux%u (view box %g %g %g %g), %u paints, %u shapes, %s, %zu bytes\n", in, img.width,
+               img.height, img.vb_x, img.vb_y, img.vb_w, img.vb_h, doc.npaints, doc.nshapes,
+               img.current_color ? "tintable (current color)" : "fixed colors", size);
+    } else if (mimg_info(d, size, &img)) {
         printf("%s: image %ux%u %s, %zu bytes\n", in, img.width, img.height, img.alpha ? "RGBA" : "RGB", size);
     } else if (size >= MVID_HEADER_SIZE && mvid_parse_header(d, size, &vid)) {
         printf("%s: video %ux%u %s, %u frames at %.2f fps (%u:%02u), keyframe every %u, %s\n", in, vid.width,
@@ -582,12 +713,13 @@ static void cmd_info(const char* in) {
 
 int main(int argc, char** argv) {
     if (argc >= 4 && !strcmp(argv[1], "img")) cmd_img(argv[2], argv[3]);
-    else if (argc >= 4 && !strcmp(argv[1], "png")) cmd_png(argv[2], argv[3]);
+    else if (argc >= 4 && !strcmp(argv[1], "png")) cmd_png(argc, argv);
+    else if (argc >= 4 && !strcmp(argv[1], "vimg")) cmd_vimg(argc, argv);
     else if (argc >= 4 && !strcmp(argv[1], "vid")) cmd_vid(argc, argv);
     else if (argc >= 4 && !strcmp(argv[1], "unvid")) cmd_unvid(argv[2], argv[3]);
     else if (argc >= 3 && !strcmp(argv[1], "info")) cmd_info(argv[2]);
     else {
-        fprintf(stderr, "usage: mosmedia img|png|vid|unvid <in> <out> [options], mosmedia info <file>\n");
+        fprintf(stderr, "usage: mosmedia img|png|vimg|vid|unvid <in> <out> [options], mosmedia info <file>\n");
         return 2;
     }
     return 0;

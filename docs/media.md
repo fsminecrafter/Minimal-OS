@@ -4,6 +4,12 @@ Minimal-OS has its own picture and video formats, in
 `Minimal-OS-SDK/include/mosmedia.h` (plain C, no libc, so they run in
 programs, in mosWM and on the build PC).
 
+An `.img` is a raster picture (lossless RGB or RGBA) or a **vector
+picture**: paths filled and stroked with solid colors and gradients, drawn
+again at whatever size is asked for, so icons and logos stay sharp from
+16 px to 1024 px and can be tinted with the theme's color (see
+[Vector images](#vector-images)).
+
 A `.vid` file uses one of three codecs, the way an `.adi` file is PCM16 or
 ADPCM:
 
@@ -18,12 +24,12 @@ player (which uses ffmpeg for `h264`).
 
 | | .img | .vid |
 | --- | --- | --- |
-| What | A picture, 8-bit RGB or RGBA (transparency, like PNG) | Frames in 32-bit ARGB8888 (including transparency), a frame rate and an `.adi` soundtrack |
-| Compression | Lossless, about PNG's size, faster to decode | `tiles`: lossless, only changed tiles are stored; `motion`: lossy, like H.264; `h264`: H.264 itself |
+| What | A picture, 8-bit RGB or RGBA (transparency, like PNG), or a vector picture (shapes, any size) | Frames in 32-bit ARGB8888 (including transparency), a frame rate and an `.adi` soundtrack |
+| Compression | Raster: lossless, about PNG's size, faster to decode. Vector: a few hundred bytes for an icon | `tiles`: lossless, only changed tiles are stored; `motion`: lossy, like H.264; `h264`: H.264 itself |
 | Opens with | Photos (`0:/programs/mos_photos.run`), and as a wallpaper in Settings | Video (`0:/programs/mos_video.run`) |
 | In the terminal | `img 0:/users/me/Pictures/cat.img` | `video 0:/users/me/Videos/clip.vid` |
 | In Mxplorer | `<img src="cat.img">`, or open the file's address | `<video src="clip.vid" controls>`, or open the file's address |
-| Make one | `mosmedia img picture.png out.img` | `mosmedia vid movie.mp4 out.vid` (motion), `mosmedia vid screen.mkv out.vid --codec tiles`, `mosmedia vid movie.mp4 out.vid --codec h264` |
+| Make one | `mosmedia img picture.png out.img`, `mosmedia vimg icon.svg icon.img` (vector) | `mosmedia vid movie.mp4 out.vid` (motion), `mosmedia vid screen.mkv out.vid --codec tiles`, `mosmedia vid movie.mp4 out.vid --codec h264` |
 
 ## In the terminal
 
@@ -40,7 +46,8 @@ Relative paths are inside the current folder.
 
 Mxplorer shows `.img` pictures in `<img>` and plays `.vid` videos in
 `<video>`, with sound. It picks files by their extension, so other
-pictures (PNG, JPEG) still show a placeholder:
+pictures (PNG, JPEG) still show a placeholder. A vector `.img` is shown at its
+natural size, like any other:
 
 ```html
 <img src="logo.img" alt="Logo" width="200">
@@ -89,6 +96,8 @@ python tools/media/mosplayer.py docs/examples/sample.vid
 ```sh
 build/tools/mosmedia img logo.png logo.img        # any picture ffmpeg reads; keeps transparency
 build/tools/mosmedia png logo.img logo.png        # and back
+build/tools/mosmedia vimg logo.svg logo.img       # SVG -> vector .img (no ffmpeg needed)
+build/tools/mosmedia png logo.img big.png --size 1024   # a vector .img drawn at 1024 px
 build/tools/mosmedia vid film.mp4 film.vid --width 640 --q 26   # motion codec
 build/tools/mosmedia vid screen.mkv screen.vid --codec tiles      # lossless
 build/tools/mosmedia vid film.mp4 film.vid --codec h264 --width 640   # H.264 (needs ffmpeg with libx264)
@@ -286,7 +295,157 @@ encoded.
 profile. This decoder is the video half for the Baseline streams; an MP4
 demuxer, an AAC decoder and the missing profiles are separate work.
 
-## .img layout
+## Vector images
+
+A vector `.img` (version 2) has no pixels. It holds a view box and a list of
+shapes, each a path with a fill and/or a stroke, and is rasterized when it
+is shown. `mimg_decode` draws it at its natural size (the view box rounded
+up), so Photos, Mxplorer and mosWM show vector files with no change;
+programs that want a crisp icon at the size they need call `mimg_render`.
+
+Make one from an SVG on the build PC (no ffmpeg needed):
+
+```sh
+build/tools/mosmedia vimg icon.svg icon.img            # prints the shape count and size
+build/tools/mosmedia vimg logo.svg logo.img --shift 8  # coordinate precision (default: from the size)
+build/tools/mosmedia png icon.img icon.png --size 256  # look at it: 256 px on the longer side
+build/tools/mosmedia png icon.img tinted.png --color 2255cc   # RRGGBB or AARRGGBB for "current color"
+build/tools/mosmedia info icon.img                     # view box, paints, shapes, tintable or not
+```
+
+[docs/examples](examples) has `sample-icon.svg` (an envelope, 188 bytes as an
+`.img`, tintable) and `sample-logo.svg` (gradients, strokes, 839 bytes) to
+convert and try.
+
+### What the converter reads
+
+`<svg viewBox width height>` (the view box is the natural size; without one
+the width and height are), `<g>`, `<a>`, `<switch>`, `<use href>` with x and
+y (also of `<symbol>`), `<path d>` with every command (relative ones, `S`,
+`T`, and arcs `A`/`a` turned into cubics), `<rect rx ry>`, `<circle>`,
+`<ellipse>`, `<line>`, `<polyline>`, `<polygon>`; `transform` (`matrix`,
+`translate`, `scale`, `rotate`, `skewX`, `skewY`); `fill`, `stroke`,
+`stroke-width`, `stroke-linecap`, `stroke-linejoin`, `stroke-miterlimit`,
+`opacity`, `fill-opacity`, `stroke-opacity`, `fill-rule`, `color`,
+`display`, `visibility`, as attributes and in `style=""` (a style wins), all
+inherited down the tree the way SVG inherits them; colors as `#rgb`,
+`#rgba`, `#rrggbb`, `#rrggbbaa`, `rgb()`, `rgba()`, `hsl()`, about 60 names,
+`transparent`, `none` and `currentColor`; and `<linearGradient>` /
+`<radialGradient>` referenced as `url(#id)` (with a fallback color), with
+`<stop>`s, `href` inheritance, `gradientUnits` (both), `gradientTransform`
+and `spreadMethod`.
+
+What it cannot draw is skipped with a warning and the rest is converted:
+text, images, filters, masks, clip paths, patterns, markers, `<style>`
+sheets (class selectors), `stroke-dasharray` (the line is drawn solid) and
+gradients with more than 8 stops (8 of them are used). Notes:
+
+- `currentColor` becomes a **current color** paint, which takes the color
+  the program passes to `mimg_render_ex`; if the drawing sets the `color`
+  property itself it is that fixed color instead.
+- Transforms are applied to the coordinates. A shape with a stroke under a
+  transform that is not a similarity (a non-uniform scale or a skew) keeps
+  its transform so the stroke bends like the SVG's.
+- `opacity` on a group multiplies into the opacity of each shape below it
+  (SVG would composite the group at once, which differs only where shapes
+  of one group overlap).
+- A gradient in `objectBoundingBox` units is turned into one in the shape's
+  own coordinates, so the same gradient on two shapes is two paints.
+
+### Layout (version 2)
+
+All numbers are little-endian. Header, 24 bytes like the raster header:
+
+| Offset | Size | Field |
+| --- | --- | --- |
+| 0 | 4 | `MIMG` |
+| 4 | 1 | version, **2** (raster files stay 1, so a reader that only knows version 1 refuses vector files) |
+| 5 | 1 | channels, 4 |
+| 6 | 1 | shift, 0 to 12: coordinates are integers in 1/2^shift of a drawing unit (the converter picks about 14 bits for the view box: 1/512 unit for a 24-unit icon, 1/32 for a 256-unit logo) |
+| 7 | 1 | flags: bit 0 set when some paint is "current color" (a tintable icon); the rest 0 |
+| 8 | 4 | natural width, 1 to 16384 (the view box rounded up) |
+| 12 | 4 | natural height |
+| 16 | 4 | payload size in bytes |
+| 20 | 4 | reserved, 0 |
+
+The payload follows. A *varint* is LEB128 (7 bits at a time, low first, at
+most 5 bytes); an *svarint* is a varint of the zigzag value
+`(v << 1) ^ (v >> 31)`; *fixed* is an svarint in the units above.
+
+| Field | Encoding |
+| --- | --- |
+| view box | svarint x, svarint y (fixed), varint width, varint height (fixed, above 0) |
+| counts | u16 paints (at most 1024), u16 shapes (at most 65535) |
+| paints | that many paints |
+| shapes | that many shapes; the payload ends right after the last |
+
+A **paint** starts with a byte: bits 0-1 the type (0 solid, 1 current
+color, 2 linear gradient, 3 radial gradient), bits 2-3 the spread (0 pad,
+1 reflect, 2 repeat), bit 4 "has a matrix", bits 5-7 zero.
+
+| Type | What follows |
+| --- | --- |
+| solid | u32 `0xAARRGGBB` |
+| current color | u8 alpha (multiplies the caller's alpha) |
+| gradient | u8 stop count (1 to 8), each stop a u8 offset (0 to 255) and a u32 `0xAARRGGBB`; then f32 geometry: linear `x1 y1 x2 y2`, radial `cx cy r fx fy` (a focal point outside the circle is moved onto it) |
+| matrix (bit 4) | f32 `a b c d e f`, from gradient space to the shape's path coordinates (`x' = a x + c y + e`, `y' = b x + d y + f`) |
+
+Gradients are interpolated in sRGB without premultiplying. A gradient with
+no extent (equal end points, radius 0) paints its last stop. Stops whose
+offsets decrease are raised to the previous offset.
+
+A **shape**:
+
+| Field | Encoding |
+| --- | --- |
+| flags | u8: bit 0 fill, bit 1 stroke, bit 2 even-odd fill rule (else nonzero), bit 3 transform; bits 4-7 zero |
+| fill | with bit 0: varint paint index, u8 opacity (0 to 255) |
+| stroke | with bit 1: varint paint index, varint width (fixed), u8 `cap` + `join` << 2 (caps 0 butt, 1 round, 2 square; joins 0 miter, 1 round, 2 bevel), u8 miter limit in 1/8 (at least 1.0), u8 opacity |
+| transform | with bit 3: f32 `a b c d e f` from path coordinates to drawing units (applied to the stroke too) |
+| path | runs: u8 `op` + (`count` - 1) << 3, then `count` groups of coordinates; ends with a 0 byte |
+
+Path operations (coordinates are svarint fixed, **relative to the current
+point**; a quadratic's and a cubic's control points too):
+
+| op | Meaning | Coordinates |
+| --- | --- | --- |
+| 1 | move | dx dy |
+| 2 | line | dx dy |
+| 3 | quadratic curve | control dx dy, end dx dy |
+| 4 | cubic curve | control 1 dx dy, control 2 dx dy, end dx dy |
+| 5 | close | none; the current point returns to the subpath's start |
+| 6 | horizontal line | dx |
+| 7 | vertical line | dy |
+
+A path begins with a move; a drawing operation after a close starts a new
+subpath where the last one began. Fills close open subpaths implicitly.
+The file is checked as a whole before any drawing: bad counts, indexes,
+unknown bits, runs that leave the payload or a payload that does not end
+exactly where the last shape ends are rejected.
+
+### How it is drawn
+
+Curves are split into line segments by how far they bend at the target size
+(within 0.02 px); strokes are made from one convex polygon per segment, join
+and cap, all wound the same way (a join beyond the miter limit is a bevel;
+a zero-length subpath with round or square caps is a dot); and the
+segments are accumulated in a float buffer as exact signed area per pixel,
+the method of font-rs and stb_truetype. A pixel's coverage is its running
+sum along the row: nonzero is `min(|sum|, 1)`, even-odd a triangle wave of
+`|sum|`. Edges are anti-aliased exactly (a half-covered pixel has alpha
+127 or 128); where several edges of one shape cross a pixel the fill rules
+are approximated as in FreeType and AGG. Gradients are evaluated per pixel
+through a 256-entry table. Shapes composite in order with source-over into
+the non-premultiplied `0xAARRGGBB` buffer.
+
+A picture is drawn into the rectangle it is given keeping its aspect ratio,
+centered (`MIMG_FIT_CONTAIN`); `MIMG_FIT_STRETCH` and `MIMG_FIT_COVER` are
+options of `mimg_render_ex`. Speed on one core of a modern PC (`-O2`, see
+`make bench-vimg`): the 24-unit sample icon takes 12 us at 16 px, 18 us at
+32, 33 us at 64 and 240 us at 256; the sample logo 1.2 ms at 256 px, 4 ms at
+512 and 16 ms at 1024.
+
+## .img layout (raster, version 1)
 
 All numbers are little-endian.
 
@@ -384,6 +543,28 @@ if (mimg_info(data, size, &info)) {
     mimg_decode(data, size, px, info.width);          // 0xAARRGGBB
 }
 size_t n = mimg_encode(px, w, h, w, true, out, mimg_encode_bound(w, h));
+
+// Vector pictures (and raster ones, scaled) at any size
+mimg_info_t info;
+mimg_info(data, size, &info);                      // info.vector, info.current_color, view box
+mimg_render_opts_t o;
+mimg_render_opts_init(&o);                         // black "current color", cleared, aspect kept
+o.current_color = 0xFFEAF2F8;                      // tint for icons that use "current color"
+o.clear = false;                                   // or composite over what is in the buffer
+o.alloc = malloc; o.free = free;                   // scratch memory (or o.scratch / o.scratch_size)
+mimg_render_ex(data, size, window_px, 24, 24, win_stride, &o);
+mimg_render(data, size, px, 64, 64, 64);           // the short form (built-in scratch)
+size_t scratch = mimg_scratch_size(data, size, 64, 64);   // recommended scratch for a size
+
+// Making a vector picture in code (mimg_vw_*; see the header)
+mimg_vwriter_t w;
+mimg_vw_begin(&w, buf, cap, mimg_vw_default_shift(24, 24), 0, 0, 24, 24);
+int p = mimg_vw_paint_current(&w, 255);
+mimg_vstyle_t st = mimg_vstyle_stroke(p, 2);
+mimg_vw_shape_begin(&w, &st);
+mimg_vw_move(&w, 4, 12); mimg_vw_line(&w, 20, 12);
+mimg_vw_shape_end(&w);
+size_t n = mimg_vw_finish(&w);
 
 // Videos: give it a read function (offset, buffer, length)
 mvid_reader_t r;

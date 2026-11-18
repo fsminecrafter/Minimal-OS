@@ -30,7 +30,7 @@ Updated after OS-0 to OS-5 (see the status list under Part A). Everything in the
 | Area | Today | What it means for the engine |
 | --- | --- | --- |
 | 3D | FGPU (`SYS_GPU` 40) runs in the kernel, with one context per program and one render lock. The CPU backend has a tile-binning rasterizer, an x86 shader JIT (SSE4.1 and AVX2) and asynchronous submits with fences. Read-only shader storage buffers (4 slots, vec4 loads) were added on 2026-11-16. **Scissor, 2D mips with trilinear filtering and 16 texture units** were added on 2026-11-17 (ABI 4; the NVIDIA backend does the scissor, mips and units above 4 still run on the CPU backend). It still has **no MRT, compute, writable SSBOs, instancing or integer formats** (OS-6 and OS-7). | The CPU backend *is* the renderer on QEMU, Intel and AMD. The engine can use scissor and mips now; MRT waits for OS-6. |
-| NVIDIA | Turing GSP-RM and copy engine work on an RTX 2060. The 3D engine and SASS compiler aren't proven on a card yet. | A bonus path, not a dependency. |
+| NVIDIA | Turing GSP-RM, the copy engine and 3D clears work on an RTX 2060. The first draw failed with Xid 69 (a pitch-linear color target next to a depth buffer) and NVDEC with RM error 0x1F (no engine context); both are fixed in code (block-linear color copies; falcon context promote, 2026-11-17) but not yet rerun on the card. | A bonus path, not a dependency. |
 | CPU | **AVX and AVX2 work** (XSAVE state saving, OS-2; AVX-512 untested). **A program's threads run on all cores** (OS-3), with affinity and priority calls. One intermittent kernel crash in the thread tests is still open. | The job system can use every core. AVX2 code paths are picked by hand at startup (no ifunc). |
 | Memory | Programs live above 4 GiB with `SYS_VM` (map, unmap, protect, decommit; demand-zero pages, NX, guard pages). ELF files up to 256 MiB are streamed in, the main stack is 8 MiB (configurable), and the page pool is sized from RAM, including RAM above 4 GiB. The SDK's own `malloc` is still one syscall per call. | The engine's allocator sits on `SYS_VM`. GCC on the OS has the address space it needs. |
 | Runtime | TLS, futex, clocks, spawn/wait and the environment exist (OS-0). The SDK's C library is still tiny: no libm, STL or `operator new`. Static PIE with RELATIVE relocations only (so no ifunc). | Until mlibc is ported, the engine carries a small C/C++ runtime of its own (`runtime/minimalos` in the engine repo). |
@@ -52,15 +52,15 @@ Updated after OS-0 to OS-5 (see the status list under Part A). Everything in the
 | OS-0 to OS-4 | Done (QEMU only). |
 | OS-5 present and windows | Mostly done; mosWM compositing from shared frames is untested. |
 | OS-6 FGPU v3 graphics + FGSL v2 | Started: OS-6.1 scissor done, OS-6.5 2D mips + trilinear done, OS-6.2 16 texture units and the limits block done (2026-11-17). The rest not started. |
-| OS-7 compute + NVIDIA | Read-only SSBOs done; the rest not started. |
+| OS-7 compute + NVIDIA | Read-only SSBOs done; NVIDIA 3D/NVDEC fixes and NVIDIA scissor written, waiting for a run on the card; the rest not started. |
 | OS-8 input and storage | Not started. |
 | OS-9 audio | The queue query exists; the rest not started. |
 | Dev loop | Done (H5): `make run` picks `-cpu host` with KVM or `-cpu max`; `make run-engine`. |
 | S1 to S4 (mlibc, GCC target, `msdk` in C, native toolchain) | Not started. |
 | S5 FarcadeGL v3 + FGSL v2 SDK | Follows OS-6/OS-7. |
 | E0 core | Mostly open (only math exists). |
-| E1 FL0 Lua player | Partly done. |
-| E3 editor on the OS | Partly done. |
+| E1 FL0 Lua player | Mostly done: feplayer, .fepak packages + VFS, feature levels from caps (2026-11-17). |
+| E3 editor on the OS | Mostly done: project settings, model import, export of Lua games (.run + .fepak, .mpkg) on the OS (2026-11-17). |
 | E2, E4 to E9 | Not started. |
 
 ---
@@ -108,9 +108,9 @@ Dependencies are in brackets. OS and engine lanes run in parallel.
 
 **Status (2026-11-17):**
 - **E0:** mostly open. `engine/core` has only math; the allocator, jobs, profiler, reflection and VFS/pak are not there.
-- **E1:** partly done: renderer, flecs, Lua 5.4 and the audio mixer exist; the pak reader and a cooker CLI beyond `mofconv` do not.
+- **E1:** mostly done: renderer (feature levels, post stack, cascades, probe GI, graphics settings as named choices), flecs, Lua 5.4, the audio mixer, the `.fepak` reader/VFS and the `feplayer` runtime exist; a cooker CLI beyond `mofconv`/export and asynchronous loading do not.
 - **E2:** not started (see Repository status).
-- **E3:** partly done: the editor runs on the OS (full screen and as a window), with scenes, undo/redo and Lua scripts. It cannot yet create, import and export a game on the OS.
+- **E3:** mostly done: the editor runs on the OS (full screen and as a window, F11 fixed), with scenes, undo/redo, Lua scripts, project settings, model import (glTF/OBJ to .mof) and File > Export game (`.run` + `.fepak` + optional `.mpkg`, graphics settings exported); export runs on the OS in QEMU. Templates and prefabs are open.
 - **E4 to E9:** not started.
 
 **OS track order:** OS-0, then OS-1, then OS-4 alongside OS-2 (the SSE4.1 JIT doesn't wait for AVX), then OS-3, OS-5, OS-6, OS-7, OS-8/OS-9.
@@ -143,7 +143,7 @@ Legend: `[x]` done, `[~]` partly done, `[ ]` open. "Needs" lists what must come 
 - [ ] **E0.6** Containers, strings and log.
 - [ ] **E0.7** Reflection: `FE_REFLECT` X-macros, starting from the existing field tables in `engine/scene/modules.cpp`.
 - [ ] **E0.8** Serialization driven by reflection (text scenes, cooked binary). Needs E0.7.
-- [ ] **E0.9** VFS and `.fepak` reader (zstd, parts of at most 2 GiB, 64-bit index).
+- [~] **E0.9** VFS and `.fepak` reader (zstd, parts of at most 2 GiB, 64-bit index). Done without zstd (2026-11-17, engine/core/pak, vfs; docs/pak-format.md).
 - [ ] **E0.10** Profiler: an rdtsc ring buffer per thread.
 - [~] **E0.11** Unit tests in headless CI: host tests (`make test`) exist; doctest is not added yet.
 - [ ] **E0.12** Exit: "hello pak" runs in QEMU.
@@ -152,13 +152,13 @@ Legend: `[x]` done, `[~]` partly done, `[ ]` open. "Needs" lists what must come 
 - [x] Done so far: flecs behind `fe::World`, Lua 5.4.7 running scripts in Play, the FL0-style forward renderer and GPU tier, an audio mixer.
 - [ ] **E1.1** `gfx` resource pools: sub-allocation from FGPU buffers of at most 16 MiB, within handle budgets.
 - [ ] **E1.2** Upload rings (2 to 3 buffers) and an ordered pass list.
-- [ ] **E1.3** Pick the feature level from `fglGetDeviceInfo` caps.
+- [x] **E1.3** Pick the feature level from `fglGetDeviceInfo` caps (engine/gfx/feature_level).
 - [ ] **E1.4** Packed 20-byte vertices for FL0.
 - [ ] **E1.5** FGSL compiled at cook time and cached in paks. Needs E0.9.
 - [~] **E1.6** Lua bindings generated from reflection (bindings exist; generation needs E0.7).
 - [~] **E1.7** Audio mixer features from C6: buses, 3D pan/attenuation/doppler, low-pass, reverb (a mixer exists in `engine/audio/mixer.cpp`).
 - [~] **E1.8** Cooker CLI: `tools/mofconv` converts models; add textures, audio, Lua bytecode, FGSL and scenes, writing paks.
-- [ ] **E1.9** Pak reader and asynchronous loader on an I/O thread. Needs E0.9.
+- [~] **E1.9** Pak reader and asynchronous loader on an I/O thread. Needs E0.9. The pak reader is done; loading is synchronous.
 - [ ] **E1.10** Exit: a Lua-scripted level runs on today's kernel.
 
 #### E2 Native toolchain (critical path)
@@ -175,7 +175,7 @@ Legend: `[x]` done, `[~]` partly done, `[ ]` open. "Needs" lists what must come 
 - [ ] **E3.3** Asset import: "Import from URL" (`SYS_NET` + minimaSSL), Deliver packages, `.mpkg` modules.
 - [ ] **E3.4** Prefabs on flecs prefabs.
 - [ ] **E3.5** Autosave.
-- [ ] **E3.6** Export of Lua-only games with the prebuilt `feplayer`, then packaging as a `.run` + paks (C8). Needs E1.8 and E1.9.
+- [x] **E3.6** Export of Lua-only games with the prebuilt `feplayer`, then packaging as a `.run` + paks (C8). Done 2026-11-17: File > Export game and `farcade-editor --export`, `.fepak` next to the `.run`, optional `.mpkg`; graphics settings go with the game and scripts change them with `fe.graphics`.
 - [ ] **E3.7** Exit: a Lua game is created, imported, edited and exported entirely on the OS.
 
 #### E4 C++ gameplay
@@ -313,6 +313,38 @@ Keep `fgpu_abi.h` identical in the kernel and the SDK in every step.
 - [ ] **OS-7.4** Barriers by splitting the branch-free IR, shared memory, 32/64-bit atomics via `lock cmpxchg`, indirect dispatch.
 - [ ] **OS-7.5** NVIDIA: prove 3D on the card.
 - [ ] **OS-7.6** NVIDIA: batch one job per frame, the compute class, real branches, proper SASS scheduling.
+- [~] **OS-7.7** NVIDIA backend catches up with FGPU ABI 4 (the `TODO(nv)` guards below). Scissor done; mipmaps and 16 texture units open.
+
+**NVIDIA backend: `TODO(nv)` guards and integration notes (from the OS-6 work, 2026-11-17)**
+
+The OS-6 work (FGPU ABI 4: scissor, 2D mipmaps, 16 texture units) kept such work off the NVIDIA backend with `TODO(nv)` guards. Status as of the merge into `main` (Minimal-OS 6c70d5c / ef03f05):
+
+*TODO(nv) guards*
+- `src/modules/GPU/fgpu_backend_nv.c`, in `nv_draw` (now `nv_draw_3d`), right after `const fgpu_pipeline_t* pipe = d->pipe;`:
+  ```c
+  // TODO(nv): ... scissor, mipmapped textures (mip_count > 1), texture units >= FGPU_MAX_TEXTURE_UNITS ...
+  if (pipe->scissor) return false;
+  for (uint32_t u = 0; u < FGPU_TEXTURE_UNITS; u++)
+      if (pipe->textures[u].pixels && (pipe->textures[u].mip_count > 1 || u >= FGPU_MAX_TEXTURE_UNITS)) return false;
+  ```
+  **Status:** the `pipe->scissor` line is gone (6c70d5c: the backend sets the hardware scissor); the mip-chain and unit checks stay.
+- There was also a one-comment TODO above `nv_clear`. **Status:** removed with the scissored clears (6c70d5c).
+- `nv_clear` had no pipeline or scissor argument, so the scissored-clear guard was in `fgpu.c`, in the `FGPU_OP_CLEAR` case: `if (g_hw && !st->pipe.scissor)`. **Status:** removed; `fgpu_hw_target_t` now carries the scissor rectangle and `nv_clear` clears just that rectangle (3D engine `SET_CLEAR_SURFACE_CONTROL.USE_SCISSOR0`, or a copy-engine fill of the rectangle).
+- `fgpu.c` also skips offering a draw to the hardware backend when scissor is on, any bound texture has a chain, or a bound texture is on unit >= 4. This is a `cpu_only` check marked `TODO(nv)`. **Status:** the scissor part is gone; the mip-chain and unit parts stay.
+- Shaders that sample a unit above 3 already fail `nv_sass.c`'s own range check, so they run on the CPU.
+- `FGPU_MAX_TEXTURE_UNITS` carries a `TODO(nv)` comment in `fgpu_abi.h`.
+- On the d12ab89 merge: `nv_sass_tests.c` took only the `fgpu_texture_t` initialiser change, and `fgpu_backend_nv.c` took the comment above `nv_clear` plus the `nv_draw` guard. Nothing in `nv_3d.c` was touched by the OS-6 work.
+
+*What the integrator had to do*
+- [x] Bump the SDK pin in Minimal-OS to the SDK commit `61e38ca` (branch `wt/os-fgpu`). Done in ef03f05.
+- [x] Copy the FGPU sources into Farcade-Engine's `external/fgpu`. The set that changed: `fgpu_abi.h`, `fgpu_raster.h`, `fgpu_shader.h`, `fgpu_raster.c`, `fgpu_shader.c`, `fgpu_jit_x64.c`. Done in Farcade-Engine ff81b3a (with the host device `engine/gfx/host/fgpu_host.c` taught ABI 4). The engine does not copy the kernel's host tests, so `tests/host/fgpu_mip_tests.c` and its Makefile rule (which must come after `JIT_SRC` is defined) stay in Minimal-OS.
+- [x] Merge d12ab89 with `wt/os-fgpu` and rerun `make test-host -j2`. Done in 6c70d5c; all host tests pass, `ci-os0` passes (1085 checks).
+- NV backend work for later:
+  - [x] Scissor: add a rectangle parameter to the backend `clear` callback and set hardware scissor in `nv_3d.c`, then drop both the `nv_draw` guard and the `fgpu.c` check. Done in 6c70d5c (the rectangle travels in `fgpu_hw_target_t`); not yet run on a card.
+  - [ ] Mips: sample mip chains by writing a multi-level texture header, and place such surfaces in VRAM.
+  - [ ] 16 units: widen the constant-buffer texture-handle table and the TIC/TSC pools, then raise `FGPU_MAX_TEXTURE_UNITS` to `FGPU_TEXTURE_UNITS`.
+- Not done, and not needed for the first step: explicit-LOD `textureLod` and `dFdx` in FGSL, `texelFetch`, and 3D/array textures.
+- One known limit: the legacy immediate path (`fgpuold`, float edge functions) can miss pixels that lie exactly on a shared diagonal. The previous rasterizer already did that (1 pixel in a 64x64 quad). The binned default path is exact, and the mip tests allow about 1% there for the immediate path only.
 
 **OS-8 input and storage**
 - [ ] **OS-8.1** USB hubs.

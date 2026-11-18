@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 256 256">
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1b2a6b"/>
+      <stop offset="0.6" stop-color="#3b5bdb"/>
+      <stop offset="1" stop-color="#74c0fc"/>
+    </linearGradient>
+    <radialGradient id="sun" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#fff9db"/>
+      <stop offset="0.55" stop-color="#ffd43b"/>
+      <stop offset="1" stop-color="#ff922b" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="hill" gradientUnits="userSpaceOnUse" x1="0" y1="150" x2="256" y2="256">
+      <stop offset="0" stop-color="#2b8a3e"/>
+      <stop offset="1" stop-color="#0b3d2e"/>
+    </linearGradient>
+    <path id="star" d="M0-6 1.8-1.9 6-1.9 2.6 0.8 3.7 5 0 2.6-3.7 5-2.6 0.8-6-1.9-1.8-1.9z"/>
+  </defs>
+  <rect width="256" height="256" rx="48" fill="url(#sky)"/>
+  <circle cx="176" cy="84" r="46" fill="url(#sun)"/>
+  <circle cx="176" cy="84" r="22" fill="#fff3bf"/>
+  <g fill="#fff" opacity=".85">
+    <use href="#star" x="40" y="40"/>
+    <use href="#star" x="86" y="26" transform="scale(.8)"/>
+    <use href="#star" x="120" y="62"/>
+    <use href="#star" x="62" y="96"/>
+  </g>
+  <path d="M0 176 C48 128 88 128 128 164 S212 196 256 150 V256 H0Z" fill="url(#hill)"/>
+  <path d="M0 214 C60 172 110 188 150 208 S226 226 256 196 V256 H0Z" fill="#0b2e22" fill-opacity=".8"/>
+  <g transform="translate(62 164)" stroke-linejoin="round">
+    <path d="M0 0 22 -46 44 0Z" fill="#12372a" stroke="#d3f9d8" stroke-width="3"/>
+    <path d="M11 0 28 -34 45 0Z" fill="#1c4d3a" stroke="#d3f9d8" stroke-width="3"/>
+  </g>
+  <path d="M28 232 A 100 100 0 0 1 228 232" fill="none" stroke="#fff" stroke-width="6" stroke-linecap="round" stroke-opacity=".5"/>
+  <g fill="none" stroke="#e7f5ff" stroke-width="5" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M150 232 l14 -26 l14 26"/>
+    <path d="M156 222 h16"/>
+  </g>
+  <rect x="3" y="3" width="250" height="250" rx="45" fill="none" stroke="#ffffff" stroke-opacity=".35" stroke-width="2"/>
+</svg>

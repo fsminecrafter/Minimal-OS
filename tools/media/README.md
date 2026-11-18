@@ -36,6 +36,8 @@ those files), PCM16 and IMA-ADPCM `.adi`,
 including `.adi` soundtracks embedded in `.vid`. Unsupported audio codecs
 are reported instead of being silently misplayed. Large media files and
 images have safety limits to avoid accidental excessive memory use.
+Vector `.img` files (version 2) are refused as "not a supported .img file";
+look at them with `build/tools/mosmedia png icon.img icon.png --size 256`.
 
 Run its decoder tests with:
 

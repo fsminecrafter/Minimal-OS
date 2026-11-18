@@ -139,6 +139,32 @@ static uint8_t g_buf[4096];             // RPC payload assembly
 
 /* ---------------------------------------------------------- utilities */
 
+/* What the driver says after boot (when nothing prints it) is kept here,
+ * so the 'gpu' report can show why the 3D engine was switched off. */
+#define LOG_LINES 24u
+#define LOG_CHARS 160u
+static char g_log[LOG_LINES][LOG_CHARS];
+static uint32_t g_log_count;                // lines ever logged
+
+static void log_line(const char* text) {
+    // One entry per line of text.
+    while (*text) {
+        char* d = g_log[g_log_count % LOG_LINES];
+        uint32_t n = 0;
+        while (*text && *text != '\n' && n + 1 < LOG_CHARS) d[n++] = *text++;
+        d[n] = '\0';
+        while (*text && *text != '\n') text++;
+        if (*text == '\n') text++;
+        if (n) g_log_count++;
+    }
+}
+
+uint32_t nv_rm_log_count(void) { return g_log_count < LOG_LINES ? g_log_count : LOG_LINES; }
+const char* nv_rm_log_line(uint32_t i) {
+    uint32_t first = g_log_count < LOG_LINES ? 0 : g_log_count - LOG_LINES;
+    return g_log[(first + i) % LOG_LINES];
+}
+
 static void say(const char* fmt, ...) {
     char line[200];
     va_list ap;
@@ -146,6 +172,7 @@ static void say(const char* fmt, ...) {
     vsnprintf(line, sizeof(line), fmt, ap);
     va_end(ap);
     if (c.print) c.print(line);
+    else log_line(line);
     serial_write_str(line);
 }
 
@@ -748,7 +775,7 @@ bool nv_rm_ce_copy_surface(gpu_adapter_t* a, uint64_t src_off, uint32_t src_pitc
 
 void nv_rm_chan_quiet(void) {
     c.print = NULL;
-    nv_gsp_rm_set_print(NULL);
+    nv_gsp_rm_set_print(log_line);      // GSP-RM's error log too
 }
 
 /* ------------------------------------------------- graphics context */

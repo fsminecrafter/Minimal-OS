@@ -791,6 +791,17 @@ evaluator) and the CPU shader machine, and checks that they agree.
      error 0xE NAME` (from 0x400100/0x400704/0x400708/0x400110, as
      nouveau's gf100_gr_intr reads them), which names the method.
 
+   Second run (2026-11-18): NVDEC came up (`ok: the video decoder's
+   channel runs`) and the 3D clear worked, but the draw failed with
+   `Graphics Exception: Shader Program Header 11 Error`, ESR
+   `0x405840 = 0xa0000800` (`NV_PGRAPH_PRI_DS_HWW_ESR`: SPH11, pipe stage
+   0x20 = pixel) and RC exception 13. The pixel shader header lacked
+   `IMAP_POSITION_W` (bit 191); the card wants it in every pixel header,
+   as Mesa's nvc0 driver notes ("getting a trap if FRAG_COORD_UMASK.w =
+   0"). `nv_sass.c` now sets it, `nv_sass_tests` checks it, and a failed
+   3D job also prints `DS trap: shader header errors 0x... in the ...
+   stage` from that register.
+
    The centre is inside both triangles (the near, blue-ish one must win),
    `left` only inside the far red one, `corner` in neither. If the first
    try shows only the clear color, the test repeats with the other

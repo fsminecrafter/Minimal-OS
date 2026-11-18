@@ -244,7 +244,8 @@ static void compare(const char* name, const char* vs, const char* fs) {
           ((vsh.sph[13] >> 12) & 0xF) == 0xF, msg);
     snprintf(msg, sizeof msg, "%s: pixel header", name);
     CHECK((fsh.sph[0] & 0x1F) == 2 && ((fsh.sph[0] >> 10) & 0xF) == 5 && (fsh.sph[0] & (1u << 14)) &&
-          (fsh.sph[18] & 0xF) == 0xF && (((fsh.sph[0] >> 15) & 1u) != 0) == fsh.kills, msg);
+          (fsh.sph[18] & 0xF) == 0xF && (((fsh.sph[0] >> 15) & 1u) != 0) == fsh.kills &&
+          (fsh.sph[5] & 0x80000000u), msg);   // IMAP_POSITION_W, or the card traps (SPH11)
     // Every varying the vertex stage writes is one the pixel stage reads.
     for (uint32_t c = 0; c < nvar * 4u; c++) {
         bool wrote = (vsh.sph[(432 + c) / 32] >> ((432 + c) % 32)) & 1u;

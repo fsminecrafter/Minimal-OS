@@ -528,6 +528,16 @@ static void report_gr_trap(void) {
         if (k_codes[i].code == (code & 0xFFu)) name = k_codes[i].name;
     say("  PGRAPH trap: status 0x%08x, subchannel %u method 0x%04x data 0x%08x, error 0x%x %s\n", stat,
         (addr >> 16) & 7u, addr & 0x3FFCu, data, code, name);
+    // Shader-header traps (SPHn errors) are reported by DS, not the FE trap
+    // above: NV_PGRAPH_PRI_DS_HWW_ESR, bits 0..23 the SPH checks, 29:24 the
+    // pipe stage (1 VSA, 2 VSB, 4 TI, 8 TS, 0x10 GS, 0x20 PS).
+    uint32_t ds = nv_rd32(c.a, 0x405840);
+    if (ds & 0x00FFFFFFu) {
+        uint32_t stage = (ds >> 24) & 0x3Fu;
+        say("  DS trap: shader header errors 0x%06x in the %s stage\n", ds & 0x00FFFFFFu,
+            stage == 0x20u ? "pixel" : stage == 0x02u ? "vertex" : stage == 0x01u ? "vertex A" :
+            stage == 0x10u ? "geometry" : stage ? "tessellation" : "unknown");
+    }
 }
 
 static bool submit_and_wait(chan_t* ch, uint32_t words, uint32_t payload, uint32_t timeout_ms) {

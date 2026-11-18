@@ -551,7 +551,9 @@ static bool submit_and_wait(chan_t* ch, uint32_t words, uint32_t payload, uint32
     wr(NV_USERMODE_BASE + NV_USERMODE_NOTIFY_CHANNEL_PENDING, ch->token);
 
     uint64_t end = time_get_uptime_ms() + timeout_ms;
-    uint64_t next_poll = 0;
+    // GSP-RM events only matter for a job that does not finish: a draw
+    // takes microseconds, so the first look at the queue waits 5 ms.
+    uint64_t next_poll = time_get_uptime_ms() + 5;
     while (*semaphore(ch) != payload) {
         uint64_t now = time_get_uptime_ms();
         if (now >= end) {

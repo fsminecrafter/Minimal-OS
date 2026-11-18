@@ -71,6 +71,7 @@ static uint64_t g_flipped_owner;        // pid whose surface is on screen, 0 = n
 static const fgpu_backend_t* g_hw;
 static const char* g_hw_why = "not chosen yet";
 static bool g_hw_pending;               // GPU work queued since the last finish()
+static fgpu_hw_counts_t g_hw_counts;
 
 /* CPU draws are recorded in a pass and rendered at flush (fgpu_raster.h,
  * docs/gpu.md "Binned rasterizer"). Flush points, all under the render lock: the end of
@@ -125,6 +126,8 @@ void fgpu_backend_select(void) {
     }
 }
 
+void fgpu_hw_counts(fgpu_hw_counts_t* out) { *out = g_hw_counts; }
+
 const fgpu_backend_t* fgpu_hw_backend(const char** why) {
     if (why) *why = g_hw_why;
     return g_hw;
@@ -150,7 +153,7 @@ void fgpu_video_h264_mismatch(void) {
 
 // Waits for queued GPU work before the CPU reads or writes GPU memory.
 static void hw_sync(void) {
-    if (g_hw && g_hw_pending) g_hw->finish();
+    if (g_hw && g_hw_pending) { g_hw->finish(); g_hw_counts.syncs++; }
     g_hw_pending = false;
 }
 
@@ -908,14 +911,18 @@ static uint64_t execute(exec_state_t* st, const uint32_t* cmd, uint32_t words) {
                         return SYS_ERR_INVAL;
                 }
                 // A shader the backend could not compile runs on the CPU. So do draws that use
-                // state it does not know (ABI 4): mipmapped textures, units >= 4.
-                // TODO(nv): drop these checks as the backend learns each feature.
+                // state it does not know (ABI 4): texture units >= 4. (Mipmapped textures are
+                // the backend's choice: the NVIDIA one samples their level 0.)
+                // TODO(nv): drop this check as the backend learns each feature.
                 bool cpu_only = false;
-                for (uint32_t u = 0; u < FGPU_TEXTURE_UNITS && !cpu_only; u++) {
-                    const fgpu_texture_t* tx = &st->pipe.textures[u];
-                    if (tx->pixels && (tx->mip_count > 1 || u >= FGPU_MAX_TEXTURE_UNITS)) cpu_only = true;
+                for (uint32_t u = FGPU_MAX_TEXTURE_UNITS; u < FGPU_TEXTURE_UNITS && !cpu_only; u++)
+                    if (st->pipe.textures[u].pixels) cpu_only = true;
+                if (g_hw) {
+                    if (cpu_only) g_hw_counts.texture_units++;
+                    else if (st->pipe.shader && !st->hw_program) g_hw_counts.shader_on_cpu++;
                 }
                 if (g_hw && !cpu_only && (!st->pipe.shader || st->hw_program)) {
+                    g_hw_counts.offered++;
                     st->triangles += pass_flush();      // CPU draws recorded earlier come first
                     fgpu_hw_target_t ht;
                     make_hw_target(st, &t, &ht);
@@ -939,6 +946,7 @@ static uint64_t execute(exec_state_t* st, const uint32_t* cmd, uint32_t words) {
                         st->triangles += drawn;
                         break;
                     }
+                    g_hw_counts.refused++;
                 }
                 // Recorded now, drawn at the next flush (pipeline state, uniforms and
                 // constants are snapshotted; buffers, textures and programs are

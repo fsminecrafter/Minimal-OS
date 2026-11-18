@@ -12,6 +12,7 @@
 #include "string.h"
 #include "fglsl.h"
 #include <stdarg.h>
+#include "x86_64/clock.h"
 
 /*
  * FGPU hardware backend for NVIDIA Turing (RTX 20 / GTX 16), and the
@@ -64,6 +65,7 @@ typedef struct {
     uint64_t vram;              // header + code, GPU_VRAM_INVALID if none
     uint32_t regs;
     uint32_t textures;
+    uint32_t buffers;           // storage buffer bindings read
 } nv_stage_t;
 
 typedef struct {
@@ -96,7 +98,19 @@ static struct {
     } tiled[MAX_TILED];
     float uniforms[FGPU_SHADER_MAX_UNIFORMS * 4];
     uint32_t draws, clears, resolves, uploads;
+    // For the 'gpu' report: why draws went back to the CPU, and where the
+    // time of the GPU path goes (jobs wait for the engine; copies are the
+    // block-linear loads and resolves).
+    uint32_t refused[8];
+    uint64_t jobs, job_ns, copy_ns;
 } g;
+
+enum { R_TARGET, R_PROGRAM, R_BUFFERS, R_TEXTURE, R_STORAGE, R_DEPTH, R_TILED, R_JOB };
+static const char* const k_refused[8] = {
+    "target not in VRAM", "shader not on the card", "vertex/index buffer not in VRAM",
+    "texture not usable", "storage buffer not usable", "no depth buffer", "no block-linear copy", "job failed",
+};
+#define REFUSE(r) do { g.refused[r]++; return false; } while (0)
 
 #define POOL_TIC   0u
 #define POOL_TSC   (NV3D_POOL_ENTRIES * 32u)
@@ -141,6 +155,7 @@ static bool compile_stage(const fgpu_program_t* p, bool fragment, nv_stage_t* ou
                 out->vram = off;
                 out->regs = sh.regs;
                 out->textures = sh.textures;
+                out->buffers = sh.buffers;
                 ok = true;
             } else if (off != GPU_VRAM_INVALID) {
                 gpu_vram_free(g.a, off);
@@ -261,7 +276,11 @@ static bool end_job(nv_push_t* p) {
         nv_rm_3d_cancel();
         return false;
     }
-    if (!nv_rm_3d_submit()) {
+    uint64_t t0 = clock_monotonic_ns();
+    bool ok = nv_rm_3d_submit();
+    g.job_ns += clock_monotonic_ns() - t0;
+    g.jobs++;
+    if (!ok) {
         g.hw3d = false;
         serial_write_str("nv: a 3D job failed; rendering goes back to the CPU\n");
         return false;
@@ -317,10 +336,12 @@ static void tiled_drop(int i) {
 // The block-linear copy back to the FGPU surface, if it is newer.
 static bool tiled_resolve(int i) {
     if (i < 0 || !g.tiled[i].dirty) return true;
-    if (!nv_rm_ce_copy_surface(g.a, g.tiled[i].vram, 0, g.tiled[i].linear, g.tiled[i].pitch,
+    uint64_t t0 = clock_monotonic_ns();
+    bool ok = nv_rm_ce_copy_surface(g.a, g.tiled[i].vram, 0, g.tiled[i].linear, g.tiled[i].pitch,
                                g.tiled[i].bl_width * 4u, g.tiled[i].bl_height, g.tiled[i].width * 4u,
-                               g.tiled[i].height))
-        return false;
+                               g.tiled[i].height);
+    g.copy_ns += clock_monotonic_ns() - t0;
+    if (!ok) return false;
     g.tiled[i].dirty = false;
     g.resolves++;
     return true;
@@ -368,10 +389,12 @@ static int tiled_for(const fgpu_hw_target_t* t, bool overwrite) {
         g.tiled[i].valid = g.tiled[i].dirty = false;
     }
     if (!g.tiled[i].valid && !overwrite) {
-        if (!nv_rm_ce_copy_surface(g.a, g.tiled[i].linear, g.tiled[i].pitch, g.tiled[i].vram, 0,
-                                   g.tiled[i].bl_width * 4u, g.tiled[i].bl_height, g.tiled[i].width * 4u,
-                                   g.tiled[i].height))
-            return -1;
+        uint64_t t0 = clock_monotonic_ns();
+        bool ok = nv_rm_ce_copy_surface(g.a, g.tiled[i].linear, g.tiled[i].pitch, g.tiled[i].vram, 0,
+                                        g.tiled[i].bl_width * 4u, g.tiled[i].bl_height, g.tiled[i].width * 4u,
+                                        g.tiled[i].height);
+        g.copy_ns += clock_monotonic_ns() - t0;
+        if (!ok) return -1;
         g.tiled[i].valid = true;
         g.uploads++;
     }
@@ -501,23 +524,25 @@ static bool nv_draw(const fgpu_hw_draw_t* d, uint32_t* triangles) {
 
 static bool nv_draw_3d(const fgpu_hw_draw_t* d, uint32_t* triangles) {
     const fgpu_pipeline_t* pipe = d->pipe;
-    // TODO(nv): state this backend does not implement yet runs on the CPU backend:
-    // mipmapped textures (mip_count > 1), texture units >= FGPU_MAX_TEXTURE_UNITS. (fgpu.c
-    // does not offer such draws either.)
-    for (uint32_t u = 0; u < FGPU_TEXTURE_UNITS; u++)
-        if (pipe->textures[u].pixels && (pipe->textures[u].mip_count > 1 || u >= FGPU_MAX_TEXTURE_UNITS)) return false;
+    // TODO(nv): texture units >= FGPU_MAX_TEXTURE_UNITS run on the CPU backend (fgpu.c does
+    // not offer such draws either). Mipmapped textures are sampled at level 0 only: the
+    // header describes a pitch-linear surface, which the hardware cannot mip. Drawing
+    // them here keeps the frame on the card; going to the CPU for them meant copying the
+    // render target back and forth for every such draw.
+    for (uint32_t u = FGPU_MAX_TEXTURE_UNITS; u < FGPU_TEXTURE_UNITS; u++)
+        if (pipe->textures[u].pixels) return false;
     nv3d_draw_t nd;
     memset(&nd, 0, sizeof(nd));
-    if (!color_ok(d->target, &nd.color)) return false;
+    if (!color_ok(d->target, &nd.color)) REFUSE(R_TARGET);
 
     const nv_program_t* np = pipe->shader ? (const nv_program_t*)d->program : builtin_program(pipe->program);
-    if (!np || !np->gpu) return false;
+    if (!np || !np->gpu) REFUSE(R_PROGRAM);
 
     uint64_t stride = (uint64_t)d->layout->stride * 4u;
     uint64_t vb_bytes = (uint64_t)d->vertex_count * stride;
-    if (!in_gpu_reach(&d->vertices, d->vertex_offset + vb_bytes) || !vb_bytes) return false;
+    if (!in_gpu_reach(&d->vertices, d->vertex_offset + vb_bytes) || !vb_bytes) REFUSE(R_BUFFERS);
     uint32_t count = d->count - d->count % 3u;
-    if (d->indices.cpu && !in_gpu_reach(&d->indices, d->index_offset + (uint64_t)count * 4u)) return false;
+    if (d->indices.cpu && !in_gpu_reach(&d->indices, d->index_offset + (uint64_t)count * 4u)) REFUSE(R_BUFFERS);
 
     // Textures the program samples: a header and a sampler per unit.
     uint32_t used = np->vs.textures | np->fs.textures;
@@ -529,10 +554,10 @@ static bool nv_draw_3d(const fgpu_hw_draw_t* d, uint32_t* triangles) {
         if (!tex->pixels || !tex->width || !tex->height ||
             !in_gpu_reach(mem, (uint64_t)pitch * tex->height) || (mem->vram_offset & 31u) || (pitch & 31u) ||
             mem->cpu == d->target->color.cpu)       // sampling the target it draws to
-            return false;
+            REFUSE(R_TEXTURE);
         // A surface drawn earlier through its block-linear copy: bring the
         // pixels back first (the texture header reads the surface).
-        if (!tiled_resolve(tiled_find(mem->cpu))) return false;
+        if (!tiled_resolve(tiled_find(mem->cpu))) REFUSE(R_TEXTURE);
         uint32_t words[8];
         nv3d_texture_header(words, nv_rm_vram_va(mem->vram_offset), pitch, tex->width, tex->height, NV3D_TEX_ARGB, 0);
         vram_write(g.pools + POOL_TIC + (u + 1u) * 32u, words, 32);
@@ -541,10 +566,22 @@ static bool nv_draw_3d(const fgpu_hw_draw_t* d, uint32_t* triangles) {
         nd.tex_handle[u] = (u + 1u) | ((u + 1u) << 20);
         nd.textures_changed = true;
     }
+    // Storage buffers the program reads: constant buffers on their memory.
+    uint32_t sbs = np->vs.buffers | np->fs.buffers;
+    for (uint32_t b = 0; b < FGPU_MAX_STORAGE_BUFFERS; b++) {
+        if (!(sbs & (1u << b))) continue;
+        const fgpu_mem_t* mem = &d->storage_buffers[b];
+        uint64_t bytes = mem->bytes & ~15ull;
+        if (bytes > NV_SASS_CB_STORAGE_BYTES) bytes = NV_SASS_CB_STORAGE_BYTES;
+        if (!bytes || !in_gpu_reach(mem, bytes) || (mem->vram_offset & 255u)) REFUSE(R_STORAGE);
+        nd.sb_mask |= 1u << b;
+        nd.sb_va[b] = nv_rm_vram_va(mem->vram_offset);
+        nd.sb_bytes[b] = (uint32_t)bytes;
+    }
     bool depth = d->target->cpu.depth && (pipe->state & (FGPU_STATE_DEPTH_TEST | FGPU_STATE_DEPTH_WRITE));
     if (depth) {
         nd.zeta = zeta_for(d->target);
-        if (!nd.zeta) return false;
+        if (!nd.zeta) REFUSE(R_DEPTH);
     }
     if (count == 0) { *triangles = 0; return true; }
     if (pipe->scissor) {
@@ -560,7 +597,7 @@ static bool nv_draw_3d(const fgpu_hw_draw_t* d, uint32_t* triangles) {
     int ti = tiled_find(d->target->color.cpu);
     if (depth || ti >= 0) {
         ti = tiled_for(d->target, false);
-        if (ti < 0) return false;
+        if (ti < 0) REFUSE(R_TILED);
         tiled_color(ti, &nd.color);
     }
 
@@ -584,9 +621,9 @@ static bool nv_draw_3d(const fgpu_hw_draw_t* d, uint32_t* triangles) {
     nd.count = count;
 
     nv_push_t* p = begin_job();
-    if (!p) return false;
+    if (!p) REFUSE(R_JOB);
     nv3d_push_draw(p, &nd);
-    if (!end_job(p)) return false;
+    if (!end_job(p)) REFUSE(R_JOB);
     if (ti >= 0) g.tiled[ti].dirty = true;
     *triangles = count / 3u;
     g.draws++;
@@ -1369,6 +1406,23 @@ void nv_bringup_report(gpu_adapter_t* a, void (*print)(const char* text)) {
         snprintf(line, sizeof(line), "        depth draws use block-linear color copies (%u copied back, %u loaded)\n",
                  (unsigned)g.resolves, (unsigned)g.uploads);
         print(line);
+        // Where the GPU path's time goes, and why draws went back to the CPU
+        // (counts since boot; run 'gpu' twice around a few seconds of work).
+        fgpu_hw_counts_t hc;
+        fgpu_hw_counts(&hc);
+        snprintf(line, sizeof(line), "        jobs: %llu, %llu us each on average; copies took %llu ms in all\n",
+                 (unsigned long long)g.jobs, (unsigned long long)(g.jobs ? g.job_ns / g.jobs / 1000u : 0),
+                 (unsigned long long)(g.copy_ns / 1000000u));
+        print(line);
+        snprintf(line, sizeof(line), "        draws offered to the card %u; on the CPU: shader %u, texture units %u, refused %u; CPU syncs %u\n",
+                 (unsigned)hc.offered, (unsigned)hc.shader_on_cpu, (unsigned)hc.texture_units, (unsigned)hc.refused,
+                 (unsigned)hc.syncs);
+        print(line);
+        for (uint32_t r = 0; r < 8; r++) {
+            if (!g.refused[r]) continue;
+            snprintf(line, sizeof(line), "          refused: %s %u\n", k_refused[r], (unsigned)g.refused[r]);
+            print(line);
+        }
         snprintf(line, sizeof(line), "        video: colour conversion of motion .vid frames on the GPU (%u frames so far)\n",
                  (unsigned)v.frames);
         print(line);

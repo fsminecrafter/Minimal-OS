@@ -47,6 +47,11 @@
 #define NV_SASS_CB_UNIFORM_BYTES 1024u      // FGPU_SHADER_MAX_UNIFORMS vec4s
 #define NV_SASS_CB_TEX_OFFSET    1024u      // then one handle per texture unit
 #define NV_SASS_CB_BYTES         2048u
+// Storage buffer b is bound as constant buffer NV_SASS_CB_STORAGE + b (up to
+// 64 KiB of it); loads with a constant index read c[bank][16 * index + 4 * comp].
+// Out-of-range constant reads return zero, as FGPU_SOP_BUFFER_LOAD does.
+#define NV_SASS_CB_STORAGE       1u
+#define NV_SASS_CB_STORAGE_BYTES 65536u
 
 // Attribute addresses (a[...]) shared by the stages.
 #define NV_SASS_ATTR_POSITION   0x070u
@@ -60,6 +65,7 @@ typedef struct {
     uint32_t regs;              // registers per thread, reserved ones included
     bool kills;                 // fragment stage discards
     uint32_t inputs;            // bit per attribute / varying read
+    uint32_t buffers;           // bit per storage buffer binding read
     uint32_t outputs;           // vertex stage: bit per varying written
     uint32_t textures;          // bit per texture unit sampled
 } nv_sass_t;

@@ -811,6 +811,26 @@ evaluator) and the CPU shader machine, and checks that they agree.
    `NV_SASS_HW_RESERVED_REGS` (2) to `regs`, and `nv_sass_tests` checks
    that the code stays below `regs - 2`.
 
+   Fourth run (2026-11-18): the 3D engine draws, but the Farcade editor
+   took 800 ms a frame on Medium and 80 ms on Low. Medium's lit shader
+   reads its lights and shadow data from a storage buffer, and
+   `nv_sass.c` refused every storage buffer load, so every lit draw ran
+   on the CPU between GPU passes, and each one copied the render target
+   out of its block-linear copy and back. Mipmapped textures did the
+   same. Now:
+   - storage buffer `b` is bound as constant buffer `1 + b` (up to
+     64 KiB, the constant cache dropped on each draw), and loads with a
+     constant index, which is every load in the engine's shaders, are
+     `c[1+b][16 * index + 4 * comp]` operands. A computed index still
+     stays on the CPU (it would need `LDC` with a register offset);
+   - mipmapped textures are drawn on the card from level 0 (pitch-linear
+     textures cannot have mips);
+   - a job no longer polls the GSP-RM queue before it has waited 5 ms;
+   - `gpu` reports the jobs and their average time, the time spent in
+     block-linear copies, the draws offered to the card and the ones the
+     CPU did with the reason. Run it twice around a few seconds in the
+     editor to see where a slow frame goes.
+
    The centre is inside both triangles (the near, blue-ish one must win),
    `left` only inside the far red one, `corner` in neither. If the first
    try shows only the clear color, the test repeats with the other

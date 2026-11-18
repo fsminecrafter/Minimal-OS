@@ -623,7 +623,18 @@ static bool nv_draw_3d(const fgpu_hw_draw_t* d, uint32_t* triangles) {
     nv_push_t* p = begin_job();
     if (!p) REFUSE(R_JOB);
     nv3d_push_draw(p, &nd);
-    if (!end_job(p)) REFUSE(R_JOB);
+    if (!end_job(p)) {
+        // Say which draw the engine did not finish (it is now switched off).
+        char line[200];
+        snprintf(line, sizeof(line),
+                 "nv: the failed draw: %s, vs %u regs, fs %u regs, textures 0x%x, storage 0x%x, %s, %s, %u %s\n",
+                 pipe->shader ? "shader" : "built-in program", (unsigned)np->vs.regs, (unsigned)np->fs.regs,
+                 (unsigned)used, (unsigned)nd.sb_mask, nd.zeta ? "depth" : "no depth",
+                 nd.color.block_linear ? "block-linear target" : "pitch target", (unsigned)count,
+                 nd.indexed ? "indices" : "vertices");
+        nv_rm_say(line);
+        REFUSE(R_JOB);
+    }
     if (ti >= 0) g.tiled[ti].dirty = true;
     *triangles = count / 3u;
     g.draws++;
@@ -1399,8 +1410,12 @@ void nv_bringup_report(gpu_adapter_t* a, void (*print)(const char* text)) {
         print("Step 3a RPC to GSP-RM works; 3b copy engine channel not up (run 'gpu nvidia boot')\n");
     else
         print("Step 3  RPC, channel + TURING_A, first clear   waits for step 2b\n");
-    if (g.hw3d) {
-        snprintf(line, sizeof(line), "Step 4  FarcadeGL draws run on the 3D engine (%u draws, %u clears so far)\n",
+    // The counters also after the 3D engine was switched off: they say
+    // what ran before that.
+    bool was_up = g.hw3d || g.draws || g.refused[R_JOB];
+    if (was_up) {
+        snprintf(line, sizeof(line), g.hw3d ? "Step 4  FarcadeGL draws run on the 3D engine (%u draws, %u clears so far)\n"
+                                            : "Step 4  3D engine switched off after a failed job (%u draws, %u clears before; see the errors below)\n",
                  (unsigned)g.draws, (unsigned)g.clears);
         print(line);
         snprintf(line, sizeof(line), "        depth draws use block-linear color copies (%u copied back, %u loaded)\n",
@@ -1427,7 +1442,14 @@ void nv_bringup_report(gpu_adapter_t* a, void (*print)(const char* text)) {
                  (unsigned)v.frames);
         print(line);
     }
-    if (g.hw3d) {
+    if (nv_rm_log_count()) {
+        print("\nGPU errors since boot (the last ones):\n");
+        for (uint32_t i = 0; i < nv_rm_log_count(); i++) {
+            snprintf(line, sizeof(line), "  %s\n", nv_rm_log_line(i));
+            print(line);
+        }
+    }
+    if (was_up) {
         /* reported above */
     } else if (nv_rm_3d_ready(a)) {
         print("Step 4  3D channel is up, but the draw self-test failed (run 'gpu nvidia boot' to see it)\n");

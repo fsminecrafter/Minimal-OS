@@ -142,6 +142,9 @@ bool nv_rm_screen_test(gpu_adapter_t* a, void (*print)(const char* text));
 // After the command that set things up returns: later messages (channel
 // errors, page faults) go to the serial/network log only.
 void nv_rm_chan_quiet(void);
+// Lines the driver logged after boot (the last 24), oldest first.
+uint32_t nv_rm_log_count(void);
+const char* nv_rm_log_line(uint32_t i);
 bool nv_gsp_rm_rpc_ok(gpu_adapter_t* a);
 
 // Prints the bring-up status of an NVIDIA adapter, line by line.

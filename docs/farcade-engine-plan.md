@@ -313,6 +313,38 @@ Keep `fgpu_abi.h` identical in the kernel and the SDK in every step.
 - [ ] **OS-7.4** Barriers by splitting the branch-free IR, shared memory, 32/64-bit atomics via `lock cmpxchg`, indirect dispatch.
 - [ ] **OS-7.5** NVIDIA: prove 3D on the card.
 - [ ] **OS-7.6** NVIDIA: batch one job per frame, the compute class, real branches, proper SASS scheduling.
+- [~] **OS-7.7** NVIDIA backend catches up with FGPU ABI 4 (the `TODO(nv)` guards below). Scissor done; mipmaps and 16 texture units open.
+
+**NVIDIA backend: `TODO(nv)` guards and integration notes (from the OS-6 work, 2026-11-17)**
+
+The OS-6 work (FGPU ABI 4: scissor, 2D mipmaps, 16 texture units) kept such work off the NVIDIA backend with `TODO(nv)` guards. Status as of the merge into `main` (Minimal-OS 6c70d5c / ef03f05):
+
+*TODO(nv) guards*
+- `src/modules/GPU/fgpu_backend_nv.c`, in `nv_draw` (now `nv_draw_3d`), right after `const fgpu_pipeline_t* pipe = d->pipe;`:
+  ```c
+  // TODO(nv): ... scissor, mipmapped textures (mip_count > 1), texture units >= FGPU_MAX_TEXTURE_UNITS ...
+  if (pipe->scissor) return false;
+  for (uint32_t u = 0; u < FGPU_TEXTURE_UNITS; u++)
+      if (pipe->textures[u].pixels && (pipe->textures[u].mip_count > 1 || u >= FGPU_MAX_TEXTURE_UNITS)) return false;
+  ```
+  **Status:** the `pipe->scissor` line is gone (6c70d5c: the backend sets the hardware scissor); the mip-chain and unit checks stay.
+- There was also a one-comment TODO above `nv_clear`. **Status:** removed with the scissored clears (6c70d5c).
+- `nv_clear` had no pipeline or scissor argument, so the scissored-clear guard was in `fgpu.c`, in the `FGPU_OP_CLEAR` case: `if (g_hw && !st->pipe.scissor)`. **Status:** removed; `fgpu_hw_target_t` now carries the scissor rectangle and `nv_clear` clears just that rectangle (3D engine `SET_CLEAR_SURFACE_CONTROL.USE_SCISSOR0`, or a copy-engine fill of the rectangle).
+- `fgpu.c` also skips offering a draw to the hardware backend when scissor is on, any bound texture has a chain, or a bound texture is on unit >= 4. This is a `cpu_only` check marked `TODO(nv)`. **Status:** the scissor part is gone; the mip-chain and unit parts stay.
+- Shaders that sample a unit above 3 already fail `nv_sass.c`'s own range check, so they run on the CPU.
+- `FGPU_MAX_TEXTURE_UNITS` carries a `TODO(nv)` comment in `fgpu_abi.h`.
+- On the d12ab89 merge: `nv_sass_tests.c` took only the `fgpu_texture_t` initialiser change, and `fgpu_backend_nv.c` took the comment above `nv_clear` plus the `nv_draw` guard. Nothing in `nv_3d.c` was touched by the OS-6 work.
+
+*What the integrator had to do*
+- [x] Bump the SDK pin in Minimal-OS to the SDK commit `61e38ca` (branch `wt/os-fgpu`). Done in ef03f05.
+- [x] Copy the FGPU sources into Farcade-Engine's `external/fgpu`. The set that changed: `fgpu_abi.h`, `fgpu_raster.h`, `fgpu_shader.h`, `fgpu_raster.c`, `fgpu_shader.c`, `fgpu_jit_x64.c`. Done in Farcade-Engine ff81b3a (with the host device `engine/gfx/host/fgpu_host.c` taught ABI 4). The engine does not copy the kernel's host tests, so `tests/host/fgpu_mip_tests.c` and its Makefile rule (which must come after `JIT_SRC` is defined) stay in Minimal-OS.
+- [x] Merge d12ab89 with `wt/os-fgpu` and rerun `make test-host -j2`. Done in 6c70d5c; all host tests pass, `ci-os0` passes (1085 checks).
+- NV backend work for later:
+  - [x] Scissor: add a rectangle parameter to the backend `clear` callback and set hardware scissor in `nv_3d.c`, then drop both the `nv_draw` guard and the `fgpu.c` check. Done in 6c70d5c (the rectangle travels in `fgpu_hw_target_t`); not yet run on a card.
+  - [ ] Mips: sample mip chains by writing a multi-level texture header, and place such surfaces in VRAM.
+  - [ ] 16 units: widen the constant-buffer texture-handle table and the TIC/TSC pools, then raise `FGPU_MAX_TEXTURE_UNITS` to `FGPU_TEXTURE_UNITS`.
+- Not done, and not needed for the first step: explicit-LOD `textureLod` and `dFdx` in FGSL, `texelFetch`, and 3D/array textures.
+- One known limit: the legacy immediate path (`fgpuold`, float edge functions) can miss pixels that lie exactly on a shared diagonal. The previous rasterizer already did that (1 pixel in a 64x64 quad). The binned default path is exact, and the mip tests allow about 1% there for the immediate path only.
 
 **OS-8 input and storage**
 - [ ] **OS-8.1** USB hubs.

@@ -802,6 +802,15 @@ evaluator) and the CPU shader machine, and checks that they agree.
    3D job also prints `DS trap: shader header errors 0x... in the ...
    stage` from that register.
 
+   Third run (2026-11-18): no header error any more, but every SM
+   reported `Graphics SM Warp Exception: Out Of Range Register` (warp ESR
+   `0x...730 = 0x..0d`, PC `0x174`) and RC exception 13. Since Volta each
+   thread's program counter lives in two registers after the ones the
+   code uses (NAK's `hw_reserved_gprs`), so `SET_PIPELINE_REGISTER_COUNT`
+   has to count them; we gave the bare count. `nv_sass_encode` now adds
+   `NV_SASS_HW_RESERVED_REGS` (2) to `regs`, and `nv_sass_tests` checks
+   that the code stays below `regs - 2`.
+
    The centre is inside both triangles (the near, blue-ish one must win),
    `left` only inside the far red one, `corner` in neither. If the first
    try shows only the clear color, the test repeats with the other

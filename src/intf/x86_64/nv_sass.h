@@ -37,6 +37,12 @@
 #define NV_SASS_SPH_WORDS       32u         // header, in front of the code
 #define NV_SASS_MAX_WORDS       (4u * 24576u)
 #define NV_SASS_MAX_REGS        240u
+// Volta and later keep each thread's program counter in two registers
+// past the ones the code uses (NAK's hw_reserved_gprs), so the count given
+// to SET_PIPELINE_REGISTER_COUNT must include them. Without them the SM
+// raises "Out Of Range Register" on the first instruction that touches
+// one of the last registers.
+#define NV_SASS_HW_RESERVED_REGS 2u
 
 #define NV_SASS_CB_UNIFORM_BYTES 1024u      // FGPU_SHADER_MAX_UNIFORMS vec4s
 #define NV_SASS_CB_TEX_OFFSET    1024u      // then one handle per texture unit
@@ -51,7 +57,7 @@ typedef struct {
     uint32_t* code;             // caller's storage
     uint32_t capacity;          // words in code
     uint32_t count;             // words used (4 per instruction)
-    uint32_t regs;              // registers per thread
+    uint32_t regs;              // registers per thread, reserved ones included
     bool kills;                 // fragment stage discards
     uint32_t inputs;            // bit per attribute / varying read
     uint32_t outputs;           // vertex stage: bit per varying written

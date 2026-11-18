@@ -271,7 +271,7 @@ bool nv_sass_encode(const fgpu_ir_inst_t* code, uint32_t count, uint32_t ir_regs
     e.scratch = base;
     e.tex_base = e.scratch + SCRATCH_REGS;
     e.out_base = e.tex_base + 4u * tex_count;
-    out->regs = e.out_base + (fragment ? 4u : 0u);
+    out->regs = e.out_base + (fragment ? 4u : 0u) + NV_SASS_HW_RESERVED_REGS;
     if (out->regs > NV_SASS_MAX_REGS) { *why = "too many registers"; return false; }
 
     uint32_t* sph = out->sph;

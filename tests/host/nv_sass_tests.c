@@ -261,7 +261,7 @@ static void compare(const char* name, const char* vs, const char* fs) {
         float in[FGPU_MAX_ATTRIBS][4], out[1 + FGPU_SHADER_MAX_VARYINGS][4];
         static sim_t s;
         memset(&s, 0, sizeof s);
-        s.regs = vsh.regs;
+        s.regs = vsh.regs - NV_SASS_HW_RESERVED_REGS;   // the code may not use those
         for (int i = 0; i < (int)FGPU_MAX_ATTRIBS; i++)
             for (int c = 0; c < 4; c++) {
                 in[i][c] = frand(-1.5f, 1.5f);
@@ -284,7 +284,7 @@ static void compare(const char* name, const char* vs, const char* fs) {
         float special[2][4] = { { frand(0, 64), frand(0, 64), frand(0, 1), frand(0.1f, 2) }, { 1, 1, 1, 1 } };
         float color[1][4];
         memset(&s, 0, sizeof s);
-        s.regs = fsh.regs;
+        s.regs = fsh.regs - NV_SASS_HW_RESERVED_REGS;
         for (int i = 0; i < (int)FGPU_MAX_ATTRIBS; i++)
             for (int c = 0; c < 4; c++) {
                 in[i][c] = frand(-1.5f, 1.5f);

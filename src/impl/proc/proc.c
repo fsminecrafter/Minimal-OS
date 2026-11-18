@@ -89,6 +89,18 @@ static inline spinlock_t* heap_lock_of(process_t* owner) {
 	return (spinlock_t*)&owner->heap_lock;
 }
 
+// Bytes of SYS_HEAP memory a program holds (for SYS_TASK).
+uint64_t proc_heap_bytes(process_t* proc) {
+	process_t* owner = proc_mem_owner(proc);
+	if (!owner) return 0;
+	uint64_t total = 0;
+	uint64_t flags = spinlock_acquire(heap_lock_of(owner));
+	for (struct user_heap_allocation* item = owner->user_heap_allocations; item; item = item->next)
+		total += item->size;
+	spinlock_release(heap_lock_of(owner), flags);
+	return total;
+}
+
 static int heap_map_locked(process_t* proc, void* address, size_t length);
 static int heap_unmap_locked(process_t* proc, void* address, size_t length, bool* changed);
 

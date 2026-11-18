@@ -827,6 +827,68 @@ static uint64_t sys_pslist_impl(syscall_process_info_t* out, uint32_t max_entrie
     return n;
 }
 
+/*
+ * SYS_TASK: the process list with what a task manager shows, and ending
+ * a program. Threads (process_t with mem_owner set) are folded into their
+ * program's entry.
+ */
+static uint64_t sys_task_list(syscall_task_info_t* out, uint32_t max_entries) {
+    if (!out || max_entries == 0) return 0;
+    if (max_entries > 4096) max_entries = 4096;
+    size_t count = 0;
+    process_t** procs = get_procs(&count);
+    if (!procs) return 0;
+    syscall_task_info_t* tmp = (syscall_task_info_t*)alloc(sizeof(*tmp) * max_entries);
+    if (!tmp) { free_mem(procs); return SYS_ERR_NOMEM; }
+    uint64_t now = time_get_uptime_ms();
+    uint32_t n = 0;
+    for (size_t i = 0; i < count && n < max_entries; i++) {
+        process_t* p = procs[i];
+        if (p->mem_owner) continue;                 // a thread: counted below
+        if (p->state == PROCESS_TERMINATED) continue;
+        syscall_task_info_t* t = &tmp[n++];
+        memset(t, 0, sizeof(*t));
+        t->pid = p->pid;
+        t->parent_pid = p->parent_pid;
+        strncpy(t->name, p->name, sizeof(t->name) - 1);
+        t->state = (uint8_t)p->state;
+        t->privilege = (uint8_t)p->privilege;
+        t->cpu = p->sched_cpu;
+        t->cpu_time_ms = p->cpu_time_ms;
+        t->age_ms = now > p->creation_time_ms ? now - p->creation_time_ms : 0;
+        if (p->is_window_manager) t->flags |= SYS_TASK_FLAG_WINDOW_MANAGER;
+        if (p->crashed) t->flags |= SYS_TASK_FLAG_CRASHED;
+        if (p->privilege == PROC_PRIVILEGE_USER)
+            t->memory_bytes = uvm_committed_bytes(p) + proc_heap_bytes(p);
+        for (size_t k = 0; k < count; k++) {
+            process_t* th = procs[k];
+            if (th->mem_owner != p || th->state == PROCESS_ZOMBIE || th->state == PROCESS_TERMINATED) continue;
+            t->threads++;
+            t->cpu_time_ms += th->cpu_time_ms;
+        }
+    }
+    free_mem(procs);
+    uint64_t r = n;
+    if (n && !syscall_user_copy_out(out, tmp, sizeof(*tmp) * n)) r = SYS_ERR_INVAL;
+    free_mem(tmp);
+    return r;
+}
+
+static uint64_t sys_task_end(uint64_t pid) {
+    process_t* self = current_process;
+    process_t* proc = NULL;
+    for (process_t* p = proc_list_head; p; p = p->next)
+        if (p->pid == pid && !p->mem_owner) { proc = p; break; }
+    if (!proc || proc->state == PROCESS_ZOMBIE || proc->state == PROCESS_TERMINATED) return SYS_ERR_NOTFOUND;
+    if (proc->privilege != PROC_PRIVILEGE_USER || proc->is_window_manager || proc == proc_mem_owner(self))
+        return SYS_ERR_PERM;
+    serial_write_str("[TASK] ending ");
+    serial_write_str(proc->name);
+    serial_write_str("\n");
+    kill(proc);
+    return SYS_SUCCESS;
+}
+
 /* ============================================================
  * SECURITY: user/kernel syscall privilege boundary
  *
@@ -1815,6 +1877,15 @@ static void syscall_dispatch_inner(syscall_regs_t* regs) {
         }
         case SYS_SYSINFO:
             regs->rax = sys_sysinfo_impl(regs->rdi);
+            break;
+
+        case SYS_TASK:
+            if (regs->rdi == SYS_TASK_LIST)
+                regs->rax = sys_task_list((syscall_task_info_t*)regs->rsi, (uint32_t)regs->rdx);
+            else if (regs->rdi == SYS_TASK_END)
+                regs->rax = sys_task_end(regs->rsi);
+            else
+                regs->rax = SYS_ERR_INVAL;
             break;
 
         case SYS_ROOT:

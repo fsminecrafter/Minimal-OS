@@ -222,6 +222,7 @@ process_t* proc_create_ex(const char* file_name, void (*entry_point)(),
 void proc_start(process_t* proc);
 
 void kill(process_t* proc);
+uint64_t proc_heap_bytes(process_t* proc);     // SYS_HEAP bytes a program holds
 process_t* get_proc_by_name(const char* name);
 process_t** get_procs(size_t* count);
 

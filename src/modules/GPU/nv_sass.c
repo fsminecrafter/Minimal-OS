@@ -140,11 +140,11 @@ static void mov(enc_t* e, uint32_t dst, const opnd_t* src, uint32_t pred) {
     emit(e, w, pred, true, true);
 }
 
-static void mov_cbuf(enc_t* e, uint32_t dst, uint32_t offset) {
+static void mov_cbuf(enc_t* e, uint32_t dst, uint32_t bank, uint32_t offset) {
     uint32_t w[4] = { 0 };
     set(w, 16, 24, dst);
     set(w, 38, 54, offset);                     // byte offset
-    set(w, 54, 59, 0);                          // constant buffer 0
+    set(w, 54, 59, bank);                       // constant buffer
     set(w, 0, 9, OP_MOV);
     set(w, 9, 12, FORM_CBUF);
     set(w, 72, 76, 0xF);
@@ -334,7 +334,7 @@ bool nv_sass_encode(const fgpu_ir_inst_t* code, uint32_t count, uint32_t ir_regs
             }
             case FGPU_IR_UNIFORM:
                 if (in->aux * 4u >= NV_SASS_CB_UNIFORM_BYTES) { *why = "uniform out of range"; return false; }
-                mov_cbuf(&e, in->reg, in->aux * 4u);
+                mov_cbuf(&e, in->reg, 0, in->aux * 4u);
                 break;
             case FGPU_IR_ADD: binary(&e, in, OP_FADD); break;
             case FGPU_IR_MUL: binary(&e, in, OP_FMUL); break;
@@ -447,9 +447,31 @@ bool nv_sass_encode(const fgpu_ir_inst_t* code, uint32_t count, uint32_t ir_regs
                 mov(&e, in->reg, &r, PRED_TRUE);
                 break;
             }
-            case FGPU_IR_BUFFER_LOAD:
-                *why = "storage buffer loads run on the CPU backend for NVIDIA safety";
-                return false;
+            case FGPU_IR_BUFFER_LOAD: {
+                // Only constant indices (all the engine's shaders use: loops
+                // are unrolled): the buffer is a constant buffer and the load
+                // a c[bank][offset] operand. A computed index would need LDC
+                // with a register offset; such shaders stay on the CPU.
+                const fgpu_ir_inst_t* def = &code[in->src[0].value];
+                uint32_t binding = in->aux / 4u;
+                if (def->op != FGPU_IR_IMM) { *why = "storage buffer load with a computed index"; return false; }
+                if (binding >= FGPU_MAX_STORAGE_BUFFERS) { *why = "storage buffer out of range"; return false; }
+                float index = def->imm;
+                if (in->src[0].mods & FGPU_IR_ABS) index = index < 0.0f ? -index : index;
+                if (in->src[0].mods & FGPU_IR_NEG) index = -index;
+                if (!(index >= 0.0f)) {                 // negative or NaN: the interpreter reads zero
+                    opnd_t zero = imm_opnd(0);
+                    mov(&e, in->reg, &zero, PRED_TRUE);
+                    break;
+                }
+                if (index >= (float)(NV_SASS_CB_STORAGE_BYTES / 16u)) {
+                    *why = "storage buffer index beyond 64 KiB";
+                    return false;
+                }
+                mov_cbuf(&e, in->reg, NV_SASS_CB_STORAGE + binding, (uint32_t)index * 16u + (in->aux % 4u) * 4u);
+                out->buffers |= 1u << binding;
+                break;
+            }
             case FGPU_IR_OUTPUT: {
                 opnd_t v = source(&e, in, 0, true);
                 uint32_t reg = in->aux / 4u, comp = in->aux % 4u;

@@ -99,3 +99,14 @@ extern fgpu_backend_t fgpu_backend_nvidia;
 
 // The hardware backend in use (NULL = CPU only) and, if none, why.
 const fgpu_backend_t* fgpu_hw_backend(const char** why);
+
+// Draws the CPU backend did although a hardware backend is up, by reason
+// (since boot), for the 'gpu' report.
+typedef struct {
+    uint32_t offered;           // draws given to the hardware backend
+    uint32_t shader_on_cpu;     // its shader did not compile for the card
+    uint32_t texture_units;     // samples a unit the backend does not have
+    uint32_t refused;           // offered, but the backend said no
+    uint32_t syncs;             // GPU work waited for so the CPU could touch memory
+} fgpu_hw_counts_t;
+void fgpu_hw_counts(fgpu_hw_counts_t* out);

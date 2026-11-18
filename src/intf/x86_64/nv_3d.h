@@ -64,6 +64,11 @@ typedef struct {
     bool front_ccw;                 // what the hardware calls front (found by the self-test)
     nv3d_stage_t vs, fs;
     uint64_t cb_va;                 // constant buffer, NV_SASS_CB_BYTES
+    // Storage buffers read by the shaders, bound as constant buffers
+    // NV_SASS_CB_STORAGE + b: address 256-byte aligned, size a multiple of 16.
+    uint32_t sb_mask;
+    uint64_t sb_va[FGPU_MAX_STORAGE_BUFFERS];
+    uint32_t sb_bytes[FGPU_MAX_STORAGE_BUFFERS];
     const float* uniforms;          // FGPU_SHADER_MAX_UNIFORMS * 4 floats
     uint32_t tex_handle[FGPU_MAX_TEXTURE_UNITS];    // header index | sampler index << 20
     bool textures_changed;          // headers or samplers were rewritten
@@ -144,6 +149,7 @@ void nv3d_sampler(uint32_t out[8], uint32_t flags);
 #define NVC597_SET_STENCIL_TEST             0x1380u
 #define NVC597_SET_WINDOW_ORIGIN            0x13ACu
 #define NVC597_INVALIDATE_SAMPLER_CACHE_NO_WFI 0x1424u
+#define NVC597_INVALIDATE_SHADER_CACHES_NO_WFI 0x0da4u     // bit 12: constant cache
 #define NVC597_INVALIDATE_TEXTURE_HEADER_CACHE_NO_WFI 0x1428u
 #define NVC597_SET_ANTI_ALIAS_ENABLE        0x1534u
 #define NVC597_SET_ZT_SELECT                0x1538u

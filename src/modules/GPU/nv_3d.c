@@ -322,6 +322,22 @@ void nv3d_push_draw(nv_push_t* p, const nv3d_draw_t* d) {
     load_constants(p, NV_SASS_CB_TEX_OFFSET, d->tex_handle, FGPU_MAX_TEXTURE_UNITS);
     m1(p, NVC597_BIND_GROUP_CONSTANT_BUFFER(NV3D_GROUP_VERTEX), 1);        // valid, slot 0
     m1(p, NVC597_BIND_GROUP_CONSTANT_BUFFER(NV3D_GROUP_PIXEL), 1);
+    // Storage buffers as constant buffers on their memory. The CPU may have
+    // written them since the last draw, so the constant cache is dropped.
+    if (d->sb_mask) {
+        for (uint32_t b = 0; b < FGPU_MAX_STORAGE_BUFFERS; b++) {
+            if (!(d->sb_mask & (1u << b))) continue;
+            uint32_t sb[3] = { d->sb_bytes[b], (uint32_t)(d->sb_va[b] >> 32) & 0xFFu, (uint32_t)d->sb_va[b] };
+            nv_push_method(p, S, NVC597_SET_CONSTANT_BUFFER_SELECTOR_A, sb, 3);
+            uint32_t slot = 1u | ((NV_SASS_CB_STORAGE + b) << 4);
+            m1(p, NVC597_BIND_GROUP_CONSTANT_BUFFER(NV3D_GROUP_VERTEX), slot);
+            m1(p, NVC597_BIND_GROUP_CONSTANT_BUFFER(NV3D_GROUP_PIXEL), slot);
+        }
+        m1(p, NVC597_INVALIDATE_SHADER_CACHES_NO_WFI, 1u << 12);
+        // LOAD_CONSTANT_BUFFER writes through the selector: point it back
+        // at the constants for the next job.
+        nv_push_method(p, S, NVC597_SET_CONSTANT_BUFFER_SELECTOR_A, sel, 3);
+    }
     if (d->textures_changed) {
         m1(p, NVC597_INVALIDATE_SAMPLER_CACHE_NO_WFI, 0);
         m1(p, NVC597_INVALIDATE_TEXTURE_HEADER_CACHE_NO_WFI, 0);

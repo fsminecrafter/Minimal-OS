@@ -31,6 +31,9 @@ static fgpu_program_t prog;
 static float uniforms[FGPU_SHADER_MAX_UNIFORMS][4];
 static fgpu_texture_t textures[FGPU_MAX_TEXTURE_UNITS];
 static uint32_t texels[2][8 * 8];
+// Storage buffers as the card sees them: constant buffers NV_SASS_CB_STORAGE + b.
+static const float* sb_data[FGPU_MAX_STORAGE_BUFFERS];
+static uint32_t sb_bytes[FGPU_MAX_STORAGE_BUFFERS];
 
 static uint32_t rng = 777u;
 static float frand(float lo, float hi) {
@@ -122,9 +125,16 @@ static bool sim_run(sim_t* s, const nv_sass_t* sh, bool fragment) {
         float b;
         if (form == 4) { b_bits = F(32, 64); b = u2f(b_bits); }
         else if (form == 5) {
-            uint32_t off = F(38, 54);
-            if (F(54, 59) != 0 || off + 4 > NV_SASS_CB_UNIFORM_BYTES) s->bad = true;
-            memcpy(&b_bits, (const uint8_t*)uniforms + off, 4);
+            uint32_t off = F(38, 54), bank = F(54, 59);
+            if (bank == 0) {
+                if (off + 4 > NV_SASS_CB_UNIFORM_BYTES) s->bad = true;
+                memcpy(&b_bits, (const uint8_t*)uniforms + off, 4);
+            } else {
+                uint32_t sb = bank - NV_SASS_CB_STORAGE;
+                if (bank < NV_SASS_CB_STORAGE || sb >= FGPU_MAX_STORAGE_BUFFERS) { s->bad = true; continue; }
+                b_bits = 0;                         // past the bound size: zero, as on the card
+                if (sb_data[sb] && off + 4 <= sb_bytes[sb]) memcpy(&b_bits, (const uint8_t*)sb_data[sb] + off, 4);
+            }
             b = u2f(b_bits);
         } else if (form == 1) { b_bits = rd(s, F(32, 40)); b = mod(b_bits, F(62, 63), F(63, 64)); }
         else { s->bad = true; continue; }
@@ -189,31 +199,53 @@ static bool close_enough(float a, float b) {
     return d <= 2e-3f + 2e-3f * m;
 }
 
-static void test_storage_buffer_fallback(void) {
-    const char* vs = "attribute vec3 position; void main() { gl_Position = vec4(position, 1.0); }";
-    const char* fs =
-        "layout(binding = 0) buffer vec4 values[];\n"
-        "void main() { gl_FragColor = values[0.0]; }\n";
-    if (fglsl_compile(&comp, vs, fs) != 0) {
-        CHECK(false, "storage buffer shader compiles");
-        return;
-    }
-    const char* why = "";
-    if (!fgpu_program_check(comp.words, comp.size, &prog, &why)) {
-        CHECK(false, "storage buffer shader validates");
-        return;
-    }
-    if (!prog.h.storage_buffer_mask) return;
+// Storage buffer loads with constant indices become constant buffer reads;
+// a computed index stays on the CPU.
+static bool storage_stage(const char* fs, nv_sass_t* sh, const char** why) {
+    const char* vs = "attribute vec3 position; varying vec4 v_k;\n"
+                     "void main() { v_k = vec4(position, 1.0); gl_Position = vec4(position, 1.0); }";
+    if (fglsl_compile(&comp, vs, fs) != 0) { *why = comp.error; return false; }
+    if (!fgpu_program_check(comp.words, comp.size, &prog, why)) return false;
     fgpu_ir_t ir = { .code = code, .capacity = CAP, .hash = hash_words };
-    if (!fgpu_ir_lower(&ir, &prog, true, &why)) {
-        CHECK(false, "storage buffer shader lowers to IR");
-        return;
-    }
+    if (!fgpu_ir_lower(&ir, &prog, true, why)) return false;
     fgpu_ir_allocate(&ir);
-    nv_sass_t sh = { .code = sass_words[1], .capacity = CAP * 8u };
-    CHECK(!nv_sass_encode(ir.code, ir.count, ir.reg_count, true, prog.h.varying_count, &sh, &why) &&
-          strstr(why, "storage buffer loads run on the CPU"),
-          "NVIDIA encoder refuses unsafe native storage loads");
+    *sh = (nv_sass_t){ .code = sass_words[1], .capacity = CAP * 8u };
+    return nv_sass_encode(ir.code, ir.count, ir.reg_count, true, prog.h.varying_count, sh, why);
+}
+
+static void test_storage_buffer(void) {
+    const char* why = "";
+    nv_sass_t sh;
+    // Two buffers, an index past the end of the first (reads zero) and a
+    // negative one (zero too, like the interpreter).
+    const char* fs =
+        "layout(binding = 0) buffer vec4 a[];\n"
+        "layout(binding = 2) buffer vec4 b[];\n"
+        "void main() { gl_FragColor = a[1.0] + b[0.0] * 2.0 + a[7.0] + a[-1.0]; }\n";
+    bool ok = storage_stage(fs, &sh, &why);
+    if (!ok) printf("  storage: %s\n", why);
+    CHECK(ok, "constant-index storage buffer loads encode");
+    if (!ok) return;
+    CHECK(sh.buffers == 5u, "the stage reports buffers 0 and 2");
+    static const float a[3][4] = { { 9, 9, 9, 9 }, { 1, 2, 3, 4 }, { 9, 9, 9, 9 } };
+    static const float bb[1][4] = { { 0.5f, -1, 10, 0 } };
+    sb_data[0] = &a[0][0]; sb_bytes[0] = sizeof a;
+    sb_data[2] = &bb[0][0]; sb_bytes[2] = sizeof bb;
+    static sim_t s;
+    memset(&s, 0, sizeof s);
+    s.regs = sh.regs - NV_SASS_HW_RESERVED_REGS;
+    bool ran = sim_run(&s, &sh, true) && !s.bad;
+    CHECK(ran, "storage buffer shader runs in the simulator");
+    const float want[4] = { 2, 0, 23, 4 };
+    for (int c = 0; c < 4 && ran; c++) CHECK(close_enough(u2f(s.r[c]), want[c]), "storage buffer values");
+    sb_data[0] = sb_data[2] = NULL;
+
+    // A computed index needs LDC with a register offset: not encoded.
+    const char* dyn =
+        "layout(binding = 0) buffer vec4 a[];\n"
+        "varying vec4 v_k;\n"
+        "void main() { gl_FragColor = a[v_k.x]; }\n";
+    CHECK(!storage_stage(dyn, &sh, &why) && strstr(why, "computed index"), "a computed index stays on the CPU");
 }
 
 // Compiles a shader pair and runs both stages on random inputs through
@@ -531,7 +563,7 @@ int main(void) {
     test_encodings();
     test_pushbuffers();
     test_nvdec();
-    test_storage_buffer_fallback();
+    test_storage_buffer();
     compare("built-in color", NV_BUILTIN_VS_PLAIN, NV_BUILTIN_FS_PLAIN);
     compare("video NV12 to RGB", NV_VIDEO_VS, NV_VIDEO_NV12_FS);
     compare("built-in gouraud", NV_BUILTIN_VS_GOURAUD, NV_BUILTIN_FS_PLAIN);

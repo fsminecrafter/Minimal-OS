@@ -152,6 +152,9 @@ typedef enum {
 #define SYSCALL_INPUT_MOD_SHIFT (1u << 0)
 #define SYSCALL_INPUT_MOD_CTRL (1u << 1)
 #define SYSCALL_INPUT_MOD_ALT (1u << 2)
+// Right Alt (AltGr): the layout's third character on a key. Left Alt is
+// SYSCALL_INPUT_MOD_ALT; the two are reported separately.
+#define SYSCALL_INPUT_MOD_ALTGR (1u << 3)
 #define SYSCALL_INPUT_BTN_LEFT (1u << 0)
 #define SYSCALL_INPUT_BTN_RIGHT (1u << 1)
 #define SYSCALL_INPUT_BTN_MIDDLE (1u << 2)
@@ -396,9 +399,15 @@ typedef struct {
     uint32_t buttons;
     int32_t wheel;
     uint8_t mods;
+    // KEY events: reserved[0] is 1 on a key-down the window manager repeats
+    // while the key is held (see SYSCALL_WINDOW_KEY_IS_REPEAT). Others: 0.
     uint8_t reserved[3];
     uint32_t time_ms;
 } syscall_window_event_t;
+
+// True for an auto-repeated key-down; programs that act on presses only
+// (toggles, game actions) skip these, text input takes them.
+#define SYSCALL_WINDOW_KEY_IS_REPEAT(ev) ((ev)->reserved[0] != 0)
 
 typedef struct {
     uint32_t width;

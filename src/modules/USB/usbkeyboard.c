@@ -54,6 +54,15 @@ static const char* g_key_names[256] = {
 static void usb_keyboard_handle_key_press(uint8_t scancode, uint8_t modifiers);
 static void usb_keyboard_handle_key_release(uint8_t scancode);
 
+// Alt bits for the raw input queue: left Alt is Alt, right Alt is AltGr
+// (it types the third character on a key, like { [ ] } \ @ on Nordic and
+// German layouts), so programs do not take AltGr+7 for an Alt shortcut.
+static uint8_t input_alt_mods(void) {
+    uint8_t m = g_keyboard_state.current_report.modifiers;
+    return (uint8_t)(((m & USB_MOD_LALT) ? SYSCALL_INPUT_MOD_ALT : 0) |
+                     ((m & USB_MOD_RALT) ? SYSCALL_INPUT_MOD_ALTGR : 0));
+}
+
 // ===========================================
 // INITIALIZATION
 // ===========================================
@@ -103,7 +112,7 @@ void usb_keyboard_process_report(const usb_hid_keyboard_report_t* report) {
     if (changed) {
         uint8_t now = (g_keyboard_state.shift ? SYSCALL_INPUT_MOD_SHIFT : 0) |
                       (g_keyboard_state.ctrl ? SYSCALL_INPUT_MOD_CTRL : 0) |
-                      (g_keyboard_state.alt ? SYSCALL_INPUT_MOD_ALT : 0);
+                      input_alt_mods();
         for (uint8_t bit = 0; bit < 8; bit++) {
             if (!(changed & (1u << bit))) continue;
             input_event_push((mods & (1u << bit)) ? SYSCALL_INPUT_KEY_DOWN : SYSCALL_INPUT_KEY_UP,
@@ -195,7 +204,7 @@ static void usb_keyboard_handle_key_press(uint8_t scancode, uint8_t modifiers) {
 
     uint8_t mods = (g_keyboard_state.shift ? SYSCALL_INPUT_MOD_SHIFT : 0) |
                    (g_keyboard_state.ctrl ? SYSCALL_INPUT_MOD_CTRL : 0) |
-                   (g_keyboard_state.alt ? SYSCALL_INPUT_MOD_ALT : 0);
+                   input_alt_mods();
     input_event_push(SYSCALL_INPUT_KEY_DOWN, scancode, mods, 0, 0, 0, 0);
 
     if (character) {
@@ -224,7 +233,7 @@ static void usb_keyboard_handle_key_release(uint8_t scancode) {
 
     uint8_t mods = (g_keyboard_state.shift ? SYSCALL_INPUT_MOD_SHIFT : 0) |
                    (g_keyboard_state.ctrl ? SYSCALL_INPUT_MOD_CTRL : 0) |
-                   (g_keyboard_state.alt ? SYSCALL_INPUT_MOD_ALT : 0);
+                   input_alt_mods();
     input_event_push(SYSCALL_INPUT_KEY_UP, scancode, mods, 0, 0, 0, 0);
     
     // Call user callback

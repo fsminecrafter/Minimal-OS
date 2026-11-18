@@ -515,6 +515,11 @@ bool nv_sass_encode(const fgpu_ir_inst_t* code, uint32_t count, uint32_t ir_regs
         sph_bit(sph, 14);                           // per-target outputs
         if (out->kills) sph_bit(sph, 15);
         sph_field(sph, 576, 580, 0xFu);             // writes target 0's r, g, b, a
+        // IMAP_POSITION_W must be set in every pixel header: without it the
+        // card raises "Shader Program Header 11 Error" (DS_HWW_ESR SPH11,
+        // pipe stage PS) on the first draw. Mesa's nvc0 driver sets it
+        // unconditionally for the same reason ("FRAG_COORD_UMASK.w").
+        sph_bit(sph, 191);
         // Every varying counts as read (perspective), also the unused
         // ones: the vertex stage writes them all, and outputs nobody
         // reads raise an exception on the card.

@@ -89,6 +89,13 @@ static struct {
         const void* cpu;        // the FGPU depth surface it shadows
         uint64_t vram;
         nv3d_zeta_t z;
+        // The FGPU depth surface (float32, pitch-linear): kept in step with the GPU buffer, so draws that
+        // fall back to the CPU test against what the card drew and the card against what the CPU drew.
+        bool in_vram;
+        uint64_t linear;
+        uint32_t pitch, width, height;
+        bool gpu_newer;         // the card wrote depth the surface does not have yet
+        bool stale;             // the surface may hold depth the card does not have (load before use)
     } zeta[MAX_ZETA];
     struct {
         const void* cpu;        // the FGPU color surface it stands in for, NULL = free
@@ -106,6 +113,7 @@ static struct {
     // block-linear loads and resolves).
     uint32_t refused[8];
     uint64_t jobs, job_ns, copy_ns;
+    uint32_t depth_loads, depth_stores;     // depth copied between the GPU buffers and the surfaces
 } g;
 
 enum { R_TARGET, R_PROGRAM, R_BUFFERS, R_TEXTURE, R_STORAGE, R_DEPTH, R_TILED, R_JOB };
@@ -294,11 +302,46 @@ static bool end_job(nv_push_t* p) {
 
 // The GPU depth buffer behind an FGPU depth surface; made (and cleared
 // to the far plane) the first time it is needed.
-static const nv3d_zeta_t* zeta_for(const fgpu_hw_target_t* t) {
+// The surface's depth into the GPU buffer, when the CPU may have changed it (block-linear, GOBs like the
+// color copies: D32F is 4 bytes a pixel).
+static bool zeta_load(uint32_t i) {
+    if (!g.zeta[i].stale) return true;
+    if (!g.zeta[i].in_vram) { g.zeta[i].stale = false; return true; }
+    uint64_t t0 = clock_monotonic_ns();
+    bool ok = nv_rm_ce_copy_surface(g.a, g.zeta[i].linear, g.zeta[i].pitch, g.zeta[i].vram, 0, g.zeta[i].z.width * 4u,
+                                    g.zeta[i].z.height, g.zeta[i].width * 4u, g.zeta[i].height);
+    g.copy_ns += clock_monotonic_ns() - t0;
+    if (ok) { g.zeta[i].stale = false; g.depth_loads++; }
+    return ok;
+}
+
+// The GPU buffer's depth back into the surface (the CPU is about to read or draw).
+static void zeta_store(uint32_t i) {
+    if (!g.zeta[i].gpu_newer || !g.zeta[i].in_vram) return;
+    uint64_t t0 = clock_monotonic_ns();
+    if (nv_rm_ce_copy_surface(g.a, g.zeta[i].vram, 0, g.zeta[i].linear, g.zeta[i].pitch, g.zeta[i].z.width * 4u,
+                              g.zeta[i].z.height, g.zeta[i].width * 4u, g.zeta[i].height)) {
+        g.zeta[i].gpu_newer = false;
+        g.depth_stores++;
+    }
+    g.copy_ns += clock_monotonic_ns() - t0;
+}
+
+static int zeta_index(const nv3d_zeta_t* z) {
+    for (uint32_t i = 0; i < MAX_ZETA; i++) if (g.zeta[i].cpu && &g.zeta[i].z == z) return (int)i;
+    return -1;
+}
+
+// `overwrite`: the caller replaces all of it (a whole clear), so the surface's depth need not be loaded.
+static const nv3d_zeta_t* zeta_for_ex(const fgpu_hw_target_t* t, bool overwrite) {
     if (!t->cpu.depth) return NULL;
     int free_slot = -1;
     for (uint32_t i = 0; i < MAX_ZETA; i++) {
-        if (g.zeta[i].cpu == t->depth.cpu) return &g.zeta[i].z;
+        if (g.zeta[i].cpu == t->depth.cpu) {
+            if (overwrite) g.zeta[i].stale = false;
+            else if (!zeta_load(i)) return NULL;
+            return &g.zeta[i].z;
+        }
         if (!g.zeta[i].cpu && free_slot < 0) free_slot = (int)i;
     }
     if (free_slot < 0) return NULL;
@@ -318,8 +361,19 @@ static const nv3d_zeta_t* zeta_for(const fgpu_hw_target_t* t) {
     g.zeta[free_slot].cpu = t->depth.cpu;
     g.zeta[free_slot].vram = off;
     g.zeta[free_slot].z = z;
+    g.zeta[free_slot].in_vram = t->depth.in_vram;
+    g.zeta[free_slot].linear = t->depth.vram_offset;
+    g.zeta[free_slot].pitch = t->cpu.depth_pitch * 4u;
+    g.zeta[free_slot].width = t->cpu.width;
+    g.zeta[free_slot].height = t->cpu.height;
+    g.zeta[free_slot].gpu_newer = false;
+    // A new buffer starts from what the surface holds (the CPU's clears and draws so far).
+    g.zeta[free_slot].stale = !overwrite && t->depth.in_vram;
+    if (!zeta_load((uint32_t)free_slot)) { g.zeta[free_slot].cpu = NULL; gpu_vram_free(g.a, off); return NULL; }
     return &g.zeta[free_slot].z;
 }
+
+static const nv3d_zeta_t* zeta_for(const fgpu_hw_target_t* t) { return zeta_for_ex(t, false); }
 
 /* Block-linear color copies (see the top of the file). */
 
@@ -455,7 +509,8 @@ static bool nv_clear_3d(const fgpu_hw_target_t* t, uint32_t flags, uint32_t colo
                         uint32_t y1) {
     nv3d_color_t c;
     if (!color_ok(t, &c)) return false;
-    const nv3d_zeta_t* z = want_depth ? zeta_for(t) : NULL;
+    bool whole_area = !rect || (x0 == 0 && y0 == 0 && x1 == t->cpu.width && y1 == t->cpu.height);
+    const nv3d_zeta_t* z = want_depth ? zeta_for_ex(t, whole_area) : NULL;
     if (!g.hw3d || (want_depth && !z)) return false;
     int ti = tiled_find(t->color.cpu);
     // Color cleared together with depth, or a surface whose pixels live in
@@ -476,6 +531,8 @@ static bool nv_clear_3d(const fgpu_hw_target_t* t, uint32_t flags, uint32_t colo
     if (want_color && c.block_linear) g.tiled[ti].valid = g.tiled[ti].dirty = true;
     // The CPU's depth buffer follows the clears, for draws that fall back.
     if (want_depth) {
+        int zi = zeta_index(z);
+        if (zi >= 0 && whole_area) g.zeta[zi].gpu_newer = false;     // both hold the cleared value
         if (rect) fgpu_raster_clear_rect(&t->cpu, FGPU_CLEAR_DEPTH, 0, depth, (int32_t)x0, (int32_t)y0,
                                          (int32_t)(x1 - x0), (int32_t)(y1 - y0));
         else fgpu_raster_clear(&t->cpu, FGPU_CLEAR_DEPTH, 0, depth);
@@ -640,6 +697,10 @@ static bool nv_draw_3d(const fgpu_hw_draw_t* d, uint32_t* triangles) {
         REFUSE(R_JOB);
     }
     if (ti >= 0) g.tiled[ti].dirty = true;
+    if (nd.zeta && (pipe->state & FGPU_STATE_DEPTH_WRITE)) {
+        int zi = zeta_index(nd.zeta);
+        if (zi >= 0) g.zeta[zi].gpu_newer = true;
+    }
     *triangles = count / 3u;
     g.draws++;
     return true;
@@ -650,6 +711,13 @@ static bool nv_draw_3d(const fgpu_hw_draw_t* d, uint32_t* triangles) {
 // change a surface after this, so a copy is reloaded before its next use
 // (unless a clear overwrites it).
 static void nv_finish(void) {
+    // Depth too: a draw the CPU does next must test against what the card drew, and the card reloads it
+    // before its next draw (the CPU may draw depth meanwhile).
+    for (uint32_t i = 0; i < MAX_ZETA; i++) {
+        if (!g.zeta[i].cpu) continue;
+        zeta_store(i);
+        if (g.zeta[i].in_vram) g.zeta[i].stale = true;
+    }
     for (uint32_t i = 0; i < MAX_TILED; i++) {
         if (!g.tiled[i].cpu) continue;
         if (!tiled_resolve((int)i)) { tiled_drop((int)i); continue; }
@@ -1523,8 +1591,8 @@ void nv_bringup_report(gpu_adapter_t* a, void (*print)(const char* text)) {
                                             : "Step 4  3D engine switched off after a failed job (%u draws, %u clears before; see the errors below)\n",
                  (unsigned)g.draws, (unsigned)g.clears);
         print(line);
-        snprintf(line, sizeof(line), "        depth draws use block-linear color copies (%u copied back, %u loaded)\n",
-                 (unsigned)g.resolves, (unsigned)g.uploads);
+        snprintf(line, sizeof(line), "        depth draws use block-linear color copies (%u copied back, %u loaded); depth synced %u / %u times (to the CPU / to the card)\n",
+                 (unsigned)g.resolves, (unsigned)g.uploads, (unsigned)g.depth_stores, (unsigned)g.depth_loads);
         print(line);
         // Where the GPU path's time goes, and why draws went back to the CPU
         // (counts since boot; run 'gpu' twice around a few seconds of work).

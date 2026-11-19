@@ -11,6 +11,7 @@
 static blockdev_t g_devices[BLOCKDEV_MAX];
 static spinlock_t g_table_lock = SPINLOCK_INIT;
 static bool g_probed;
+static bool g_real_probed;      // AHCI and NVMe looked at (a RamFS boot does it only when asked)
 
 void blockdev_init(void) {
     memset(g_devices, 0, sizeof(g_devices));
@@ -291,6 +292,22 @@ static void scan_all_partitions(void) {
     }
 }
 
+// RamFS boots leave the real disks alone; the installer needs to see them, so a task probes them once the
+// system is up (read only: the controllers and the partition tables). Nothing is mounted. Not from a syscall:
+// the controllers are waited for with timer ticks.
+void blockdev_probe_real_disks(void) {
+    if (g_real_probed || !g_probed) return;
+    g_real_probed = true;
+    uint32_t sata = probe_ahci();
+    uint32_t nvme = nvme_probe_all();
+    serial_write_str("blockdev: RamFS: disks probed for the installer: sata=");
+    serial_write_dec(sata);
+    serial_write_str(" nvme=");
+    serial_write_dec(nvme);
+    serial_write_str("\n");
+    scan_all_partitions();
+}
+
 uint32_t blockdev_probe_all(void) {
     if (!g_probed && kernel_boot_ramfs) {
         // RamFS: the RAM disk is the only disk; real ones stay untouched.
@@ -300,6 +317,7 @@ uint32_t blockdev_probe_all(void) {
     }
     if (!g_probed) {
         g_probed = true;
+        g_real_probed = true;
         uint32_t sata = probe_ahci();
         uint32_t nvme = nvme_probe_all();
         serial_write_str("blockdev: disks found: sata=");

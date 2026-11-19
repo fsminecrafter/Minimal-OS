@@ -154,6 +154,18 @@ static bool disk_has_mounts(blockdev_t* disk) {
     return false;
 }
 
+// Unmounts every drive on disk except 0:. False when 0: is on it.
+static bool release_mounts(blockdev_t* disk) {
+    for (uint32_t i = 0; i < BLOCKDEV_MAX; i++) {
+        blockdev_t* d = blockdev_get(i);
+        if (!d || (d != disk && d->parent != disk) || d->mounted_drive < 0) continue;
+        if (d->mounted_drive == 0) return false;
+        serial_write_str("install: unmounting the target's drive before erasing it\n");
+        minimafs_unmount((uint8_t)d->mounted_drive);
+    }
+    return true;
+}
+
 static blockdev_t* find_partition_of_kind(blockdev_t* disk, partition_kind_t kind) {
     for (uint32_t i = 0; i < BLOCKDEV_MAX; i++) {
         blockdev_t* d = blockdev_get(i);
@@ -342,8 +354,14 @@ bool installer_run(const install_options_t* opt, storage_progress_fn progress,
             fail(err, err_size, "target is not a disk");
             return false;
         }
+        // Volumes on it that are mounted as other drives (1:, 2:, ... from the automount) are let go;
+        // the disk holding the running system (0:) cannot be the target.
+        if (!release_mounts(disk)) {
+            fail(err, err_size, "the target disk holds the running system (0:)");
+            return false;
+        }
         if (disk_has_mounts(disk)) {
-            fail(err, err_size, "the target disk is in use (a drive on it is mounted)");
+            fail(err, err_size, "the target disk is in use (a drive on it could not be unmounted)");
             return false;
         }
         if (blockdev_size_bytes(disk) < INSTALLER_MIN_DISK_BYTES) {

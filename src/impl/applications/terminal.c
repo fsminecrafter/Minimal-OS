@@ -3,6 +3,7 @@
 #include "prochandler.h"
 #include "x86_64/gpu.h"
 #include "x86_64/gpucore.h"
+#include "x86_64/blockdev.h"
 #include "panic.h"
 #include "applications/terminal.h"
 #include "x86_64/scheduler.h"
@@ -480,6 +481,11 @@ void terminal_init_keyboard(void) {
 
 
 
+// After a RamFS boot: the AHCI and NVMe disks, listed (read only) for the installer.
+static void ramfs_disk_probe_task(void) {
+    blockdev_probe_real_disks();
+}
+
 // RamFS boot option: formats the RAM disk as 0: and unpacks the system
 // files into it, like 'format' does for a real disk. Returns mountdrive()'s
 // codes (1 = ready).
@@ -560,6 +566,9 @@ void terminal_program_entry(void) {
                 bootanim_apply_setting();       // BootupAnim=false ends it here
                 // The NVIDIA bring-up, when it worked before (before the desktop, so FarcadeGL finds the card).
                 gpu_nvidia_autoboot();
+                // RamFS left the real disks alone; the installer needs to see them. Probing waits for the
+                // controllers (timer ticks), so it runs as a task of its own, not in a syscall.
+                if (kernel_boot_ramfs) createProcess("diskprobe", ramfs_disk_probe_task);
 
                 // Check inside the success branch, because the disk must be mounted first.
                 bool desktop = minimafs_exists("0:/services/mosWM.service") &&

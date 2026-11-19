@@ -68,6 +68,9 @@ typedef struct {
     // target->scissor; draws honour pipe->scissor (or return false).
     bool (*clear)(const fgpu_hw_target_t* target, uint32_t flags, uint32_t color, float depth);
     bool (*draw)(const fgpu_hw_draw_t* draw, uint32_t* triangles);
+    // Optional: the CPU backend is about to draw into `target` with its depth buffer (a draw the backend
+    // did not take). A backend that keeps its own depth copy brings it into target->depth here.
+    void (*cpu_draw)(const fgpu_hw_target_t* target);
 
     // Waits until the GPU finished everything queued, before the CPU
     // touches a surface or buffer.

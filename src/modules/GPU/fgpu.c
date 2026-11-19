@@ -1061,6 +1061,12 @@ static uint64_t execute(exec_state_t* st, const uint32_t* cmd, uint32_t words) {
                 // kept alive by the flush points above).
                 const uint32_t* idx = ib ? (const uint32_t*)ib->mem + d.first_index : NULL;
                 uint32_t count = ib ? d.index_count : (d.vertex_count < avail ? d.vertex_count : avail);
+                // The hardware backend may hold the depth the GPU drew: it hands it over first.
+                if (g_hw && g_hw->cpu_draw && t.depth && (st->pipe.state & (FGPU_STATE_DEPTH_TEST | FGPU_STATE_DEPTH_WRITE))) {
+                    fgpu_hw_target_t cht;
+                    make_hw_target(st, &t, &cht);
+                    g_hw->cpu_draw(&cht);
+                }
                 if (g_pass) {
                     fgpu_pass_draw_layout(g_pass, &t, &st->pipe, layout, verts, avail, idx, count, 0);
                 } else {

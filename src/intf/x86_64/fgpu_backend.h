@@ -108,5 +108,7 @@ typedef struct {
     uint32_t texture_units;     // samples a unit the backend does not have
     uint32_t refused;           // offered, but the backend said no
     uint32_t syncs;             // GPU work waited for so the CPU could touch memory
+    uint32_t programs_compiled; // shader programs compiled for the card
+    uint32_t programs_reused;   // made again and found already compiled (the program cache)
 } fgpu_hw_counts_t;
 void fgpu_hw_counts(fgpu_hw_counts_t* out);

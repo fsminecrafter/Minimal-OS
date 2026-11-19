@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <dirent.h>
 #include "x86_64/fgpu_ir.h"
 #include "x86_64/nv_sass.h"
 #include "x86_64/nv_3d.h"
@@ -52,6 +53,10 @@ typedef struct {
     bool killed;
     uint32_t regs;                  // registers the header promises
     bool bad;
+    // Read before written: the card has leftovers there (the simulator's zeros would hide it).
+    bool written[256], p_written[8];
+    int uninit_reg, uninit_pred;    // first such register / predicate, -1 = none
+    uint32_t ip, uninit_ip, uninit_op;
 } sim_t;
 
 static float u2f(uint32_t u) { float f; memcpy(&f, &u, 4); return f; }
@@ -61,6 +66,7 @@ static uint32_t f2u(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }
 static uint32_t rd(sim_t* s, uint32_t reg) {
     if (reg == 255) return 0;
     if (reg >= s->regs) s->bad = true;
+    if (!s->written[reg] && s->uninit_reg < 0) { s->uninit_reg = (int)reg; s->uninit_ip = s->ip; }
     return s->r[reg];
 }
 
@@ -68,6 +74,7 @@ static void wr(sim_t* s, uint32_t reg, uint32_t v) {
     if (reg == 255) return;
     if (reg >= s->regs) { s->bad = true; return; }
     s->r[reg] = v;
+    s->written[reg] = true;
 }
 
 static float mod(uint32_t bits, bool abs, bool neg) {
@@ -81,13 +88,18 @@ static bool sim_run(sim_t* s, const nv_sass_t* sh, bool fragment) {
     bool exited = false;
     for (uint32_t ip = 0; ip + 4 <= sh->count; ip += 4) {
         const uint32_t* w = &sh->code[ip];
+        s->ip = ip / 4;
         if (exited) { s->bad = true; break; }       // code after EXIT
         uint32_t pred = F(12, 15);
+        if (pred != 7 && !s->p_written[pred] && s->uninit_pred < 0) s->uninit_pred = (int)pred;
         bool run = pred == 7 ? true : s->p[pred];
         if (F(15, 16)) run = !run;
         // Scheduling as the encoder promises: wait for both barriers
         // from the second instruction on.
-        if (F(116, 122) != (ip ? 3u : 0u) || F(105, 109) != 0) s->bad = true;
+        // Fixed-latency results are covered by the stall (no scoreboard): at least the FP32 latency,
+        // longer after a predicate write.
+        if (F(116, 122) != (ip ? 3u : 0u) || F(105, 109) < (F(0, 9) == 0x00Bu ? NV_SASS_STALL_PRED : NV_SASS_STALL_ALU))
+            s->bad = true;
         uint32_t full = F(0, 12), dst = F(16, 24);
         if (full == 0x94D) { exited = true; continue; }
         if (!run) continue;
@@ -121,8 +133,8 @@ static bool sim_run(sim_t* s, const nv_sass_t* sh, bool fragment) {
             continue;
         }
         uint32_t op = F(0, 9), form = F(9, 12);
-        uint32_t a_bits = rd(s, F(24, 32));
         bool has0 = op == 0x009 || op == 0x00B || op == 0x020 || op == 0x021 || op == 0x023 || op == 0x007;
+        uint32_t a_bits = has0 ? rd(s, F(24, 32)) : 0;      // only read by the ops that have it
         float a = has0 ? mod(a_bits, F(73, 74), F(72, 73)) : 0.0f;
         uint32_t b_bits;
         float b;
@@ -143,7 +155,10 @@ static bool sim_run(sim_t* s, const nv_sass_t* sh, bool fragment) {
         else { s->bad = true; continue; }
         switch (op) {
             case 0x002: wr(s, dst, b_bits); if (F(72, 76) != 0xF) s->bad = true; break;
-            case 0x007: wr(s, dst, (s->p[F(87, 90)] != (bool)F(90, 91)) ? a_bits : b_bits); break;
+            case 0x007:
+                if (F(87, 90) != 7 && !s->p_written[F(87, 90)] && s->uninit_pred < 0) s->uninit_pred = (int)F(87, 90);
+                wr(s, dst, (s->p[F(87, 90)] != (bool)F(90, 91)) ? a_bits : b_bits);
+                break;
             case 0x009: wr(s, dst, f2u(F(90, 91) ? (a > b ? a : b) : (a < b ? a : b))); break;
             case 0x00B: {
                 bool r;
@@ -156,6 +171,7 @@ static bool sim_run(sim_t* s, const nv_sass_t* sh, bool fragment) {
                 }
                 if (F(81, 84) != 0 || F(84, 87) != 7 || F(87, 90) != 7) s->bad = true;
                 s->p[0] = r;
+                s->p_written[0] = true;
                 break;
             }
             case 0x020: wr(s, dst, f2u(a * b)); if (F(64, 72) != 255 || F(84, 87) != 4) s->bad = true; break;
@@ -297,6 +313,7 @@ static void compare(const char* name, const char* vs, const char* fs) {
         static sim_t s;
         memset(&s, 0, sizeof s);
         s.regs = vsh.regs - NV_SASS_HW_RESERVED_REGS;   // the code may not use those
+        s.uninit_reg = s.uninit_pred = -1;
         for (int i = 0; i < (int)FGPU_MAX_ATTRIBS; i++)
             for (int c = 0; c < 4; c++) {
                 in[i][c] = frand(-1.5f, 1.5f);
@@ -305,6 +322,11 @@ static void compare(const char* name, const char* vs, const char* fs) {
         fgpu_shader_io_t io = { &prog, in, out, uniforms, NULL, textures };
         fgpu_shader_run_vertex(&io);
         if (!sim_run(&s, &vsh, false)) { bad = 1; break; }
+        if (s.uninit_reg >= 0 || s.uninit_pred >= 0) {
+            printf("  vertex stage reads R%d / P%d before writing it\n", s.uninit_reg, s.uninit_pred);
+            bad = 1;
+            break;
+        }
         for (uint32_t r = 0; r <= nvar && !bad; r++)
             for (int c = 0; c < 4; c++) {
                 uint32_t address = r == 0 ? NV_SASS_ATTR_POSITION + 4 * c
@@ -320,6 +342,7 @@ static void compare(const char* name, const char* vs, const char* fs) {
         float color[1][4];
         memset(&s, 0, sizeof s);
         s.regs = fsh.regs - NV_SASS_HW_RESERVED_REGS;
+        s.uninit_reg = s.uninit_pred = -1;
         for (int i = 0; i < (int)FGPU_MAX_ATTRIBS; i++)
             for (int c = 0; c < 4; c++) {
                 in[i][c] = frand(-1.5f, 1.5f);
@@ -329,6 +352,11 @@ static void compare(const char* name, const char* vs, const char* fs) {
         fgpu_shader_io_t fio = { &prog, in, color, uniforms, special, textures };
         bool kept = fgpu_shader_run_fragment(&fio);
         if (!sim_run(&s, &fsh, true)) { bad = 1; break; }
+        if (s.uninit_reg >= 0 || s.uninit_pred >= 0) {
+            printf("  pixel stage reads R%d / P%d before writing it (instruction %u of %u, opcode 0x%03x)\n", s.uninit_reg, s.uninit_pred, s.uninit_ip, fsh.count / 4, nv_sass_field(&fsh.code[s.uninit_ip * 4], 0, 12));
+            bad = 1;
+            break;
+        }
         if (kept == s.killed) { printf("  discard differs\n"); bad = 1; }
         for (int c = 0; c < 4 && kept && !bad; c++)
             if (!close_enough(u2f(s.r[c]), color[0][c])) {
@@ -555,6 +583,52 @@ static void test_nvdec(void) {
     CHECK((th[0] & 0x7F) == 0x18 && ((th[0] >> 22) & 7) == 3, "block-linear colour texture header");
 }
 
+// NV_SASS_SHADER_DIR=<dir>: every <dir>/NAME.vs + NAME.fs pair (Farcade's shader_compile_tests writes
+// them with FE_DUMP_DIR) through the encoder and the simulator.
+static char* read_text(const char* path) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char* t = (char*)malloc((size_t)n + 1);
+    if (t && fread(t, 1, (size_t)n, f) != (size_t)n) { free(t); t = NULL; }
+    if (t) t[n] = 0;
+    fclose(f);
+    return t;
+}
+
+static int name_cmp(const void* a, const void* b) { return strcmp(*(char* const*)a, *(char* const*)b); }
+
+static void test_shader_dir(const char* dir) {
+    DIR* d = opendir(dir);
+    if (!d) { printf("FAIL: cannot open %s\n", dir); failures++; return; }
+    char* names[4096];
+    int n = 0;
+    struct dirent* e;
+    while ((e = readdir(d)) && n < 4096) {
+        size_t l = strlen(e->d_name);
+        if (l > 3 && !strcmp(e->d_name + l - 3, ".vs")) { names[n] = (char*)malloc(l + 1); memcpy(names[n++], e->d_name, l + 1); }
+    }
+    closedir(d);
+    qsort(names, (size_t)n, sizeof names[0], name_cmp);
+    int before = failures;
+    for (int i = 0; i < n; i++) {
+        char path[1024], label[160];
+        snprintf(path, sizeof path, "%s/%s", dir, names[i]);
+        char* vs = read_text(path);
+        size_t l = strlen(path);
+        path[l - 2] = 'f';
+        char* fs = read_text(path);
+        memcpy(path + l - 2, "name", 5);
+        char* what = read_text(path);
+        snprintf(label, sizeof label, "%.*s %s", (int)(strlen(names[i]) - 3), names[i], what ? what : "");
+        if (vs && fs) compare(label, vs, fs);
+        free(vs); free(fs); free(what); free(names[i]);
+    }
+    printf("shader dir: %d programs, %d failing checks\n", n, failures - before);
+}
+
 int main(void) {
     for (int t = 0; t < 2; t++) {
         for (int i = 0; i < 64; i++) {
@@ -562,6 +636,10 @@ int main(void) {
             texels[t][i] = rng;
         }
         textures[t] = (fgpu_texture_t){ .pixels = texels[t], .width = 8, .height = 8, .pitch = 8, .flags = t ? FGPU_TEXTURE_LINEAR : 0 };
+    }
+    if (getenv("NV_SASS_SHADER_DIR")) {
+        test_shader_dir(getenv("NV_SASS_SHADER_DIR"));
+        return failures ? 1 : 0;
     }
     test_encodings();
     test_pushbuffers();

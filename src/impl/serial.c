@@ -1,3 +1,4 @@
+#include "x86_64/bootanim.h"
 #include "serial.h"
 #include <stdint.h>
 #include <stdbool.h>
@@ -83,6 +84,7 @@ void serial_write(char a) {
 }
 
 void serial_write_str(const char* str) {
+    bootanim_poll();            // the boot animation draws while the kernel logs
     while (*str) {
         if (*str == '\n') {
             serial_write('\r'); // Add carriage return before newline

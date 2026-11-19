@@ -1,3 +1,4 @@
+#include "x86_64/bootanim.h"
 #include "graphics.h"
 #include "prochandler.h"
 #include "x86_64/gpu.h"
@@ -555,6 +556,7 @@ void terminal_program_entry(void) {
                 // Every other MinimaFS volume becomes 1:, 2:, ...
                 storage_automount_others();
                 systeminfo_load_saved_resolution();
+                bootanim_apply_setting();       // BootupAnim=false ends it here
 
                 // Check inside the success branch, because the disk must be mounted first.
                 bool desktop = minimafs_exists("0:/services/mosWM.service") &&
@@ -568,6 +570,7 @@ void terminal_program_entry(void) {
 
                 if (desktop) {
                     serial_write_str("Terminal: mosWM detected; skipping terminal UI.\n");
+                    bootanim_stop_after(20000);     // mosWM claims the screen and ends it
                     createProcess("terminal_update", terminal_update);
                     createProcess("usb_keyboard_update", usb_keyboard_update_task);
                     schedulerInit();
@@ -586,6 +589,8 @@ void terminal_program_entry(void) {
             }
         }
     }
+
+    bootanim_stop(true);                    // the terminal takes over
 
     // Start cursor updates only after startup drawing and resolution changes.
     serial_write_str("Terminal: Starting cursor process...\n");

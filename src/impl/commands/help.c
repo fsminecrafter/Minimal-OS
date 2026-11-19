@@ -90,6 +90,7 @@ static void help_audio(void) {
 static void help_keyboard_and_programs(void) {
     help_section("Keyboard and programs");
     help_item("kbrlayout <set|get|list> [value]", "Manage the keyboard layout.");
+    help_item("mossettings <list|get|set> [name] [value]", "System settings (bootupanim).");
     help_item("run <file>", "Run a .run executable.");
     help_item("services", "List registered services.");
 }

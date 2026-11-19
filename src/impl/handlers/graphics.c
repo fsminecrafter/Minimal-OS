@@ -1,3 +1,4 @@
+#include "x86_64/bootanim.h"
 #include "graphics.h"
 #include "prochandler.h"
 #include "x86_64/gpu.h"
@@ -36,6 +37,7 @@ bool graphics_claim_screen(void) {
         if (g_screen_owner_pid != pid) g_backbuffer_stale = false;   // a new owner
         g_screen_owner_pid = pid;
         spinlock_release(&g_graphics_lock, flags);
+        bootanim_stop(false);                   // mosWM (or a program) takes the screen
         return true;
     }
     spinlock_release(&g_graphics_lock, flags);
@@ -305,6 +307,7 @@ void graphics_free_image(bmp_image_t* image) {
 
 void graphics_terminal_putchar(char c, uint32_t col, uint32_t row, color_t fg, color_t bg) {
     if (!g_gpu || !g_gpu->fb) return;
+    if (bootanim_hides_console()) return;       // the text stays in the buffer
 
     if (c < 32 || c > 126)
         c = '?';
@@ -516,6 +519,7 @@ void graphics_terminal_scroll(void) {
 
     // Clear the last row in the buffer
     if (rows > 0) term_buf_clear_row(rows - 1);
+    if (bootanim_hides_console()) { g_terminal.cursor_y = rows - 1; return; }
 
     // Moving the pixels up means reading the screen back. That is cheap
     // when VRAM is ordinary memory (QEMU), but on a real graphics card every
@@ -1322,6 +1326,7 @@ void graphics_clear(uint8_t r, uint8_t g, uint8_t b) {
         return;
     }
     
+    if (bootanim_hides_console()) return;       // the boot animation owns the screen
     uint32_t color = 0xFF000000 | (r << 16) | (g << 8) | b;
     gpu_clear(g_gpu, color);
 }

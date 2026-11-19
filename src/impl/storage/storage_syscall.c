@@ -82,6 +82,18 @@ uint64_t storage_syscall(syscall_storage_request_t* r) {
                 strncpy(r->boot_device, boot->name, sizeof(r->boot_device) - 1);
             return SYS_SUCCESS;
         }
+        case SYS_STORAGE_APPS: {
+            char* out = (char*)devices;
+            if (!capacity || !out || capacity > 65536 ||
+                !syscall_user_range_ok(out, capacity, true)) return SYS_ERR_INVAL;
+            static char list[2048];
+            int n = storage_setup_list_apps(list, sizeof(list));
+            size_t len = strlen(list);
+            if (len >= capacity) len = capacity - 1;
+            memcpy(out, list, len);
+            out[len] = '\0';
+            return (uint64_t)n;
+        }
         default:
             return SYS_ERR_INVAL;
     }

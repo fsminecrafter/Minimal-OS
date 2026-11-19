@@ -844,6 +844,9 @@ void syscall_dispatch(syscall_regs_t* regs);
 
 #define SYS_STORAGE_LIST   1u   // fill devices[capacity], returns the count
 #define SYS_STORAGE_STATUS 2u   // install_payload, boot_device
+#define SYS_STORAGE_APPS   3u   // apps on the install media: "name bytes\n" lines
+                                // into the char buffer at devices (capacity
+                                // bytes, NUL-terminated); returns the count
 
 #define SYSCALL_STORAGE_KIND_DISK      0u
 #define SYSCALL_STORAGE_KIND_PARTITION 1u

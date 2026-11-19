@@ -39,6 +39,12 @@ typedef struct {
     const char* boot_part;      // becomes the FAT32 boot partition
 
     const char* label;          // MinimaFS volume name, default "system"
+
+    // Apps from the install media: comma-separated names, "" for none,
+    // NULL for all (see storage_setup_choose).
+    const char* apps;
+    // Deliver servers ("host:port", newline-separated) for N:/etc/dlr/repos.
+    const char* repos;
 } install_options_t;
 
 // True when GRUB loaded the install payload module.

@@ -467,6 +467,7 @@ bool installer_run(const install_options_t* opt, storage_progress_fn progress,
     }
 
     step(progress, 60, "Copying system files");
+    storage_setup_choose(opt->apps, opt->repos);
     bool populated = storage_populate_system((uint8_t)drive, progress);
     minimafs_unmount((uint8_t)drive);
     if (!populated) {

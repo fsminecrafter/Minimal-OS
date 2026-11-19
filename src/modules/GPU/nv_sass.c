@@ -45,7 +45,7 @@
 #define CMP_LE  0x3u
 #define CMP_NEU 0xDu            // not equal, or unordered
 
-#define SCRATCH_REGS 5u         // 0..2 operands, 3..4 texture coordinates
+#define SCRATCH_REGS 3u         // operands 0..2 (immediates, modified sources)
 
 /* ------------------------------------------------------------- fields */
 
@@ -77,7 +77,8 @@ typedef struct {
     bool first;                 // nothing emitted yet
     bool overflow;
     uint32_t scratch;           // first scratch register
-    uint32_t tex_base;          // first texture result register
+    uint32_t coord;             // TEX coordinates: two registers, the first even
+    uint32_t tex_base;          // first texture result register (a multiple of 4)
     uint32_t out_base;          // fragment color registers
 } enc_t;
 
@@ -269,7 +270,11 @@ bool nv_sass_encode(const fgpu_ir_inst_t* code, uint32_t count, uint32_t ir_regs
     // The fragment color ends up in R0..R3 whatever the IR used them for.
     uint32_t base = fragment && ir_regs < 4u ? 4u : ir_regs;
     e.scratch = base;
-    e.tex_base = e.scratch + SCRATCH_REGS;
+    // Turing wants multi-register operands aligned to their size: the TEX
+    // coordinate pair on an even register, its four results on a multiple
+    // of 4 ("Misaligned Register" warp errors otherwise).
+    e.coord = (e.scratch + SCRATCH_REGS + 1u) & ~1u;
+    e.tex_base = (e.coord + 2u + 3u) & ~3u;
     e.out_base = e.tex_base + 4u * tex_count;
     out->regs = e.out_base + (fragment ? 4u : 0u) + NV_SASS_HW_RESERVED_REGS;
     if (out->regs > NV_SASS_MAX_REGS) { *why = "too many registers"; return false; }
@@ -412,13 +417,13 @@ bool nv_sass_encode(const fgpu_ir_inst_t* code, uint32_t count, uint32_t ir_regs
                 // The coordinates go in two registers in a row.
                 for (uint32_t k = 0; k < 2; k++) {
                     opnd_t s = source(&e, in, k, true);
-                    mov(&e, e.scratch + 3u + k, &s, PRED_TRUE);
+                    mov(&e, e.coord + k, &s, PRED_TRUE);
                 }
                 uint32_t result = e.tex_base + 4u * tex_index++;
                 uint32_t w[4] = { 0 };
                 set(w, 0, 12, OP_TEX);
                 set(w, 16, 24, result);
-                set(w, 24, 32, e.scratch + 3u);
+                set(w, 24, 32, e.coord);
                 set(w, 32, 40, REG_ZERO);               // no array index, bias or offset
                 set(w, 40, 54, (NV_SASS_CB_TEX_OFFSET + 4u * in->aux) / 4u);
                 set(w, 54, 59, 0);                      // handle from constant buffer 0

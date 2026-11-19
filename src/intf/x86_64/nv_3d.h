@@ -95,6 +95,10 @@ void nv3d_push_clear(nv_push_t* p, const nv3d_color_t* color, const nv3d_zeta_t*
 void nv3d_push_clear_rect(nv_push_t* p, const nv3d_color_t* color, const nv3d_zeta_t* zeta, uint32_t flags,
                           uint32_t xrgb, float depth, uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1);
 void nv3d_push_draw(nv_push_t* p, const nv3d_draw_t* d);
+// Render-to-texture barrier: the draws before it have written their targets (WAIT_FOR_IDLE) and the
+// texture and data caches forget what they held, so a later draw that samples one of those targets
+// reads the new pixels. Lets one batch draw a pass and sample it in the next.
+void nv3d_push_barrier(nv_push_t* p);
 
 // A texture header (8 words) for an image the backend samples:
 //   NV3D_TEX_ARGB      pitch-linear ARGB8888
@@ -154,6 +158,8 @@ void nv3d_sampler(uint32_t out[8], uint32_t flags);
 #define NVC597_INVALIDATE_SAMPLER_CACHE_NO_WFI 0x1424u
 #define NVC597_INVALIDATE_SHADER_CACHES_NO_WFI 0x0da4u     // bit 12: constant cache
 #define NVC597_INVALIDATE_TEXTURE_HEADER_CACHE_NO_WFI 0x1428u
+#define NVC597_WAIT_FOR_IDLE                0x0110u
+#define NVC597_INVALIDATE_TEXTURE_DATA_CACHE_NO_WFI 0x1288u  // 0 = all lines
 #define NVC597_SET_ANTI_ALIAS_ENABLE        0x1534u
 #define NVC597_SET_ZT_SELECT                0x1538u
 #define NVC597_SET_RENDER_ENABLE_C          0x1558u

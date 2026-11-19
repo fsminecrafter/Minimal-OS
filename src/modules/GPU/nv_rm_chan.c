@@ -8,6 +8,7 @@
 #include "string.h"
 #include "time.h"
 #include "serial.h"
+#include "x86_64/clock.h"
 
 /*
  * Step 3b: channels through GSP-RM. Step 3c: the copy engine fills
@@ -184,6 +185,12 @@ static uint64_t pa(const void* p) { return (uint64_t)(uintptr_t)p; }
 static void wc_flush(void) { __asm__ volatile("sfence" ::: "memory"); }
 
 static void vram_wr32(uint64_t off, uint32_t v) { *(volatile uint32_t*)(c.a->aperture + off) = v; }
+// Words into VRAM through BAR1 (write-combined: the stores merge into bursts).
+static void vram_write(uint64_t off, const void* data, uint32_t bytes) {
+    const uint32_t* w = (const uint32_t*)data;
+    volatile uint32_t* d = (volatile uint32_t*)(c.a->aperture + off);
+    for (uint32_t i = 0; i < bytes / 4u; i++) d[i] = w[i];
+}
 static uint32_t vram_rd32(uint64_t off) { return *(volatile uint32_t*)(c.a->aperture + off); }
 static void vram_wr64(uint64_t off, uint64_t v) {
     vram_wr32(off, (uint32_t)v);
@@ -567,21 +574,37 @@ static void report_gr_trap(void) {
     }
 }
 
-static bool submit_and_wait(chan_t* ch, uint32_t words, uint32_t payload, uint32_t timeout_ms) {
+// Engine usage for the Task Manager (nv_rm_engine_stats): time each channel's engine spent on jobs. Jobs
+// that are waited for count from submit to the semaphore; the 3D channel's asynchronous batches count from
+// when the engine got work until it was seen idle again (seen at the next wait or stats call, so close).
+static uint64_t g_busy_ns[4];               // NV_RM_ENGINE_*
+static uint64_t g_jobs_total[4];
+
+static int engine_of(chan_t* ch);
+
+static bool sem_reached(chan_t* ch, uint32_t payload) {
+    return (int32_t)(*semaphore(ch) - payload) >= 0;
+}
+
+// Puts `words` words at GPU address va on the channel's GPFIFO and rings the doorbell.
+static void kick(chan_t* ch, uint64_t va, uint32_t words) {
     uint32_t* ring = (uint32_t*)(ch->sys + SYS_GPFIFO * 4096u);
-    nv_gpfifo_entry(chan_va_sys(ch) + SYS_PUSH * 4096ull, words, &ring[ch->gp_put * 2u]);
+    nv_gpfifo_entry(va, words, &ring[ch->gp_put * 2u]);
     ch->gp_put = (ch->gp_put + 1u) % GPFIFO_ENTRIES;
     __asm__ volatile("mfence" ::: "memory");
     vram_wr32(ch->userd + NV_USERD_GP_PUT, ch->gp_put);
     wc_flush();
     (void)vram_rd32(ch->userd + NV_USERD_GP_PUT);
     wr(NV_USERMODE_BASE + NV_USERMODE_NOTIFY_CHANNEL_PENDING, ch->token);
+}
 
+// Until the channel's semaphore reaches payload (later payloads count: jobs finish in order).
+static bool wait_payload(chan_t* ch, uint32_t payload, uint32_t timeout_ms) {
     uint64_t end = time_get_uptime_ms() + timeout_ms;
     // GSP-RM events only matter for a job that does not finish: a draw
     // takes microseconds, so the first look at the queue waits 5 ms.
     uint64_t next_poll = time_get_uptime_ms() + 5;
-    while (*semaphore(ch) != payload) {
+    while (!sem_reached(ch, payload)) {
         uint64_t now = time_get_uptime_ms();
         if (now >= end) {
             say("  %s: no semaphore after %u ms (got 0x%x, want 0x%x); GP_GET %u, GP_PUT %u\n", ch->name,
@@ -597,6 +620,18 @@ static bool submit_and_wait(chan_t* ch, uint32_t words, uint32_t payload, uint32
         __asm__ volatile("pause");
     }
     return true;
+}
+
+static void async_seen_idle(void);
+
+static bool submit_and_wait(chan_t* ch, uint32_t words, uint32_t payload, uint32_t timeout_ms) {
+    uint64_t t0 = clock_monotonic_ns();
+    if (ch == &g_gr) async_seen_idle();     // the engine's queued batches count up to here
+    kick(ch, chan_va_sys(ch) + SYS_PUSH * 4096ull, words);
+    bool ok = wait_payload(ch, payload, timeout_ms);
+    int e = engine_of(ch);
+    if (e >= 0) { g_busy_ns[e] += clock_monotonic_ns() - t0; g_jobs_total[e]++; }
+    return ok;
 }
 
 static bool fill_locked(uint64_t vram_offset, uint32_t width, uint32_t height, uint32_t pitch_bytes,
@@ -708,6 +743,101 @@ bool nv_rm_3d_submit(void) {
 }
 
 uint32_t nv_rm_3d_push_capacity(void) { return PUSH_WORDS - 8u; }
+
+/* Asynchronous 3D batches: a ring of pushbuffers in VRAM (the GPU fetches them; the CPU writes them through
+ * BAR1). A batch is queued and the call returns; its fence is the semaphore payload it releases. A slot is
+ * reused once the batch that last used it is done, so up to ASYNC_SLOTS batches run while the CPU records
+ * the next. */
+#define ASYNC_SLOTS 4u
+#define ASYNC_SLOT_BYTES (64u * 1024u)
+static struct {
+    uint64_t vram;                  // ASYNC_SLOTS slots, 0 = not made yet
+    bool failed;                    // no VRAM for it: batches go through the synchronous path
+    uint32_t fence[ASYNC_SLOTS];
+    uint32_t next;
+    uint32_t last;                  // fence of the newest batch
+    uint64_t busy_since;            // the engine got work and was not seen idle since (0 = idle)
+} g_async;
+
+static int engine_of(chan_t* ch) {
+    return ch == &g_gr ? NV_RM_ENGINE_3D : ch == &g_ce ? NV_RM_ENGINE_COPY : ch == &g_dec ? NV_RM_ENGINE_DECODE : -1;
+}
+
+// The queued batches are done (or it is not known yet): their time counts as 3D engine use.
+static void async_seen_idle(void) {
+    if (!g_async.busy_since) return;
+    if (!sem_reached(&g_gr, g_async.last)) return;
+    g_busy_ns[NV_RM_ENGINE_3D] += clock_monotonic_ns() - g_async.busy_since;
+    g_async.busy_since = 0;
+}
+
+uint32_t nv_rm_3d_async_capacity(void) { return ASYNC_SLOT_BYTES / 4u - 16u; }
+
+uint32_t nv_rm_3d_submit_async(gpu_adapter_t* a, const uint32_t* words, uint32_t n) {
+    if (!c.gr_ready || c.a != a || !n || n > nv_rm_3d_async_capacity() || g_async.failed) return 0;
+    if (!g_async.vram) {
+        uint64_t off = gpu_vram_alloc(a, (uint64_t)ASYNC_SLOTS * ASYNC_SLOT_BYTES, 4096, 0);
+        if (off == GPU_VRAM_INVALID || off + (uint64_t)ASYNC_SLOTS * ASYNC_SLOT_BYTES > c.vram_mapped) {
+            if (off != GPU_VRAM_INVALID) gpu_vram_free(a, off);
+            g_async.failed = true;
+            say("  3D: no VRAM for the asynchronous pushbuffers; batches wait for the engine\n");
+            return 0;
+        }
+        g_async.vram = off;
+    }
+    if (!lock()) return 0;
+    nv_bar1_keep_physical(a);
+    uint32_t slot = g_async.next;
+    // The batch that used this slot last must be done before it is written again.
+    if (g_async.fence[slot] && !wait_payload(&g_gr, g_async.fence[slot], 2000)) {
+        c.gr_ready = false;
+        say("  3D channel disabled after a batch did not finish\n");
+        unlock();
+        return 0;
+    }
+    uint32_t payload = ++g_gr.payload;
+    uint32_t tail[16];
+    nv_push_t t;
+    nv_push_init(&t, tail, 16);
+    nv_push_host_semaphore(&t, sem_va(&g_gr), payload);
+    uint64_t base = g_async.vram + (uint64_t)slot * ASYNC_SLOT_BYTES;
+    vram_write(base, words, n * 4u);
+    vram_write(base + n * 4u, tail, t.count * 4u);
+    wc_flush();
+    async_seen_idle();
+    if (!g_async.busy_since) g_async.busy_since = clock_monotonic_ns();
+    kick(&g_gr, VA_VRAM + base, n + t.count);
+    g_async.fence[slot] = payload;
+    g_async.last = payload;
+    g_async.next = (slot + 1u) % ASYNC_SLOTS;
+    g_jobs_total[NV_RM_ENGINE_3D]++;
+    c.jobs3d++;
+    unlock();
+    return payload;
+}
+
+bool nv_rm_3d_done(uint32_t fence) { return !fence || sem_reached(&g_gr, fence); }
+
+bool nv_rm_3d_wait(uint32_t fence) {
+    if (!fence) return true;
+    if (sem_reached(&g_gr, fence)) { async_seen_idle(); return true; }
+    if (!wait_payload(&g_gr, fence, 2000)) {
+        c.gr_ready = false;
+        say("  3D channel disabled after a batch did not finish (%u done before)\n", c.jobs3d);
+        return false;
+    }
+    async_seen_idle();
+    return true;
+}
+
+void nv_rm_engine_stats(uint64_t busy_ns[NV_RM_ENGINES], uint64_t jobs[NV_RM_ENGINES]) {
+    async_seen_idle();
+    uint64_t pending = g_async.busy_since ? clock_monotonic_ns() - g_async.busy_since : 0;
+    for (int e = 0; e < NV_RM_ENGINES; e++) {
+        busy_ns[e] = g_busy_ns[e] + (e == NV_RM_ENGINE_3D ? pending : 0);
+        jobs[e] = g_jobs_total[e];
+    }
+}
 
 // A block-linear surface (blocks of one GOB) in VRAM to or from system memory through the staging pages:
 // the copy engine converts the layout, the CPU copies the rows. False when it does not fit the staging

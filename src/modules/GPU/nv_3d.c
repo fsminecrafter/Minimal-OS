@@ -257,6 +257,14 @@ static void load_constants(nv_push_t* p, uint32_t offset, const uint32_t* words,
     for (uint32_t i = 0; i < count; i++) p->words[p->count++] = words[i];
 }
 
+void nv3d_push_barrier(nv_push_t* p) {
+    m1(p, NVC597_WAIT_FOR_IDLE, 0);
+    m1(p, NVC597_INVALIDATE_TEXTURE_DATA_CACHE_NO_WFI, 0);          // all lines
+    m1(p, NVC597_INVALIDATE_SHADER_CACHES_NO_WFI, (1u << 4) | (1u << 12));  // global data, constants
+    m1(p, NVC597_INVALIDATE_TEXTURE_HEADER_CACHE_NO_WFI, 0);
+    m1(p, NVC597_INVALIDATE_SAMPLER_CACHE_NO_WFI, 0);
+}
+
 void nv3d_push_draw(nv_push_t* p, const nv3d_draw_t* d) {
     color_target(p, &d->color);
     surface_clip(p, d->color.width, d->color.height);

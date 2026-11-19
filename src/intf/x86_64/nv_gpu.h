@@ -115,6 +115,16 @@ nv_push_t* nv_rm_3d_begin(gpu_adapter_t* a);
 bool nv_rm_3d_submit(void);
 void nv_rm_3d_cancel(void);
 void nv_rm_3d_disable(void);
+// Asynchronous 3D batches: submit_async queues n words (at most nv_rm_3d_async_capacity()) and returns at
+// once with the batch's fence (0: not queued; use the synchronous path). wait blocks until the batch is
+// done (false: it did not finish and the 3D path is off); done only looks.
+uint32_t nv_rm_3d_async_capacity(void);
+uint32_t nv_rm_3d_submit_async(gpu_adapter_t* a, const uint32_t* words, uint32_t n);
+bool nv_rm_3d_wait(uint32_t fence);
+bool nv_rm_3d_done(uint32_t fence);
+// Engine use since boot, for the Task Manager: nanoseconds busy and jobs, by engine.
+enum { NV_RM_ENGINE_3D = 0, NV_RM_ENGINE_COPY = 1, NV_RM_ENGINE_DECODE = 2, NV_RM_ENGINE_ENCODE = 3, NV_RM_ENGINES = 4 };
+void nv_rm_engine_stats(uint64_t busy_ns[NV_RM_ENGINES], uint64_t jobs[NV_RM_ENGINES]);
 // Step 5a: the video decoder (NVDEC) has a channel. Jobs as for 3D.
 bool nv_rm_dec_ready(gpu_adapter_t* a);
 nv_push_t* nv_rm_dec_begin(gpu_adapter_t* a);

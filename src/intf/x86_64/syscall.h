@@ -1207,6 +1207,7 @@ typedef struct {
 #define SYS_TASK_ABI_VERSION 1u
 #define SYS_TASK_LIST 1u
 #define SYS_TASK_END  2u
+#define SYS_TASK_GPU  3u    // rsi = syscall_gpu_stats_t*: the graphics card, for a Performance page
 
 #define SYS_TASK_FLAG_WINDOW_MANAGER 1u
 #define SYS_TASK_FLAG_CRASHED        2u
@@ -1225,6 +1226,27 @@ typedef struct {
     uint64_t age_ms;            // since it started
     uint64_t memory_bytes;      // committed user pages + SYS_HEAP memory
 } syscall_task_info_t;
+
+// SYS_TASK_GPU: the adapter driving the screen. Engine times are totals since boot: sample twice and divide
+// the difference by the time between (now_ns) for a usage percentage, as a task manager does for the CPU.
+#define SYS_GPU_ENGINE_3D     0u
+#define SYS_GPU_ENGINE_COPY   1u
+#define SYS_GPU_ENGINE_DECODE 2u    // video decode (NVDEC)
+#define SYS_GPU_ENGINE_ENCODE 3u    // video encode (not used yet: always 0)
+#define SYS_GPU_ENGINES       4u
+#define SYS_GPU_STATS_ENGINES 1u    // engine_busy_ns is measured (a hardware backend runs)
+#define SYS_GPU_STATS_HW_3D   2u    // FarcadeGL draws on the card's 3D engine
+typedef struct {
+    uint32_t size;                  // sizeof(syscall_gpu_stats_t), set by the caller
+    uint32_t flags;                 // SYS_GPU_STATS_*
+    char name[64];                  // "NVIDIA GeForce RTX 2060", "" = no graphics card
+    char renderer[32];              // what draws FarcadeGL: "nvidia 3D engine", "CPU"
+    uint64_t vram_total, vram_used; // bytes (dedicated video memory), 0 = unknown
+    uint64_t now_ns;                // when these were taken (monotonic)
+    uint64_t engine_busy_ns[SYS_GPU_ENGINES];
+    uint64_t engine_jobs[SYS_GPU_ENGINES];
+    uint64_t cpu_render_ns;         // FarcadeGL work the CPU did instead (draws and clears it ran)
+} syscall_gpu_stats_t;
 
 
 // VM: rdi = operation. Memory of the program's own, in whole 4 KiB pages,

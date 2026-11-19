@@ -2,6 +2,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "x86_64/fgpu_abi.h"
+#include "x86_64/syscall.h"
 
 // SYS_GPU entry (rdi = syscall_gpu_request_t*).
 uint64_t fgpu_syscall(syscall_gpu_request_t* request);
@@ -21,3 +22,6 @@ extern bool kernel_boot_fgpuold;
 // Renders any draws the CPU backend has recorded but not drawn yet. Called
 // before anything reads or writes surfaces, buffers or programs.
 void fgpu_flush_pending(void);
+
+// SYS_TASK_GPU: the graphics card, its VRAM and its engines' use.
+void fgpu_gpu_stats(syscall_gpu_stats_t* out);

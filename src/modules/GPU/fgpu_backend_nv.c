@@ -81,6 +81,10 @@ static struct {
     bool tex_tested, tex_ok;    // step 4c: texture sampling on the card (draws that sample go to the CPU if not ok)
     uint32_t tex_wrong;         // pixels the sampling test got wrong (of 4096)
     uint32_t tex_first_x, tex_first_y, tex_got, tex_want;
+    // Step 4c, second part: sampling a draw target's block-linear copy directly. When it passes, a pass
+    // that samples what an earlier pass drew reads that copy instead of copying it back to the surface.
+    bool tex_bl_tested, tex_bl_ok;
+    uint32_t tex_bl_wrong, bl_samples;
     bool init_sent;             // nv3d_push_init reached the channel
     bool front_ccw;
     uint64_t pools;             // VRAM: texture headers, samplers, constants, a zero page
@@ -106,6 +110,7 @@ static struct {
         uint32_t bl_width, bl_height, bytes;
         bool valid;             // holds the surface's current pixels
         bool dirty;             // newer than the surface: the GPU drew into it
+        bool batch_written;     // drawn into by the batch being recorded (sampling it needs a flush first)
     } tiled[MAX_TILED];
     float uniforms[FGPU_SHADER_MAX_UNIFORMS * 4];
     uint32_t draws, clears, resolves, uploads;
@@ -287,6 +292,7 @@ static uint32_t g_batches;
 
 static bool batch_flush(void) {
     g_tic_next = TEX_FIRST_DRAW;
+    for (uint32_t i = 0; i < MAX_TILED; i++) g.tiled[i].batch_written = false;
     if (!g_batch_ready || !g_batch.count) return true;
     uint32_t n = g_batch.count, draws = g_batch_draws;
     bool overflow = g_batch.overflow;
@@ -701,6 +707,7 @@ static bool nv_draw_3d(const fgpu_hw_draw_t* d, uint32_t* triangles) {
 
     // Textures the program samples: a header and a sampler per unit.
     uint32_t used = np->vs.textures | np->fs.textures;
+    int bl_src[FGPU_MAX_TEXTURE_UNITS];
     if (used && g.tex_tested && !g.tex_ok) REFUSE(R_TEXTURE);    // step 4c failed: the CPU samples correctly
     for (uint32_t u = 0; u < FGPU_MAX_TEXTURE_UNITS; u++) {
         if (!(used & (1u << u))) continue;
@@ -711,9 +718,19 @@ static bool nv_draw_3d(const fgpu_hw_draw_t* d, uint32_t* triangles) {
             !in_gpu_reach(mem, (uint64_t)pitch * tex->height) || (mem->vram_offset & 31u) || (pitch & 31u) ||
             mem->cpu == d->target->color.cpu)       // sampling the target it draws to
             REFUSE(R_TEXTURE);
-        // A surface drawn earlier through its block-linear copy: bring the
-        // pixels back first (the texture header reads the surface).
-        if (!tiled_resolve(tiled_find(mem->cpu))) REFUSE(R_TEXTURE);
+        // A surface drawn earlier through its block-linear copy: sample that
+        // copy (step 4c showed the card reads it right), or bring the pixels
+        // back first (the texture header reads the surface).
+        int si = tiled_find(mem->cpu);
+        bl_src[u] = -1;
+        if (si >= 0 && g.tiled[si].valid && g.tiled[si].dirty && g.tex_bl_ok &&
+            g.tiled[si].width == tex->width && g.tiled[si].height == tex->height) {
+            // Drawn into by this batch: the draws must be done before it is read.
+            if (g.tiled[si].batch_written && !batch_flush()) REFUSE(R_TEXTURE);
+            bl_src[u] = si;
+        } else if (!tiled_resolve(si)) {
+            REFUSE(R_TEXTURE);
+        }
     }
     // Storage buffers the program reads: constant buffers on their memory.
     uint32_t sbs = np->vs.buffers | np->fs.buffers;
@@ -785,8 +802,14 @@ static bool nv_draw_3d(const fgpu_hw_draw_t* d, uint32_t* triangles) {
             const fgpu_mem_t* mem = &d->textures[u];
             uint32_t slot = g_tic_next++;
             uint32_t words[8];
-            nv3d_texture_header(words, nv_rm_vram_va(mem->vram_offset), tex->pitch * 4u, tex->width, tex->height,
-                                NV3D_TEX_ARGB, 0);
+            if (bl_src[u] >= 0) {
+                nv3d_texture_header(words, nv_rm_vram_va(g.tiled[bl_src[u]].vram), 0, tex->width, tex->height,
+                                    NV3D_TEX_ARGB_BL, 0);
+                g.bl_samples++;
+            } else {
+                nv3d_texture_header(words, nv_rm_vram_va(mem->vram_offset), tex->pitch * 4u, tex->width, tex->height,
+                                    NV3D_TEX_ARGB, 0);
+            }
             vram_write(g.pools + POOL_TIC + slot * 32u, words, 32);
             nv3d_sampler(words, tex->flags);
             vram_write(g.pools + POOL_TSC + slot * 32u, words, 32);
@@ -802,7 +825,7 @@ static bool nv_draw_3d(const fgpu_hw_draw_t* d, uint32_t* triangles) {
         REFUSE(R_JOB);
     }
     g_batch_draws++;
-    if (ti >= 0) g.tiled[ti].dirty = true;
+    if (ti >= 0) g.tiled[ti].dirty = g.tiled[ti].batch_written = true;
     if (nd.zeta && (pipe->state & FGPU_STATE_DEPTH_WRITE)) {
         int zi = zeta_index(nd.zeta);
         if (zi >= 0) g.zeta[zi].gpu_newer = true;
@@ -1354,6 +1377,56 @@ static uint32_t tex_test_texel(uint32_t x, uint32_t y) {
     return 0xFF000000u | (x * 4u) << 16 | (y * 4u) << 8 | (((x ^ y) & 63u) * 4u);
 }
 
+// One sampling draw of the test: a full-screen triangle into surf, the texture described by tic.
+static bool tex_test_draw(const nv_program_t* np, uint64_t surf, uint32_t pitch, uint32_t n, uint64_t vbo,
+                          const uint32_t tic[8]) {
+    uint32_t words[8];
+    vram_write(g.pools + POOL_TIC + 32u, tic, 32);
+    nv3d_sampler(words, FGPU_TEXTURE_CLAMP);
+    vram_write(g.pools + POOL_TSC + 32u, words, 32);
+    static float zero_uniforms[FGPU_SHADER_MAX_UNIFORMS * 4];
+    static const uint32_t attrib[1] = { FGPU_ATTRIB(0, 3) };
+    nv3d_draw_t d;
+    memset(&d, 0, sizeof(d));
+    d.color = (nv3d_color_t){ nv_rm_vram_va(surf), pitch, n, n, false, 0, 0 };
+    d.vp_w = n; d.vp_h = n;
+    d.front_ccw = g.front_ccw;
+    d.vs = (nv3d_stage_t){ nv_rm_vram_va(np->vs.vram), np->vs.regs };
+    d.fs = (nv3d_stage_t){ nv_rm_vram_va(np->fs.vram), np->fs.regs };
+    d.cb_va = nv_rm_vram_va(g.pools + POOL_CB);
+    d.uniforms = zero_uniforms;
+    d.tex_handle[0] = 1u | (1u << 20);
+    d.textures_changed = true;
+    d.stride_bytes = 12; d.attrib_count = 1; d.attrib = attrib;
+    d.vb_va = nv_rm_vram_va(vbo); d.vb_bytes = 36;
+    d.count = 3;
+    nv_push_t* p = begin_job();
+    if (!p) { say("  the 3D channel is not available\n"); return false; }
+    nv3d_push_clear(p, &d.color, NULL, FGPU_CLEAR_COLOR, 0x00FF00FFu, 1.0f);
+    nv3d_push_draw(p, &d);
+    if (!end_job(p)) { say("  the sampling draw did not finish (see the lines above)\n"); return false; }
+    return true;
+}
+
+// Pixels of surf that are not their texel; orientation 0 upright, 1 rows flipped, -1 the better one
+// (written back). The first wrong pixel goes to *fx, *fy, *fg, *fw.
+static uint32_t tex_test_compare(uint64_t surf, uint32_t pitch, uint32_t n, int* orientation, uint32_t* fx,
+                                 uint32_t* fy, uint32_t* fg, uint32_t* fw) {
+    uint32_t wrong[2] = { 0, 0 }, x0[2] = { 0, 0 }, y0[2] = { 0, 0 }, g0[2] = { 0, 0 }, w0[2] = { 0, 0 };
+    for (uint32_t y = 0; y < n; y++)
+        for (uint32_t x = 0; x < n; x++) {
+            uint32_t got = vram_read32(surf + y * pitch + x * 4u) & 0xFFFFFFu;
+            for (int o = 0; o < 2; o++) {
+                uint32_t want = tex_test_texel(x, o ? n - 1u - y : y) & 0xFFFFFFu;
+                if (got != want && wrong[o]++ == 0) { x0[o] = x; y0[o] = y; g0[o] = got; w0[o] = want; }
+            }
+        }
+    int best = *orientation >= 0 ? *orientation : (wrong[1] < wrong[0] ? 1 : 0);
+    *orientation = best;
+    *fx = x0[best]; *fy = y0[best]; *fg = g0[best]; *fw = w0[best];
+    return wrong[best];
+}
+
 static void tex_self_test(void) {
     enum { N = 64, PITCH = N * 4 };
     g.tex_tested = true;
@@ -1371,12 +1444,15 @@ static void tex_self_test(void) {
         say("  the sampling shader did not compile to machine code: textures stay on the CPU\n");
         return;
     }
+    uint32_t bw, bh, bl_bytes;
+    nv3d_color_bl_size(N, N, &bw, &bh, &bl_bytes);
     uint64_t tex = gpu_vram_alloc(g.a, PITCH * N, 4096, 0);
     uint64_t surf = gpu_vram_alloc(g.a, PITCH * N, 4096, 0);
     uint64_t vbo = gpu_vram_alloc(g.a, 4096, 4096, 0);
+    uint64_t bl = gpu_vram_alloc(g.a, bl_bytes, 4096, 0);
     uint64_t mapped = nv_rm_vram_mapped(g.a);
-    if (tex == GPU_VRAM_INVALID || surf == GPU_VRAM_INVALID || vbo == GPU_VRAM_INVALID || tex + PITCH * N > mapped ||
-        surf + PITCH * N > mapped || vbo + 4096 > mapped) {
+    if (tex == GPU_VRAM_INVALID || surf == GPU_VRAM_INVALID || vbo == GPU_VRAM_INVALID || bl == GPU_VRAM_INVALID ||
+        tex + PITCH * N > mapped || surf + PITCH * N > mapped || vbo + 4096 > mapped || bl + bl_bytes > mapped) {
         say("  out of VRAM for the test\n");
         goto out;
     }
@@ -1388,55 +1464,44 @@ static void tex_self_test(void) {
     {
         static const float tri[3][3] = { { -1, -1, 0 }, { 3, -1, 0 }, { -1, 3, 0 } };
         vram_write(vbo, tri, sizeof(tri));
-        uint32_t words[8];
-        nv3d_texture_header(words, nv_rm_vram_va(tex), PITCH, N, N, NV3D_TEX_ARGB, 0);
-        vram_write(g.pools + POOL_TIC + 32u, words, 32);
-        nv3d_sampler(words, FGPU_TEXTURE_CLAMP);
-        vram_write(g.pools + POOL_TSC + 32u, words, 32);
-        static float zero_uniforms[FGPU_SHADER_MAX_UNIFORMS * 4];
-        static const uint32_t attrib[1] = { FGPU_ATTRIB(0, 3) };
-        nv3d_draw_t d;
-        memset(&d, 0, sizeof(d));
-        d.color = (nv3d_color_t){ nv_rm_vram_va(surf), PITCH, N, N, false, 0, 0 };
-        d.vp_w = N; d.vp_h = N;
-        d.front_ccw = g.front_ccw;
-        d.vs = (nv3d_stage_t){ nv_rm_vram_va(np->vs.vram), np->vs.regs };
-        d.fs = (nv3d_stage_t){ nv_rm_vram_va(np->fs.vram), np->fs.regs };
-        d.cb_va = nv_rm_vram_va(g.pools + POOL_CB);
-        d.uniforms = zero_uniforms;
-        d.tex_handle[0] = 1u | (1u << 20);
-        d.textures_changed = true;
-        d.stride_bytes = 12; d.attrib_count = 1; d.attrib = attrib;
-        d.vb_va = nv_rm_vram_va(vbo); d.vb_bytes = sizeof(tri);
-        d.count = 3;
-        nv_push_t* p = begin_job();
-        if (!p) { say("  the 3D channel is not available\n"); goto out; }
-        nv3d_push_clear(p, &d.color, NULL, FGPU_CLEAR_COLOR, 0x00FF00FFu, 1.0f);
-        nv3d_push_draw(p, &d);
-        if (!end_job(p)) { say("  the sampling draw did not finish (see the lines above)\n"); goto out; }
     }
+    int orientation = -1;
     {
-        uint32_t wrong[2] = { 0, 0 }, fx[2] = { 0, 0 }, fy[2] = { 0, 0 }, fg[2] = { 0, 0 }, fw[2] = { 0, 0 };
-        for (uint32_t y = 0; y < N; y++)
-            for (uint32_t x = 0; x < N; x++) {
-                uint32_t got = vram_read32(surf + y * PITCH + x * 4u) & 0xFFFFFFu;
-                for (int o = 0; o < 2; o++) {
-                    uint32_t want = tex_test_texel(x, o ? N - 1u - y : y) & 0xFFFFFFu;
-                    if (got != want && wrong[o]++ == 0) { fx[o] = x; fy[o] = y; fg[o] = got; fw[o] = want; }
-                }
-            }
-        int best = wrong[1] < wrong[0] ? 1 : 0;
-        g.tex_wrong = wrong[best];
-        g.tex_first_x = fx[best]; g.tex_first_y = fy[best]; g.tex_got = fg[best]; g.tex_want = fw[best];
-        g.tex_ok = wrong[best] <= (N * N) / 100u;        // a few edge texels may round either way
-        if (g.tex_ok) say("  ok: %u of %u pixels are their texel (%s)\n", N * N - wrong[best], N * N, best ? "rows flipped" : "upright");
+        uint32_t tic[8];
+        nv3d_texture_header(tic, nv_rm_vram_va(tex), PITCH, N, N, NV3D_TEX_ARGB, 0);
+        if (!tex_test_draw(np, surf, PITCH, N, vbo, tic)) goto out;
+        uint32_t fx, fy, fg, fw;
+        uint32_t wrong = tex_test_compare(surf, PITCH, N, &orientation, &fx, &fy, &fg, &fw);
+        g.tex_wrong = wrong;
+        g.tex_first_x = fx; g.tex_first_y = fy; g.tex_got = fg; g.tex_want = fw;
+        g.tex_ok = wrong <= (N * N) / 100u;        // a few edge texels may round either way
+        if (g.tex_ok) say("  ok: %u of %u pixels are their texel (%s)\n", N * N - wrong, N * N, orientation ? "rows flipped" : "upright");
         else say("  WRONG: %u of %u pixels differ; first at %u,%u: got 0x%06x, want 0x%06x. Draws that sample textures run on the CPU.\n",
-                 wrong[best], N * N, fx[best], fy[best], fg[best], fw[best]);
+                 wrong, N * N, fx, fy, fg, fw);
+    }
+    // The same texels in a draw target's block-linear layout (made by the copy engine, as for targets).
+    if (g.tex_ok) {
+        g.tex_bl_tested = true;
+        if (!nv_rm_ce_copy_surface(g.a, tex, PITCH, bl, 0, bw * 4u, bh, N * 4u, N)) {
+            say("  block-linear: the copy engine did not make the test copy; passes copy targets back before sampling\n");
+            goto out;
+        }
+        uint32_t tic[8];
+        nv3d_texture_header(tic, nv_rm_vram_va(bl), 0, N, N, NV3D_TEX_ARGB_BL, 0);
+        if (!tex_test_draw(np, surf, PITCH, N, vbo, tic)) goto out;
+        uint32_t fx, fy, fg, fw;
+        uint32_t wrong = tex_test_compare(surf, PITCH, N, &orientation, &fx, &fy, &fg, &fw);
+        g.tex_bl_wrong = wrong;
+        g.tex_bl_ok = wrong <= (N * N) / 100u;
+        if (g.tex_bl_ok) say("  ok: block-linear targets are sampled directly (%u of %u pixels right)\n", N * N - wrong, N * N);
+        else say("  block-linear sampling WRONG (%u of %u differ; first %u,%u got 0x%06x want 0x%06x): targets are copied back before sampling\n",
+                 wrong, N * N, fx, fy, fg, fw);
     }
 out:
     if (tex != GPU_VRAM_INVALID) gpu_vram_free(g.a, tex);
     if (surf != GPU_VRAM_INVALID) gpu_vram_free(g.a, surf);
     if (vbo != GPU_VRAM_INVALID) gpu_vram_free(g.a, vbo);
+    if (bl != GPU_VRAM_INVALID) gpu_vram_free(g.a, bl);
     nv_program_destroy(np);
 }
 
@@ -1710,7 +1775,11 @@ void nv_bringup_report(gpu_adapter_t* a, void (*print)(const char* text)) {
                  (unsigned)hc.syncs);
         print(line);
         if (g.tex_tested) {
-            if (g.tex_ok) snprintf(line, sizeof(line), "        texture sampling test: ok\n");
+            if (g.tex_ok && g.tex_bl_ok)
+                snprintf(line, sizeof(line), "        texture sampling test: ok; block-linear targets sampled directly (%u times)\n", (unsigned)g.bl_samples);
+            else if (g.tex_ok && g.tex_bl_tested)
+                snprintf(line, sizeof(line), "        texture sampling test: ok; block-linear sampling WRONG (%u of 4096): targets copied back first\n", (unsigned)g.tex_bl_wrong);
+            else if (g.tex_ok) snprintf(line, sizeof(line), "        texture sampling test: ok\n");
             else snprintf(line, sizeof(line), "        texture sampling test: WRONG (%u of 4096 pixels; first %u,%u got 0x%06x want 0x%06x): sampling draws run on the CPU\n",
                           (unsigned)g.tex_wrong, (unsigned)g.tex_first_x, (unsigned)g.tex_first_y, (unsigned)g.tex_got, (unsigned)g.tex_want);
             print(line);

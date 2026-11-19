@@ -877,7 +877,7 @@ void fgpu_shader_run_vertex(const fgpu_shader_io_t* io) {
     fgpu_shader_batch_reset(&g_single, p->h.temp_count);
     for (uint32_t i = 0; i < FGPU_MAX_ATTRIBS; i++)
         for (int c = 0; c < 4; c++) g_single.input[i][c][0] = io->input[i][c];
-    fgpu_shader_run_batch(p, false, &g_single, 1, io->uniforms, io->textures);
+    fgpu_shader_run_batch_buffers(p, false, &g_single, 1, io->uniforms, io->textures, io->storage_buffers);
     for (uint32_t o = 0; o < 1 + p->h.varying_count; o++)
         for (int c = 0; c < 4; c++) io->output[o][c] = g_single.output[o][c][0];
 }
@@ -889,7 +889,7 @@ bool fgpu_shader_run_fragment(const fgpu_shader_io_t* io) {
         for (int c = 0; c < 4; c++) g_single.input[i][c][0] = io->input[i][c];
     for (int i = 0; i < 2; i++)
         for (int c = 0; c < 4; c++) g_single.special[i][c][0] = io->special ? io->special[i][c] : 0.0f;
-    uint32_t kept = fgpu_shader_run_batch(p, true, &g_single, 1, io->uniforms, io->textures);
+    uint32_t kept = fgpu_shader_run_batch_buffers(p, true, &g_single, 1, io->uniforms, io->textures, io->storage_buffers);
     for (int c = 0; c < 4; c++) io->output[0][c] = g_single.output[0][c][0];
     return kept != 0;
 }

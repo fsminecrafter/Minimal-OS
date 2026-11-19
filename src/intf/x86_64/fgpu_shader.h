@@ -49,6 +49,7 @@ typedef struct {
     const float (*uniforms)[4]; // FGPU_SHADER_MAX_UNIFORMS registers
     const float (*special)[4];  // fragment stage: 2 registers, else NULL
     const fgpu_texture_t* textures;     // FGPU_TEXTURE_UNITS, NULL = none
+    const fgpu_storage_buffer_t* storage_buffers;   // FGPU_MAX_STORAGE_BUFFERS, NULL = none
 } fgpu_shader_io_t;
 
 /* Batches: FGPU_LANES invocations at once (how the rasterizer runs

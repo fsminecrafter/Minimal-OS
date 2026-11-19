@@ -129,7 +129,28 @@ static bool sim_run(sim_t* s, const nv_sass_t* sh, bool fragment) {
                 continue;
             }
             fgpu_texture_sample(&textures[unit], u2f(rd(s, base)), u2f(rd(s, base + 1)), out);
-            for (int c = 0; c < 4; c++) wr(s, dst + (uint32_t)c, f2u(out[c]));
+            // Like the card: r, g go to Rd, Rd+1 and b, a to the second
+            // result register Rd2 (bits 64..71), Rd2+1. RZ throws them away.
+            uint32_t dst2 = F(64, 72);
+            wr(s, dst, f2u(out[0]));
+            wr(s, dst + 1u, f2u(out[1]));
+            if (dst2 != 255u) {
+                if (dst2 & 1u) { s->bad = true; continue; }
+                wr(s, dst2, f2u(out[2]));
+                wr(s, dst2 + 1u, f2u(out[3]));
+            }
+            continue;
+        }
+        if (full == 0xB82) {                        // LDC: c[bank][R + offset]
+            uint32_t bank = F(54, 59), sb = bank - NV_SASS_CB_STORAGE;
+            if (F(73, 76) != 4 || F(78, 80) != 0 || bank < NV_SASS_CB_STORAGE || sb >= FGPU_MAX_STORAGE_BUFFERS) {
+                s->bad = true;
+                continue;
+            }
+            uint32_t off = rd(s, F(24, 32)) + F(38, 54), v = 0;
+            // Past the bound size (a negative index wraps to a huge offset): zero, as on the card.
+            if (sb_data[sb] && off < sb_bytes[sb] && off + 4 <= sb_bytes[sb]) memcpy(&v, (const uint8_t*)sb_data[sb] + off, 4);
+            wr(s, dst, v);
             continue;
         }
         uint32_t op = F(0, 9), form = F(9, 12);
@@ -177,6 +198,10 @@ static bool sim_run(sim_t* s, const nv_sass_t* sh, bool fragment) {
             case 0x020: wr(s, dst, f2u(a * b)); if (F(64, 72) != 255 || F(84, 87) != 4) s->bad = true; break;
             case 0x021: wr(s, dst, f2u(a + b)); break;
             case 0x023: wr(s, dst, f2u(a * b + mod(rd(s, F(64, 72)), F(74, 75), F(75, 76)))); break;
+            case 0x105:                             // F2I.S32.TRUNC
+                if (F(72, 73) != 1 || F(75, 77) != 2 || F(78, 80) != 3 || F(84, 86) != 2) s->bad = true;
+                wr(s, dst, (uint32_t)(int32_t)(b != b ? 0.0f : b < -2147483648.0f ? -2147483648.0f : b > 2147483520.0f ? 2147483520.0f : b));
+                break;
             case 0x107: wr(s, dst, f2u(floorf(b))); if (F(78, 80) != 1 || F(84, 86) != 2 || F(75, 77) != 2) s->bad = true; break;
             case 0x108:
                 switch (F(74, 80)) {
@@ -232,6 +257,8 @@ static bool storage_stage(const char* fs, nv_sass_t* sh, const char** why) {
     return nv_sass_encode(ir.code, ir.count, ir.reg_count, true, prog.h.varying_count, sh, why);
 }
 
+static void compare(const char* name, const char* vs, const char* fs);
+
 static void test_storage_buffer(void) {
     const char* why = "";
     nv_sass_t sh;
@@ -259,12 +286,17 @@ static void test_storage_buffer(void) {
     for (int c = 0; c < 4 && ran; c++) CHECK(close_enough(u2f(s.r[c]), want[c]), "storage buffer values");
     sb_data[0] = sb_data[2] = NULL;
 
-    // A computed index needs LDC with a register offset: not encoded.
+    // A computed index: LDC with a register offset. compare() runs it against
+    // the interpreter with indices in range, past the end and negative.
+    const char* dyn_vs = "attribute vec3 position; varying vec4 v_k;\n"
+                         "void main() { v_k = vec4(position, 1.0); gl_Position = vec4(position, 1.0); }";
     const char* dyn =
         "layout(binding = 0) buffer vec4 a[];\n"
+        "layout(binding = 1) buffer vec4 b[];\n"
         "varying vec4 v_k;\n"
-        "void main() { gl_FragColor = a[v_k.x]; }\n";
-    CHECK(!storage_stage(dyn, &sh, &why) && strstr(why, "computed index"), "a computed index stays on the CPU");
+        "void main() { gl_FragColor = a[v_k.x * 4.0 + 3.0] + b[v_k.y * 6.0] * 0.5 + a[14.0 + floor(v_k.z * 2.0) * 10.0]; }\n";
+    CHECK(storage_stage(dyn, &sh, &why), "a computed storage buffer index encodes");
+    compare("computed buffer index", dyn_vs, dyn);
 }
 
 // Compiles a shader pair and runs both stages on random inputs through
@@ -305,6 +337,17 @@ static void compare(const char* name, const char* vs, const char* fs) {
     }
 
     int bad = 0;
+    // Storage buffers with random contents, for shaders that read them (the
+    // simulator and the interpreter see the same 40 vec4s per buffer).
+    static float sb_vals[FGPU_MAX_STORAGE_BUFFERS][40][4];
+    static fgpu_storage_buffer_t sbufs[FGPU_MAX_STORAGE_BUFFERS];
+    for (int b = 0; b < (int)FGPU_MAX_STORAGE_BUFFERS; b++) {
+        for (int i = 0; i < 40; i++)
+            for (int c = 0; c < 4; c++) sb_vals[b][i][c] = frand(-2.0f, 2.0f);
+        sbufs[b] = (fgpu_storage_buffer_t){ (const float (*)[4])sb_vals[b], 40 };
+        sb_data[b] = &sb_vals[b][0][0];
+        sb_bytes[b] = sizeof sb_vals[b];
+    }
     for (int round = 0; round < 200 && !bad; round++) {
         for (int i = 0; i < (int)FGPU_SHADER_MAX_UNIFORMS; i++)
             for (int c = 0; c < 4; c++) uniforms[i][c] = frand(-2.0f, 2.0f);
@@ -319,7 +362,7 @@ static void compare(const char* name, const char* vs, const char* fs) {
                 in[i][c] = frand(-1.5f, 1.5f);
                 s.attr_in[(NV_SASS_ATTR_GENERIC + 16 * i + 4 * c) / 4] = in[i][c];
             }
-        fgpu_shader_io_t io = { &prog, in, out, uniforms, NULL, textures };
+        fgpu_shader_io_t io = { &prog, in, out, uniforms, NULL, textures, sbufs };
         fgpu_shader_run_vertex(&io);
         if (!sim_run(&s, &vsh, false)) { bad = 1; break; }
         if (s.uninit_reg >= 0 || s.uninit_pred >= 0) {
@@ -349,7 +392,7 @@ static void compare(const char* name, const char* vs, const char* fs) {
                 s.attr_in[(NV_SASS_ATTR_GENERIC + 16 * i + 4 * c) / 4] = in[i][c];
             }
         for (int c = 0; c < 4; c++) s.attr_in[(NV_SASS_ATTR_POSITION + 4 * c) / 4] = special[0][c];
-        fgpu_shader_io_t fio = { &prog, in, color, uniforms, special, textures };
+        fgpu_shader_io_t fio = { &prog, in, color, uniforms, special, textures, sbufs };
         bool kept = fgpu_shader_run_fragment(&fio);
         if (!sim_run(&s, &fsh, true)) { bad = 1; break; }
         if (s.uninit_reg >= 0 || s.uninit_pred >= 0) {
@@ -364,6 +407,7 @@ static void compare(const char* name, const char* vs, const char* fs) {
                 bad = 1;
             }
     }
+    for (int b = 0; b < (int)FGPU_MAX_STORAGE_BUFFERS; b++) sb_data[b] = NULL;
     snprintf(msg, sizeof msg, "%s: machine code matches the CPU shader machine", name);
     CHECK(!bad, msg);
     printf("  %-22s vertex %4u instructions %3u registers, pixel %4u instructions %3u registers\n", name,

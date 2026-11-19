@@ -66,7 +66,7 @@ void nv3d_texture_header(uint32_t out[8], uint64_t va, uint32_t pitch_bytes, uin
         bits(out, 28, 31, 5);               // w = A
     }
     bits(out, 64, 80, (uint32_t)(va >> 32) & 0xFFFFu);
-    if (kind == NV3D_TEX_R8_BL || kind == NV3D_TEX_RG8_BL) {
+    if (kind == NV3D_TEX_R8_BL || kind == NV3D_TEX_RG8_BL || kind == NV3D_TEX_ARGB_BL) {
         bits(out, 41, 64, (uint32_t)(va >> 9) & 0x7FFFFFu);
         bits(out, 85, 88, 3);               // block-linear header
         bits(out, 99, 102, block_log2);     // GOBs per block: 1 wide, 2^n high, 1 deep

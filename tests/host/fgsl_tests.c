@@ -44,7 +44,7 @@ static void set_uniform(const char* name, const float* v, int n) {
 static int run_fs(const float var[][4], float out[4]) {
     float special[2][4] = { { 10.5f, 20.5f, 0.5f, 1.0f }, { 1, 1, 1, 1 } };
     float o[1][4];
-    fgpu_shader_io_t io = { &prog, var, o, (const float (*)[4])uniforms, (const float (*)[4])special, NULL };
+    fgpu_shader_io_t io = { &prog, var, o, (const float (*)[4])uniforms, (const float (*)[4])special, NULL, NULL };
     int kept = fgpu_shader_run_fragment(&io);
     memcpy(out, o[0], sizeof(o[0]));
     return kept;

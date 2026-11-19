@@ -1,3 +1,4 @@
+#include "x86_64/bootanim.h"
 #include "panic.h"
 #include "print.h"
 #include "x86_64/exec_trace.h"
@@ -314,6 +315,7 @@ static void print_registers(const RegisterState* regs, int start_row) {
 }
 
 noreturn void panic(const char* message, const char* file, int line, const RegisterState* regs) {
+    bootanim_abort();
 	cli();
 
 	// Only the first core to panic reports; the others (stopped by the

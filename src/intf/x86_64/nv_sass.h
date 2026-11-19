@@ -26,8 +26,10 @@
  *
  * Registers, per thread:
  *   0 .. ir_regs-1      the IR's own registers
- *   then 5 scratch      immediates, modified operands, texture coordinates
- *   then 4 per TEX      texture results
+ *   then 3 scratch      immediates, modified operands
+ *   then 2              texture coordinates, from an even register
+ *   then 4 per TEX      texture results, from a multiple of 4 (Turing traps
+ *                       "Misaligned Register" for unaligned register vectors)
  *   then 4              fragment stage: the color, moved to R0..R3 at the end
  *
  * Uniforms are constant buffer 0 (c[0][slot * 4]); the texture handle of

@@ -109,6 +109,9 @@ static bool sim_run(sim_t* s, const nv_sass_t* sh, bool fragment) {
         if (full == 0xB60) {                        // TEX
             uint32_t unit = (F(40, 54) * 4u - cb_tex) / 4u, base = F(24, 32);
             float out[4];
+            // The card wants register vectors aligned: the coordinate pair
+            // on an even register, the four results on a multiple of 4.
+            if ((base & 1u) || (dst & 3u)) { s->bad = true; continue; }
             if (unit >= FGPU_MAX_TEXTURE_UNITS || F(61, 64) != 1 || F(72, 76) != 0xF || F(87, 90) != 1) {
                 s->bad = true;
                 continue;

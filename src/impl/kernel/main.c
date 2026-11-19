@@ -1,3 +1,4 @@
+#include "x86_64/bootanim.h"
 #include "x86_64/cpu_simd.h"
 #include "x86_64/ramdisk.h"
 #include "x86_64/netlog.h"
@@ -161,6 +162,8 @@ void kernel_main(uint64_t mb2_info_addr) {
     serial_write_hex(heap_region_end);
     serial_write_str("\n");
     startroutine(heap_region_start, heap_region_end);
+    // The hourglass, from here until the terminal or mosWM takes over.
+    bootanim_start(mb_info);
     //verify_memory_initialization((void*)0x400000, (void*)total_ram_bytes);
 
     //memory_scanner_init();
@@ -206,11 +209,13 @@ void kernel_main(uint64_t mb2_info_addr) {
     gpu_multiboot2_set_info(mb_info);
     gpu_manager_register_driver(gpu_multiboot2_get_driver());
     gpu_manager_register_driver(gpu_bochs_vbe_get_driver());
+    bootanim_pause(true);              // the drivers may set a new mode
     if (!gpu_manager_init()) {
         serial_write_str("No display driver available - continuing headless\n");
     }
     // Graphics adapters beyond the framebuffer: VRAM, chip drivers.
     gpu_core_init();
+    bootanim_pause(false);
     if (multiboot2_has_cmdline_token(mb_info, "memtest")) {
         memory_test_run();
     }

@@ -831,6 +831,14 @@ evaluator) and the CPU shader machine, and checks that they agree.
      CPU did with the reason. Run it twice around a few seconds in the
      editor to see where a slow frame goes.
 
+   Fifth run (2026-11-19): 33 jobs ran, then every SM reported `Graphics
+   SM Warp Exception: Misaligned Register` (RC exception 13). Turing wants
+   register vectors aligned to their size; the TEX coordinate pair sat at
+   `scratch + 3` and the four results at `tex_base`, both wherever the IR's
+   register count put them. The coordinates now start on an even register
+   and the results on a multiple of 4, and `nv_sass_tests` refuses
+   unaligned TEX operands.
+
    The centre is inside both triangles (the near, blue-ish one must win),
    `left` only inside the far red one, `corner` in neither. If the first
    try shows only the clear color, the test repeats with the other

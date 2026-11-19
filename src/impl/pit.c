@@ -12,6 +12,7 @@
 #include "x86_64/network_manager.h"
 #include "x86_64/smp.h"
 #include "x86_64/exec_trace.h"
+#include "x86_64/bootanim.h"
 
 // PIT ports
 #define PIT_COMMAND_PORT 0x43
@@ -49,6 +50,7 @@ void pit_irq_handler() {
     
     // Update system time
     time_tick(pit_frequency);
+    bootanim_tick();
     wm_watchdog_tick();
 
     // Usb poll

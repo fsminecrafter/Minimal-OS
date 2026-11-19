@@ -1190,6 +1190,40 @@ typedef struct {
     uint32_t reserved;
 } syscall_wait_t;
 
+// ===========================================
+// TASKS (SYS_TASK): what a task manager needs
+// ===========================================
+// SYS_TASK_LIST (mos_task_list() in minimalos.h):
+//   rdi = SYS_TASK_LIST, rsi = buffer, rdx = max entries; returns the count
+//   written. One entry per program (a program's threads are counted in
+//   `threads`, not listed), kernel tasks included.
+// SYS_TASK_END: rdi = SYS_TASK_END, rsi = pid. Ends a user program (and its
+//   threads, windows, GPU and audio objects). Kernel tasks, the window
+//   manager and the caller itself are refused (SYS_ERR_PERM).
+#define SYS_TASK 56
+#define SYS_TASK_ABI_VERSION 1u
+#define SYS_TASK_LIST 1u
+#define SYS_TASK_END  2u
+
+#define SYS_TASK_FLAG_WINDOW_MANAGER 1u
+#define SYS_TASK_FLAG_CRASHED        2u
+
+typedef struct {
+    uint64_t pid;
+    uint64_t parent_pid;
+    char name[64];
+    uint8_t state;              // SYSCALL_PROC_STATE_*
+    uint8_t privilege;          // SYSCALL_PROC_PRIV_*
+    uint16_t threads;           // user threads besides the main one
+    uint32_t flags;             // SYS_TASK_FLAG_*
+    uint32_t cpu;               // run queue it belongs to
+    uint32_t reserved;
+    uint64_t cpu_time_ms;       // scheduler ticks it ran (its threads included)
+    uint64_t age_ms;            // since it started
+    uint64_t memory_bytes;      // committed user pages + SYS_HEAP memory
+} syscall_task_info_t;
+
+
 // VM: rdi = operation. Memory of the program's own, in whole 4 KiB pages,
 // above everything else it has (addresses from 2 TiB up). Pages read as
 // zero until written and take physical memory only from their first use,

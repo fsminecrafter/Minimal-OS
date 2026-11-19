@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <dirent.h>
 #include "x86_64/fgpu_ir.h"
 #include "x86_64/nv_sass.h"
 #include "x86_64/nv_3d.h"
@@ -555,6 +556,52 @@ static void test_nvdec(void) {
     CHECK((th[0] & 0x7F) == 0x18 && ((th[0] >> 22) & 7) == 3, "block-linear colour texture header");
 }
 
+// NV_SASS_SHADER_DIR=<dir>: every <dir>/NAME.vs + NAME.fs pair (Farcade's shader_compile_tests writes
+// them with FE_DUMP_DIR) through the encoder and the simulator.
+static char* read_text(const char* path) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char* t = (char*)malloc((size_t)n + 1);
+    if (t && fread(t, 1, (size_t)n, f) != (size_t)n) { free(t); t = NULL; }
+    if (t) t[n] = 0;
+    fclose(f);
+    return t;
+}
+
+static int name_cmp(const void* a, const void* b) { return strcmp(*(char* const*)a, *(char* const*)b); }
+
+static void test_shader_dir(const char* dir) {
+    DIR* d = opendir(dir);
+    if (!d) { printf("FAIL: cannot open %s\n", dir); failures++; return; }
+    char* names[4096];
+    int n = 0;
+    struct dirent* e;
+    while ((e = readdir(d)) && n < 4096) {
+        size_t l = strlen(e->d_name);
+        if (l > 3 && !strcmp(e->d_name + l - 3, ".vs")) { names[n] = (char*)malloc(l + 1); memcpy(names[n++], e->d_name, l + 1); }
+    }
+    closedir(d);
+    qsort(names, (size_t)n, sizeof names[0], name_cmp);
+    int before = failures;
+    for (int i = 0; i < n; i++) {
+        char path[1024], label[160];
+        snprintf(path, sizeof path, "%s/%s", dir, names[i]);
+        char* vs = read_text(path);
+        size_t l = strlen(path);
+        path[l - 2] = 'f';
+        char* fs = read_text(path);
+        memcpy(path + l - 2, "name", 5);
+        char* what = read_text(path);
+        snprintf(label, sizeof label, "%.*s %s", (int)(strlen(names[i]) - 3), names[i], what ? what : "");
+        if (vs && fs) compare(label, vs, fs);
+        free(vs); free(fs); free(what); free(names[i]);
+    }
+    printf("shader dir: %d programs, %d failing checks\n", n, failures - before);
+}
+
 int main(void) {
     for (int t = 0; t < 2; t++) {
         for (int i = 0; i < 64; i++) {
@@ -562,6 +609,10 @@ int main(void) {
             texels[t][i] = rng;
         }
         textures[t] = (fgpu_texture_t){ .pixels = texels[t], .width = 8, .height = 8, .pitch = 8, .flags = t ? FGPU_TEXTURE_LINEAR : 0 };
+    }
+    if (getenv("NV_SASS_SHADER_DIR")) {
+        test_shader_dir(getenv("NV_SASS_SHADER_DIR"));
+        return failures ? 1 : 0;
     }
     test_encodings();
     test_pushbuffers();

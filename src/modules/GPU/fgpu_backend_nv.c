@@ -77,6 +77,9 @@ typedef struct {
 static struct {
     gpu_adapter_t* a;
     bool hw3d;                  // the self-test passed
+    bool tex_tested, tex_ok;    // step 4c: texture sampling on the card (draws that sample go to the CPU if not ok)
+    uint32_t tex_wrong;         // pixels the sampling test got wrong (of 4096)
+    uint32_t tex_first_x, tex_first_y, tex_got, tex_want;
     bool init_sent;             // nv3d_push_init reached the channel
     bool front_ccw;
     uint64_t pools;             // VRAM: texture headers, samplers, constants, a zero page
@@ -546,6 +549,7 @@ static bool nv_draw_3d(const fgpu_hw_draw_t* d, uint32_t* triangles) {
 
     // Textures the program samples: a header and a sampler per unit.
     uint32_t used = np->vs.textures | np->fs.textures;
+    if (used && g.tex_tested && !g.tex_ok) REFUSE(R_TEXTURE);    // step 4c failed: the CPU samples correctly
     for (uint32_t u = 0; u < FGPU_MAX_TEXTURE_UNITS; u++) {
         if (!(used & (1u << u))) continue;
         const fgpu_texture_t* tex = &pipe->textures[u];
@@ -1171,6 +1175,103 @@ out:
     return ok;
 }
 
+// Step 4c: texture sampling. A 64x64 pattern in VRAM is sampled (nearest) by a full screen triangle into a
+// pitch-linear target and read back: every pixel must be its texel (either way up). If not, draws that sample
+// textures run on the CPU, which keeps pictures right (the report says what the card got).
+#define TEX_TEST_VS "attribute vec3 position; varying vec2 v;\n" \
+    "void main() { v = position.xy * 0.5 + 0.5; gl_Position = vec4(position.xy, 0.0, 1.0); }\n"
+#define TEX_TEST_FS "uniform sampler2D t; varying vec2 v;\nvoid main() { gl_FragColor = texture(t, v); }\n"
+
+static uint32_t tex_test_texel(uint32_t x, uint32_t y) {
+    return 0xFF000000u | (x * 4u) << 16 | (y * 4u) << 8 | (((x ^ y) & 63u) * 4u);
+}
+
+static void tex_self_test(void) {
+    enum { N = 64, PITCH = N * 4 };
+    g.tex_tested = true;
+    g.tex_ok = false;
+    g.tex_wrong = N * N;
+    say("\nStep 4c: texture sampling on the 3D engine\n");
+    fglsl_program_t* c = (fglsl_program_t*)alloc_unzeroed(sizeof(fglsl_program_t));
+    nv_program_t* np = NULL;
+    fgpu_program_t prog;
+    const char* why = "";
+    if (c && fglsl_compile(c, TEX_TEST_VS, TEX_TEST_FS) == 0 && fgpu_program_check(c->words, c->size, &prog, &why))
+        np = (nv_program_t*)nv_program_create(&prog);
+    if (c) free_mem(c);
+    if (!np) {
+        say("  the sampling shader did not compile to machine code: textures stay on the CPU\n");
+        return;
+    }
+    uint64_t tex = gpu_vram_alloc(g.a, PITCH * N, 4096, 0);
+    uint64_t surf = gpu_vram_alloc(g.a, PITCH * N, 4096, 0);
+    uint64_t vbo = gpu_vram_alloc(g.a, 4096, 4096, 0);
+    uint64_t mapped = nv_rm_vram_mapped(g.a);
+    if (tex == GPU_VRAM_INVALID || surf == GPU_VRAM_INVALID || vbo == GPU_VRAM_INVALID || tex + PITCH * N > mapped ||
+        surf + PITCH * N > mapped || vbo + 4096 > mapped) {
+        say("  out of VRAM for the test\n");
+        goto out;
+    }
+    for (uint32_t y = 0; y < N; y++)
+        for (uint32_t x = 0; x < N; x++) {
+            uint32_t v = tex_test_texel(x, y);
+            vram_write(tex + y * PITCH + x * 4u, &v, 4);
+        }
+    {
+        static const float tri[3][3] = { { -1, -1, 0 }, { 3, -1, 0 }, { -1, 3, 0 } };
+        vram_write(vbo, tri, sizeof(tri));
+        uint32_t words[8];
+        nv3d_texture_header(words, nv_rm_vram_va(tex), PITCH, N, N, NV3D_TEX_ARGB, 0);
+        vram_write(g.pools + POOL_TIC + 32u, words, 32);
+        nv3d_sampler(words, FGPU_TEXTURE_CLAMP);
+        vram_write(g.pools + POOL_TSC + 32u, words, 32);
+        static float zero_uniforms[FGPU_SHADER_MAX_UNIFORMS * 4];
+        static const uint32_t attrib[1] = { FGPU_ATTRIB(0, 3) };
+        nv3d_draw_t d;
+        memset(&d, 0, sizeof(d));
+        d.color = (nv3d_color_t){ nv_rm_vram_va(surf), PITCH, N, N, false, 0, 0 };
+        d.vp_w = N; d.vp_h = N;
+        d.front_ccw = g.front_ccw;
+        d.vs = (nv3d_stage_t){ nv_rm_vram_va(np->vs.vram), np->vs.regs };
+        d.fs = (nv3d_stage_t){ nv_rm_vram_va(np->fs.vram), np->fs.regs };
+        d.cb_va = nv_rm_vram_va(g.pools + POOL_CB);
+        d.uniforms = zero_uniforms;
+        d.tex_handle[0] = 1u | (1u << 20);
+        d.textures_changed = true;
+        d.stride_bytes = 12; d.attrib_count = 1; d.attrib = attrib;
+        d.vb_va = nv_rm_vram_va(vbo); d.vb_bytes = sizeof(tri);
+        d.count = 3;
+        nv_push_t* p = begin_job();
+        if (!p) { say("  the 3D channel is not available\n"); goto out; }
+        nv3d_push_clear(p, &d.color, NULL, FGPU_CLEAR_COLOR, 0x00FF00FFu, 1.0f);
+        nv3d_push_draw(p, &d);
+        if (!end_job(p)) { say("  the sampling draw did not finish (see the lines above)\n"); goto out; }
+    }
+    {
+        uint32_t wrong[2] = { 0, 0 }, fx[2] = { 0, 0 }, fy[2] = { 0, 0 }, fg[2] = { 0, 0 }, fw[2] = { 0, 0 };
+        for (uint32_t y = 0; y < N; y++)
+            for (uint32_t x = 0; x < N; x++) {
+                uint32_t got = vram_read32(surf + y * PITCH + x * 4u) & 0xFFFFFFu;
+                for (int o = 0; o < 2; o++) {
+                    uint32_t want = tex_test_texel(x, o ? N - 1u - y : y) & 0xFFFFFFu;
+                    if (got != want && wrong[o]++ == 0) { fx[o] = x; fy[o] = y; fg[o] = got; fw[o] = want; }
+                }
+            }
+        int best = wrong[1] < wrong[0] ? 1 : 0;
+        g.tex_wrong = wrong[best];
+        g.tex_first_x = fx[best]; g.tex_first_y = fy[best]; g.tex_got = fg[best]; g.tex_want = fw[best];
+        g.tex_ok = wrong[best] <= (N * N) / 100u;        // a few edge texels may round either way
+        if (g.tex_ok) say("  ok: %u of %u pixels are their texel (%s)\n", N * N - wrong[best], N * N, best ? "rows flipped" : "upright");
+        else say("  WRONG: %u of %u pixels differ; first at %u,%u: got 0x%06x, want 0x%06x. Draws that sample textures run on the CPU.\n",
+                 wrong[best], N * N, fx[best], fy[best], fg[best], fw[best]);
+    }
+out:
+    if (tex != GPU_VRAM_INVALID) gpu_vram_free(g.a, tex);
+    if (surf != GPU_VRAM_INVALID) gpu_vram_free(g.a, surf);
+    if (vbo != GPU_VRAM_INVALID) gpu_vram_free(g.a, vbo);
+    nv_program_destroy(np);
+}
+
 static bool nv_init(gpu_adapter_t* a, const char** why) {
     if (!a || a->vendor != GPU_VENDOR_NVIDIA || !a->mmio) { *why = "not an NVIDIA adapter"; return false; }
     if (!is_turing(nv_chipset(a))) { *why = "hardware rendering is planned for Turing first"; return false; }
@@ -1188,6 +1289,7 @@ static bool nv_init(gpu_adapter_t* a, const char** why) {
         if (g.pools) {
             g.hw3d = true;              // so the test's own jobs run
             g.hw3d = self_test();
+            if (g.hw3d) tex_self_test();
         }
         if (!g.hw3d) say("  FarcadeGL stays on the CPU; clears use the copy engine.\n");
     }
@@ -1378,8 +1480,11 @@ void nv_bringup_report(gpu_adapter_t* a, void (*print)(const char* text)) {
     for (; fl && fl->name; fl++) {
         nv_falcon_state_t st;
         if (!nv_falcon_read_state(a, fl, &st)) {
-            snprintf(line, sizeof(line), "  %s 0x%06x  not reachable (powered off?)\n",
-                     padded(fl->name, 6, pad, sizeof(pad)), (unsigned)fl->base);
+            // With GSP-RM running, it power-gates engines while they are idle: their registers do not
+            // answer the CPU, though the engine works (NVDEC: see step 5).
+            bool gated = nv_rm_chan_ready(a);
+            snprintf(line, sizeof(line), "  %s 0x%06x  %s\n", padded(fl->name, 6, pad, sizeof(pad)), (unsigned)fl->base,
+                     gated ? "power-gated by GSP-RM while idle (normal)" : "not reachable (powered off?)");
         } else {
             char state[12];
             snprintf(line, sizeof(line), "  %s 0x%06x  IMEM %3u KiB  DMEM %3u KiB  %s mailbox 0x%x\n",
@@ -1433,6 +1538,15 @@ void nv_bringup_report(gpu_adapter_t* a, void (*print)(const char* text)) {
                  (unsigned)hc.offered, (unsigned)hc.shader_on_cpu, (unsigned)hc.texture_units, (unsigned)hc.refused,
                  (unsigned)hc.syncs);
         print(line);
+        if (g.tex_tested) {
+            if (g.tex_ok) snprintf(line, sizeof(line), "        texture sampling test: ok\n");
+            else snprintf(line, sizeof(line), "        texture sampling test: WRONG (%u of 4096 pixels; first %u,%u got 0x%06x want 0x%06x): sampling draws run on the CPU\n",
+                          (unsigned)g.tex_wrong, (unsigned)g.tex_first_x, (unsigned)g.tex_first_y, (unsigned)g.tex_got, (unsigned)g.tex_want);
+            print(line);
+        }
+        snprintf(line, sizeof(line), "        shader programs: %u compiled for the card, %u made again and reused\n",
+                 (unsigned)hc.programs_compiled, (unsigned)hc.programs_reused);
+        print(line);
         for (uint32_t r = 0; r < 8; r++) {
             if (!g.refused[r]) continue;
             snprintf(line, sizeof(line), "          refused: %s %u\n", k_refused[r], (unsigned)g.refused[r]);
@@ -1460,7 +1574,8 @@ void nv_bringup_report(gpu_adapter_t* a, void (*print)(const char* text)) {
         print("Step 5  H.264 on NVDEC: switched off, its pictures differed from the CPU decoder's\n");
     } else if (nv_rm_dec_ready(a)) {
         snprintf(line, sizeof(line), "Step 5  H.264 .vid on the video decoder (NVDEC): channel up, %u pictures decoded%s\n",
-                 (unsigned)hd.pictures, g.hw3d ? "" : " (needs step 4 for the colour conversion)");
+                 (unsigned)hd.pictures, g.hw3d ? (hd.pictures ? "" : " (motion .vid files do not use it: only H.264 ones)")
+                                                : " (needs step 4 for the colour conversion)");
         print(line);
     } else {
         print("Step 5  H.264 on NVDEC: no decoder channel (step 5a, 'gpu nvidia boot')\n");

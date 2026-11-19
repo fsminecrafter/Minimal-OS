@@ -62,7 +62,9 @@ typedef struct {
     uint64_t owner;
     uint32_t* blob;             // kernel copy; `program` points into it
     fgpu_program_t program;
-    void* hw;                   // the hardware backend's compiled program, or NULL
+    void* hw;                   // the hardware backend's compiled program, or NULL (shared: g_hwprog)
+    uint32_t blob_bytes;
+    bool hw_tried;              // hwprog_get was called (program_free gives it back)
 } fgpu_shader_program_t;
 
 static uint64_t g_flipped_owner;        // pid whose surface is on screen, 0 = none
@@ -126,7 +128,12 @@ void fgpu_backend_select(void) {
     }
 }
 
-void fgpu_hw_counts(fgpu_hw_counts_t* out) { *out = g_hw_counts; }
+static uint32_t g_hwprog_hits, g_hwprog_compiles;
+void fgpu_hw_counts(fgpu_hw_counts_t* out) {
+    *out = g_hw_counts;
+    out->programs_compiled = g_hwprog_compiles;
+    out->programs_reused = g_hwprog_hits;
+}
 
 const fgpu_backend_t* fgpu_hw_backend(const char** why) {
     if (why) *why = g_hw_why;
@@ -179,8 +186,109 @@ static fgpu_mem_t buffer_mem(const fgpu_buffer_t* b) {
     return m;
 }
 
+/*
+ * Compiled hardware programs, shared by identical programs (same blob) and
+ * kept for a while after the last one is gone: a renderer that drops and
+ * makes the same shader again, or several programs and contexts using one,
+ * compile it for the card once. Up to HWPROG_SLOTS; an unused entry is
+ * destroyed when its slot is needed.
+ */
+#define HWPROG_SLOTS 96u
+static struct {
+    uint64_t hash;
+    uint32_t bytes;
+    uint32_t* blob;             // kernel copy, for the exact compare
+    void* hw;                   // the backend's program (never NULL)
+    uint32_t refs;
+    uint64_t last;
+} g_hwprog[HWPROG_SLOTS];
+static uint64_t g_hwprog_clock;
+static volatile uint32_t g_hwprog_lock;
+
+static void hwprog_lock(void) { while (__sync_lock_test_and_set(&g_hwprog_lock, 1)) __asm__ volatile("pause"); }
+static void hwprog_unlock(void) { __sync_lock_release(&g_hwprog_lock); }
+
+static uint64_t blob_hash(const uint32_t* w, uint32_t bytes) {
+    uint64_t h = 1469598103934665603ull;
+    const uint8_t* b = (const uint8_t*)w;
+    for (uint32_t i = 0; i < bytes; i++) { h ^= b[i]; h *= 1099511628211ull; }
+    return h;
+}
+
+// The backend's program for `program` (made from `blob`): an existing one, or compiled now.
+static void* hwprog_get(const fgpu_program_t* program, const uint32_t* blob, uint32_t bytes) {
+    if (!g_hw || !g_hw->program_create) return NULL;
+    uint64_t h = blob_hash(blob, bytes);
+    hwprog_lock();
+    g_hwprog_clock++;
+    for (uint32_t i = 0; i < HWPROG_SLOTS; i++) {
+        if (g_hwprog[i].blob && g_hwprog[i].hw && g_hwprog[i].hash == h && g_hwprog[i].bytes == bytes &&
+            memcmp(g_hwprog[i].blob, blob, bytes) == 0) {
+            g_hwprog[i].refs++;
+            g_hwprog[i].last = g_hwprog_clock;
+            g_hwprog_hits++;
+            void* hw = g_hwprog[i].hw;
+            hwprog_unlock();
+            return hw;
+        }
+    }
+    hwprog_unlock();
+    // Compiling may take long and allocate: outside the spinlock.
+    void* hw = g_hw->program_create(program);
+    // A program the card cannot run is not remembered: the 3D engine may only be getting ready.
+    if (!hw) return NULL;
+    uint32_t* copy = (uint32_t*)alloc_unzeroed(bytes);
+    if (!copy) return hw;                   // not cached: program_free destroys it (hwprog_put finds nothing)
+    memcpy(copy, blob, bytes);
+    void* evict = NULL;
+    uint32_t* evict_blob = NULL;
+    hwprog_lock();
+    g_hwprog_compiles++;
+    uint32_t slot = HWPROG_SLOTS;
+    for (uint32_t i = 0; i < HWPROG_SLOTS; i++) if (!g_hwprog[i].blob) { slot = i; break; }
+    if (slot == HWPROG_SLOTS) {
+        for (uint32_t i = 0; i < HWPROG_SLOTS; i++)
+            if (!g_hwprog[i].refs && (slot == HWPROG_SLOTS || g_hwprog[i].last < g_hwprog[slot].last)) slot = i;
+    }
+    if (slot == HWPROG_SLOTS) {             // every entry in use: this one is not cached
+        hwprog_unlock();
+        free_mem(copy);
+        return hw;
+    }
+    evict = g_hwprog[slot].hw;
+    evict_blob = g_hwprog[slot].blob;
+    g_hwprog[slot].hash = h;
+    g_hwprog[slot].bytes = bytes;
+    g_hwprog[slot].blob = copy;
+    g_hwprog[slot].hw = hw;
+    g_hwprog[slot].refs = 1;
+    g_hwprog[slot].last = g_hwprog_clock;
+    hwprog_unlock();
+    if (evict_blob) {
+        if (evict && g_hw->program_destroy) g_hw->program_destroy(evict);
+        free_mem(evict_blob);
+    }
+    return hw;
+}
+
+// A program using `hw` is gone. False when `hw` is not in the cache (the caller destroys it).
+static bool hwprog_put(void* hw, const uint32_t* blob, uint32_t bytes) {
+    uint64_t h = blob_hash(blob, bytes);
+    hwprog_lock();
+    for (uint32_t i = 0; i < HWPROG_SLOTS; i++) {
+        if (g_hwprog[i].blob && g_hwprog[i].hw == hw && g_hwprog[i].hash == h && g_hwprog[i].bytes == bytes) {
+            if (g_hwprog[i].refs) g_hwprog[i].refs--;
+            hwprog_unlock();
+            return true;
+        }
+    }
+    hwprog_unlock();
+    return false;
+}
+
 static void program_free(fgpu_shader_program_t* sp) {
-    if (sp->hw && g_hw && g_hw->program_destroy) g_hw->program_destroy(sp->hw);
+    if (sp->hw && !(sp->hw_tried && hwprog_put(sp->hw, sp->blob, sp->blob_bytes)) && g_hw && g_hw->program_destroy)
+        g_hw->program_destroy(sp->hw);
     sp->hw = NULL;
     fgpu_program_release(&sp->program);     // OS-4: frees the compiled shader code
     free_mem(sp->blob);
@@ -1235,7 +1343,9 @@ static uint64_t op_create_program(syscall_gpu_request_t* r, uint64_t owner) {
     fgpu_program_jit(&sp->program);         // OS-4: compile now (here we may allocate); falls back silently
     sp->owner = owner;
     sp->blob = blob;
-    sp->hw = g_hw && g_hw->program_create ? g_hw->program_create(&sp->program) : NULL;
+    sp->blob_bytes = (uint32_t)r->bytes;
+    sp->hw = hwprog_get(&sp->program, blob, sp->blob_bytes);
+    sp->hw_tried = true;
     sp->id = table_insert(OBJ_PROGRAM, sp, owner);
     if (!sp->id) { program_free(sp); return SYS_ERR_NOMEM; }
     r->handle = sp->id;

@@ -1884,6 +1884,17 @@ static void syscall_dispatch_inner(syscall_regs_t* regs) {
                 regs->rax = sys_task_list((syscall_task_info_t*)regs->rsi, (uint32_t)regs->rdx);
             else if (regs->rdi == SYS_TASK_END)
                 regs->rax = sys_task_end(regs->rsi);
+            else if (regs->rdi == SYS_TASK_GPU) {
+                syscall_gpu_stats_t* out = (syscall_gpu_stats_t*)regs->rsi;
+                if (!out || !user_range_ok(out, sizeof(*out), true) || out->size != sizeof(*out)) {
+                    regs->rax = SYS_ERR_INVAL;
+                } else {
+                    syscall_gpu_stats_t st;
+                    fgpu_gpu_stats(&st);
+                    *out = st;
+                    regs->rax = SYS_SUCCESS;
+                }
+            }
             else
                 regs->rax = SYS_ERR_INVAL;
             break;

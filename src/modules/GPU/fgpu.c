@@ -88,11 +88,18 @@ bool kernel_boot_fgpuold;
 static fgpu_pass_t* g_pass;
 static void hw_sync_for_cpu(void);
 
+// Time the CPU spent drawing FarcadeGL work (the Task Manager shows it next to the card's engines).
+static uint64_t g_cpu_render_ns;
+
 // Renders the recorded CPU draws; returns the triangles drawn since the last flush.
 static uint32_t pass_flush(void) {
     if (!g_pass) return 0;
-    if (fgpu_pass_pending(g_pass)) hw_sync_for_cpu();
-    return fgpu_pass_flush(g_pass);
+    if (!fgpu_pass_pending(g_pass)) return fgpu_pass_flush(g_pass);
+    hw_sync_for_cpu();
+    uint64_t t0 = clock_monotonic_ns();
+    uint32_t n = fgpu_pass_flush(g_pass);
+    g_cpu_render_ns += clock_monotonic_ns() - t0;
+    return n;
 }
 
 void fgpu_flush_pending(void) {
@@ -1071,7 +1078,9 @@ static uint64_t execute(exec_state_t* st, const uint32_t* cmd, uint32_t words) {
                     fgpu_pass_draw_layout(g_pass, &t, &st->pipe, layout, verts, avail, idx, count, 0);
                 } else {
                     hw_sync();
+                    uint64_t t0 = clock_monotonic_ns();
                     st->triangles += fgpu_raster_draw_layout(&t, &st->pipe, layout, verts, avail, idx, count);
+                    g_cpu_render_ns += clock_monotonic_ns() - t0;
                 }
                 break;
             }
@@ -1722,4 +1731,25 @@ out:
     if (cmd) free_mem(cmd);
     __asm__ volatile("cli");
     return result;
+}
+
+// SYS_TASK_GPU: the adapter, its VRAM and how busy its engines were (totals since boot).
+void fgpu_gpu_stats(syscall_gpu_stats_t* out) {
+    memset(out, 0, sizeof(*out));
+    out->size = sizeof(*out);
+    out->now_ns = clock_monotonic_ns();
+    out->cpu_render_ns = g_cpu_render_ns;
+    gpu_adapter_t* a = gpu_primary_adapter();
+    if (a) {
+        strncpy(out->name, a->name, sizeof(out->name) - 1);
+        out->vram_total = a->vram_size;
+        out->vram_used = gpu_vram_used(a);
+    }
+    const fgpu_backend_t* hw = g_hw;
+    strncpy(out->renderer, hw ? hw->name : "CPU", sizeof(out->renderer) - 1);
+    if (hw && (hw->caps & FGPU_CAP_HW_3D)) out->flags |= SYS_GPU_STATS_HW_3D;
+    if (hw && hw->engine_stats) {
+        hw->engine_stats(out->engine_busy_ns, out->engine_jobs);
+        out->flags |= SYS_GPU_STATS_ENGINES;
+    }
 }

@@ -93,6 +93,8 @@ typedef struct {
     bool (*h264_decode)(const syscall_media_h264_t* pic, uint32_t* out, uint32_t width, uint32_t height);
     // Optional. The caller found the card's pictures wrong: stop offering them.
     void (*h264_mismatch)(void);
+    // Engine use since boot (Task Manager): nanoseconds busy and jobs, by SYS_GPU_ENGINE_*. NULL = unknown.
+    void (*engine_stats)(uint64_t busy_ns[4], uint64_t jobs[4]);
 } fgpu_backend_t;
 
 // NVIDIA Turing (fgpu_backend_nv.c). init() fails until GSP-RM and the

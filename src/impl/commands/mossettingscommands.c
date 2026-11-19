@@ -7,6 +7,7 @@
  *
  * Names are matched without regard to case. Settings:
  *     bootupanim   true|false   the hourglass animation while the system starts
+ *     nvidiaboot   true|false   the NVIDIA bring-up ('gpu nvidia boot') at every boot
  */
 #include <stdbool.h>
 #include <stddef.h>
@@ -29,6 +30,8 @@ typedef struct {
 static const setting_t k_settings[] = {
     { "bootupanim", "BootupAnim", SET_BOOL, "true",
       "The hourglass animation from power-on until the terminal or the desktop starts" },
+    { "nvidiaboot", "NvidiaAutoBoot", SET_BOOL, "false",
+      "Runs the NVIDIA bring-up ('gpu nvidia boot') at every boot; turned on when it first works" },
 };
 #define SETTING_COUNT (sizeof(k_settings) / sizeof(k_settings[0]))
 

@@ -2,6 +2,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "string.h"
+#include "x86_64/sysconf.h"
 #include "graphics.h"
 #include "serial.h"
 #include "x86_64/commandhandler.h"
@@ -369,38 +370,80 @@ static void jit_say(const char* line) {
     serial_write_str("\n");
 }
 
+// GSP boot on every NVIDIA card: FWSEC-FRTS, then booter_load and GSP-RM, the RPC channels and the 3D engine;
+// FarcadeGL then picks the card's backend. Writes to the card. True when FarcadeGL got a hardware backend.
+static bool nvidia_boot(void (*say)(const char*)) {
+    uint32_t count = gpu_adapter_count();
+    bool any = false, ok = false;
+    for (uint32_t i = 0; i < count; i++) {
+        gpu_adapter_t* a = gpu_adapter_get(i);
+        if (a->vendor != GPU_VENDOR_NVIDIA) continue;
+        any = true;
+        uint64_t lo, hi;
+        bool frts = nv_gsp_rm_running(a) || nv_gsp_wpr2(a, &lo, &hi);
+        if (frts) {
+            say("GSP boot, step 2b: FWSEC-FRTS already done (WPR2 is set up)\n");
+        } else {
+            say("GSP boot, step 2b: FWSEC-FRTS\n");
+            frts = nv_gsp_fwsec_frts(a, say);
+        }
+        // Step 3: channel on a copy engine, then pixels on the screen;
+        // FGPU then sends clears of VRAM surfaces to the GPU.
+        if (frts && nv_gsp_rm_boot(a, say) && nv_rm_chan_init(a, say)) {
+            nv_rm_screen_test(a, say);
+            fgpu_backend_select();
+            const char* why = "";
+            const fgpu_backend_t* hw = fgpu_hw_backend(&why);
+            say(hw ? "FGPU: clears of VRAM surfaces now run on the GPU.\n" : "FGPU: still on the CPU: ");
+            if (!hw) { say(why); say("\n"); }
+            ok = ok || hw != NULL;
+        }
+        nv_rm_chan_quiet();
+    }
+    if (!any) say("No NVIDIA GPU found.\n");
+    return ok;
+}
+
+static void serial_say(const char* line) { serial_write_str(line); }
+
+static bool conf_true(const char* key) {
+    char v[8];
+    return sysconf_get(key, v, sizeof(v)) && (v[0] == 't' || v[0] == 'T' || v[0] == '1' || v[0] == 'y' || v[0] == 'Y');
+}
+
+// At boot, once 0: is mounted: the bring-up again when it worked before (NvidiaAutoBoot=true). A boot that
+// hung or crashed in it leaves NvidiaAutoBootTrying=true behind; the next boot then skips it and turns it off.
+void gpu_nvidia_autoboot(void) {
+    if (!conf_true("NvidiaAutoBoot")) return;
+    bool nvidia = false;
+    for (uint32_t i = 0; i < gpu_adapter_count(); i++)
+        if (gpu_adapter_get(i)->vendor == GPU_VENDOR_NVIDIA) nvidia = true;
+    if (!nvidia) return;                        // the disk moved to another computer
+    if (conf_true("NvidiaAutoBootTrying")) {
+        serial_write_str("gpu: the NVIDIA bring-up did not finish at the last boot; it no longer runs at boot "
+                         "(run 'gpu nvidia boot' to try again)\n");
+        sysconf_set("NvidiaAutoBoot", "false");
+        sysconf_set("NvidiaAutoBootTrying", "false");
+        return;
+    }
+    sysconf_set("NvidiaAutoBootTrying", "true");
+    serial_write_str("gpu: NVIDIA bring-up at boot (NvidiaAutoBoot=true)\n");
+    bool ok = nvidia_boot(serial_say);
+    sysconf_set("NvidiaAutoBootTrying", "false");
+    serial_write_str(ok ? "gpu: NVIDIA bring-up at boot done: FarcadeGL draws on the card\n"
+                        : "gpu: NVIDIA bring-up at boot did not finish; FarcadeGL stays on the CPU\n");
+}
+
 void cmd_gpu(int argc, const char** argv) {
     uint32_t count = gpu_adapter_count();
     if (argc >= 3 && strcmp(argv[1], "nvidia") == 0 && strcmp(argv[2], "boot") == 0) {
-        // GSP boot: FWSEC-FRTS, then booter_load and GSP-RM, then the
-        // first RPC. Writes to the card.
-        bool any = false;
-        for (uint32_t i = 0; i < count; i++) {
-            gpu_adapter_t* a = gpu_adapter_get(i);
-            if (a->vendor != GPU_VENDOR_NVIDIA) continue;
-            any = true;
-            uint64_t lo, hi;
-            bool frts = nv_gsp_rm_running(a) || nv_gsp_wpr2(a, &lo, &hi);
-            if (frts) {
-                info_text("GSP boot, step 2b: FWSEC-FRTS already done (WPR2 is set up)\n");
-            } else {
-                info_text("GSP boot, step 2b: FWSEC-FRTS\n");
-                frts = nv_gsp_fwsec_frts(a, info_text);
-            }
-            // Step 3: channel on a copy engine, then pixels on the screen;
-            // FGPU then sends clears of VRAM surfaces to the GPU.
-            if (frts && nv_gsp_rm_boot(a, info_text) && nv_rm_chan_init(a, info_text)) {
-                nv_rm_screen_test(a, info_text);
-                fgpu_backend_select();
-                const char* why = "";
-                const fgpu_backend_t* hw = fgpu_hw_backend(&why);
-                info_text(hw ? "FGPU: clears of VRAM surfaces now run on the GPU.\n"
-                             : "FGPU: still on the CPU: ");
-                if (!hw) { info_text(why); info_text("\n"); }
-            }
-            nv_rm_chan_quiet();
+        if (!nvidia_boot(info_text)) return;
+        // Worked once: run it at every boot from now on (mossettings set nvidiaboot false stops that).
+        char v[8];
+        if (!sysconf_get("NvidiaAutoBoot", v, sizeof(v)) || (v[0] != 't' && v[0] != 'T' && v[0] != '1')) {
+            if (sysconf_set("NvidiaAutoBoot", "true"))
+                info_text("The NVIDIA bring-up now runs at every boot ('mossettings set nvidiaboot false' turns that off).\n");
         }
-        if (!any) info_text("No NVIDIA GPU found.\n");
         return;
     }
     if (argc >= 2 && strcmp(argv[1], "jit") == 0) {

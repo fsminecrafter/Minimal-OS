@@ -2,6 +2,7 @@
 #include "graphics.h"
 #include "prochandler.h"
 #include "x86_64/gpu.h"
+#include "x86_64/gpucore.h"
 #include "panic.h"
 #include "applications/terminal.h"
 #include "x86_64/scheduler.h"
@@ -557,6 +558,8 @@ void terminal_program_entry(void) {
                 storage_automount_others();
                 systeminfo_load_saved_resolution();
                 bootanim_apply_setting();       // BootupAnim=false ends it here
+                // The NVIDIA bring-up, when it worked before (before the desktop, so FarcadeGL finds the card).
+                gpu_nvidia_autoboot();
 
                 // Check inside the success branch, because the disk must be mounted first.
                 bool desktop = minimafs_exists("0:/services/mosWM.service") &&

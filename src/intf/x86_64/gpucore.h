@@ -117,3 +117,7 @@ bool gpu_vram_probe_range(gpu_adapter_t* adapter, uint64_t offset, uint64_t leng
 extern const gpu_adapter_driver_t gpu_bochs_adapter_driver;
 extern const gpu_adapter_driver_t gpu_nvidia_adapter_driver;
 extern const gpu_adapter_driver_t gpu_generic_adapter_driver;
+
+// At boot, after 0: is mounted: runs 'gpu nvidia boot' again when it worked before (NvidiaAutoBoot=true in
+// System.conf; 'mossettings set nvidiaboot false' turns it off). Logs to the serial port only.
+void gpu_nvidia_autoboot(void);

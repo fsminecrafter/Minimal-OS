@@ -63,12 +63,12 @@
 
 // Per channel, behind its sysmem VA (4 KiB pages).
 #define SYS_GPFIFO   0u             // 1 page
-#define SYS_PUSH     1u             // 4 pages
-#define SYS_SEM      5u             // 1 page
-#define SYS_PAGES    6u
+#define SYS_PUSH     1u             // 12 pages: a batch of draws (fgpu_backend_nv.c)
+#define SYS_SEM      13u            // 1 page
+#define SYS_PAGES    14u
 #define SYS_STRIDE   16u            // pages of VA per channel
 #define GPFIFO_ENTRIES 128u
-#define PUSH_WORDS   (4u * 4096u / 4u)
+#define PUSH_WORDS   (12u * 4096u / 4u)
 
 // Staging: system memory the copy engine copies VRAM into, so the CPU
 // never reads VRAM through BAR1 (uncached, very slow). Mapped once, at
@@ -705,6 +705,53 @@ bool nv_rm_3d_submit(void) {
     }
     unlock();
     return ok;
+}
+
+uint32_t nv_rm_3d_push_capacity(void) { return PUSH_WORDS - 8u; }
+
+// A block-linear surface (blocks of one GOB) in VRAM to or from system memory through the staging pages:
+// the copy engine converts the layout, the CPU copies the rows. False when it does not fit the staging
+// memory or the copy did not finish.
+static bool ce_bl_stage(gpu_adapter_t* a, uint64_t bl_off, uint32_t bl_width_bytes, uint32_t bl_height,
+                        uint32_t row_bytes, uint32_t rows, void* cpu, uint32_t cpu_pitch, bool to_cpu) {
+    if (!c.ready || c.a != a || !c.stage || !row_bytes || !rows || row_bytes > bl_width_bytes || rows > bl_height)
+        return false;
+    uint32_t stage_pitch = (row_bytes + 63u) & ~63u;
+    if ((uint64_t)stage_pitch * rows > (uint64_t)c.stage_pages * 4096u) return false;
+    if (bl_off + (uint64_t)bl_width_bytes * bl_height > c.vram_mapped) return false;
+    if (!lock()) return false;
+    nv_bar1_keep_physical(a);
+    if (!to_cpu)
+        for (uint32_t y = 0; y < rows; y++)
+            memcpy(c.stage + (size_t)y * stage_pitch, (const uint8_t*)cpu + (size_t)y * cpu_pitch, row_bytes);
+    nv_ce_surface_t bl = { VA_VRAM + bl_off, true, 0, bl_width_bytes, bl_height, 0 };
+    nv_ce_surface_t lin = { VA_STAGE, false, stage_pitch, bl_width_bytes, bl_height, 0 };
+    nv_push_t p;
+    nv_push_init(&p, push_words(&g_ce), PUSH_WORDS);
+    uint32_t payload = ++g_ce.payload;
+    if (to_cpu) nv_push_ce_copy_2d(&p, &bl, &lin, row_bytes, rows, sem_va(&g_ce), payload);
+    else nv_push_ce_copy_2d(&p, &lin, &bl, row_bytes, rows, sem_va(&g_ce), payload);
+    wc_flush();
+    bool ok = !p.overflow && submit_and_wait(&g_ce, p.count, payload, 2000);
+    if (ok && to_cpu)
+        for (uint32_t y = 0; y < rows; y++)
+            memcpy((uint8_t*)cpu + (size_t)y * cpu_pitch, c.stage + (size_t)y * stage_pitch, row_bytes);
+    if (!ok && !p.overflow) {
+        c.ready = false;
+        say("  copy engine channel disabled after a failed staging copy\n");
+    }
+    unlock();
+    return ok;
+}
+
+bool nv_rm_ce_bl_to_cpu(gpu_adapter_t* a, uint64_t bl_off, uint32_t bl_width_bytes, uint32_t bl_height,
+                        uint32_t row_bytes, uint32_t rows, void* dst, uint32_t dst_pitch) {
+    return ce_bl_stage(a, bl_off, bl_width_bytes, bl_height, row_bytes, rows, dst, dst_pitch, true);
+}
+
+bool nv_rm_ce_cpu_to_bl(gpu_adapter_t* a, uint64_t bl_off, uint32_t bl_width_bytes, uint32_t bl_height,
+                        uint32_t row_bytes, uint32_t rows, const void* src, uint32_t src_pitch) {
+    return ce_bl_stage(a, bl_off, bl_width_bytes, bl_height, row_bytes, rows, (void*)src, src_pitch, false);
 }
 
 uint64_t nv_rm_vram_va(uint64_t vram_offset) { return VA_VRAM + vram_offset; }

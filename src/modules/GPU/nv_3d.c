@@ -318,7 +318,10 @@ void nv3d_push_draw(nv_push_t* p, const nv3d_draw_t* d) {
     // it sees every change.
     uint32_t sel[3] = { NV_SASS_CB_BYTES, (uint32_t)(d->cb_va >> 32) & 0xFFu, (uint32_t)d->cb_va };
     nv_push_method(p, S, NVC597_SET_CONSTANT_BUFFER_SELECTOR_A, sel, 3);
-    load_constants(p, 0, (const uint32_t*)d->uniforms, NV_SASS_CB_UNIFORM_BYTES / 4u);
+    // Only the uniforms the program reads (the rest of the buffer is never looked at).
+    uint32_t uw = d->uniform_words && d->uniform_words < NV_SASS_CB_UNIFORM_BYTES / 4u ? d->uniform_words
+                                                                                     : NV_SASS_CB_UNIFORM_BYTES / 4u;
+    if (uw) load_constants(p, 0, (const uint32_t*)d->uniforms, uw);
     load_constants(p, NV_SASS_CB_TEX_OFFSET, d->tex_handle, FGPU_MAX_TEXTURE_UNITS);
     m1(p, NVC597_BIND_GROUP_CONSTANT_BUFFER(NV3D_GROUP_VERTEX), 1);        // valid, slot 0
     m1(p, NVC597_BIND_GROUP_CONSTANT_BUFFER(NV3D_GROUP_PIXEL), 1);

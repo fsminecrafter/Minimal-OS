@@ -70,6 +70,7 @@ typedef struct {
 
 typedef struct {
     nv_stage_t vs, fs;
+    uint32_t uniform_words;     // words of uniforms the program reads (pushed with each draw)
     bool gpu;                   // both stages are on the card
     int32_t builtin_reg[8];     // built-in programs: uniform registers (-1 = unused)
 } nv_program_t;
@@ -125,9 +126,12 @@ static const char* const k_refused[8] = {
 
 #define POOL_TIC   0u
 #define POOL_TSC   (NV3D_POOL_ENTRIES * 32u)
-#define POOL_CB    4096u
-#define POOL_ZERO  8192u            // 4096..8191: two constant buffers (draws, video)
-#define POOL_BYTES 12288u
+#define POOL_CB    (2u * NV3D_POOL_ENTRIES * 32u)
+#define POOL_ZERO  (POOL_CB + 4096u)    // POOL_CB..: two constant buffers (draws, video)
+#define POOL_BYTES (POOL_ZERO + 4096u)
+// Texture header / sampler entries: 1..15 for the synchronous jobs (self-tests, video, H.264), 16.. for
+// the draws of a batch, each draw its own (a later draw must not change what an earlier one samples).
+#define TEX_FIRST_DRAW 16u
 
 static void vram_write(uint64_t offset, const void* data, uint32_t bytes) {
     const uint32_t* w = (const uint32_t*)data;
@@ -199,6 +203,8 @@ static void* nv_program_create(const fgpu_program_t* p) {
     nv_program_t* np = (nv_program_t*)alloc(sizeof(nv_program_t));
     if (!np) return NULL;
     np->vs.vram = np->fs.vram = GPU_VRAM_INVALID;
+    uint32_t uc = p->h.uniform_count;
+    np->uniform_words = (uc > FGPU_SHADER_MAX_UNIFORMS ? FGPU_SHADER_MAX_UNIFORMS : uc) * 4u;
     np->gpu = compile_stage(p, false, &np->vs) && compile_stage(p, true, &np->fs);
     if (!np->gpu) {
         nv_program_destroy(np);
@@ -265,8 +271,70 @@ static bool color_ok(const fgpu_hw_target_t* t, nv3d_color_t* c) {
     return true;
 }
 
-// Takes the GPU for a 3D job; other cores may hold it for a moment.
+static bool end_job(nv_push_t* p);
+static nv_push_t* job_begin_raw(void);
+
+/* Batches. Draws and clears are recorded here and submitted together (one job, one wait) when the batch is
+ * full, before anything else touches what they draw (copy engine copies, CPU access: finish(), reads,
+ * surface frees) and before any synchronous job. One draw used to be one job and one wait: ~0.3-0.5 ms
+ * each on the RTX 2060, so a frame of a few hundred draws spent most of its time waiting. */
+#define BATCH_MAX_WORDS (12u * 1024u)
+static uint32_t g_batch_buf[BATCH_MAX_WORDS];
+static nv_push_t g_batch;
+static bool g_batch_ready;
+static uint32_t g_batch_draws, g_tic_next = TEX_FIRST_DRAW;
+static uint32_t g_batches;
+
+static bool batch_flush(void) {
+    g_tic_next = TEX_FIRST_DRAW;
+    if (!g_batch_ready || !g_batch.count) return true;
+    uint32_t n = g_batch.count, draws = g_batch_draws;
+    bool overflow = g_batch.overflow;
+    g_batch.count = 0;
+    g_batch.overflow = false;
+    g_batch_draws = 0;
+    if (overflow) { serial_write_str("nv: a batch overflowed; its draws are lost\n"); return false; }
+    nv_push_t* p = job_begin_raw();
+    if (!p) return false;
+    if (p->capacity - p->count < n) {
+        nv_rm_3d_cancel();
+        serial_write_str("nv: a batch did not fit the pushbuffer\n");
+        return false;
+    }
+    memcpy(p->words + p->count, g_batch_buf, (size_t)n * 4u);
+    p->count += n;
+    g_batches++;
+    if (!end_job(p)) {
+        char line[96];
+        snprintf(line, sizeof(line), "nv: a batch of %u draws did not finish\n", (unsigned)draws);
+        nv_rm_say(line);
+        return false;
+    }
+    return true;
+}
+
+// Room for `words` more in the batch (flushing it first if needed); NULL if the GPU cannot take it.
+static nv_push_t* batch_room(uint32_t words) {
+    if (!g_batch_ready) {
+        uint32_t cap = nv_rm_3d_push_capacity();
+        cap = cap > 1024u ? cap - 1024u : cap / 2u;          // the first job also carries the init methods
+        if (cap > BATCH_MAX_WORDS) cap = BATCH_MAX_WORDS;
+        nv_push_init(&g_batch, g_batch_buf, cap);
+        g_batch_ready = true;
+    }
+    if (g_batch.capacity - g_batch.count < words && !batch_flush()) return NULL;
+    if (g_batch.capacity - g_batch.count < words) return NULL;
+    return &g_batch;
+}
+
+// A synchronous job (self-tests, video, zeta setup): the batch goes first.
 static nv_push_t* begin_job(void) {
+    if (!batch_flush()) return NULL;
+    return job_begin_raw();
+}
+
+// Takes the GPU for a 3D job; other cores may hold it for a moment.
+static nv_push_t* job_begin_raw(void) {
     for (uint32_t tries = 0; tries < 2000000u; tries++) {
         nv_push_t* p = nv_rm_3d_begin(g.a);
         if (p) {
@@ -306,10 +374,14 @@ static bool end_job(nv_push_t* p) {
 // color copies: D32F is 4 bytes a pixel).
 static bool zeta_load(uint32_t i) {
     if (!g.zeta[i].stale) return true;
-    if (!g.zeta[i].in_vram) { g.zeta[i].stale = false; return true; }
+    if (!batch_flush()) return false;
     uint64_t t0 = clock_monotonic_ns();
-    bool ok = nv_rm_ce_copy_surface(g.a, g.zeta[i].linear, g.zeta[i].pitch, g.zeta[i].vram, 0, g.zeta[i].z.width * 4u,
-                                    g.zeta[i].z.height, g.zeta[i].width * 4u, g.zeta[i].height);
+    // A depth surface in system memory goes through the staging pages, one in VRAM directly.
+    bool ok = g.zeta[i].in_vram
+        ? nv_rm_ce_copy_surface(g.a, g.zeta[i].linear, g.zeta[i].pitch, g.zeta[i].vram, 0, g.zeta[i].z.width * 4u,
+                                g.zeta[i].z.height, g.zeta[i].width * 4u, g.zeta[i].height)
+        : nv_rm_ce_cpu_to_bl(g.a, g.zeta[i].vram, g.zeta[i].z.width * 4u, g.zeta[i].z.height, g.zeta[i].width * 4u,
+                             g.zeta[i].height, g.zeta[i].cpu, g.zeta[i].pitch);
     g.copy_ns += clock_monotonic_ns() - t0;
     if (ok) { g.zeta[i].stale = false; g.depth_loads++; }
     return ok;
@@ -317,10 +389,15 @@ static bool zeta_load(uint32_t i) {
 
 // The GPU buffer's depth back into the surface (the CPU is about to read or draw).
 static void zeta_store(uint32_t i) {
-    if (!g.zeta[i].gpu_newer || !g.zeta[i].in_vram) return;
+    if (!g.zeta[i].gpu_newer) return;
+    if (!batch_flush()) return;
     uint64_t t0 = clock_monotonic_ns();
-    if (nv_rm_ce_copy_surface(g.a, g.zeta[i].vram, 0, g.zeta[i].linear, g.zeta[i].pitch, g.zeta[i].z.width * 4u,
-                              g.zeta[i].z.height, g.zeta[i].width * 4u, g.zeta[i].height)) {
+    bool ok = g.zeta[i].in_vram
+        ? nv_rm_ce_copy_surface(g.a, g.zeta[i].vram, 0, g.zeta[i].linear, g.zeta[i].pitch, g.zeta[i].z.width * 4u,
+                                g.zeta[i].z.height, g.zeta[i].width * 4u, g.zeta[i].height)
+        : nv_rm_ce_bl_to_cpu(g.a, g.zeta[i].vram, g.zeta[i].z.width * 4u, g.zeta[i].z.height, g.zeta[i].width * 4u,
+                             g.zeta[i].height, (void*)g.zeta[i].cpu, g.zeta[i].pitch);
+    if (ok) {
         g.zeta[i].gpu_newer = false;
         g.depth_stores++;
     }
@@ -368,7 +445,7 @@ static const nv3d_zeta_t* zeta_for_ex(const fgpu_hw_target_t* t, bool overwrite)
     g.zeta[free_slot].height = t->cpu.height;
     g.zeta[free_slot].gpu_newer = false;
     // A new buffer starts from what the surface holds (the CPU's clears and draws so far).
-    g.zeta[free_slot].stale = !overwrite && t->depth.in_vram;
+    g.zeta[free_slot].stale = !overwrite;
     if (!zeta_load((uint32_t)free_slot)) { g.zeta[free_slot].cpu = NULL; gpu_vram_free(g.a, off); return NULL; }
     return &g.zeta[free_slot].z;
 }
@@ -393,6 +470,7 @@ static void tiled_drop(int i) {
 // The block-linear copy back to the FGPU surface, if it is newer.
 static bool tiled_resolve(int i) {
     if (i < 0 || !g.tiled[i].dirty) return true;
+    if (!batch_flush()) return false;
     uint64_t t0 = clock_monotonic_ns();
     bool ok = nv_rm_ce_copy_surface(g.a, g.tiled[i].vram, 0, g.tiled[i].linear, g.tiled[i].pitch,
                                g.tiled[i].bl_width * 4u, g.tiled[i].bl_height, g.tiled[i].width * 4u,
@@ -446,6 +524,7 @@ static int tiled_for(const fgpu_hw_target_t* t, bool overwrite) {
         g.tiled[i].valid = g.tiled[i].dirty = false;
     }
     if (!g.tiled[i].valid && !overwrite) {
+        if (!batch_flush()) return -1;
         uint64_t t0 = clock_monotonic_ns();
         bool ok = nv_rm_ce_copy_surface(g.a, g.tiled[i].linear, g.tiled[i].pitch, g.tiled[i].vram, 0,
                                         g.tiled[i].bl_width * 4u, g.tiled[i].bl_height, g.tiled[i].width * 4u,
@@ -464,6 +543,7 @@ static void tiled_color(int i, nv3d_color_t* c) {
 }
 
 static void nv_surface_destroy(const fgpu_mem_t* mem) {
+    batch_flush();                          // pending draws may use it
     for (uint32_t i = 0; i < MAX_ZETA; i++) {
         if (!g.zeta[i].cpu || g.zeta[i].cpu != mem->cpu) continue;
         gpu_vram_free(g.a, g.zeta[i].vram);
@@ -475,6 +555,7 @@ static void nv_surface_destroy(const fgpu_mem_t* mem) {
 static bool nv_read(const fgpu_mem_t* mem, uint32_t row_bytes, uint32_t rows, uint32_t src_pitch,
                     void* dst, uint32_t dst_pitch) {
     if (!g.a || !mem->in_vram) return false;
+    if (!batch_flush()) return false;
     if (!tiled_resolve(tiled_find(mem->cpu))) return false;
     return nv_rm_ce_read(g.a, mem->vram_offset, row_bytes, rows, src_pitch, dst, dst_pitch);
 }
@@ -523,11 +604,12 @@ static bool nv_clear_3d(const fgpu_hw_target_t* t, uint32_t flags, uint32_t colo
         if (ti < 0) return false;
         tiled_color(ti, &c);
     }
-    nv_push_t* p = begin_job();
+    nv_push_t* p = batch_room(256u);
     if (!p) return false;
+    uint32_t mark = p->count;
     if (rect) nv3d_push_clear_rect(p, want_color ? &c : NULL, z, flags, color, depth, x0, y0, x1, y1);
     else nv3d_push_clear(p, want_color ? &c : NULL, z, flags, color, depth);
-    if (!end_job(p)) return false;
+    if (p->overflow) { p->count = mark; p->overflow = false; return false; }
     if (want_color && c.block_linear) g.tiled[ti].valid = g.tiled[ti].dirty = true;
     // The CPU's depth buffer follows the clears, for draws that fall back.
     if (want_depth) {
@@ -560,6 +642,7 @@ static bool nv_clear(const fgpu_hw_target_t* t, uint32_t flags, uint32_t color, 
     }
     if (want_color) tiled_release(t->color.cpu);
     if ((want_color && !t->color.in_vram) || (want_depth && !t->depth.in_vram)) return false;
+    if (!batch_flush()) return false;
     uint64_t cpitch = (uint64_t)t->cpu.color_pitch * 4u, dpitch = (uint64_t)t->cpu.depth_pitch * 4u;
     if (want_color && !nv_rm_ce_fill(g.a, t->color.vram_offset + y0 * cpitch + x0 * 4u, x1 - x0, y1 - y0,
                                      (uint32_t)cpitch, color | 0xFF000000u))
@@ -573,6 +656,18 @@ static bool nv_clear(const fgpu_hw_target_t* t, uint32_t flags, uint32_t color, 
 }
 
 static bool nv_draw_3d(const fgpu_hw_draw_t* d, uint32_t* triangles);
+
+// The CPU draws into `t` with its depth buffer next: it gets the card's depth, and the card reloads the
+// surface's depth before it draws there again. (Only then: copying depth back at every finish() cost a
+// readback per frame.)
+static void nv_cpu_draw(const fgpu_hw_target_t* t) {
+    if (!g.a || !t->cpu.depth) return;
+    for (uint32_t i = 0; i < MAX_ZETA; i++) {
+        if (g.zeta[i].cpu != t->depth.cpu) continue;
+        zeta_store(i);
+        g.zeta[i].stale = true;
+    }
+}
 
 static bool nv_draw(const fgpu_hw_draw_t* d, uint32_t* triangles) {
     if (!g.hw3d) return false;
@@ -619,13 +714,6 @@ static bool nv_draw_3d(const fgpu_hw_draw_t* d, uint32_t* triangles) {
         // A surface drawn earlier through its block-linear copy: bring the
         // pixels back first (the texture header reads the surface).
         if (!tiled_resolve(tiled_find(mem->cpu))) REFUSE(R_TEXTURE);
-        uint32_t words[8];
-        nv3d_texture_header(words, nv_rm_vram_va(mem->vram_offset), pitch, tex->width, tex->height, NV3D_TEX_ARGB, 0);
-        vram_write(g.pools + POOL_TIC + (u + 1u) * 32u, words, 32);
-        nv3d_sampler(words, tex->flags);
-        vram_write(g.pools + POOL_TSC + (u + 1u) * 32u, words, 32);
-        nd.tex_handle[u] = (u + 1u) | ((u + 1u) << 20);
-        nd.textures_changed = true;
     }
     // Storage buffers the program reads: constant buffers on their memory.
     uint32_t sbs = np->vs.buffers | np->fs.buffers;
@@ -681,21 +769,39 @@ static bool nv_draw_3d(const fgpu_hw_draw_t* d, uint32_t* triangles) {
     }
     nd.count = count;
 
-    nv_push_t* p = begin_job();
-    if (!p) REFUSE(R_JOB);
-    nv3d_push_draw(p, &nd);
-    if (!end_job(p)) {
-        // Say which draw the engine did not finish (it is now switched off).
-        char line[200];
-        snprintf(line, sizeof(line),
-                 "nv: the failed draw: %s, vs %u regs, fs %u regs, textures 0x%x, storage 0x%x, %s, %s, %u %s\n",
-                 pipe->shader ? "shader" : "built-in program", (unsigned)np->vs.regs, (unsigned)np->fs.regs,
-                 (unsigned)used, (unsigned)nd.sb_mask, nd.zeta ? "depth" : "no depth",
-                 nd.color.block_linear ? "block-linear target" : "pitch target", (unsigned)count,
-                 nd.indexed ? "indices" : "vertices");
-        nv_rm_say(line);
+    nd.uniform_words = np->uniform_words;
+
+    // Recorded into the batch. Nothing after the room check may flush it: the texture entries taken
+    // below belong to this batch.
+    if (!batch_room(640u + nd.uniform_words)) REFUSE(R_JOB);
+    // Header and sampler entries of this draw's own (the batch's earlier draws keep theirs).
+    if (used) {
+        uint32_t n = 0;
+        for (uint32_t m = used; m; m &= m - 1u) n++;      // units sampled (no libgcc in the kernel)
+        if (g_tic_next + n > NV3D_POOL_ENTRIES && (!batch_flush() || !batch_room(640u + nd.uniform_words))) REFUSE(R_JOB);
+        for (uint32_t u = 0; u < FGPU_MAX_TEXTURE_UNITS; u++) {
+            if (!(used & (1u << u))) continue;
+            const fgpu_texture_t* tex = &pipe->textures[u];
+            const fgpu_mem_t* mem = &d->textures[u];
+            uint32_t slot = g_tic_next++;
+            uint32_t words[8];
+            nv3d_texture_header(words, nv_rm_vram_va(mem->vram_offset), tex->pitch * 4u, tex->width, tex->height,
+                                NV3D_TEX_ARGB, 0);
+            vram_write(g.pools + POOL_TIC + slot * 32u, words, 32);
+            nv3d_sampler(words, tex->flags);
+            vram_write(g.pools + POOL_TSC + slot * 32u, words, 32);
+            nd.tex_handle[u] = slot | (slot << 20);
+        }
+        nd.textures_changed = true;
+    }
+    uint32_t mark = g_batch.count;
+    nv3d_push_draw(&g_batch, &nd);
+    if (g_batch.overflow) {                 // did not fit after all: take it back out, the CPU draws it
+        g_batch.count = mark;
+        g_batch.overflow = false;
         REFUSE(R_JOB);
     }
+    g_batch_draws++;
     if (ti >= 0) g.tiled[ti].dirty = true;
     if (nd.zeta && (pipe->state & FGPU_STATE_DEPTH_WRITE)) {
         int zi = zeta_index(nd.zeta);
@@ -711,13 +817,7 @@ static bool nv_draw_3d(const fgpu_hw_draw_t* d, uint32_t* triangles) {
 // change a surface after this, so a copy is reloaded before its next use
 // (unless a clear overwrites it).
 static void nv_finish(void) {
-    // Depth too: a draw the CPU does next must test against what the card drew, and the card reloads it
-    // before its next draw (the CPU may draw depth meanwhile).
-    for (uint32_t i = 0; i < MAX_ZETA; i++) {
-        if (!g.zeta[i].cpu) continue;
-        zeta_store(i);
-        if (g.zeta[i].in_vram) g.zeta[i].stale = true;
-    }
+    batch_flush();
     for (uint32_t i = 0; i < MAX_TILED; i++) {
         if (!g.tiled[i].cpu) continue;
         if (!tiled_resolve((int)i)) { tiled_drop((int)i); continue; }
@@ -1377,6 +1477,7 @@ fgpu_backend_t fgpu_backend_nvidia = {
     .program_destroy = nv_program_destroy,
     .clear = nv_clear,
     .draw = nv_draw,
+    .cpu_draw = nv_cpu_draw,
     .finish = nv_finish,
     .read = nv_read,
     .surface_destroy = nv_surface_destroy,
@@ -1598,6 +1699,8 @@ void nv_bringup_report(gpu_adapter_t* a, void (*print)(const char* text)) {
         // (counts since boot; run 'gpu' twice around a few seconds of work).
         fgpu_hw_counts_t hc;
         fgpu_hw_counts(&hc);
+        snprintf(line, sizeof(line), "        batches: %u (draws and clears submitted together)\n", (unsigned)g_batches);
+        print(line);
         snprintf(line, sizeof(line), "        jobs: %llu, %llu us each on average; copies took %llu ms in all\n",
                  (unsigned long long)g.jobs, (unsigned long long)(g.jobs ? g.job_ns / g.jobs / 1000u : 0),
                  (unsigned long long)(g.copy_ns / 1000000u));

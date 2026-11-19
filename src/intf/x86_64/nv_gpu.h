@@ -121,6 +121,13 @@ nv_push_t* nv_rm_dec_begin(gpu_adapter_t* a);
 bool nv_rm_dec_submit(void);
 void nv_rm_dec_disable(void);
 // GPU virtual address of a VRAM offset, and how much VRAM is mapped.
+// Words a 3D job's pushbuffer takes (nv_rm_3d_begin).
+uint32_t nv_rm_3d_push_capacity(void);
+// A block-linear surface (one-GOB blocks) in VRAM to / from system memory through the staging pages.
+bool nv_rm_ce_bl_to_cpu(gpu_adapter_t* a, uint64_t bl_off, uint32_t bl_width_bytes, uint32_t bl_height,
+                        uint32_t row_bytes, uint32_t rows, void* dst, uint32_t dst_pitch);
+bool nv_rm_ce_cpu_to_bl(gpu_adapter_t* a, uint64_t bl_off, uint32_t bl_width_bytes, uint32_t bl_height,
+                        uint32_t row_bytes, uint32_t rows, const void* src, uint32_t src_pitch);
 uint64_t nv_rm_vram_va(uint64_t vram_offset);
 uint64_t nv_rm_vram_mapped(gpu_adapter_t* a);
 // Reads rows of VRAM into system memory through the copy engine and its

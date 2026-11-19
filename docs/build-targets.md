@@ -18,6 +18,8 @@ NASM, Python 3, GRUB utilities, and xorriso.
 | `make run-mosdesk` | Build and run the MOSdesk ISO in QEMU |
 | `make mosdesk-doom` | Build the MOSdesk ISO with Doom (1993) included |
 | `make run-mosdesk-doom` | Build and run the MOSdesk ISO with Doom in QEMU |
+| `make all` | Build the MOSdesk ISO with everything: Doom and the Farcade editor (`make mosdesk-fe DOOM=1`) |
+| `make packages` | Build Deliver install packages in `build/dlrpackages`: `MOSdesk.mpkg`, `Doom.mpkg`, `Farcade.mpkg`, each with its folder and `.pkg` manifest. Copy them into `0:/var/dlrd/packages` and `dlr serve` offers them (`dlr install Doom`). `DLR_PACKAGES_DIR=` puts them elsewhere |
 | `make netboot` | Serve the built ISO for PXE boot on the LAN; requires elevated network setup |
 | `make run-installed` | Boot `INSTALL_DISK` as a BIOS-installed system |
 | `make run-installed-uefi` | Boot `INSTALL_DISK` with OVMF UEFI firmware |

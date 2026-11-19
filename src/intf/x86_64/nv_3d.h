@@ -23,7 +23,7 @@
  * pitch-linear depth.
  */
 
-#define NV3D_POOL_ENTRIES 16u       // texture headers / samplers (32 bytes each)
+#define NV3D_POOL_ENTRIES 128u      // texture headers / samplers (32 bytes each); draws of a batch take 16..127
 
 typedef struct {
     uint64_t va;
@@ -70,6 +70,7 @@ typedef struct {
     uint64_t sb_va[FGPU_MAX_STORAGE_BUFFERS];
     uint32_t sb_bytes[FGPU_MAX_STORAGE_BUFFERS];
     const float* uniforms;          // FGPU_SHADER_MAX_UNIFORMS * 4 floats
+    uint32_t uniform_words;         // words of `uniforms` the program reads (0 = all of them)
     uint32_t tex_handle[FGPU_MAX_TEXTURE_UNITS];    // header index | sampler index << 20
     bool textures_changed;          // headers or samplers were rewritten
     uint32_t stride_bytes;

@@ -594,6 +594,62 @@ mosdesk-dlr: mosdesk-build $(mxplorer_run)
 	$(MKPKG) $(mosdesk_dlr_pkg) $(mosdesk_dlr_pkg).mpkg --store
 	@echo "mosdesk-dlr: Deliver package ready: $(mosdesk_dlr_pkg)/ + $(MOSDESK_DLR_NAME).mpkg"
 
+# ---------------------------------------------------------------- all, packages
+#   make all        the desktop ISO with everything: MOSdesk, Doom and the Farcade editor
+#                   (the same as 'make mosdesk-fe DOOM=1')
+#   make packages   Deliver install packages in build/dlrpackages:
+#                     MOSdesk/ + MOSdesk.mpkg, Doom/ + Doom.mpkg, Farcade/ + Farcade.mpkg
+#                   Copy them into 0:/var/dlrd/packages and `dlr serve` offers them; clients
+#                   install with `dlr install MOSdesk` (Doom, Farcade). Each installs below 0:/.
+DLR_PACKAGES_DIR ?= build/dlrpackages
+
+.PHONY: all packages doom-dlr fe-dlr
+all:
+	$(MAKE) mosdesk-fe DOOM=1
+
+packages:
+	$(MAKE) mosdesk-dlr MOSDESK_DLR_DIR=$(DLR_PACKAGES_DIR)
+	$(MAKE) doom-dlr fe-dlr DLR_PACKAGES_DIR=$(DLR_PACKAGES_DIR)
+	@echo "packages: $(DLR_PACKAGES_DIR)/{MOSdesk,Doom,Farcade}.mpkg (and their folders)"
+
+doom_dlr_pkg = $(DLR_PACKAGES_DIR)/Doom
+doom-dlr: doom-sdk
+	$(MAKE) $(doom_run) $(if $(DOOM_WAD),,$(FREEDOOM_ZIP))
+	rm -rf "$(doom_dlr_pkg)" "$(doom_dlr_pkg).mpkg"
+	mkdir -p $(doom_dlr_pkg)/programs/Doom
+	cp $(doom_run) $(doom_dlr_pkg)/programs/Doom.run
+	cp $(DOOM_DIR)/README.md $(doom_dlr_pkg)/programs/Doom/README.md
+	cp $(DOOM_DIR)/COPYING $(doom_dlr_pkg)/programs/Doom/COPYING
+	@if [ -n "$(DOOM_WAD)" ]; then \
+		[ -f "$(DOOM_WAD)" ] || { echo "DOOM_WAD: $(DOOM_WAD) not found" >&2; exit 1; }; \
+		cp "$(DOOM_WAD)" "$(doom_dlr_pkg)/programs/Doom/$$(basename "$(DOOM_WAD)" | tr 'A-Z' 'a-z')"; \
+	else \
+		python3 tools/media/extract_freedoom.py $(FREEDOOM_ZIP) $(FREEDOOM_VERSION) $(doom_dlr_pkg)/programs/Doom; \
+	fi
+	printf '%s\n' '[Info]' 'name=Doom' 'version=$(FREEDOOM_VERSION)' \
+		'description=Doom for Minimal-OS, with Freedoom game data unless DOOM_WAD was given' \
+		'arch=x86_64' 'operatingsystem=MINIMALOS' '' \
+		'# programs/Doom.run and programs/Doom/ install below 0:/' \
+		'[Install.minimalos]' 'target=0:/' > $(doom_dlr_pkg)/Doom.pkg
+	$(MKPKG) $(doom_dlr_pkg) $(doom_dlr_pkg).mpkg
+	@echo "doom-dlr: Deliver package ready: $(doom_dlr_pkg)/ + Doom.mpkg"
+
+fe_dlr_pkg = $(DLR_PACKAGES_DIR)/Farcade
+fe-dlr: fe-build
+	rm -rf "$(fe_dlr_pkg)" "$(fe_dlr_pkg).mpkg"
+	mkdir -p $(fe_dlr_pkg)/programs/FarcadeEditor
+	cp "$(fe_editor_run)" $(fe_dlr_pkg)/programs/FarcadeEditor.run
+	if [ -f "$(fe_player_run)" ]; then cp "$(fe_player_run)" $(fe_dlr_pkg)/programs/feplayer.run; fi
+	cp "$(FARCADE_DIR)/README.md" $(fe_dlr_pkg)/programs/FarcadeEditor/README.md
+	cp "$(FARCADE_DIR)/LICENSE" $(fe_dlr_pkg)/programs/FarcadeEditor/LICENSE
+	printf '%s\n' '[Info]' 'name=Farcade' "version=0.1.0+$$(git -C "$(FARCADE_DIR)" rev-parse --short HEAD 2>/dev/null || echo local)" \
+		'description=Farcade Engine: the editor and the game player (feplayer)' \
+		'arch=x86_64' 'operatingsystem=MINIMALOS' '' \
+		'# programs/FarcadeEditor.run, feplayer.run and FarcadeEditor/ install below 0:/' \
+		'[Install.minimalos]' 'target=0:/' > $(fe_dlr_pkg)/Farcade.pkg
+	$(MKPKG) $(fe_dlr_pkg) $(fe_dlr_pkg).mpkg
+	@echo "fe-dlr: Deliver package ready: $(fe_dlr_pkg)/ + Farcade.mpkg"
+
 # Boots the disk the installer wrote ($(INSTALL_DISK)) without the CD.
 # Boots the ISO in QEMU/KVM showing the guest a Hyper-V interface
 # (enlightenments, SynIC, VMBus), the Linux stand-in for a Hyper-V test VM.

@@ -705,6 +705,17 @@ evaluator) and the CPU shader machine, and checks that they agree.
   KIL if R3 != 0
 ```
 
+#### At every boot
+
+Once `gpu nvidia boot` has brought FarcadeGL onto the card, it sets
+`NvidiaAutoBoot=true` in `0:/etc/System.conf` and the bring-up runs at every
+boot from then on, after `0:` is mounted and before the services (mosWM)
+start, so the desktop's FarcadeGL programs find the card. It logs to the
+serial port only. `mossettings set nvidiaboot false` turns it off (and
+`gpu nvidia boot` succeeding turns it on again). A boot that hangs or
+crashes in the bring-up leaves `NvidiaAutoBootTrying=true` behind; the next
+boot then skips it and switches `NvidiaAutoBoot` off.
+
 #### Next steps on a card
 
 1. Run `gpu nvidia` with the firmware copied: every file should show

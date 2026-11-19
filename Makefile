@@ -631,7 +631,9 @@ doom-dlr: doom-sdk
 		'arch=x86_64' 'operatingsystem=MINIMALOS' '' \
 		'# programs/Doom.run and programs/Doom/ install below 0:/' \
 		'[Install.minimalos]' 'target=0:/' > $(doom_dlr_pkg)/Doom.pkg
-	$(MKPKG) $(doom_dlr_pkg) $(doom_dlr_pkg).mpkg
+	# Stored, not compressed: mkpkg's LZSS (pure Python, one core per file) takes minutes on the 28 MB WAD
+	# and saves about half of it; the ISO's games module is stored too.
+	$(MKPKG) $(doom_dlr_pkg) $(doom_dlr_pkg).mpkg --store
 	@echo "doom-dlr: Deliver package ready: $(doom_dlr_pkg)/ + Doom.mpkg"
 
 fe_dlr_pkg = $(DLR_PACKAGES_DIR)/Farcade

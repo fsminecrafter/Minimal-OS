@@ -1,16 +1,16 @@
 #pragma once
 /*
- * The boot animation: the Minimal-OS hourglass in the middle of the screen
- * from early boot until the terminal or mosWM takes over.
+ * The boot animation, from early boot until the terminal or mosWM takes over. It is drawn from the timer
+ * interrupt (about 30 frames a second) and hides the boot text while it plays. Three styles:
  *
- * Its top half falls to the left, the whole glass turns so that half ends
- * at the bottom, the new top half falls to the right, and the glass turns
- * back the other way; then again. It is drawn from the timer interrupt
- * (about 30 frames a second) and hides the boot text while it plays.
+ *   logo       the Minimal-OS logo (Icon.png, src/resources/bootlogo.h) with five dots circling under it
+ *   pulse      the logo breathing, a light sweeping across it
+ *   hourglass  the logo's hourglass mark turning over again and again
  *
- * Off with `mossettings set bootupanim false` (BootupAnim=false in
- * 0:/etc/System.conf, read once the disk is mounted), or the kernel
- * command line `nobootanim` (also off with `--debug`).
+ * `mossettings set bootanimstyle logo|pulse|hourglass` (BootupAnimStyle in 0:/etc/System.conf, read once
+ * the disk is mounted: every style starts with the logo fading in), or `bootanim=<style>` on the kernel
+ * command line (counts from the first frame). Off with `mossettings set bootupanim false`, the kernel
+ * command line `nobootanim`, or `--debug`.
  */
 #include <stdbool.h>
 #include <stdint.h>

@@ -7,30 +7,26 @@
 #include "serial.h"
 #include "time.h"
 #include "x86_64/clock.h"
+#include "string.h"
+#include "../../resources/bootlogo.h"     // Icon.png as coverage (tools/media/make_bootlogo.py)
 
 /*
- * See bootanim.h. The glass is two halves joined at the waist; each half is
- * a bar and two sides drawn as anti-aliased capsules, with a faint fill.
- * A half points along an angle measured counter-clockwise from "up"
- * (0 up, 90 left, 180 down, -90 right). The four phases of a cycle:
+ * See bootanim.h. Three styles (BootupAnimStyle in System.conf, or bootanim=<style> on the kernel command
+ * line, which also counts before the disk is mounted):
  *
- *   A  top 0 -> 90             the top half falls to the left
- *   B  top 90 -> 180,          the whole glass turns on: the fallen half
- *      bottom 180 -> 360       ends at the bottom, the other on top
- *   C  bottom 0 -> -90         the new top half falls to the right
- *   D  bottom -90 -> -180,     it turns back the other way to the start
- *      top 180 -> 0
+ *   logo       the Minimal-OS logo (Icon.png) and five dots circling under it (the default)
+ *   pulse      the logo breathing, with a light sweeping across it
+ *   hourglass  the logo's hourglass mark turning over, again and again
+ *
+ * Every style starts with the logo fading in: System.conf can only be read once the disk is mounted, so
+ * until then it shows what the logo styles have in common.
+ *
  */
 
 #define FRAME_MS   33u
-#define FALL_MS    700u
-#define TURN_MS    900u
-#define HOLD_MS    260u
-#define CYCLE_MS   (2u * (FALL_MS + HOLD_MS) + 2u * (TURN_MS + HOLD_MS))
 
 #define COLOR_BG     0xFF000000u
 #define COLOR_LINE   0xFFE8EEF3u
-#define COLOR_FILL   0xFF4FA3E0u
 
 static volatile bool g_active;          // drawing frames
 static volatile bool g_hiding;          // the console only keeps its buffer
@@ -53,7 +49,6 @@ void bootanim_pause(bool paused) { g_paused = paused; }
 
 /* ------------------------------------------------------------ math */
 
-static float fabs_(float x) { return x < 0 ? -x : x; }
 
 // sin and cos of an angle in degrees (a short polynomial; good enough for pixels).
 static void sincos_deg(float deg, float* s, float* c) {
@@ -77,91 +72,7 @@ static void sincos_deg(float deg, float* s, float* c) {
 
 static float smooth(float t) { return t * t * (3.0f - 2.0f * t); }
 
-// A fall: faster and faster, then a small bounce where it lands.
-static float fall(float t) {
-    if (t < 0.78f) { float u = t / 0.78f; return u * u; }
-    float u = (t - 0.78f) / 0.22f;          // 0..1
-    float s, c;
-    sincos_deg(u * 180.0f, &s, &c);
-    return 1.0f - 0.07f * s;
-}
-
-// The two halves' angles at `ms` into the cycle.
-static void pose(uint32_t ms, float* top, float* bottom) {
-    uint32_t t = ms % CYCLE_MS;
-    if (t < FALL_MS) { *top = 90.0f * fall((float)t / FALL_MS); *bottom = 180.0f; return; }
-    t -= FALL_MS;
-    if (t < HOLD_MS) { *top = 90.0f; *bottom = 180.0f; return; }
-    t -= HOLD_MS;
-    if (t < TURN_MS) {
-        float e = smooth((float)t / TURN_MS);
-        *top = 90.0f + 90.0f * e;
-        *bottom = 180.0f + 180.0f * e;
-        return;
-    }
-    t -= TURN_MS;
-    if (t < HOLD_MS) { *top = 180.0f; *bottom = 0.0f; return; }
-    t -= HOLD_MS;
-    if (t < FALL_MS) { *top = 180.0f; *bottom = -90.0f * fall((float)t / FALL_MS); return; }
-    t -= FALL_MS;
-    if (t < HOLD_MS) { *top = 180.0f; *bottom = -90.0f; return; }
-    t -= HOLD_MS;
-    if (t < TURN_MS) {
-        float e = smooth((float)t / TURN_MS);
-        *bottom = -90.0f - 90.0f * e;
-        *top = 180.0f - 180.0f * e;
-        return;
-    }
-    *top = 0.0f;
-    *bottom = 180.0f;
-}
-
 /* ------------------------------------------------------------ drawing */
-
-typedef struct { float ax, ay, bx, by, r; } capsule_t;
-typedef struct { float x[3], y[3]; } tri_t;
-
-typedef struct {
-    capsule_t cap[6];
-    tri_t tri[2];
-    int x0, y0, x1, y1;                 // bounding box
-} shape_t;
-
-static void half(shape_t* sh, int k, float cx, float cy, float deg, float len, float wid, float line, float bar) {
-    float s, c;
-    sincos_deg(deg, &s, &c);
-    float ax = -s, ay = -c;             // outward, screen y down
-    float px = -ay, py = ax;            // across
-    float ex = cx + ax * len, ey = cy + ay * len;
-    float lx = ex + px * wid, ly = ey + py * wid, rx = ex - px * wid, ry = ey - py * wid;
-    float bw = wid * 1.18f;
-    sh->cap[k * 3 + 0] = (capsule_t){ cx, cy, lx, ly, line };
-    sh->cap[k * 3 + 1] = (capsule_t){ cx, cy, rx, ry, line };
-    sh->cap[k * 3 + 2] = (capsule_t){ ex + px * bw, ey + py * bw, ex - px * bw, ey - py * bw, bar };
-    sh->tri[k] = (tri_t){ { cx, lx, rx }, { cy, ly, ry } };
-}
-
-static float capsule_dist(const capsule_t* c, float x, float y) {
-    float dx = c->bx - c->ax, dy = c->by - c->ay;
-    float qx = x - c->ax, qy = y - c->ay;
-    float len2 = dx * dx + dy * dy;
-    float t = len2 > 0 ? (qx * dx + qy * dy) / len2 : 0;
-    if (t < 0) t = 0;
-    if (t > 1) t = 1;
-    float ox = qx - dx * t, oy = qy - dy * t;
-    float d2 = ox * ox + oy * oy;
-    float r;
-    __asm__("sqrtss %1, %0" : "=x"(r) : "x"(d2));   // the kernel has no libm
-    return r - c->r;
-}
-
-static bool in_tri(const tri_t* t, float x, float y) {
-    float d1 = (x - t->x[1]) * (t->y[0] - t->y[1]) - (t->x[0] - t->x[1]) * (y - t->y[1]);
-    float d2 = (x - t->x[2]) * (t->y[1] - t->y[2]) - (t->x[1] - t->x[2]) * (y - t->y[2]);
-    float d3 = (x - t->x[0]) * (t->y[2] - t->y[0]) - (t->x[2] - t->x[0]) * (y - t->y[0]);
-    bool neg = d1 < 0 || d2 < 0 || d3 < 0, pos = d1 > 0 || d2 > 0 || d3 > 0;
-    return !(neg && pos);
-}
 
 static uint32_t blend(uint32_t a, uint32_t b, int t) {        // t of 256 toward b
     uint32_t r = (((a >> 16) & 255) * (uint32_t)(256 - t) + ((b >> 16) & 255) * (uint32_t)t) >> 8;
@@ -189,61 +100,197 @@ static void fill_rect(const gpu_device_t* g, int x0, int y0, int x1, int y1, uin
     }
 }
 
-static void draw_frame(uint32_t ms) {
-    const gpu_device_t* g = target();
-    if (!g) return;
-    int w = (int)g->width, h = (int)g->height;
-    if (g->fb != g_last_fb || (uint32_t)w != g_last_w || (uint32_t)h != g_last_h) {
-        // A new screen (the driver took over, the mode changed): start black.
-        fill_rect(g, 0, 0, w, h, COLOR_BG);
-        g_last_fb = g->fb;
-        g_last_w = (uint32_t)w;
-        g_last_h = (uint32_t)h;
-        g_box_x1 = g_box_x0 = 0;
+// What the frames covered (cleared when the animation stops).
+static void box_add(int x0, int y0, int x1, int y1) {
+    if (g_box_x1 <= g_box_x0) { g_box_x0 = x0; g_box_y0 = y0; g_box_x1 = x1; g_box_y1 = y1; return; }
+    if (x0 < g_box_x0) g_box_x0 = x0;
+    if (y0 < g_box_y0) g_box_y0 = y0;
+    if (x1 > g_box_x1) g_box_x1 = x1;
+    if (y1 > g_box_y1) g_box_y1 = y1;
+}
+
+/* ------------------------------------------------------------ the logo */
+
+enum { STYLE_LOGO, STYLE_PULSE, STYLE_HOURGLASS };
+static volatile int g_style = STYLE_LOGO;
+static volatile bool g_style_known;             // from the command line or System.conf
+static int g_drawn_style = -1;                  // what the screen shows (a change clears it)
+static int g_logo_level = -1;                   // brightness the static logo was last drawn at (256 = full)
+
+#define INTRO_MS   650u                         // the logo fades in
+#define PULSE_MS   2400u                        // one breath / one sweep
+#define ORBIT_MS   2600u                        // one turn of the dots
+#define COLOR_ACCENT 0xFF4FA3E0u
+
+// Coverage of the logo at (u, v) in its own pixels (bilinear).
+static int logo_cov(float u, float v) {
+    if (u < 0.0f || v < 0.0f) return 0;
+    int x = (int)u, y = (int)v;
+    if (x >= (int)BOOTLOGO_SIZE - 1 || y >= (int)BOOTLOGO_SIZE - 1) return 0;
+    float fx = u - (float)x, fy = v - (float)y;
+    const uint8_t* p = &k_bootlogo[(size_t)y * BOOTLOGO_SIZE + (size_t)x];
+    float a = p[0] + (p[1] - p[0]) * fx;
+    float b = p[BOOTLOGO_SIZE] + (p[BOOTLOGO_SIZE + 1] - p[BOOTLOGO_SIZE]) * fx;
+    return (int)(a + (b - a) * fy);
+}
+
+// Where the logo goes on a w x h screen: its top-left corner and side.
+static void logo_place(int w, int h, int* lx, int* ly, int* side) {
+    int m = w < h ? w : h;
+    int s = m * 34 / 100;
+    if (s < 96) s = 96;
+    *side = s;
+    *lx = (w - s) / 2;
+    *ly = (h - s) / 2 - s / 10;
+}
+
+// The logo at brightness level (0..256). sweep >= 0: a light band at that x (0..1 across the logo).
+static void draw_logo(const gpu_device_t* g, int level, float sweep) {
+    int w = (int)g->width, h = (int)g->height, lx, ly, side;
+    logo_place(w, h, &lx, &ly, &side);
+    float k = (float)BOOTLOGO_SIZE / (float)side;
+    int y_first = ly + (int)((float)BOOTLOGO_FIRST_ROW / k) - 1, y_last = ly + (int)((float)BOOTLOGO_LAST_ROW / k) + 2;
+    if (y_first < 0) y_first = 0;
+    if (y_last > h) y_last = h;
+    int x0 = lx < 0 ? 0 : lx, x1 = lx + side > w ? w : lx + side;
+    uint32_t bg = gpu_pack_color(g, COLOR_BG);
+    for (int y = y_first; y < y_last; y++) {
+        volatile uint32_t* row = g->fb + ((size_t)y * g->pitch) / 4u;
+        float v = ((float)(y - ly) + 0.5f) * k - 0.5f;
+        for (int x = x0; x < x1; x++) {
+            float u = ((float)(x - lx) + 0.5f) * k - 0.5f;
+            int c = logo_cov(u, v);
+            if (!c) { row[x] = bg; continue; }
+            uint32_t col = COLOR_LINE;
+            if (sweep >= 0.0f) {
+                float d = (float)(x - lx) / (float)side - sweep;
+                if (d < 0) d = -d;
+                if (d < 0.12f) col = blend(COLOR_LINE, COLOR_ACCENT, (int)((0.12f - d) / 0.12f * 200.0f));
+            }
+            row[x] = gpu_pack_color(g, blend(COLOR_BG, col, c * level / 255));
+        }
     }
-    float size = (float)(w < h ? w : h);
-    float len = size * 0.13f, wid = len * 0.62f, line = size * 0.0075f + 1.0f, bar = line * 1.35f;
+    box_add(x0, y_first, x1, y_last);
+}
+
+// Five dots circling under the logo, bunching up and spreading out (each a little behind the one before).
+static void draw_dots(const gpu_device_t* g, uint32_t ms, int level) {
+    int w = (int)g->width, h = (int)g->height, lx, ly, side;
+    logo_place(w, h, &lx, &ly, &side);
+    float r = (float)side * 0.075f, dot = (float)side * 0.012f + 1.2f;
+    float cx = (float)w * 0.5f, cy = (float)(ly + side) + r * 2.2f;
+    int bx0 = (int)(cx - r - dot - 2), by0 = (int)(cy - r - dot - 2), bx1 = (int)(cx + r + dot + 3), by1 = (int)(cy + r + dot + 3);
+    if (bx0 < 0) bx0 = 0;
+    if (by0 < 0) by0 = 0;
+    if (bx1 > w) bx1 = w;
+    if (by1 > h) by1 = h;
+    float px[5], py[5];
+    for (int i = 0; i < 5; i++) {
+        float t = (float)((ms + ORBIT_MS - (uint32_t)i * 150u) % ORBIT_MS) / (float)ORBIT_MS;
+        // Slow at the top, fast at the bottom: the angle eases in and out over a turn.
+        float e = t < 0.5f ? 2.0f * t * t : 1.0f - 2.0f * (1.0f - t) * (1.0f - t);
+        float s, c;
+        sincos_deg(e * 360.0f, &s, &c);
+        px[i] = cx + s * r;
+        py[i] = cy - c * r;
+    }
+    uint32_t bg = gpu_pack_color(g, COLOR_BG);
+    for (int y = by0; y < by1; y++) {
+        volatile uint32_t* row = g->fb + ((size_t)y * g->pitch) / 4u;
+        float fy = (float)y + 0.5f;
+        for (int x = bx0; x < bx1; x++) {
+            float fx = (float)x + 0.5f, best = 1e9f;
+            for (int i = 0; i < 5; i++) {
+                float dx = fx - px[i], dy = fy - py[i], d2 = dx * dx + dy * dy, d;
+                if (d2 > (dot + 2) * (dot + 2)) continue;
+                __asm__("sqrtss %1, %0" : "=x"(d) : "x"(d2));
+                if (d - dot < best) best = d - dot;
+            }
+            if (best >= 0.5f) { row[x] = bg; continue; }
+            float cov = best <= -0.5f ? 1.0f : 0.5f - best;
+            row[x] = gpu_pack_color(g, blend(COLOR_BG, COLOR_LINE, (int)(cov * (float)level)));
+        }
+    }
+    box_add(bx0, by0, bx1, by1);
+}
+
+// The mark of the logo (its rows 16..254: the hourglass without the name) turning over: it rests, then
+// turns half a circle, like an hourglass being flipped.
+#define MARK_TOP    16.0f
+#define MARK_BOTTOM 254.0f
+#define MARK_CX     159.5f
+#define MARK_CY     135.0f
+#define MARK_R      170.0f                      // centre to the farthest corner, in logo pixels
+#define FLIP_REST_MS 1000u
+#define FLIP_TURN_MS 850u
+static void draw_mark_turning(const gpu_device_t* g, uint32_t ms, int level) {
+    int w = (int)g->width, h = (int)g->height;
+    int m = w < h ? w : h;
+    float side = (float)(m * 30 / 100);         // the mark as big as the logo styles' whole logo
+    float k = (float)BOOTLOGO_SIZE / side;      // logo pixels per screen pixel
+    uint32_t cyc = FLIP_REST_MS + FLIP_TURN_MS, n = ms / cyc, t = ms % cyc;
+    float deg = 180.0f * (float)(n & 1u);
+    if (t > FLIP_REST_MS) deg += 180.0f * smooth((float)(t - FLIP_REST_MS) / (float)FLIP_TURN_MS);
+    float s, c;
+    sincos_deg(deg, &s, &c);
     float cx = (float)w * 0.5f, cy = (float)h * 0.5f;
-    float top, bottom;
-    pose(ms, &top, &bottom);
-    shape_t sh;
-    half(&sh, 0, cx, cy, top, len, wid, line, bar);
-    half(&sh, 1, cx, cy, bottom, len, wid, line, bar);
-    // Everything the glass can reach in any pose: a square around the waist.
-    int reach = (int)(len * 1.32f + bar + 3.0f);
+    int reach = (int)(MARK_R / k) + 2;
     int x0 = (int)cx - reach, y0 = (int)cy - reach, x1 = (int)cx + reach, y1 = (int)cy + reach;
     if (x0 < 0) x0 = 0;
     if (y0 < 0) y0 = 0;
     if (x1 > w) x1 = w;
     if (y1 > h) y1 = h;
     uint32_t bg = gpu_pack_color(g, COLOR_BG);
-    uint32_t fill = blend(COLOR_BG, COLOR_FILL, 72);
     for (int y = y0; y < y1; y++) {
         volatile uint32_t* row = g->fb + ((size_t)y * g->pitch) / 4u;
-        float fy = (float)y + 0.5f;
+        float dy = ((float)y + 0.5f - cy) * k;
         for (int x = x0; x < x1; x++) {
-            float fx = (float)x + 0.5f;
-            uint32_t base = (in_tri(&sh.tri[0], fx, fy) || in_tri(&sh.tri[1], fx, fy)) ? fill : COLOR_BG;
-            float d = 1e9f;
-            for (int k = 0; k < 6; k++) {
-                const capsule_t* c = &sh.cap[k];
-                // Cheap reject: outside the capsule's box plus a pixel.
-                float lo_x = (c->ax < c->bx ? c->ax : c->bx) - c->r - 1.0f, hi_x = (c->ax > c->bx ? c->ax : c->bx) + c->r + 1.0f;
-                float lo_y = (c->ay < c->by ? c->ay : c->by) - c->r - 1.0f, hi_y = (c->ay > c->by ? c->ay : c->by) + c->r + 1.0f;
-                if (fx < lo_x || fx > hi_x || fy < lo_y || fy > hi_y) continue;
-                float dk = capsule_dist(c, fx, fy);
-                if (dk < d) d = dk;
-            }
-            uint32_t argb = base;
-            if (d < 0.5f) {
-                float cov = d <= -0.5f ? 1.0f : 0.5f - d;     // one pixel of anti-aliasing
-                argb = blend(base, COLOR_LINE, (int)(cov * 256.0f));
-            }
-            row[x] = argb == COLOR_BG ? bg : gpu_pack_color(g, argb);
+            float dx = ((float)x + 0.5f - cx) * k;
+            // Back into the logo: rotate by -deg around the mark's centre.
+            float u = MARK_CX + dx * c + dy * s, v = MARK_CY - dx * s + dy * c;
+            int cov = (v >= MARK_TOP - 1.0f && v <= MARK_BOTTOM + 1.0f) ? logo_cov(u, v) : 0;
+            row[x] = cov ? gpu_pack_color(g, blend(COLOR_BG, COLOR_LINE, cov * level / 255)) : bg;
         }
     }
-    g_box_x0 = x0; g_box_y0 = y0; g_box_x1 = x1; g_box_y1 = y1;
-    (void)fabs_;
+    box_add(x0, y0, x1, y1);
+}
+
+static void draw_frame(uint32_t ms) {
+    const gpu_device_t* g = target();
+    if (!g) return;
+    int w = (int)g->width, h = (int)g->height;
+    // Until the setting is known, the logo style (every style starts with the logo).
+    int style = g_style_known ? g_style : STYLE_LOGO;
+    if (g->fb != g_last_fb || (uint32_t)w != g_last_w || (uint32_t)h != g_last_h || style != g_drawn_style) {
+        // A new screen (the driver took over, the mode changed) or another style: start black.
+        fill_rect(g, 0, 0, w, h, COLOR_BG);
+        g_last_fb = g->fb;
+        g_last_w = (uint32_t)w;
+        g_last_h = (uint32_t)h;
+        g_box_x1 = g_box_x0 = 0;
+        g_drawn_style = style;
+        g_logo_level = -1;
+    }
+    int level = ms >= INTRO_MS ? 256 : (int)(smooth((float)ms / (float)INTRO_MS) * 256.0f);
+    switch (style) {
+        case STYLE_HOURGLASS:
+            draw_mark_turning(g, ms, level);
+            break;
+        case STYLE_PULSE: {
+            // Breathes between 60 % and full brightness; a light crosses it once per breath.
+            float s, c;
+            sincos_deg((float)(ms % PULSE_MS) / (float)PULSE_MS * 360.0f, &s, &c);
+            int breath = (int)(0.80f * 256.0f + 0.20f * 256.0f * c);
+            float sweep = (float)(ms % PULSE_MS) / (float)PULSE_MS * 1.6f - 0.3f;
+            draw_logo(g, ms < INTRO_MS ? level : breath, ms < INTRO_MS ? -1.0f : sweep);
+            break;
+        }
+        default:
+            // The logo is drawn again only while it fades in; the dots every frame.
+            if (level != g_logo_level) { draw_logo(g, level, -1.0f); g_logo_level = level; }
+            draw_dots(g, ms, level);
+            break;
+    }
 }
 
 /* ------------------------------------------------------------ control */
@@ -253,6 +300,9 @@ void bootanim_start(multiboot2_info_t* mb_info) {
         multiboot2_has_cmdline_token(mb_info, "--debug"))
         return;
     multiboot2_framebuffer_info_t info;
+    static const char* const k_styles[3] = { "bootanim=logo", "bootanim=pulse", "bootanim=hourglass" };
+    for (int i = 0; i < 3; i++)
+        if (multiboot2_has_cmdline_token(mb_info, k_styles[i])) { g_style = i; g_style_known = true; }
     if (!multiboot2_get_framebuffer(mb_info, &info) || info.framebuffer_type != 1 || info.bpp != 32 ||
         !info.width || !info.height || info.width > 8192 || info.height > 8192 || info.pitch < info.width * 4u)
         return;
@@ -362,5 +412,15 @@ void bootanim_apply_setting(void) {
     if (sysconf_get("BootupAnim", v, sizeof(v)) && (v[0] == 'f' || v[0] == 'F' || v[0] == '0' || v[0] == 'n' || v[0] == 'N')) {
         serial_write_str("bootanim: off in System.conf\n");
         bootanim_stop(true);
+        return;
     }
+    // The style, unless the command line chose one.
+    if (!g_style_known && sysconf_get("BootupAnimStyle", v, sizeof(v))) {
+        int style = (v[0] == 'p' || v[0] == 'P') ? STYLE_PULSE : (v[0] == 'h' || v[0] == 'H') ? STYLE_HOURGLASS : STYLE_LOGO;
+        g_style = style;
+        serial_write_str("bootanim: style from System.conf: ");
+        serial_write_str(v);
+        serial_write_str("\n");
+    }
+    g_style_known = true;
 }

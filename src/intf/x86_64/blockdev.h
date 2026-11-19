@@ -99,6 +99,9 @@ const char* blockdev_fs_name(blockdev_fs_t fs);
 // their partition tables and identifies filesystems. Later calls rescan
 // partitions only. Returns the number of disks.
 uint32_t blockdev_probe_all(void);
+// After a RamFS boot (which probes no real disk): probe AHCI and NVMe disks now, read only, mounting nothing.
+// Does nothing on other boots or the second time.
+void blockdev_probe_real_disks(void);
 
 // Formats a size like "8.0 TiB" / "512 MiB".
 void blockdev_format_size(uint64_t bytes, char* out, size_t out_size);

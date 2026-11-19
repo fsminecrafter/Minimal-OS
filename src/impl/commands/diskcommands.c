@@ -378,8 +378,15 @@ static void storage_write_repos(uint8_t drive_number) {
     memcpy(text, g_setup_repos, n);
     if (n && text[n - 1] != '\n') text[n++] = '\n';
     snprintf(path, sizeof(path), "%u:/etc/dlr/repos", (unsigned)drive_number);
-    if (!minimafs_write_file_segments(path, text, (uint32_t)n, NULL, 0, "text", "conf"))
+    if (!minimafs_write_file_segments(path, text, (uint32_t)n, NULL, 0, "text", "conf")) {
         serial_write_str("setup: could not write /etc/dlr/repos\n");
+    } else {
+        serial_write_str("setup: Deliver repositories for the new system (");
+        serial_write_str(path);
+        serial_write_str("): ");
+        serial_write_str(g_setup_repos);
+        if (text[n - 1] != '\n') serial_write_str("\n");
+    }
 }
 
 // Games: an ISO made with 'make mosdesk-doom' carries a "mosgames" boot

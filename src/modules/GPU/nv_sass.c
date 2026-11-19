@@ -93,7 +93,13 @@ typedef struct {
 // `pred` is a predicate register number, PRED_TRUE for always.
 static void emit(enc_t* e, uint32_t w[4], uint32_t pred, bool writes, bool reads) {
     set(w, 12, 15, pred);
-    set(w, 105, 109, 0);                        // no extra stall
+    // Stall cycles before the next instruction of this warp issues. Turing's scoreboards (the barriers
+    // below) only cover variable-latency units (MUFU, TEX, attribute loads); a fixed-latency ALU result
+    // (FFMA, FADD, MOV, FSEL, FMNMX, ...) is only there after its pipeline latency, which the stall must
+    // cover. With 0, a dependent instruction read the old register whenever no other warp filled the
+    // gap: right pictures with random wrong pixels (more of them in big shaders, fewer warps resident).
+    // 6 covers the FP32 pipeline's read-after-write latency, 13 a predicate written by FSETP.
+    set(w, 105, 109, nv_sass_field(w, 0, 9) == 0x00Bu ? NV_SASS_STALL_PRED : NV_SASS_STALL_ALU);
     set(w, 110, 113, writes ? 0u : 7u);         // barrier set when the result is written
     set(w, 113, 116, reads ? 1u : 7u);          // barrier set when the operands were read
     set(w, 116, 122, e->first ? 0u : 3u);       // wait for the previous instruction's barriers

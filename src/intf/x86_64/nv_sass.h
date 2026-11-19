@@ -44,6 +44,10 @@
 // to SET_PIPELINE_REGISTER_COUNT must include them. Without them the SM
 // raises "Out Of Range Register" on the first instruction that touches
 // one of the last registers.
+// Stall cycles after an instruction (control bits 105..108): fixed-latency results are not on a
+// scoreboard, the stall covers them (nv_sass.c emit()).
+#define NV_SASS_STALL_ALU 6u
+#define NV_SASS_STALL_PRED 13u
 #define NV_SASS_HW_RESERVED_REGS 2u
 
 #define NV_SASS_CB_UNIFORM_BYTES 1024u      // FGPU_SHADER_MAX_UNIFORMS vec4s

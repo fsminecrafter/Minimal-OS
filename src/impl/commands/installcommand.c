@@ -7,12 +7,16 @@
 #include "x86_64/commandreg.h"
 #include "x86_64/blockdev.h"
 #include "x86_64/installer.h"
+#include "x86_64/storage_setup.h"
 #include "minimafshandler.h"
 
 /*
  * install                                   show disks and usage
  * install <disk> [--mbr] [--size <N[M|G|T]>] [--label <name>] [--yes]
  * install --system <part> --boot <part> [--yes]
+ *   [--apps <a,b>|--apps none]   apps from the install media (default all)
+ *   [--repo <host:port>]...      Deliver servers for the installed system
+ * install --list-apps              apps on the install media, "name bytes"
  */
 
 static void say(const char* s) { graphics_write_textr(s); }
@@ -45,6 +49,8 @@ static void print_progress(uint32_t percent, const char* text) {
 static void usage(void) {
     say("usage: install <disk> [--mbr] [--size 20G] [--label name] [--yes]\n"
         "       install --system <partition> --boot <partition> [--yes]\n"
+        "  --apps a,b|none  apps from the install media (default: all; see --list-apps)\n"
+        "  --repo host:port Deliver server for the installed system (repeatable)\n"
         "The first form erases the whole disk. The disk then boots on both\n"
         "BIOS and UEFI PCs. See 'disks' for names.\n");
 }
@@ -63,6 +69,8 @@ void cmd_install(int argc, const char** argv) {
     install_options_t opt;
     memset(&opt, 0, sizeof(opt));
     bool yes = false;
+    static char repos[512];
+    repos[0] = '\0';
 
     for (int i = 1; i < argc; i++) {
         const char* a = argv[i];
@@ -74,6 +82,23 @@ void cmd_install(int argc, const char** argv) {
         } else if (strcmp(a, "--label") == 0 && i + 1 < argc) opt.label = argv[++i];
         else if (strcmp(a, "--system") == 0 && i + 1 < argc) opt.system_part = argv[++i];
         else if (strcmp(a, "--boot") == 0 && i + 1 < argc) opt.boot_part = argv[++i];
+        else if (strcmp(a, "--apps") == 0 && i + 1 < argc) {
+            opt.apps = strcmp(argv[i + 1], "none") == 0 ? "" : argv[i + 1];
+            i++;
+        } else if (strcmp(a, "--repo") == 0 && i + 1 < argc) {
+            const char* r = argv[++i];
+            size_t n = strlen(repos), rn = strlen(r);
+            if (n + rn + 2 > sizeof(repos)) { say("install: too many repositories\n"); return; }
+            memcpy(repos + n, r, rn);
+            repos[n + rn] = '\n';
+            repos[n + rn + 1] = '\0';
+            opt.repos = repos;
+        } else if (strcmp(a, "--list-apps") == 0) {
+            static char list[1024];
+            if (storage_setup_list_apps(list, sizeof(list)) == 0) say("(no apps on the install media)\n");
+            else say(list);
+            return;
+        }
         else if (a[0] != '-' && !opt.disk) opt.disk = a;
         else { usage(); return; }
     }

@@ -101,8 +101,39 @@ static bool format_parent_dir(const char* full_path, char* out, size_t out_size)
     return true;
 }
 
+// The app an archive entry belongs to: its first path component without
+// ".run" ("Doom.run", "Doom/freedoom1.wad" -> "Doom").
+static void app_of_entry(const char* name, char* out, size_t out_size) {
+    size_t n = 0;
+    while (name[n] && name[n] != '/' && n + 1 < out_size) { out[n] = name[n]; n++; }
+    out[n] = '\0';
+    if (n > 4 && strcmp(out + n - 4, ".run") == 0) out[n - 4] = '\0';
+}
+
+// True when app is one of the comma-separated names in list.
+static bool app_listed(const char* list, const char* app) {
+    size_t len = strlen(app);
+    const char* p = list;
+    while (*p) {
+        const char* end = p;
+        while (*end && *end != ',') end++;
+        if ((size_t)(end - p) == len && len && memcmp(p, app, len) == 0) return true;
+        p = *end ? end + 1 : end;
+    }
+    return false;
+}
+
+// only: NULL unpacks everything, else just the entries of the listed apps.
+static bool format_install_package_only(const uint8_t* archive, uint32_t archive_size,
+                                        const char* target_dir, const char* only);
+
 static bool format_install_package(const uint8_t* archive, uint32_t archive_size,
                                    const char* target_dir) {
+    return format_install_package_only(archive, archive_size, target_dir, NULL);
+}
+
+static bool format_install_package_only(const uint8_t* archive, uint32_t archive_size,
+                                        const char* target_dir, const char* only) {
     if (archive_size < MPKG_HEADER_SIZE ||
         memcmp(archive, MPKG_MAGIC, MPKG_MAGIC_SIZE) != 0 ||
         format_pkg_u32(archive + 8) != MPKG_VERSION) {
@@ -132,6 +163,12 @@ static bool format_install_package(const uint8_t* archive, uint32_t archive_size
         uint32_t raw_size = format_pkg_u32(entry + MPKG_NAME_SIZE + 8);
         uint32_t packed_size = format_pkg_u32(entry + MPKG_NAME_SIZE + 12);
         uint32_t offset = format_pkg_u32(entry + MPKG_NAME_SIZE + 16);
+
+        if (only) {
+            char app[MPKG_NAME_SIZE];
+            app_of_entry(name, app, sizeof(app));
+            if (!app_listed(only, app)) continue;
+        }
 
         if (flags & MPKG_FLAG_DIRECTORY) {
             char dir_path[MINIMAFS_MAX_PATH];
@@ -260,6 +297,91 @@ static void storage_install_firmware(uint8_t drive_number, storage_progress_fn p
     }
 }
 
+// Installer choices (storage_setup_choose); NULL apps = all of them.
+static char g_setup_apps_buf[256];
+static const char* g_setup_apps;
+static char g_setup_repos[512];
+
+void storage_setup_choose(const char* apps, const char* repos) {
+    g_setup_apps = NULL;
+    if (apps) {
+        strncpy(g_setup_apps_buf, apps, sizeof(g_setup_apps_buf) - 1);
+        g_setup_apps_buf[sizeof(g_setup_apps_buf) - 1] = '\0';
+        g_setup_apps = g_setup_apps_buf;
+    }
+    g_setup_repos[0] = '\0';
+    if (repos) {
+        strncpy(g_setup_repos, repos, sizeof(g_setup_repos) - 1);
+        g_setup_repos[sizeof(g_setup_repos) - 1] = '\0';
+    }
+}
+
+int storage_setup_list_apps(char* out, size_t out_size) {
+    if (!out || !out_size) return 0;
+    out[0] = '\0';
+    memlayout_module_t m;
+    if (!kernel_multiboot_info ||
+        !memlayout_find_module(kernel_multiboot_info, "mosgames", &m)) return 0;
+    if (m.end <= m.start || m.end - m.start > 0xFFFFFFFFull) return 0;
+    const uint8_t* archive = (const uint8_t*)(uintptr_t)m.start;
+    uint32_t size = (uint32_t)(m.end - m.start);
+    if (size < MPKG_HEADER_SIZE || memcmp(archive, MPKG_MAGIC, MPKG_MAGIC_SIZE) != 0) return 0;
+    uint32_t count = format_pkg_u32(archive + 12);
+    if ((uint64_t)MPKG_HEADER_SIZE + (uint64_t)count * MPKG_ENTRY_SIZE > size) return 0;
+
+    // Up to 16 apps, in archive order, with their unpacked size.
+    enum { MAX_APPS = 16 };
+    static char names[MAX_APPS][48];
+    static uint64_t bytes[MAX_APPS];
+    int apps = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        const uint8_t* entry = archive + MPKG_HEADER_SIZE + i * MPKG_ENTRY_SIZE;
+        char name[MPKG_NAME_SIZE];
+        memcpy(name, entry, MPKG_NAME_SIZE);
+        name[MPKG_NAME_SIZE - 1] = '\0';
+        char app[48];
+        app_of_entry(name, app, sizeof(app));
+        if (!app[0]) continue;
+        int k = 0;
+        while (k < apps && strcmp(names[k], app) != 0) k++;
+        if (k == apps) {
+            if (apps == MAX_APPS) continue;
+            strcpy(names[apps], app);
+            bytes[apps] = 0;
+            apps++;
+        }
+        if (!(format_pkg_u32(entry + MPKG_NAME_SIZE) & MPKG_FLAG_DIRECTORY))
+            bytes[k] += format_pkg_u32(entry + MPKG_NAME_SIZE + 8);
+    }
+    size_t pos = 0;
+    for (int k = 0; k < apps; k++) {
+        int n = snprintf(out + pos, out_size - pos, "%s %u\n", names[k],
+                         (unsigned)(bytes[k] > 0xFFFFFFFFull ? 0xFFFFFFFFull : bytes[k]));
+        if (n <= 0 || (size_t)n >= out_size - pos) break;
+        pos += (size_t)n;
+    }
+    return apps;
+}
+
+// Deliver servers the installer picked go to N:/etc/dlr/repos; dlr adds
+// them the first time it reaches them.
+static void storage_write_repos(uint8_t drive_number) {
+    if (!g_setup_repos[0]) return;
+    char path[48];
+    snprintf(path, sizeof(path), "%u:/etc/dlr", (unsigned)drive_number);
+    if (!minimafs_is_dir(path) && !format_mkdir_p(path)) {
+        serial_write_str("setup: could not create /etc/dlr\n");
+        return;
+    }
+    char text[sizeof(g_setup_repos) + 2];
+    size_t n = strlen(g_setup_repos);
+    memcpy(text, g_setup_repos, n);
+    if (n && text[n - 1] != '\n') text[n++] = '\n';
+    snprintf(path, sizeof(path), "%u:/etc/dlr/repos", (unsigned)drive_number);
+    if (!minimafs_write_file_segments(path, text, (uint32_t)n, NULL, 0, "text", "conf"))
+        serial_write_str("setup: could not write /etc/dlr/repos\n");
+}
+
 // Games: an ISO made with 'make mosdesk-doom' carries a "mosgames" boot
 // module (an .mpkg holding Doom.run and its Doom/ data folder), unpacked
 // into N:/programs next to the other programs. Like the firmware it is
@@ -271,9 +393,10 @@ static void storage_install_games(uint8_t drive_number, storage_progress_fn prog
     if (m.end <= m.start || m.end - m.start > 0xFFFFFFFFull) return;
     char dir[16];
     snprintf(dir, sizeof(dir), "%u:/programs", (unsigned)drive_number);
-    setup_say(progress, 92, "Installing games");
-    if (!format_install_package((const uint8_t*)(uintptr_t)m.start,
-                                (uint32_t)(m.end - m.start), dir)) {
+    if (g_setup_apps && !g_setup_apps[0]) return;     // the installer picked none
+    setup_say(progress, 92, "Installing apps");
+    if (!format_install_package_only((const uint8_t*)(uintptr_t)m.start,
+                                     (uint32_t)(m.end - m.start), dir, g_setup_apps)) {
         serial_write_str("setup: games could not be installed\n");
     }
 }
@@ -330,6 +453,8 @@ bool storage_populate_system(uint8_t drive_number, storage_progress_fn progress)
     }
     storage_install_firmware(drive_number, progress);
     storage_install_games(drive_number, progress);
+    storage_write_repos(drive_number);
+    storage_setup_choose(NULL, NULL);       // the next format gets the defaults
     minimafs_refresh_storage_desc(drive);
     return true;
 }

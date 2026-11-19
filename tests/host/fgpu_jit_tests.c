@@ -928,7 +928,7 @@ static void test_program_api(void) {
         // Single-lane interfaces.
         float in[FGPU_MAX_ATTRIBS][4], out_a[1 + FGPU_SHADER_MAX_VARYINGS][4], out_b[1 + FGPU_SHADER_MAX_VARYINGS][4];
         for (uint32_t i = 0; i < FGPU_MAX_ATTRIBS; i++) for (int c = 0; c < 4; c++) in[i][c] = frand(-1, 1);
-        fgpu_shader_io_t io = { &pi, (const float (*)[4])in, out_a, (const float (*)[4])g_uniforms, NULL, g_textures };
+        fgpu_shader_io_t io = { &pi, (const float (*)[4])in, out_a, (const float (*)[4])g_uniforms, NULL, g_textures, NULL };
         fgpu_shader_run_vertex(&io);
         io.program = &pj;
         io.output = out_b;

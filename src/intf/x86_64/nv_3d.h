@@ -102,7 +102,9 @@ void nv3d_push_draw(nv_push_t* p, const nv3d_draw_t* d);
 //   NV3D_TEX_R8_BL     block-linear, one byte per texel: a video decoder's luma plane
 //   NV3D_TEX_RG8_BL    block-linear, two bytes per texel (x, y): its interleaved colour plane
 // `block_log2`: block height in GOBs, as a power of two (block-linear only).
-enum { NV3D_TEX_ARGB = 0, NV3D_TEX_R8 = 1, NV3D_TEX_R8_BL = 2, NV3D_TEX_RG8_BL = 3 };
+//   NV3D_TEX_ARGB_BL   block-linear ARGB8888: a draw target's block-linear copy (one-GOB blocks,
+//                      block_log2 0), sampled without copying it back to its surface first
+enum { NV3D_TEX_ARGB = 0, NV3D_TEX_R8 = 1, NV3D_TEX_R8_BL = 2, NV3D_TEX_RG8_BL = 3, NV3D_TEX_ARGB_BL = 4 };
 void nv3d_texture_header(uint32_t out[8], uint64_t va, uint32_t pitch_bytes, uint32_t width,
                          uint32_t height, int kind, uint32_t block_log2);
 // A sampler for FGPU_TEXTURE_* flags (8 words).

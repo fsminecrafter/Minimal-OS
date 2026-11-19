@@ -16,12 +16,14 @@
 #define OP_FMUL     0x020u
 #define OP_FADD     0x021u
 #define OP_FFMA     0x023u
+#define OP_F2I      0x105u
 #define OP_FRND     0x107u
 #define OP_MUFU     0x108u
 #define OP_ALD      0x321u      // whole 12-bit opcodes from here on
 #define OP_AST      0x322u
 #define OP_IPA      0x326u
 #define OP_TEX      0xB60u      // texture handle from a constant buffer
+#define OP_LDC      0xB82u      // constant buffer load with a register offset
 #define OP_EXIT     0x94Du
 #define OP_KILL     0x95Bu
 
@@ -434,7 +436,10 @@ bool nv_sass_encode(const fgpu_ir_inst_t* code, uint32_t count, uint32_t ir_regs
                 set(w, 40, 54, (NV_SASS_CB_TEX_OFFSET + 4u * in->aux) / 4u);
                 set(w, 54, 59, 0);                      // handle from constant buffer 0
                 set(w, 61, 64, 1);                      // 2D
-                set(w, 64, 72, REG_ZERO);               // no second result register
+                // A full TEX writes r, g to Rd, Rd+1 and b, a to the second
+                // result register Rd2, Rd2+1; with Rd2 = RZ blue and alpha
+                // were dropped (the bring-up sampling test saw blue = 0).
+                set(w, 64, 72, result + 2u);
                 set(w, 72, 76, 0xF);                    // r, g, b, a
                 set(w, 81, 84, PRED_TRUE);
                 set(w, 87, 90, 1);                      // level 0 (one level; also valid in the vertex stage)
@@ -465,8 +470,47 @@ bool nv_sass_encode(const fgpu_ir_inst_t* code, uint32_t count, uint32_t ir_regs
                 // with a register offset; such shaders stay on the CPU.
                 const fgpu_ir_inst_t* def = &code[in->src[0].value];
                 uint32_t binding = in->aux / 4u;
-                if (def->op != FGPU_IR_IMM) { *why = "storage buffer load with a computed index"; return false; }
                 if (binding >= FGPU_MAX_STORAGE_BUFFERS) { *why = "storage buffer out of range"; return false; }
+                if (def->op != FGPU_IR_IMM) {
+                    // A computed index (the shadow cascade, a light number):
+                    //   t = floor(index) * 16          (exact for any index below 2^20)
+                    //   t = F2I.S32(t)                 the byte offset of the element
+                    //   r = LDC c[bank][t + 4 * component]
+                    // A negative index makes a huge offset and one past the end is
+                    // beyond the bound size: the card reads zero for both, as the
+                    // interpreter does.
+                    opnd_t idx = source(&e, in, 0, true);
+                    uint32_t t = e.scratch + 2u;
+                    uint32_t w[4] = { 0 };
+                    alu(w, OP_FRND, t, NULL, &idx, NULL);
+                    set(w, 75, 77, 2);
+                    set(w, 78, 80, 1);                  // towards minus infinity
+                    set(w, 84, 86, 2);
+                    emit(&e, w, PRED_TRUE, true, true);
+                    opnd_t tf = reg_opnd(t), sixteen = imm_opnd(0x41800000u), rz = reg_opnd(REG_ZERO);
+                    __builtin_memset(w, 0, sizeof w);
+                    alu(w, OP_FMUL, t, &tf, &sixteen, &rz);
+                    set(w, 84, 87, 4);                  // no scaling, like the other FMULs
+                    emit(&e, w, PRED_TRUE, true, true);
+                    __builtin_memset(w, 0, sizeof w);
+                    alu(w, OP_F2I, t, NULL, &tf, NULL);
+                    set(w, 72, 73, 1);                  // signed
+                    set(w, 75, 77, 2);                  // 32-bit result
+                    set(w, 78, 80, 3);                  // towards zero (the value is whole)
+                    set(w, 84, 86, 2);                  // 32-bit source
+                    emit(&e, w, PRED_TRUE, true, true);
+                    __builtin_memset(w, 0, sizeof w);
+                    set(w, 0, 12, OP_LDC);
+                    set(w, 16, 24, in->reg);
+                    set(w, 24, 32, t);                  // byte offset register
+                    set(w, 38, 54, (in->aux % 4u) * 4u);
+                    set(w, 54, 59, NV_SASS_CB_STORAGE + binding);
+                    set(w, 73, 76, 4);                  // 32 bits
+                    set(w, 78, 80, 0);                  // plain constant buffer index
+                    emit(&e, w, PRED_TRUE, true, true);
+                    out->buffers |= 1u << binding;
+                    break;
+                }
                 float index = def->imm;
                 if (in->src[0].mods & FGPU_IR_ABS) index = index < 0.0f ? -index : index;
                 if (in->src[0].mods & FGPU_IR_NEG) index = -index;

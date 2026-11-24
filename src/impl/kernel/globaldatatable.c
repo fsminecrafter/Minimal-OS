@@ -8,14 +8,14 @@
 #define MAX_NAME_LEN 32
 
 typedef struct {
-    uint32_t variable;
+    uint64_t variable;
     char name[MAX_NAME_LEN];
     bool used;
 } gdtvar;
 
 gdtvar globallist[MAX_VARS];
 
-uint32_t findvar(const char* name) {
+uint64_t findvar(const char* name) {
     if (!name) return 0;
 
     for (int i = 0; i < MAX_VARS; i++) {
@@ -27,7 +27,7 @@ uint32_t findvar(const char* name) {
     return 0;
 }
 
-bool addvar(uint32_t variable, const char* name) {
+bool addvar(uint64_t variable, const char* name) {
     if (!name) return false;
 
     // overwrite existing

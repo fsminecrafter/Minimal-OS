@@ -9,7 +9,7 @@
 
 void cmd_memsize(int argc, const char** argv) {
     serial_write_str("Executing...");
-    uint32_t totalrambytes = findvar("totalrambytes");
+    uint64_t totalrambytes = findvar("totalrambytes");
     char totalramstringkilobytes[128];
     char totalramstringmib[64];
     serial_write_str("Converting...");

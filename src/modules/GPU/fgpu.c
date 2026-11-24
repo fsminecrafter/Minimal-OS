@@ -850,18 +850,25 @@ static bool make_target(exec_state_t* st, fgpu_target_t* t) {
  */
 
 #define VERIFY_KEYS 24u
+#define MAP_W 64u
+#define MAP_H 16u
+struct verify_key {
+    uint32_t key[6];            // vs, fs, uniforms, textures, buffers, state
+    uint32_t draws, bad_draws;
+    uint64_t pixels, bad_pixels, drawn_pixels;
+    int64_t sum[3];             // card - CPU over the differing pixels, r g b
+    int64_t all_sum[3];         // the same over every pixel either of them drew
+    uint32_t worst;             // largest channel difference
+    uint32_t wx, wy, w_gpu, w_cpu;
+    // The draw with the most differing pixels: its size, where they are, a map of them.
+    uint32_t map_bad, map_w, map_h, bx0, by0, bx1, by1;
+    char map[MAP_H][MAP_W + 1];
+};
 static struct {
     uint32_t frames_left;       // presents to go; 0 = off
     uint32_t draws, bad_draws, skipped;
     bool frame_had_draw;
-    struct verify_key {
-        uint32_t key[6];        // vs, fs, uniforms, textures, buffers, state
-        uint32_t draws, bad_draws;
-        uint64_t pixels, bad_pixels;
-        int64_t sum[3];         // card - CPU over the differing pixels, r g b
-        uint32_t worst;         // largest channel difference
-        uint32_t wx, wy, w_gpu, w_cpu;
-    } k[VERIFY_KEYS];
+    struct verify_key k[VERIFY_KEYS];
     uint32_t keys;
 } g_verify;
 
@@ -889,7 +896,8 @@ static void verify_copy(fgpu_surface_t* s, uint32_t w, uint32_t h, void* dst) {
         memcpy((uint8_t*)dst + (size_t)y * row, (const uint8_t*)s->mem + (size_t)y * s->pitch * 4u, row);
 }
 
-static void verify_compare(const exec_state_t* st, const uint32_t* gpu, const uint32_t* cpu, uint32_t w, uint32_t h) {
+static void verify_compare(const exec_state_t* st, const uint32_t* orig, const uint32_t* gpu, const uint32_t* cpu,
+                           uint32_t w, uint32_t h) {
     const fgpu_pipeline_t* p = &st->pipe;
     uint32_t key[6] = { 0, 0, 0, 0, 0, p->state };
     if (p->shader) {
@@ -906,19 +914,37 @@ static void verify_compare(const exec_state_t* st, const uint32_t* gpu, const ui
         else { g_verify.keys++; memset(&g_verify.k[ki], 0, sizeof(g_verify.k[ki])); memcpy(g_verify.k[ki].key, key, sizeof(key)); }
     }
     struct verify_key* e = &g_verify.k[ki];
-    uint64_t bad = 0;
+    // Per map cell: pixels either drew, card darker, card brighter.
+    static uint32_t cell_drawn[MAP_H][MAP_W], cell_dark[MAP_H][MAP_W], cell_bright[MAP_H][MAP_W];
+    memset(cell_drawn, 0, sizeof(cell_drawn));
+    memset(cell_dark, 0, sizeof(cell_dark));
+    memset(cell_bright, 0, sizeof(cell_bright));
+    uint64_t bad = 0, drawn = 0;
+    uint32_t bx0 = w, by0 = h, bx1 = 0, by1 = 0;
     for (uint32_t y = 0; y < h; y++) {
+        uint32_t cy = y * MAP_H / h;
         for (uint32_t x = 0; x < w; x++) {
-            uint32_t a = gpu[(size_t)y * w + x], b = cpu[(size_t)y * w + x];
-            if (a == b) continue;
-            int d[3], worst = 0;
+            size_t i = (size_t)y * w + x;
+            uint32_t a = gpu[i], b = cpu[i], o = orig[i];
+            if (a == o && b == o) continue;             // neither drew here
+            uint32_t cx = x * MAP_W / w;
+            cell_drawn[cy][cx]++;
+            drawn++;
+            int d[3], worst = 0, total = 0;
             for (int c = 0; c < 3; c++) {
                 d[c] = (int)((a >> (16 - 8 * c)) & 0xFF) - (int)((b >> (16 - 8 * c)) & 0xFF);
+                e->all_sum[c] += d[c];
+                total += d[c];
                 int m = d[c] < 0 ? -d[c] : d[c];
                 if (m > worst) worst = m;
             }
             if (worst <= 6) continue;           // rounding and filtering differences
             bad++;
+            if (total < 0) cell_dark[cy][cx]++; else cell_bright[cy][cx]++;
+            if (x < bx0) bx0 = x;
+            if (y < by0) by0 = y;
+            if (x > bx1) bx1 = x;
+            if (y > by1) by1 = y;
             for (int c = 0; c < 3; c++) e->sum[c] += d[c];
             if ((uint32_t)worst > e->worst) {
                 e->worst = (uint32_t)worst;
@@ -929,10 +955,28 @@ static void verify_compare(const exec_state_t* st, const uint32_t* gpu, const ui
     e->draws++;
     e->pixels += (uint64_t)w * h;
     e->bad_pixels += bad;
+    e->drawn_pixels += drawn;
     g_verify.draws++;
     if (bad * 1000u > (uint64_t)w * h) {        // more than 0.1% of the target
         e->bad_draws++;
         g_verify.bad_draws++;
+    }
+    if (bad > e->map_bad) {
+        // ' ' nothing drawn, '.' drawn and the same, '-' card darker, '+' card brighter, '#' both
+        e->map_bad = (uint32_t)bad; e->map_w = w; e->map_h = h;
+        e->bx0 = bx0; e->by0 = by0; e->bx1 = bx1; e->by1 = by1;
+        for (uint32_t cy = 0; cy < MAP_H; cy++) {
+            for (uint32_t cx = 0; cx < MAP_W; cx++) {
+                uint32_t dk = cell_dark[cy][cx], br = cell_bright[cy][cx];
+                char ch = ' ';
+                if (dk && br) ch = (dk > 3u * br) ? '-' : (br > 3u * dk) ? '+' : '#';
+                else if (dk) ch = '-';
+                else if (br) ch = '+';
+                else if (cell_drawn[cy][cx]) ch = '.';
+                e->map[cy][cx] = ch;
+            }
+            e->map[cy][MAP_W] = 0;
+        }
     }
 }
 
@@ -944,10 +988,12 @@ static bool verify_draw(exec_state_t* st, fgpu_target_t* t, fgpu_hw_target_t* ht
     if (!st->color) return g_hw->draw(hd, drawn);
     uint32_t w = t->width, h = t->height;
     size_t px = (size_t)w * h;
+    uint32_t* orig = (uint32_t*)alloc_unzeroed(px * 4u);
     uint32_t* start = (uint32_t*)alloc_unzeroed(px * 4u);
     uint32_t* card = (uint32_t*)alloc_unzeroed(px * 4u);
     float* depth = t->depth ? (float*)alloc_unzeroed(px * 4u) : NULL;
-    if (!start || !card || (t->depth && !depth)) {
+    if (!orig || !start || !card || (t->depth && !depth)) {
+        if (orig) free_mem(orig);
         if (start) free_mem(start);
         if (card) free_mem(card);
         if (depth) free_mem(depth);
@@ -958,6 +1004,7 @@ static bool verify_draw(exec_state_t* st, fgpu_target_t* t, fgpu_hw_target_t* ht
     if (t->depth && g_hw->cpu_draw) g_hw->cpu_draw(ht);
     hw_sync();
     verify_copy(st->color, w, h, start);
+    memcpy(orig, start, px * 4u);
     if (depth) verify_copy(st->depth, w, h, depth);
     bool ok = g_hw->draw(hd, drawn);
     if (ok) {
@@ -966,13 +1013,21 @@ static bool verify_draw(exec_state_t* st, fgpu_target_t* t, fgpu_hw_target_t* ht
         verify_copy(st->color, w, h, card);
         fgpu_target_t vt = { start, w, depth, w, w, h };
         fgpu_raster_draw_layout(&vt, &st->pipe, layout, verts, avail, idx, count);
-        verify_compare(st, card, start, w, h);
+        verify_compare(st, orig, card, start, w, h);
         g_verify.frame_had_draw = true;
     }
+    free_mem(orig);
     free_mem(start);
     free_mem(card);
     if (depth) free_mem(depth);
     return ok;
+}
+
+// v tenths as "-1.5" / "+0.3".
+static const char* tenths(int v, char* buf) {
+    unsigned m = (unsigned)(v < 0 ? -v : v);
+    snprintf(buf, 16, "%c%u.%u", v < 0 ? '-' : '+', m / 10u, m % 10u);
+    return buf;
 }
 
 void fgpu_verify_report(void (*print)(const char* text)) {
@@ -985,18 +1040,38 @@ void fgpu_verify_report(void (*print)(const char* text)) {
              (unsigned)g_verify.draws, (unsigned)g_verify.bad_draws,
              g_verify.frames_left ? ", still running" : "", (unsigned)g_verify.skipped);
     print(line);
-    print("  shader (vs fs unif tex buf state)  draws differ  bad px   card-CPU r g b   worst at (x,y) card/CPU\n");
+    print("  vs  fs un tx bf st   draws differ  bad px  card-CPU: bad px   all drawn  worst (x,y) card/CPU\n");
     for (uint32_t i = 0; i < g_verify.keys; i++) {
         struct verify_key* e = &g_verify.k[i];
-        uint64_t bp = e->bad_pixels ? e->bad_pixels : 1;
+        int64_t bp = e->bad_pixels ? (int64_t)e->bad_pixels : 1;
+        int64_t dp = e->drawn_pixels ? (int64_t)e->drawn_pixels : 1;
         uint32_t permille = e->pixels ? (uint32_t)(e->bad_pixels * 1000u / e->pixels) : 0;
-        snprintf(line, sizeof(line), "  %3u %4u %2u %x %x %04x  %5u %5u  %3u.%u%%  %+4d %+4d %+4d  %u (%u,%u) %06x/%06x\n",
+        // Mean differences in tenths of a level (the kernel's snprintf has no %f).
+        char t0[16], t1[16], t2[16];
+        int a0 = (int)(e->all_sum[0] * 10 / dp), a1 = (int)(e->all_sum[1] * 10 / dp), a2 = (int)(e->all_sum[2] * 10 / dp);
+        snprintf(line, sizeof(line),
+                 " %3u %3u %2u %x %x %04x  %5u %5u  %3u.%u%%  %+d %+d %+d   %s %s %s  %u (%u,%u) %06x/%06x\n",
                  (unsigned)(e->key[0] & 0xFFFF), (unsigned)e->key[1], (unsigned)e->key[2], (unsigned)e->key[3],
                  (unsigned)e->key[4], (unsigned)(e->key[5] & 0xFFFF), (unsigned)e->draws, (unsigned)e->bad_draws,
                  permille / 10u, permille % 10u,
-                 (int)(e->sum[0] / (int64_t)bp), (int)(e->sum[1] / (int64_t)bp), (int)(e->sum[2] / (int64_t)bp),
+                 (int)(e->sum[0] / bp), (int)(e->sum[1] / bp), (int)(e->sum[2] / bp),
+                 tenths(a0, t0), tenths(a1, t1), tenths(a2, t2),
                  (unsigned)e->worst, (unsigned)e->wx, (unsigned)e->wy, (unsigned)e->w_gpu, (unsigned)e->w_cpu);
         print(line);
+    }
+    // Where the differing pixels of the worst draw of each such shader are.
+    for (uint32_t i = 0; i < g_verify.keys; i++) {
+        struct verify_key* e = &g_verify.k[i];
+        if (!e->bad_draws) continue;
+        snprintf(line, sizeof(line),
+                 "shader %u/%u: %u px differ in a %ux%u target, within (%u,%u)-(%u,%u).  - darker  + brighter  . same\n",
+                 (unsigned)(e->key[0] & 0xFFFF), (unsigned)e->key[1], (unsigned)e->map_bad, (unsigned)e->map_w,
+                 (unsigned)e->map_h, (unsigned)e->bx0, (unsigned)e->by0, (unsigned)e->bx1, (unsigned)e->by1);
+        print(line);
+        for (uint32_t y = 0; y < MAP_H; y++) {
+            snprintf(line, sizeof(line), "  |%s|\n", e->map[y]);
+            print(line);
+        }
     }
 }
 

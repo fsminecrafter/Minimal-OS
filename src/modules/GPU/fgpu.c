@@ -661,6 +661,16 @@ static void* surface_cpu_view(fgpu_surface_t* s) {
     return s->shadow;
 }
 
+// Rows of `s` straight into `dst` (the copy engine to staging memory, then one CPU copy), without the
+// shadow copy surface_cpu_view() makes. False: not possible here, the caller copies from the view.
+static bool surface_read_into(fgpu_surface_t* s, uint32_t width, uint32_t height, void* dst, uint32_t dst_pitch) {
+    if (!s->in_vram || !g_hw || !g_hw->read || !s->adapter || (s->adapter->caps & GPU_CAP_VRAM_FAST_READ))
+        return false;
+    surface_sync(s, false);
+    fgpu_mem_t m = surface_mem(s);
+    return g_hw->read(&m, width * 4u, height, s->pitch * 4u, dst, dst_pitch);
+}
+
 static void release_flip_locked(void) {
     if (!g_flipped_owner) return;
     gpu_adapter_t* a = gpu_primary_adapter();
@@ -1235,6 +1245,9 @@ static uint64_t execute(exec_state_t* st, const uint32_t* cmd, uint32_t words) {
                         g_hw_pending = true;
                         break;
                     }
+                    // The CPU clears depth the card may hold newer: the card hands it over and reloads
+                    // it before it draws there again (a partial clear keeps the rest).
+                    if (g_hw->cpu_draw && t.depth && (arg[0] & FGPU_CLEAR_DEPTH)) g_hw->cpu_draw(&ht);
                 }
                 if (st->pipe.scissor) {
                     // CPU draws recorded earlier land first (fgpu_pass_clear_rect flushes them).
@@ -1545,11 +1558,13 @@ static uint64_t op_create_surface(syscall_gpu_request_t* r, uint64_t owner) {
         mip_count = fgpu_mip_layout(r->width, r->height, pitch, NULL, &total);
         bytes = total * 4;
     }
-    // Depth buffers are read for every pixel: keep them in system memory
-    // unless VRAM reads are cheap. Scanout surfaces must be in VRAM.
+    // Depth buffers are read for every pixel by the CPU backend: keep them in system memory unless VRAM
+    // reads are cheap, or the card draws (then the card's depth is copied in and out of the surface by
+    // the copy engine, VRAM to VRAM, instead of through staging memory and the CPU). Scanout surfaces
+    // must be in VRAM.
     bool cpu_reads = !scanout;
     bool allow_vram = !(r->flags & FGPU_SURFACE_SYSTEM_MEMORY) && !mips;
-    s->mem = place(bytes, cpu_reads, allow_vram || scanout, color, owner,
+    s->mem = place(bytes, cpu_reads, allow_vram || scanout, true, owner,
                    &s->in_vram, &s->vram_offset, &s->adapter);
     if (!s->mem) { free_mem(s); return SYS_ERR_NOMEM; }
     if (scanout && !s->in_vram) {
@@ -1672,6 +1687,9 @@ static uint64_t op_present_to(syscall_gpu_request_t* r, fgpu_surface_t* s, uint6
                 window_manager_present_done(r->window_id, owner, &target, 0, 0, 0, 0);
                 return SYS_ERR_INVAL;
             }
+            if (surface_read_into(s, target.width, target.height, target.pixels, target.pitch_px * 4u))
+                return window_manager_present_done(r->window_id, owner, &target,
+                                                   0, 0, target.width, target.height);
             const uint32_t* src_px = (const uint32_t*)surface_cpu_view(s);
             for (uint32_t row = 0; row < target.height; row++)
                 memcpy(target.pixels + (size_t)row * target.pitch_px,
@@ -1805,6 +1823,7 @@ static uint64_t run_commands(uint64_t owner, const uint32_t* cmd, uint32_t words
     if (!g_pass) g_pass = fgpu_pass_create();     // NULL: draws run immediately
     uint64_t result = execute(st, cmd, words);
     st->triangles += pass_flush();      // also when the buffer failed half way
+    if (g_hw && g_hw->kick && g_hw_pending) g_hw->kick();     // the card starts on it now
     *triangles = st->triangles;
     free_mem(st);
     return result;
@@ -2005,7 +2024,18 @@ static uint64_t fgpu_syscall_checked(syscall_gpu_request_t* r) {
         // Everything but SUBMIT has the CPU read or write GPU memory (or
         // free it). Nothing is pending between calls (SUBMIT flushes at its
         // end); this keeps that true if a later change defers work.
-        if (r->op != SYS_GPU_SUBMIT) { fgpu_flush_pending(); hw_idle(); }
+        // A backend that tracks its memory (mem_busy, cpu_access) waits only where needed: new objects
+        // need nothing, a buffer upload waits if the card may read that buffer, and surfaces are synced
+        // one by one where the CPU touches them (surface_sync).
+        if (r->op != SYS_GPU_SUBMIT) {
+            fgpu_flush_pending();
+            bool lazy = g_hw && g_hw->wait_idle && g_hw->cpu_access && g_hw->mem_busy;
+            bool skip = lazy && (r->op == SYS_GPU_CREATE_SURFACE || r->op == SYS_GPU_CREATE_BUFFER ||
+                                 r->op == SYS_GPU_CREATE_PROGRAM || r->op == SYS_GPU_UPLOAD_BUFFER ||
+                                 r->op == SYS_GPU_READBACK || r->op == SYS_GPU_PRESENT ||
+                                 r->op == SYS_GPU_WRITE_SURFACE);
+            if (!skip) hw_idle();
+        }
     }
     g_perf.drain_ns[perf_op] += clock_monotonic_ns() - perf_t0;
     if (r->op == SYS_GPU_UPLOAD_BUFFER) g_perf.upload_bytes += r->bytes;
@@ -2039,6 +2069,10 @@ static uint64_t fgpu_syscall_checked(syscall_gpu_request_t* r) {
             if (!b) { result = SYS_ERR_NOTFOUND; break; }
             if (!r->data || r->offset > b->size || r->bytes > b->size - r->offset ||
                 !syscall_user_range_ok(r->data, (size_t)r->bytes, false)) break;
+            if (g_hw && g_hw->mem_busy && g_hw_pending) {
+                fgpu_mem_t m = buffer_mem(b);
+                if (g_hw->mem_busy(&m)) hw_idle();      // queued draws read it: they finish first
+            }
             memcpy((uint8_t*)b->mem + r->offset, r->data, (size_t)r->bytes);
             result = SYS_SUCCESS;
             break;
@@ -2065,6 +2099,7 @@ static uint64_t fgpu_syscall_checked(syscall_gpu_request_t* r) {
             uint64_t row = (uint64_t)s->width * 4;
             if (!r->out || r->pitch < row ||
                 !syscall_user_range_ok(r->out, (size_t)r->pitch * (s->height - 1) + row, true)) break;
+            if (surface_read_into(s, s->width, s->height, r->out, r->pitch)) { result = SYS_SUCCESS; break; }
             const uint8_t* view = (const uint8_t*)surface_cpu_view(s);
             for (uint32_t y = 0; y < s->height; y++) {
                 memcpy((uint8_t*)r->out + (size_t)y * r->pitch,

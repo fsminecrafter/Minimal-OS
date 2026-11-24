@@ -621,12 +621,13 @@ static int vsnprintf_internal(char* buffer, size_t size, const char* fmt, va_lis
 
             bool longlong = false;
             bool zero_pad = false;
-            bool plus = false;
+            bool plus = false, left = false;
             int width = 0;
 
-            // Flags: '+' (sign on positive numbers), '-' (accepted; padding stays on the left), '0'.
+            // Flags: '+' (sign on positive numbers), '-' (left-justified strings), '0'.
             while (*fmt == '+' || *fmt == '-' || *fmt == '0' || *fmt == ' ') {
                 if (*fmt == '+') plus = true;
+                if (*fmt == '-') left = true;
                 if (*fmt == '0') zero_pad = true;
                 fmt++;
             }
@@ -646,7 +647,13 @@ static int vsnprintf_internal(char* buffer, size_t size, const char* fmt, va_lis
                 case 's': {
                     const char* s = va_arg(args, const char*);
                     if (!s) s = "(null)";
-                    pos = append_to_buffer(buffer, size, pos, s);
+                    if (left) {
+                        int n = (int)strlen(s);
+                        pos = append_to_buffer(buffer, size, pos, s);
+                        for (; n < width; n++) pos = append_char_to_buffer(buffer, size, pos, ' ');
+                    } else {
+                        pos = append_padded_to_buffer(buffer, size, pos, s, width, ' ');
+                    }
                     break;
                 }
 

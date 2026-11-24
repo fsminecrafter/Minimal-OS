@@ -52,6 +52,8 @@ typedef struct {
     fgpu_mem_t storage_buffers[FGPU_MAX_STORAGE_BUFFERS];
 } fgpu_hw_draw_t;
 
+struct fgpu_backend_perf;
+
 typedef struct {
     const char* name;           // reported as syscall_gpu_info_t.backend
     uint32_t caps;              // FGPU_CAP_* capabilities actually provided; set by init()
@@ -101,7 +103,22 @@ typedef struct {
     void (*h264_mismatch)(void);
     // Engine use since boot (Task Manager): nanoseconds busy and jobs, by SYS_GPU_ENGINE_*. NULL = unknown.
     void (*engine_stats)(uint64_t busy_ns[4], uint64_t jobs[4]);
+    // Optional. Totals since boot for 'gpu perf' (fgpu_backend_perf_t below).
+    void (*perf)(struct fgpu_backend_perf* out);
 } fgpu_backend_t;
+
+// 'gpu perf': what the hardware backend spent its time on (totals since boot).
+typedef struct fgpu_backend_perf {
+    uint64_t wait_ns, waits;        // the CPU waiting for 3D batches
+    uint64_t copy_ns;               // synchronous copy-engine copies (targets, depth)
+    uint64_t depth_cpu_ns;          // clearing the CPU's copy of depth buffers
+    uint64_t batches, draws, clears, barriers;
+    uint64_t resolves, uploads, depth_loads, depth_stores;
+    uint32_t refused[8];
+    const char* refused_names[8];
+    uint32_t compile_failures;
+    const char* last_failure;       // why the last shader stayed on the CPU, or NULL
+} fgpu_backend_perf_t;
 
 // NVIDIA Turing (fgpu_backend_nv.c). init() fails until GSP-RM and the
 // copy engine channel are up ('gpu nvidia boot'); it reports

@@ -202,8 +202,27 @@ static opnd_t source(enc_t* e, const fgpu_ir_inst_t* in, uint32_t k, bool plain)
     return o;
 }
 
+static bool is_imm(const enc_t* e, const fgpu_ir_inst_t* in, uint32_t k) {
+    return e->code[in->src[k].value].op == FGPU_IR_IMM;
+}
+
+// Source k for the B slot, which takes a 32-bit immediate: an immediate goes into the instruction
+// itself (modifiers folded in) instead of a MOV to a scratch register first.
+static opnd_t source_b(enc_t* e, const fgpu_ir_inst_t* in, uint32_t k) {
+    const fgpu_ir_src_t* s = &in->src[k];
+    const fgpu_ir_inst_t* def = &e->code[s->value];
+    if (def->op != FGPU_IR_IMM) return source(e, in, k, false);
+    uint32_t bits = f2u(def->imm);
+    if (s->mods & FGPU_IR_ABS) bits &= 0x7FFFFFFFu;
+    if (s->mods & FGPU_IR_NEG) bits ^= 0x80000000u;
+    return imm_opnd(bits);
+}
+
 static void binary(enc_t* e, const fgpu_ir_inst_t* in, uint32_t opcode) {
-    opnd_t a = source(e, in, 0, false), b = source(e, in, 1, false);
+    // All three ops are commutative: an immediate goes to the B slot.
+    uint32_t ka = 0, kb = 1;
+    if (is_imm(e, in, 0) && !is_imm(e, in, 1)) { ka = 1; kb = 0; }
+    opnd_t a = source(e, in, ka, false), b = source_b(e, in, kb);
     uint32_t w[4] = { 0 };
     if (opcode == OP_FMUL) {
         opnd_t z = reg_opnd(REG_ZERO);
@@ -253,6 +272,301 @@ static void sph_field(uint32_t* sph, uint32_t lo, uint32_t hi, uint32_t v) {
         if (v & 1u) sph_bit(sph, b);
 }
 
+/* ---------------------------------------------------------- scheduling */
+
+static void dep_read(nv_sass_deps_t* d, uint32_t reg) {
+    if (reg == REG_ZERO || d->nreads >= 6u) return;
+    for (uint32_t i = 0; i < d->nreads; i++) if (d->reads[i] == reg) return;
+    d->reads[d->nreads++] = (uint8_t)reg;
+}
+
+static void dep_write(nv_sass_deps_t* d, uint32_t reg) {
+    if (reg == REG_ZERO || d->nwrites >= 4u) return;
+    d->writes[d->nwrites++] = (uint8_t)reg;
+}
+
+void nv_sass_deps(const uint32_t w[4], bool fragment, nv_sass_deps_t* d) {
+    __builtin_memset(d, 0, sizeof(*d));
+    uint32_t full = nv_sass_field(w, 0, 12), op = nv_sass_field(w, 0, 9), form = nv_sass_field(w, 9, 12);
+    uint32_t dst = nv_sass_field(w, 16, 24);
+    if (nv_sass_field(w, 12, 15) != PRED_TRUE) d->reads_pred = true;
+    switch (full) {
+        case OP_EXIT:
+            d->kind = NV_SASS_CONTROL;
+            if (fragment) for (uint32_t r = 0; r < 4; r++) dep_read(d, r);     // the colour, read at exit
+            return;
+        case OP_KILL: d->kind = NV_SASS_CONTROL; return;
+        case OP_ALD: case OP_IPA:
+            d->kind = NV_SASS_VARIABLE;
+            dep_read(d, nv_sass_field(w, 24, 32));
+            dep_read(d, nv_sass_field(w, 32, 40));
+            dep_write(d, dst);
+            return;
+        case OP_AST:
+            d->kind = NV_SASS_VARIABLE;
+            dep_read(d, nv_sass_field(w, 24, 32));
+            dep_read(d, nv_sass_field(w, 32, 40));
+            dep_read(d, nv_sass_field(w, 64, 72));
+            return;
+        case OP_TEX: {
+            d->kind = NV_SASS_VARIABLE;
+            uint32_t c = nv_sass_field(w, 24, 32), d2 = nv_sass_field(w, 64, 72);
+            dep_read(d, c);
+            if (c != REG_ZERO) dep_read(d, c + 1u);
+            dep_read(d, nv_sass_field(w, 32, 40));
+            dep_write(d, dst);
+            if (dst != REG_ZERO) dep_write(d, dst + 1u);
+            dep_write(d, d2);
+            if (d2 != REG_ZERO) dep_write(d, d2 + 1u);
+            return;
+        }
+        case OP_LDC:
+            d->kind = NV_SASS_VARIABLE;
+            dep_read(d, nv_sass_field(w, 24, 32));
+            dep_write(d, dst);
+            return;
+        default: break;
+    }
+    // ALU forms: A at 24 (for the ops that have one), B at 32 when a register, C at 64.
+    bool has_a = op == OP_SEL || op == OP_FMNMX || op == OP_FSETP || op == OP_FMUL || op == OP_FADD || op == OP_FFMA;
+    if (has_a) dep_read(d, nv_sass_field(w, 24, 32));
+    if (form == FORM_REG) dep_read(d, nv_sass_field(w, 32, 40));
+    if (op == OP_FFMA || op == OP_FMUL) dep_read(d, nv_sass_field(w, 64, 72));
+    if (op == OP_SEL && nv_sass_field(w, 87, 90) != PRED_TRUE) d->reads_pred = true;
+    if (op == OP_FSETP) d->writes_pred = true;
+    else dep_write(d, dst);
+    d->kind = op == OP_MUFU ? NV_SASS_VARIABLE : (op == OP_F2I || op == OP_FRND) ? NV_SASS_BOTH : NV_SASS_FIXED;
+}
+
+// Reordering: a list scheduler over the finished, register-allocated code (one block: control flow is
+// flattened). The order of every register and predicate access is kept where it matters (read after
+// write, write after read, write after write); attribute stores and KILL stay in their order; EXIT stays
+// last. Among the instructions that are ready, the one on the longest path to the end goes first, so
+// texture lookups and interpolation start early and independent chains fill each other's stalls.
+// Registers are not changed, so the register count stays the same.
+#define REORDER_MAX 4096u
+#define REORDER_EDGES (16u * REORDER_MAX)
+static struct {
+    uint16_t npred[REORDER_MAX], first_succ[REORDER_MAX], nsucc[REORDER_MAX];
+    int32_t prio[REORDER_MAX], ready_at[REORDER_MAX];
+    uint16_t lat[REORDER_MAX];
+    uint16_t order[REORDER_MAX];
+    uint16_t edge_from[REORDER_EDGES], edge_to[REORDER_EDGES];
+    uint16_t succ[REORDER_EDGES];
+    uint32_t code[4u * REORDER_MAX];
+} g_ro;
+static volatile int g_ro_busy;
+bool nv_sass_reorder_enabled = true;
+
+// Estimated cycles until an instruction's result can be used (only steers the order).
+static uint16_t reorder_latency(const uint32_t* w, const nv_sass_deps_t* d) {
+    uint32_t full = nv_sass_field(w, 0, 12);
+    if (full == OP_TEX) return 120;
+    if (full == OP_LDC) return 30;
+    if (full == OP_IPA || full == OP_ALD) return 24;
+    if (d->kind == NV_SASS_VARIABLE) return 20;             // MUFU, AST
+    if (d->writes_pred) return NV_SASS_STALL_PRED;
+    return NV_SASS_STALL_ALU;
+}
+
+static void nv_sass_reorder(nv_sass_t* out, bool fragment) {
+    uint32_t n = out->count / 4u;
+    if (!nv_sass_reorder_enabled || n < 3u || n > REORDER_MAX) return;
+    if (__atomic_exchange_n(&g_ro_busy, 1, __ATOMIC_ACQUIRE)) return;     // another encode: keep the order
+    uint32_t m = n - 1u;                 // the EXIT stays last
+    uint32_t ne = 0;
+    bool overflow = false;
+    // Last writer and the readers since then, per register (256) and for P0 (index 256).
+    static int16_t last_w[257];
+    static uint16_t rdr_head[257];      // readers: a list through rdr_next, 0xFFFF = end
+    static uint16_t rdr_next[REORDER_EDGES], rdr_who[REORDER_EDGES];
+    uint32_t nr = 0;
+    for (uint32_t r = 0; r < 257; r++) { last_w[r] = -1; rdr_head[r] = 0xFFFF; }
+    int32_t last_side = -1;
+#define EDGE(a, b) do { if (ne < REORDER_EDGES) { g_ro.edge_from[ne] = (uint16_t)(a); g_ro.edge_to[ne] = (uint16_t)(b); ne++; } else overflow = true; } while (0)
+    for (uint32_t i = 0; i < m && !overflow; i++) {
+        const uint32_t* w = &out->code[4u * i];
+        nv_sass_deps_t d;
+        nv_sass_deps(w, fragment, &d);
+        g_ro.lat[i] = reorder_latency(w, &d);
+        uint16_t rs[8], ws[5];
+        uint32_t nrs = 0, nws = 0;
+        for (uint32_t k = 0; k < d.nreads; k++) rs[nrs++] = d.reads[k];
+        if (d.reads_pred) rs[nrs++] = 256;
+        for (uint32_t k = 0; k < d.nwrites; k++) ws[nws++] = d.writes[k];
+        if (d.writes_pred) ws[nws++] = 256;
+        for (uint32_t k = 0; k < nrs; k++) if (last_w[rs[k]] >= 0) EDGE(last_w[rs[k]], i);      // read after write
+        for (uint32_t k = 0; k < nws; k++) {
+            uint32_t r = ws[k];
+            if (last_w[r] >= 0) EDGE(last_w[r], i);                                            // write after write
+            for (uint16_t q = rdr_head[r]; q != 0xFFFF; q = rdr_next[q])
+                if (rdr_who[q] != i) EDGE(rdr_who[q], i);                                      // write after read
+        }
+        // Stores and KILL keep their order.
+        uint32_t full = nv_sass_field(w, 0, 12);
+        if (full == OP_AST || full == OP_KILL) {
+            if (last_side >= 0) EDGE(last_side, i);
+            last_side = (int32_t)i;
+        }
+        for (uint32_t k = 0; k < nws; k++) { last_w[ws[k]] = (int16_t)i; rdr_head[ws[k]] = 0xFFFF; }
+        for (uint32_t k = 0; k < nrs; k++) {
+            bool rewritten = false;
+            for (uint32_t j = 0; j < nws; j++) if (ws[j] == rs[k]) rewritten = true;
+            if (rewritten) continue;
+            if (nr >= REORDER_EDGES) { overflow = true; break; }
+            rdr_who[nr] = (uint16_t)i;
+            rdr_next[nr] = rdr_head[rs[k]];
+            rdr_head[rs[k]] = (uint16_t)nr++;
+        }
+    }
+#undef EDGE
+    if (overflow) { __atomic_store_n(&g_ro_busy, 0, __ATOMIC_RELEASE); return; }
+    // Successor lists (counting sort by source).
+    for (uint32_t i = 0; i < m; i++) { g_ro.npred[i] = 0; g_ro.nsucc[i] = 0; }
+    for (uint32_t e = 0; e < ne; e++) { g_ro.nsucc[g_ro.edge_from[e]]++; g_ro.npred[g_ro.edge_to[e]]++; }
+    uint32_t pos = 0;
+    for (uint32_t i = 0; i < m; i++) { g_ro.first_succ[i] = (uint16_t)pos; pos += g_ro.nsucc[i]; g_ro.nsucc[i] = 0; }
+    for (uint32_t e = 0; e < ne; e++) {
+        uint32_t f = g_ro.edge_from[e];
+        g_ro.succ[g_ro.first_succ[f] + g_ro.nsucc[f]++] = g_ro.edge_to[e];
+    }
+    // Priority: the longest latency path from the instruction to the end (edges only go forward).
+    for (uint32_t i = m; i-- > 0;) {
+        int32_t best = 0;
+        for (uint32_t k = 0; k < g_ro.nsucc[i]; k++) {
+            int32_t p = g_ro.prio[g_ro.succ[g_ro.first_succ[i] + k]];
+            if (p > best) best = p;
+        }
+        g_ro.prio[i] = best + g_ro.lat[i];
+        g_ro.ready_at[i] = 0;
+    }
+    // List scheduling on an estimated clock.
+    int32_t clock = 0;
+    for (uint32_t done = 0; done < m; done++) {
+        int pick = -1;
+        for (uint32_t i = 0; i < m; i++) {
+            if (g_ro.npred[i]) continue;          // scheduled ones get npred 0xFFFF below
+            if (pick < 0) { pick = (int)i; continue; }
+            bool ri = g_ro.ready_at[i] <= clock, rp = g_ro.ready_at[pick] <= clock;
+            if (ri != rp ? ri : ri ? g_ro.prio[i] > g_ro.prio[pick] : g_ro.ready_at[i] < g_ro.ready_at[pick])
+                pick = (int)i;
+        }
+        if (pick < 0) { __atomic_store_n(&g_ro_busy, 0, __ATOMIC_RELEASE); return; }    // cannot happen
+        uint32_t p = (uint32_t)pick;
+        if (g_ro.ready_at[p] > clock) clock = g_ro.ready_at[p];
+        g_ro.order[done] = (uint16_t)p;
+        g_ro.npred[p] = 0xFFFF;
+        for (uint32_t k = 0; k < g_ro.nsucc[p]; k++) {
+            uint32_t s2 = g_ro.succ[g_ro.first_succ[p] + k];
+            g_ro.npred[s2]--;
+            int32_t at = clock + g_ro.lat[p];
+            if (at > g_ro.ready_at[s2]) g_ro.ready_at[s2] = at;
+        }
+        clock++;
+    }
+    for (uint32_t i = 0; i < m; i++)
+        for (uint32_t k = 0; k < 4; k++) g_ro.code[4u * i + k] = out->code[4u * g_ro.order[i] + k];
+    for (uint32_t i = 0; i < 4u * m; i++) out->code[i] = g_ro.code[i];
+    __atomic_store_n(&g_ro_busy, 0, __ATOMIC_RELEASE);
+}
+
+// Sets the stall, barrier and wait bits of every instruction (program order is kept).
+//   reg_ready  cycle a fixed-latency result can be read
+//   reg_bar    barrier of the variable-latency write still outstanding (-1 none)
+//   reg_rbars  barriers of variable-latency reads of the register still outstanding (it must not be
+//              overwritten before they read it)
+static void nv_sass_schedule(nv_sass_t* out, bool fragment) {
+    uint32_t n = out->count / 4u;
+    if (!n) return;
+    int32_t reg_ready[256];
+    int8_t reg_bar[256];
+    uint8_t reg_rbars[256];
+    for (uint32_t r = 0; r < 256; r++) { reg_ready[r] = 0; reg_bar[r] = -1; reg_rbars[r] = 0; }
+    int32_t pred_ready = 0;
+    bool bar_busy[6] = { false };
+    int32_t bar_set[6] = { 0 };
+    uint32_t bar_next = 0;
+    int32_t t = 0;              // issue cycle of the current instruction
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t* w = &out->code[4u * i];
+        nv_sass_deps_t d;
+        nv_sass_deps(w, fragment, &d);
+        // Barriers to wait for: writes of what it reads or overwrites, reads of what it overwrites.
+        uint32_t wait = 0;
+        for (uint32_t k = 0; k < d.nreads; k++) if (reg_bar[d.reads[k]] >= 0) wait |= 1u << reg_bar[d.reads[k]];
+        for (uint32_t k = 0; k < d.nwrites; k++) {
+            if (reg_bar[d.writes[k]] >= 0) wait |= 1u << reg_bar[d.writes[k]];
+            wait |= reg_rbars[d.writes[k]];
+        }
+        if (d.kind == NV_SASS_CONTROL && nv_sass_field(w, 0, 12) == OP_EXIT)
+            for (uint32_t b = 0; b < 6; b++) if (bar_busy[b]) wait |= 1u << b;
+        // Barriers it sets (variable latency): one for its result, one for its operands.
+        int wbar = -1, rbar = -1;
+        bool variable = d.kind == NV_SASS_VARIABLE || d.kind == NV_SASS_BOTH;
+        for (int want = 0; variable && want < 2; want++) {
+            if (want == 0 && !d.nwrites) continue;
+            if (want == 1 && !d.nreads) continue;
+            int b = -1;
+            for (uint32_t k = 0; k < 6 && b < 0; k++) {
+                uint32_t c = (bar_next + k) % 6u;
+                if (!bar_busy[c] && !(wait & (1u << c)) && (int)c != wbar) b = (int)c;
+            }
+            if (b < 0) {        // all in use: wait for the oldest one first and take it
+                int32_t oldest = 0x7FFFFFFF;
+                for (uint32_t c = 0; c < 6; c++)
+                    if ((int)c != wbar && bar_set[c] < oldest) { oldest = bar_set[c]; b = (int)c; }
+                wait |= 1u << b;
+            }
+            bar_next = ((uint32_t)b + 1u) % 6u;
+            if (want == 0) wbar = b; else rbar = b;
+        }
+        // Waiting frees those barriers and everything they covered.
+        int32_t earliest = 0;
+        for (uint32_t b = 0; b < 6; b++) {
+            if (!(wait & (1u << b))) continue;
+            if (bar_set[b] + (int32_t)NV_SASS_BARRIER_DELAY > earliest) earliest = bar_set[b] + (int32_t)NV_SASS_BARRIER_DELAY;
+            bar_busy[b] = false;
+            for (uint32_t r = 0; r < 256; r++) {
+                if (reg_bar[r] == (int8_t)b) reg_bar[r] = -1;
+                reg_rbars[r] &= (uint8_t)~(1u << b);
+            }
+        }
+        // Fixed-latency inputs.
+        for (uint32_t k = 0; k < d.nreads; k++) if (reg_ready[d.reads[k]] > earliest) earliest = reg_ready[d.reads[k]];
+        if (d.reads_pred && pred_ready > earliest) earliest = pred_ready;
+        // A variable-latency write must not land before an older fixed-latency write of the same register.
+        if (variable) for (uint32_t k = 0; k < d.nwrites; k++) if (reg_ready[d.writes[k]] > earliest) earliest = reg_ready[d.writes[k]];
+        if (i) {
+            int32_t stall = earliest - t;
+            uint32_t* pw = &out->code[4u * (i - 1u)];
+            uint32_t prev_min = nv_sass_field(pw, 105, 109);      // set below when it was scheduled
+            if (stall < (int32_t)prev_min) stall = (int32_t)prev_min;
+            if (stall > 15) stall = 15;
+            set(pw, 105, 109, (uint32_t)stall);
+            t += stall;
+        }
+        set(w, 109, 110, 0);
+        set(w, 110, 113, wbar >= 0 ? (uint32_t)wbar : 7u);
+        set(w, 113, 116, rbar >= 0 ? (uint32_t)rbar : 7u);
+        set(w, 116, 122, wait);
+        set(w, 122, 126, 0);
+        // What it leaves behind.
+        for (uint32_t k = 0; k < d.nwrites; k++) {
+            uint32_t r = d.writes[k];
+            if (d.kind == NV_SASS_FIXED) reg_ready[r] = t + (int32_t)NV_SASS_STALL_ALU;
+            else if (d.kind == NV_SASS_BOTH) { reg_ready[r] = t + (int32_t)NV_SASS_STALL_ALU; reg_bar[r] = (int8_t)wbar; }
+            else { reg_ready[r] = t; reg_bar[r] = (int8_t)wbar; }
+        }
+        if (d.writes_pred) pred_ready = t + (int32_t)NV_SASS_STALL_PRED;
+        if (rbar >= 0) for (uint32_t k = 0; k < d.nreads; k++) reg_rbars[d.reads[k]] |= (uint8_t)(1u << rbar);
+        if (wbar >= 0) { bar_busy[wbar] = true; bar_set[wbar] = t; }
+        if (rbar >= 0) { bar_busy[rbar] = true; bar_set[rbar] = t; }
+        // The minimum stall after it (the next instruction raises it as needed): one cycle, two after an
+        // instruction that sets a barrier.
+        set(w, 105, 109, (wbar >= 0 || rbar >= 0) ? NV_SASS_BARRIER_DELAY : 1u);
+    }
+}
+
 /* -------------------------------------------------------------- stages */
 
 bool nv_sass_encode(const fgpu_ir_inst_t* code, uint32_t count, uint32_t ir_regs, bool fragment,
@@ -266,9 +580,31 @@ bool nv_sass_encode(const fgpu_ir_inst_t* code, uint32_t count, uint32_t ir_regs
     out->capacity = capacity;
     if (varyings > FGPU_SHADER_MAX_VARYINGS) { *why = "too many varyings"; return false; }
 
+    // Texture results: four registers per TEX, but only from the TEX to its last TEXC; blocks are reused
+    // after that (interval colouring in program order). Before, every TEX kept its own block for the whole
+    // shader: 4 registers per lookup, fewer warps on the SM. tex_block[] maps the n-th TEX to its block.
+    uint8_t tex_block[256];
     uint32_t tex_count = 0;
+    {
+        uint32_t block_free_after[64];  // per block: the instruction after which it is free again
+        uint32_t n = 0;
+        for (uint32_t i = 0; i < count; i++) {
+            if (code[i].op != FGPU_IR_TEX) continue;
+            if (n >= 256u) { *why = "too many texture lookups"; return false; }
+            uint32_t last = i;
+            for (uint32_t j = i + 1; j < count; j++)
+                if (code[j].op == FGPU_IR_TEXC && code[j].src[0].value == i) last = j;
+            uint32_t b = 0;
+            while (b < tex_count && block_free_after[b] >= i) b++;
+            if (b == tex_count) {
+                if (tex_count >= 64u) { *why = "too many texture lookups"; return false; }
+                tex_count++;
+            }
+            block_free_after[b] = last;
+            tex_block[n++] = (uint8_t)b;
+        }
+    }
     for (uint32_t i = 0; i < count; i++) {
-        if (code[i].op == FGPU_IR_TEX) tex_count++;
         if (code[i].op == FGPU_IR_SPECIAL && code[i].aux >= 4u) {
             *why = "front-facing is not encoded yet";
             return false;
@@ -385,7 +721,9 @@ bool nv_sass_encode(const fgpu_ir_inst_t* code, uint32_t count, uint32_t ir_regs
             case FGPU_IR_MIN:
             case FGPU_IR_MAX: binary(&e, in, OP_FMNMX); break;
             case FGPU_IR_FMA: {
-                opnd_t a = source(&e, in, 0, false), b = source(&e, in, 1, false);
+                uint32_t ka = 0, kb = 1;            // a * b is commutative: an immediate goes to B
+                if (is_imm(&e, in, 0) && !is_imm(&e, in, 1)) { ka = 1; kb = 0; }
+                opnd_t a = source(&e, in, ka, false), b = source_b(&e, in, kb);
                 opnd_t c = source(&e, in, 2, false);
                 uint32_t w[4] = { 0 };
                 alu(w, OP_FFMA, in->reg, &a, &b, &c);
@@ -393,7 +731,7 @@ bool nv_sass_encode(const fgpu_ir_inst_t* code, uint32_t count, uint32_t ir_regs
                 break;
             }
             case FGPU_IR_FLOOR: {
-                opnd_t a = source(&e, in, 0, false);
+                opnd_t a = source_b(&e, in, 0);
                 uint32_t w[4] = { 0 };
                 alu(w, OP_FRND, in->reg, NULL, &a, NULL);
                 set(w, 75, 77, 2);                      // 32-bit result
@@ -411,7 +749,7 @@ bool nv_sass_encode(const fgpu_ir_inst_t* code, uint32_t count, uint32_t ir_regs
                     [FGPU_IR_RCP] = MUFU_RCP, [FGPU_IR_RSQ] = MUFU_RSQ, [FGPU_IR_SQRT] = MUFU_SQRT,
                     [FGPU_IR_EX2] = MUFU_EX2, [FGPU_IR_LG2] = MUFU_LG2,
                 };
-                opnd_t a = source(&e, in, 0, false);
+                opnd_t a = source_b(&e, in, 0);
                 mufu(&e, in->reg, &a, fn[in->op]);
                 break;
             }
@@ -433,7 +771,7 @@ bool nv_sass_encode(const fgpu_ir_inst_t* code, uint32_t count, uint32_t ir_regs
             case FGPU_IR_SLE:
             case FGPU_IR_SEQ:
             case FGPU_IR_SNE: {
-                opnd_t a = source(&e, in, 0, false), b = source(&e, in, 1, false);
+                opnd_t a = source(&e, in, 0, false), b = source_b(&e, in, 1);
                 fsetp(&e, &a, &b, in->op == FGPU_IR_SLT ? CMP_LT : in->op == FGPU_IR_SLE ? CMP_LE :
                                   in->op == FGPU_IR_SEQ ? CMP_EQ : CMP_NEU);
                 bool_from_p0(&e, in->reg);
@@ -455,10 +793,10 @@ bool nv_sass_encode(const fgpu_ir_inst_t* code, uint32_t count, uint32_t ir_regs
                 if (in->aux >= FGPU_MAX_TEXTURE_UNITS) { *why = "texture unit out of range"; return false; }
                 // The coordinates go in two registers in a row.
                 for (uint32_t k = 0; k < 2; k++) {
-                    opnd_t s = source(&e, in, k, true);
+                    opnd_t s = is_imm(&e, in, k) ? source_b(&e, in, k) : source(&e, in, k, true);
                     mov(&e, e.coord + k, &s, PRED_TRUE);
                 }
-                uint32_t result = e.tex_base + 4u * tex_index++;
+                uint32_t result = e.tex_base + 4u * tex_block[tex_index++];
                 uint32_t w[4] = { 0 };
                 set(w, 0, 12, OP_TEX);
                 set(w, 16, 24, result);
@@ -490,7 +828,7 @@ bool nv_sass_encode(const fgpu_ir_inst_t* code, uint32_t count, uint32_t ir_regs
                     *why = "bad texture component";
                     return false;
                 }
-                opnd_t r = reg_opnd(e.tex_base + 4u * n + in->aux);
+                opnd_t r = reg_opnd(e.tex_base + 4u * tex_block[n] + in->aux);
                 mov(&e, in->reg, &r, PRED_TRUE);
                 break;
             }
@@ -559,8 +897,8 @@ bool nv_sass_encode(const fgpu_ir_inst_t* code, uint32_t count, uint32_t ir_regs
                 break;
             }
             case FGPU_IR_OUTPUT: {
-                opnd_t v = source(&e, in, 0, true);
                 uint32_t reg = in->aux / 4u, comp = in->aux % 4u;
+                opnd_t v = fragment && is_imm(&e, in, 0) ? source_b(&e, in, 0) : source(&e, in, 0, true);
                 if (fragment) {
                     if (reg != 0) { *why = "fragment output out of range"; return false; }
                     mov(&e, e.out_base + comp, &v, PRED_TRUE);
@@ -613,6 +951,8 @@ bool nv_sass_encode(const fgpu_ir_inst_t* code, uint32_t count, uint32_t ir_regs
         emit(&e, w, PRED_TRUE, false, false);
     }
     if (e.overflow) { *why = "the machine code does not fit"; return false; }
+    nv_sass_reorder(out, fragment);
+    nv_sass_schedule(out, fragment);
 
     // The header.
     sph_field(sph, 0, 5, fragment ? 2u : 1u);       // header type: pixel, or vertex/tess/geometry

@@ -971,6 +971,26 @@ static void nv_finish(void) {
     }
 }
 
+static void nv_wait_idle(void) { flush_wait(); }
+
+// One surface for the CPU: the frame it presents or reads back, pixels it writes. The other block-linear
+// copies stay valid: before, every present and buffer upload resolved all of them (the shadow map, the
+// HDR and post targets...) and the next frame's first draw into each loaded it again.
+static void nv_cpu_access(const fgpu_mem_t* mem, bool write) {
+    if (!g.a || !mem->cpu) return;
+    flush_wait();
+    int i = tiled_find(mem->cpu);
+    if (i >= 0) {
+        if (!tiled_resolve(i)) tiled_drop(i);
+        else if (write) g.tiled[i].valid = false;
+    }
+    for (uint32_t z = 0; z < MAX_ZETA; z++) {
+        if (g.zeta[z].cpu != mem->cpu) continue;
+        zeta_store(z);
+        if (write) g.zeta[z].stale = true;
+    }
+}
+
 /* ---------------------------------------------------------------- video */
 
 /* The motion codec's colour conversion as a draw: the three planes become
@@ -1667,6 +1687,8 @@ fgpu_backend_t fgpu_backend_nvidia = {
     .draw = nv_draw,
     .cpu_draw = nv_cpu_draw,
     .finish = nv_finish,
+    .wait_idle = nv_wait_idle,
+    .cpu_access = nv_cpu_access,
     .read = nv_read,
     .surface_destroy = nv_surface_destroy,
     .video_convert = nv_video_convert,

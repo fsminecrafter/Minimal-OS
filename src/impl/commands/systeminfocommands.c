@@ -446,6 +446,17 @@ void cmd_gpu(int argc, const char** argv) {
         }
         return;
     }
+    if (argc >= 2 && strcmp(argv[1], "verify") == 0) {
+        // 'gpu verify [frames]' arms the comparison; 'gpu verify report' shows what it found.
+        if (argc >= 3 && strcmp(argv[2], "report") == 0) { fgpu_verify_report(info_text); return; }
+        uint32_t frames = 0;
+        for (const char* c = argc >= 3 ? argv[2] : ""; *c >= '0' && *c <= '9' && frames < 1000; c++)
+            frames = frames * 10u + (uint32_t)(*c - '0');
+        fgpu_verify_start(frames);
+        info_text("gpu verify: the card's draws of the next frame(s) are drawn by the CPU too and compared.\n"
+                  "Open the app (it runs slowly meanwhile), then run 'gpu verify report'.\n");
+        return;
+    }
     if (argc >= 2 && strcmp(argv[1], "jit") == 0) {
         // OS-4: shader JIT self-check (interpreter against JIT, also on the other cores).
         fgpu_jit_selfcheck(jit_say);
@@ -464,7 +475,7 @@ void cmd_gpu(int argc, const char** argv) {
         return;
     }
     if (argc >= 2) {
-        info_text("Usage: gpu [nvidia [boot] | jit]\n");
+        info_text("Usage: gpu [nvidia [boot] | jit | verify [frames|report]]\n");
         return;
     }
     if (count == 0) info_text("No GPU adapter found.\n");

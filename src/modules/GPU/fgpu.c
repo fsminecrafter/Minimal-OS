@@ -173,6 +173,13 @@ static void hw_sync(void) {
 
 static void hw_sync_for_cpu(void) { hw_sync(); }
 
+// Queued GPU work finished: enough before the CPU touches a buffer, or a surface it then hands to
+// surface_sync(). Surfaces stay in the backend's copies (finish() would bring them all back).
+static void hw_idle(void) {
+    if (g_hw && g_hw_pending && g_hw->wait_idle && g_hw->cpu_access) g_hw->wait_idle();
+    else hw_sync();
+}
+
 static fgpu_mem_t surface_mem(const fgpu_surface_t* s) {
     fgpu_mem_t m = { 0 };
     if (!s) return m;
@@ -181,6 +188,16 @@ static fgpu_mem_t surface_mem(const fgpu_surface_t* s) {
     m.vram_offset = s->vram_offset;
     m.bytes = (uint64_t)s->pitch * s->height * 4;
     return m;
+}
+
+// The CPU reads (or writes) `s` next: its pixels up to date in its memory.
+static void surface_sync(const fgpu_surface_t* s, bool write) {
+    if (g_hw && g_hw_pending && g_hw->wait_idle && g_hw->cpu_access) {
+        fgpu_mem_t m = surface_mem(s);
+        g_hw->cpu_access(&m, write);
+    } else {
+        hw_sync();
+    }
 }
 
 static fgpu_mem_t buffer_mem(const fgpu_buffer_t* b) {
@@ -612,6 +629,7 @@ static void surface_gone(fgpu_surface_t* s) {
 // The surface's pixels where the CPU can read them quickly: the surface
 // itself, or (VRAM behind a slow window) a copy the backend just made.
 static void* surface_cpu_view(fgpu_surface_t* s) {
+    surface_sync(s, false);
     if (!s->in_vram || !g_hw || !g_hw->read || !s->adapter ||
         (s->adapter->caps & GPU_CAP_VRAM_FAST_READ))
         return s->mem;
@@ -819,6 +837,167 @@ static bool make_target(exec_state_t* st, fgpu_target_t* t) {
     if (st->color) { t->color = (uint32_t*)st->color->mem; t->color_pitch = st->color->pitch; }
     if (st->depth) { t->depth = (float*)st->depth->mem; t->depth_pitch = st->depth->pitch; }
     return true;
+}
+
+/* ------------------------------------------------------------ gpu verify
+ *
+ * 'gpu verify': the card's draws of the next frames are drawn by the CPU
+ * too, from the same starting pixels and depth, and the two results are
+ * compared. The report groups them by shader (its sizes and texture units)
+ * and says how far the card is off and in which direction (a darker card
+ * shows as negative r g b). Slow: each draw waits for the card and copies
+ * the target three times.
+ */
+
+#define VERIFY_KEYS 24u
+static struct {
+    uint32_t frames_left;       // presents to go; 0 = off
+    uint32_t draws, bad_draws, skipped;
+    bool frame_had_draw;
+    struct verify_key {
+        uint32_t key[6];        // vs, fs, uniforms, textures, buffers, state
+        uint32_t draws, bad_draws;
+        uint64_t pixels, bad_pixels;
+        int64_t sum[3];         // card - CPU over the differing pixels, r g b
+        uint32_t worst;         // largest channel difference
+        uint32_t wx, wy, w_gpu, w_cpu;
+    } k[VERIFY_KEYS];
+    uint32_t keys;
+} g_verify;
+
+void fgpu_verify_start(uint32_t frames) {
+    memset(&g_verify, 0, sizeof(g_verify));
+    g_verify.frames_left = frames ? frames : 1;
+}
+
+// A present ends a frame.
+static void verify_frame_end(void) {
+    if (g_verify.frames_left && g_verify.frame_had_draw) {
+        g_verify.frames_left--;
+        g_verify.frame_had_draw = false;
+    }
+}
+
+// The surface's current pixels (after hw_sync) into dst, `row` bytes a row.
+static void verify_copy(fgpu_surface_t* s, uint32_t w, uint32_t h, void* dst) {
+    uint32_t row = w * 4u;
+    if (s->in_vram && g_hw && g_hw->read) {
+        fgpu_mem_t m = surface_mem(s);
+        if (g_hw->read(&m, row, h, s->pitch * 4u, dst, row)) return;
+    }
+    for (uint32_t y = 0; y < h; y++)
+        memcpy((uint8_t*)dst + (size_t)y * row, (const uint8_t*)s->mem + (size_t)y * s->pitch * 4u, row);
+}
+
+static void verify_compare(const exec_state_t* st, const uint32_t* gpu, const uint32_t* cpu, uint32_t w, uint32_t h) {
+    const fgpu_pipeline_t* p = &st->pipe;
+    uint32_t key[6] = { 0, 0, 0, 0, 0, p->state };
+    if (p->shader) {
+        key[0] = p->shader->h.vs_count; key[1] = p->shader->h.fs_count;
+        key[2] = p->shader->h.uniform_count; key[3] = p->shader->h.texture_mask;
+        key[4] = p->shader->h.storage_buffer_mask;
+    } else {
+        key[0] = 0xFFFF0000u | p->program;
+    }
+    uint32_t ki = 0;
+    while (ki < g_verify.keys && memcmp(g_verify.k[ki].key, key, sizeof(key))) ki++;
+    if (ki == g_verify.keys) {
+        if (ki == VERIFY_KEYS) ki = VERIFY_KEYS - 1;       // full: the rest count with the last
+        else { g_verify.keys++; memset(&g_verify.k[ki], 0, sizeof(g_verify.k[ki])); memcpy(g_verify.k[ki].key, key, sizeof(key)); }
+    }
+    struct verify_key* e = &g_verify.k[ki];
+    uint64_t bad = 0;
+    for (uint32_t y = 0; y < h; y++) {
+        for (uint32_t x = 0; x < w; x++) {
+            uint32_t a = gpu[(size_t)y * w + x], b = cpu[(size_t)y * w + x];
+            if (a == b) continue;
+            int d[3], worst = 0;
+            for (int c = 0; c < 3; c++) {
+                d[c] = (int)((a >> (16 - 8 * c)) & 0xFF) - (int)((b >> (16 - 8 * c)) & 0xFF);
+                int m = d[c] < 0 ? -d[c] : d[c];
+                if (m > worst) worst = m;
+            }
+            if (worst <= 6) continue;           // rounding and filtering differences
+            bad++;
+            for (int c = 0; c < 3; c++) e->sum[c] += d[c];
+            if ((uint32_t)worst > e->worst) {
+                e->worst = (uint32_t)worst;
+                e->wx = x; e->wy = y; e->w_gpu = a & 0xFFFFFFu; e->w_cpu = b & 0xFFFFFFu;
+            }
+        }
+    }
+    e->draws++;
+    e->pixels += (uint64_t)w * h;
+    e->bad_pixels += bad;
+    g_verify.draws++;
+    if (bad * 1000u > (uint64_t)w * h) {        // more than 0.1% of the target
+        e->bad_draws++;
+        g_verify.bad_draws++;
+    }
+}
+
+// The draw on the card, then on the CPU from the same start, compared. False = the card did not take it
+// (nothing was compared; the caller draws it on the CPU as usual).
+static bool verify_draw(exec_state_t* st, fgpu_target_t* t, fgpu_hw_target_t* ht, fgpu_hw_draw_t* hd,
+                        const fgpu_layout_t* layout, const float* verts, uint32_t avail, const uint32_t* idx,
+                        uint32_t count, uint32_t* drawn) {
+    if (!st->color) return g_hw->draw(hd, drawn);
+    uint32_t w = t->width, h = t->height;
+    size_t px = (size_t)w * h;
+    uint32_t* start = (uint32_t*)alloc_unzeroed(px * 4u);
+    uint32_t* card = (uint32_t*)alloc_unzeroed(px * 4u);
+    float* depth = t->depth ? (float*)alloc_unzeroed(px * 4u) : NULL;
+    if (!start || !card || (t->depth && !depth)) {
+        if (start) free_mem(start);
+        if (card) free_mem(card);
+        if (depth) free_mem(depth);
+        g_verify.skipped++;
+        return g_hw->draw(hd, drawn);
+    }
+    // The depth the card holds back into the surface, everything finished, then the starting point.
+    if (t->depth && g_hw->cpu_draw) g_hw->cpu_draw(ht);
+    hw_sync();
+    verify_copy(st->color, w, h, start);
+    if (depth) verify_copy(st->depth, w, h, depth);
+    bool ok = g_hw->draw(hd, drawn);
+    if (ok) {
+        g_hw_pending = true;
+        hw_sync();
+        verify_copy(st->color, w, h, card);
+        fgpu_target_t vt = { start, w, depth, w, w, h };
+        fgpu_raster_draw_layout(&vt, &st->pipe, layout, verts, avail, idx, count);
+        verify_compare(st, card, start, w, h);
+        g_verify.frame_had_draw = true;
+    }
+    free_mem(start);
+    free_mem(card);
+    if (depth) free_mem(depth);
+    return ok;
+}
+
+void fgpu_verify_report(void (*print)(const char* text)) {
+    char line[200];
+    if (!g_verify.draws && !g_verify.frames_left) {
+        print("gpu verify: nothing compared yet. Run 'gpu verify', then draw a frame on the card (open the app).\n");
+        return;
+    }
+    snprintf(line, sizeof(line), "gpu verify: %u card draws compared with the CPU, %u differ%s (skipped %u)\n",
+             (unsigned)g_verify.draws, (unsigned)g_verify.bad_draws,
+             g_verify.frames_left ? ", still running" : "", (unsigned)g_verify.skipped);
+    print(line);
+    print("  shader (vs fs unif tex buf state)  draws differ  bad px   card-CPU r g b   worst at (x,y) card/CPU\n");
+    for (uint32_t i = 0; i < g_verify.keys; i++) {
+        struct verify_key* e = &g_verify.k[i];
+        uint64_t bp = e->bad_pixels ? e->bad_pixels : 1;
+        uint32_t permille = e->pixels ? (uint32_t)(e->bad_pixels * 1000u / e->pixels) : 0;
+        snprintf(line, sizeof(line), "  %3u %4u %2u %x %x %04x  %5u %5u  %3u.%u%%  %+4d %+4d %+4d  %u (%u,%u) %06x/%06x\n",
+                 (unsigned)(e->key[0] & 0xFFFF), (unsigned)e->key[1], (unsigned)e->key[2], (unsigned)e->key[3],
+                 (unsigned)e->key[4], (unsigned)(e->key[5] & 0xFFFF), (unsigned)e->draws, (unsigned)e->bad_draws,
+                 permille / 10u, permille % 10u,
+                 (int)(e->sum[0] / (int64_t)bp), (int)(e->sum[1] / (int64_t)bp), (int)(e->sum[2] / (int64_t)bp),
+                 (unsigned)e->worst, (unsigned)e->wx, (unsigned)e->wy, (unsigned)e->w_gpu, (unsigned)e->w_cpu);
+        print(line);
+    }
 }
 
 static uint64_t execute(exec_state_t* st, const uint32_t* cmd, uint32_t words) {
@@ -1056,7 +1235,14 @@ static uint64_t execute(exec_state_t* st, const uint32_t* cmd, uint32_t words) {
                         hd.storage_buffers[u] = buffer_mem(buffer);
                     }
                     uint32_t drawn = 0;
-                    if (g_hw->draw(&hd, &drawn)) {
+                    bool on_card;
+                    if (g_verify.frames_left) {
+                        const uint32_t* vidx = ib ? (const uint32_t*)ib->mem + d.first_index : NULL;
+                        on_card = verify_draw(st, &t, &ht, &hd, layout, verts, avail, vidx, hd.count, &drawn);
+                    } else {
+                        on_card = g_hw->draw(&hd, &drawn);
+                    }
+                    if (on_card) {
                         g_hw_pending = true;
                         st->triangles += drawn;
                         break;
@@ -1252,6 +1438,7 @@ static uint64_t op_set_pace(fgpu_ctx_t* c, syscall_gpu_request_t* r) {
 // and the screen are checked against. `stamp`: the time a paced present
 // was let through (pace_wait, already done by the caller).
 static uint64_t op_present(syscall_gpu_request_t* r, uint64_t group, uint64_t owner, uint64_t stamp) {
+    verify_frame_end();
     fgpu_surface_t* s = find_surface(r->handle, group);
     if (!s || s->format != FGPU_FORMAT_XRGB8888) return SYS_ERR_NOTFOUND;
     // Before ABI 3 only FLIP existed and other bits were ignored.
@@ -1298,7 +1485,6 @@ static uint64_t op_present_to(syscall_gpu_request_t* r, fgpu_surface_t* s, uint6
                 window_manager_present_done(r->window_id, owner, &target, 0, 0, 0, 0);
                 return SYS_ERR_INVAL;
             }
-            hw_sync();
             const uint32_t* src_px = (const uint32_t*)surface_cpu_view(s);
             for (uint32_t row = 0; row < target.height; row++)
                 memcpy(target.pixels + (size_t)row * target.pitch_px,
@@ -1312,7 +1498,6 @@ static uint64_t op_present_to(syscall_gpu_request_t* r, fgpu_surface_t* s, uint6
         w.version = SYS_WINDOW_ABI_VERSION;
         w.op = SYS_WINDOW_PRESENT;
         w.id = r->window_id;
-        hw_sync();
         w.pixels = (const uint32_t*)surface_cpu_view(s);
         w.pitch = s->pitch * 4;
         w.width = info.width;
@@ -1323,12 +1508,12 @@ static uint64_t op_present_to(syscall_gpu_request_t* r, fgpu_surface_t* s, uint6
     // Screen (the owner check is in op_present).
     if ((r->flags & FGPU_PRESENT_FLIP) && (s->flags & FGPU_SURFACE_SCANOUT) &&
         s->in_vram && s->adapter && s->adapter->flip) {
+        surface_sync(s, false);                 // scanned out from its memory
         if (!s->adapter->flip(s->adapter, s->vram_offset)) return SYS_ERR_INVAL;
         g_flipped_owner = owner;
         return SYS_SUCCESS;
     }
     if (g_flipped_owner == owner) release_flip_locked();
-    hw_sync();
     // Straight from the surface into the framebuffer (scaled if asked), no
     // back buffer copy: see graphics_present_scaled().
     gfx_surface_t src = { (uint32_t*)surface_cpu_view(s), (size_t)s->pitch * s->height * 4,
@@ -1377,6 +1562,7 @@ static uint64_t op_write_surface(syscall_gpu_request_t* r, uint64_t owner) {
         level = (uint32_t)r->offset;
     }
     uint32_t width = s->width, height = s->height, pitch = s->pitch;
+    surface_sync(s, true);
     uint8_t* dst = (uint8_t*)s->mem;
     if (level) {
         uint32_t offsets[FGPU_MAX_MIP_LEVELS];
@@ -1630,7 +1816,7 @@ static uint64_t fgpu_syscall_checked(syscall_gpu_request_t* r) {
         // Everything but SUBMIT has the CPU read or write GPU memory (or
         // free it). Nothing is pending between calls (SUBMIT flushes at its
         // end); this keeps that true if a later change defers work.
-        if (r->op != SYS_GPU_SUBMIT) { fgpu_flush_pending(); hw_sync(); }
+        if (r->op != SYS_GPU_SUBMIT) { fgpu_flush_pending(); hw_idle(); }
     }
     switch (r->op) {
         case SYS_GPU_CREATE_SURFACE:
@@ -1682,6 +1868,7 @@ static uint64_t fgpu_syscall_checked(syscall_gpu_request_t* r) {
             break;
         }
         case SYS_GPU_READBACK: {
+            verify_frame_end();
             fgpu_surface_t* s = find_surface(r->handle, group);
             if (!s) { result = SYS_ERR_NOTFOUND; break; }
             uint64_t row = (uint64_t)s->width * 4;

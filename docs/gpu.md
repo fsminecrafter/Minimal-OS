@@ -716,6 +716,28 @@ serial port only. `mossettings set nvidiaboot false` turns it off (and
 crashes in the bring-up leaves `NvidiaAutoBootTrying=true` behind; the next
 boot then skips it and switches `NvidiaAutoBoot` off.
 
+#### Checking the card against the CPU
+
+`gpu verify [frames]` arms a comparison: the card's draws of the next
+frame (or `frames` frames) are also drawn by the CPU, starting from the
+same pixels and depth, and the results are compared pixel by pixel. Then
+`gpu verify report` lists one line per shader (its vertex and fragment
+instruction counts, uniforms, texture units, storage buffers and state):
+how many draws differ, the share of bad pixels, the mean card minus CPU
+difference in r, g and b over those pixels (negative = the card is
+darker), and the worst pixel with both colours. The program runs slowly
+while it is armed: every draw waits for the card and copies its target
+three times.
+
+#### Surfaces between the card and the CPU
+
+A target the card draws with depth lives in a block-linear copy in VRAM.
+Only the surface the CPU needs is brought back: the frame it presents or
+reads back, or one it writes (`cpu_access`). Before, every present and
+buffer upload copied all of them back (the shadow map, the HDR and post
+targets) and the next frame loaded each one again. CPU draws still bring
+everything back first (`finish`).
+
 #### Next steps on a card
 
 1. Run `gpu nvidia` with the firmware copied: every file should show

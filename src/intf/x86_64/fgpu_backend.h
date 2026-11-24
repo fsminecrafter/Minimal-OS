@@ -75,6 +75,12 @@ typedef struct {
     // Waits until the GPU finished everything queued, before the CPU
     // touches a surface or buffer.
     void (*finish)(void);
+    // Optional, both or neither. wait_idle: the GPU finished everything queued (buffers are safe to
+    // touch), but surfaces may still be newer in the backend's own copies. cpu_access: the CPU is about
+    // to read (write = false) or write one surface: bring its pixels and depth up to date (and, for a
+    // write, forget the backend's copies). With them, fgpu calls finish() only before CPU draws.
+    void (*wait_idle)(void);
+    void (*cpu_access)(const fgpu_mem_t* mem, bool write);
 
     // Optional. Copies rows of a surface or buffer in VRAM to system
     // memory faster than the CPU can read VRAM; false = read it directly.

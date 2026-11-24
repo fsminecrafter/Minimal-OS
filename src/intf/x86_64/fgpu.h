@@ -25,3 +25,6 @@ void fgpu_flush_pending(void);
 
 // SYS_TASK_GPU: the graphics card, its VRAM and its engines' use.
 void fgpu_gpu_stats(syscall_gpu_stats_t* out);
+// 'gpu verify': compare the card's draws of the next `frames` frames with the CPU's, and the report.
+void fgpu_verify_start(uint32_t frames);
+void fgpu_verify_report(void (*print)(const char* text));

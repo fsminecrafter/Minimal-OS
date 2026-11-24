@@ -339,9 +339,25 @@ static bool written_since_barrier(const void* cpu) {
     return false;
 }
 
+// Buffers and textures the batches not yet waited for read: the CPU may overwrite anything else at once
+// (mem_busy). More than fit: everything counts as read until the next wait.
+#define READ_MAX 64u
+static const void* g_read[READ_MAX];
+static uint32_t g_read_count;
+static bool g_read_all;
+
+static void read_add(const void* cpu) {
+    if (!cpu || g_read_all) return;
+    for (uint32_t i = 0; i < g_read_count; i++) if (g_read[i] == cpu) return;
+    if (g_read_count < READ_MAX) g_read[g_read_count++] = cpu;
+    else g_read_all = true;
+}
+
 static bool gpu_wait(void) {
     g_written_count = 0;                    // done: whatever was drawn has landed
     g_written_all = false;
+    g_read_count = 0;
+    g_read_all = false;
     if (!g_fence) return true;
     uint64_t t0 = 0;
     if (!nv_rm_3d_done(g_fence)) { g_waits++; t0 = clock_monotonic_ns(); }
@@ -741,15 +757,12 @@ static bool nv_clear_3d(const fgpu_hw_target_t* t, uint32_t flags, uint32_t colo
     if (p->overflow) { p->count = mark; p->overflow = false; return false; }
     if (want_color && c.block_linear) g.tiled[ti].valid = g.tiled[ti].dirty = true;
     if (want_color) written_add(t->color.cpu);
-    // The CPU's depth buffer follows the clears, for draws that fall back.
+    // The surface's own depth is not cleared: the card's buffer holds the newest depth, and it is copied
+    // into the surface only when the CPU needs it (nv_cpu_draw, cpu_access). Clearing it here as well cost
+    // a CPU write of the whole buffer per clear (64 MiB for a 4096x4096 shadow map).
     if (want_depth) {
-        uint64_t t0 = clock_monotonic_ns();
         int zi = zeta_index(z);
-        if (zi >= 0 && whole_area) g.zeta[zi].gpu_newer = false;     // both hold the cleared value
-        if (rect) fgpu_raster_clear_rect(&t->cpu, FGPU_CLEAR_DEPTH, 0, depth, (int32_t)x0, (int32_t)y0,
-                                         (int32_t)(x1 - x0), (int32_t)(y1 - y0));
-        else fgpu_raster_clear(&t->cpu, FGPU_CLEAR_DEPTH, 0, depth);
-        g_depth_cpu_ns += clock_monotonic_ns() - t0;
+        if (zi >= 0) g.zeta[zi].gpu_newer = true;
     }
     g.clears++;
     return true;
@@ -957,6 +970,10 @@ static bool nv_draw_3d(const fgpu_hw_draw_t* d, uint32_t* triangles) {
         REFUSE(R_JOB);
     }
     g_batch_draws++;
+    read_add(d->vertices.cpu);
+    read_add(d->indices.cpu);
+    for (uint32_t b = 0; b < FGPU_MAX_STORAGE_BUFFERS; b++) if (nd.sb_mask & (1u << b)) read_add(d->storage_buffers[b].cpu);
+    for (uint32_t u = 0; u < FGPU_MAX_TEXTURE_UNITS; u++) if (used & (1u << u)) read_add(d->textures[u].cpu);
     if (ti >= 0) g.tiled[ti].dirty = true;
     written_add(d->target->color.cpu);
     if (nd.zeta && (pipe->state & FGPU_STATE_DEPTH_WRITE)) {
@@ -982,6 +999,16 @@ static void nv_finish(void) {
 }
 
 static void nv_wait_idle(void) { flush_wait(); }
+static void nv_kick(void) { if (g.hw3d) batch_flush(); }
+
+// May queued or running card work read `mem`? (False: the CPU can overwrite it without waiting.)
+static bool nv_mem_busy(const fgpu_mem_t* mem) {
+    if (!g.a || !mem->cpu) return false;
+    if (g_read_all || g_written_all) return true;
+    for (uint32_t i = 0; i < g_read_count; i++) if (g_read[i] == mem->cpu) return true;
+    for (uint32_t i = 0; i < g_written_count; i++) if (g_written[i] == mem->cpu) return true;
+    return false;
+}
 
 static void nv_perf(fgpu_backend_perf_t* o) {
     memset(o, 0, sizeof(*o));
@@ -1710,6 +1737,8 @@ fgpu_backend_t fgpu_backend_nvidia = {
     .finish = nv_finish,
     .wait_idle = nv_wait_idle,
     .cpu_access = nv_cpu_access,
+    .mem_busy = nv_mem_busy,
+    .kick = nv_kick,
     .read = nv_read,
     .surface_destroy = nv_surface_destroy,
     .video_convert = nv_video_convert,

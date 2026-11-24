@@ -83,6 +83,12 @@ typedef struct {
     // write, forget the backend's copies). With them, fgpu calls finish() only before CPU draws.
     void (*wait_idle)(void);
     void (*cpu_access)(const fgpu_mem_t* mem, bool write);
+    // Optional (with the two above). Whether work the backend queued may still read or write `mem`
+    // (a buffer or surface): false lets the CPU write a buffer without waiting for the card.
+    bool (*mem_busy)(const fgpu_mem_t* mem);
+    // Optional. Starts what was recorded so far on the card without waiting (the end of a SUBMIT: the
+    // card works while the program records its next pass).
+    void (*kick)(void);
 
     // Optional. Copies rows of a surface or buffer in VRAM to system
     // memory faster than the CPU can read VRAM; false = read it directly.

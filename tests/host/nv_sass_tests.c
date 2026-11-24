@@ -57,14 +57,24 @@ typedef struct {
     bool written[256], p_written[8];
     int uninit_reg, uninit_pred;    // first such register / predicate, -1 = none
     uint32_t ip, uninit_ip, uninit_op;
+    nv_sass_deps_t deps;            // the current instruction, as the scheduler sees it
+    int deps_miss_ip;               // first instruction touching a register its deps leave out, -1 = none
 } sim_t;
 
 static float u2f(uint32_t u) { float f; memcpy(&f, &u, 4); return f; }
 static uint32_t f2u(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }
 #define F(lo, hi) nv_sass_field(w, lo, hi)
 
+static void deps_check(sim_t* s, uint32_t reg, bool write) {
+    const uint8_t* list = write ? s->deps.writes : s->deps.reads;
+    uint32_t n = write ? s->deps.nwrites : s->deps.nreads;
+    for (uint32_t i = 0; i < n; i++) if (list[i] == reg) return;
+    if (s->deps_miss_ip < 0) s->deps_miss_ip = (int)s->ip;
+}
+
 static uint32_t rd(sim_t* s, uint32_t reg) {
     if (reg == 255) return 0;
+    deps_check(s, reg, false);
     if (reg >= s->regs) s->bad = true;
     if (!s->written[reg] && s->uninit_reg < 0) { s->uninit_reg = (int)reg; s->uninit_ip = s->ip; }
     return s->r[reg];
@@ -72,6 +82,7 @@ static uint32_t rd(sim_t* s, uint32_t reg) {
 
 static void wr(sim_t* s, uint32_t reg, uint32_t v) {
     if (reg == 255) return;
+    deps_check(s, reg, true);
     if (reg >= s->regs) { s->bad = true; return; }
     s->r[reg] = v;
     s->written[reg] = true;
@@ -94,12 +105,9 @@ static bool sim_run(sim_t* s, const nv_sass_t* sh, bool fragment) {
         if (pred != 7 && !s->p_written[pred] && s->uninit_pred < 0) s->uninit_pred = (int)pred;
         bool run = pred == 7 ? true : s->p[pred];
         if (F(15, 16)) run = !run;
-        // Scheduling as the encoder promises: wait for both barriers
-        // from the second instruction on.
-        // Fixed-latency results are covered by the stall (no scoreboard): at least the FP32 latency,
-        // longer after a predicate write.
-        if (F(116, 122) != (ip ? 3u : 0u) || F(105, 109) < (F(0, 9) == 0x00Bu ? NV_SASS_STALL_PRED : NV_SASS_STALL_ALU))
-            s->bad = true;
+        // The registers this instruction touches must be the ones the scheduler's decoder lists
+        // (checked in rd() / wr()): its dependencies are only as good as that list.
+        nv_sass_deps(w, fragment, &s->deps);
         uint32_t full = F(0, 12), dst = F(16, 24);
         if (full == 0x94D) { exited = true; continue; }
         if (!run) continue;
@@ -221,6 +229,91 @@ static bool sim_run(sim_t* s, const nv_sass_t* sh, bool fragment) {
     return exited && !s->bad;
 }
 
+/* ------------------------------------------------- the schedule checker
+ *
+ * Walks the code with the cycle each instruction issues at (from the stall counts) and the scoreboard
+ * barriers it sets and waits for, and reports the first read or overwrite that comes too early:
+ *   - a fixed-latency result read before NV_SASS_STALL_ALU cycles (a predicate: NV_SASS_STALL_PRED);
+ *   - a variable-latency result read or overwritten before its barrier was waited for (or without one);
+ *   - a register overwritten before a variable-latency instruction that reads it was waited for;
+ *   - a barrier waited for sooner than NV_SASS_BARRIER_DELAY cycles after it was set, or a stall of 0.
+ * Predicated instructions count either way (other pixels may run them). Its own decoding is
+ * nv_sass_deps(), which the simulator checks against what each instruction really touches.
+ */
+// Model latencies of variable-latency results, for the time estimate only.
+static int32_t model_latency(const uint32_t* w) {
+    switch (nv_sass_field(w, 0, 12)) {
+        case 0xB60: return 200;         // TEX
+        case 0xB82: return 30;          // LDC
+        case 0x321: case 0x326: return 20;
+        default: return 20;             // MUFU, AST, F2I, FRND
+    }
+}
+
+static int32_t g_est_cycles;            // sched_check's estimate of the last stage (barrier waits included)
+
+static const char* sched_check(const nv_sass_t* sh, bool fragment, uint32_t* at) {
+    int32_t ready[256] = { 0 }, pred_ready = 0, bar_set[6] = { 0 }, bar_done[6] = { 0 }, est = 0;
+    int8_t wbar[256];
+    uint8_t rbars[256] = { 0 };
+    bool busy[6] = { false };
+    memset(wbar, -1, sizeof wbar);
+    int32_t t = 0;
+    for (uint32_t i = 0; i < sh->count / 4u; i++) {
+        const uint32_t* w = &sh->code[4u * i];
+        *at = i;
+        uint32_t wait = F(116, 122);
+        if (!i && wait) return "the first instruction waits";
+        for (uint32_t b = 0; b < 6; b++) {
+            if (!(wait & (1u << b))) continue;
+            if (busy[b] && t < bar_set[b] + (int32_t)NV_SASS_BARRIER_DELAY) return "a barrier waited for too soon";
+            if (busy[b] && bar_done[b] > est) est = bar_done[b];
+            busy[b] = false;
+            for (uint32_t r = 0; r < 256; r++) { if (wbar[r] == (int8_t)b) wbar[r] = -1; rbars[r] &= (uint8_t)~(1u << b); }
+        }
+        nv_sass_deps_t d;
+        nv_sass_deps(w, fragment, &d);
+        for (uint32_t k = 0; k < d.nreads; k++) {
+            if (wbar[d.reads[k]] >= 0) return "reads a variable-latency result before its barrier";
+            if (t < ready[d.reads[k]]) return "reads a fixed-latency result too soon";
+        }
+        if (d.reads_pred && t < pred_ready) return "reads a predicate too soon";
+        for (uint32_t k = 0; k < d.nwrites; k++) {
+            if (wbar[d.writes[k]] >= 0) return "overwrites a variable-latency result before its barrier";
+            if (rbars[d.writes[k]]) return "overwrites a register a variable-latency instruction still reads";
+        }
+        if (F(0, 12) == 0x94D)
+            for (uint32_t b = 0; b < 6; b++) if (busy[b] && !(wait & (1u << b))) return "exits with a barrier outstanding";
+        bool variable = d.kind == NV_SASS_VARIABLE || d.kind == NV_SASS_BOTH;
+        uint32_t wb = F(110, 113), rb = F(113, 116);
+        if (variable && d.nwrites && wb > 5) return "a variable-latency result without a barrier";
+        if (variable && d.nreads && rb > 5) return "variable-latency operands without a barrier";
+        for (uint32_t k = 0; k < d.nwrites; k++) {
+            uint32_t r = d.writes[k];
+            if (d.kind == NV_SASS_FIXED || d.kind == NV_SASS_BOTH) ready[r] = t + (int32_t)NV_SASS_STALL_ALU;
+            if (variable) wbar[r] = (int8_t)wb;
+        }
+        if (d.writes_pred) pred_ready = t + (int32_t)NV_SASS_STALL_PRED;
+        if (variable && d.nreads) for (uint32_t k = 0; k < d.nreads; k++) rbars[d.reads[k]] |= (uint8_t)(1u << rb);
+        if (variable && d.nwrites) {
+            if (!busy[wb]) bar_done[wb] = 0;
+            busy[wb] = true; bar_set[wb] = t;
+            if (est + model_latency(w) > bar_done[wb]) bar_done[wb] = est + model_latency(w);
+        }
+        if (variable && d.nreads) {
+            if (!busy[rb]) bar_done[rb] = 0;
+            busy[rb] = true; bar_set[rb] = t;
+            if (est + 4 > bar_done[rb]) bar_done[rb] = est + 4;
+        }
+        uint32_t stall = F(105, 109);
+        if (!stall) return "a stall of 0";
+        t += (int32_t)stall;
+        est += (int32_t)stall;
+    }
+    g_est_cycles = est;
+    return NULL;
+}
+
 /* ---------------------------------------------------------------- tests */
 
 static bool build_stage(bool fragment, nv_sass_t* out) {
@@ -280,6 +373,7 @@ static void test_storage_buffer(void) {
     static sim_t s;
     memset(&s, 0, sizeof s);
     s.regs = sh.regs - NV_SASS_HW_RESERVED_REGS;
+    s.deps_miss_ip = -1;
     bool ran = sim_run(&s, &sh, true) && !s.bad;
     CHECK(ran, "storage buffer shader runs in the simulator");
     const float want[4] = { 2, 0, 23, 4 };
@@ -337,6 +431,17 @@ static void compare(const char* name, const char* vs, const char* fs) {
     }
 
     int bad = 0;
+    // The schedule: no read or overwrite before the result or the operand read is there.
+    for (int st = 0; st < 2; st++) {
+        uint32_t at = 0;
+        const char* hz = sched_check(st ? &fsh : &vsh, st != 0, &at);
+        if (hz) {
+            const nv_sass_t* sh = st ? &fsh : &vsh;
+            printf("  %s stage, instruction %u (opcode 0x%03x): %s\n", st ? "pixel" : "vertex", at,
+                   nv_sass_field(&sh->code[at * 4], 0, 12), hz);
+            bad = 1;
+        }
+    }
     // Storage buffers with random contents, for shaders that read them (the
     // simulator and the interpreter see the same 40 vec4s per buffer).
     static float sb_vals[FGPU_MAX_STORAGE_BUFFERS][40][4];
@@ -357,6 +462,7 @@ static void compare(const char* name, const char* vs, const char* fs) {
         memset(&s, 0, sizeof s);
         s.regs = vsh.regs - NV_SASS_HW_RESERVED_REGS;   // the code may not use those
         s.uninit_reg = s.uninit_pred = -1;
+        s.deps_miss_ip = -1;
         for (int i = 0; i < (int)FGPU_MAX_ATTRIBS; i++)
             for (int c = 0; c < 4; c++) {
                 in[i][c] = frand(-1.5f, 1.5f);
@@ -365,6 +471,11 @@ static void compare(const char* name, const char* vs, const char* fs) {
         fgpu_shader_io_t io = { &prog, in, out, uniforms, NULL, textures, sbufs };
         fgpu_shader_run_vertex(&io);
         if (!sim_run(&s, &vsh, false)) { bad = 1; break; }
+        if (s.deps_miss_ip >= 0) {
+            printf("  vertex instruction %d touches a register its dependencies leave out\n", s.deps_miss_ip);
+            bad = 1;
+            break;
+        }
         if (s.uninit_reg >= 0 || s.uninit_pred >= 0) {
             printf("  vertex stage reads R%d / P%d before writing it\n", s.uninit_reg, s.uninit_pred);
             bad = 1;
@@ -386,6 +497,7 @@ static void compare(const char* name, const char* vs, const char* fs) {
         memset(&s, 0, sizeof s);
         s.regs = fsh.regs - NV_SASS_HW_RESERVED_REGS;
         s.uninit_reg = s.uninit_pred = -1;
+        s.deps_miss_ip = -1;
         for (int i = 0; i < (int)FGPU_MAX_ATTRIBS; i++)
             for (int c = 0; c < 4; c++) {
                 in[i][c] = frand(-1.5f, 1.5f);
@@ -400,6 +512,11 @@ static void compare(const char* name, const char* vs, const char* fs) {
         fgpu_shader_io_t fio = { &prog, in, color, uniforms, special, textures, sbufs };
         bool kept = fgpu_shader_run_fragment(&fio);
         if (!sim_run(&s, &fsh, true)) { bad = 1; break; }
+        if (s.deps_miss_ip >= 0) {
+            printf("  pixel instruction %d touches a register its dependencies leave out\n", s.deps_miss_ip);
+            bad = 1;
+            break;
+        }
         if (s.uninit_reg >= 0 || s.uninit_pred >= 0) {
             printf("  pixel stage reads R%d / P%d before writing it (instruction %u of %u, opcode 0x%03x)\n", s.uninit_reg, s.uninit_pred, s.uninit_ip, fsh.count / 4, nv_sass_field(&fsh.code[s.uninit_ip * 4], 0, 12));
             bad = 1;
@@ -415,8 +532,38 @@ static void compare(const char* name, const char* vs, const char* fs) {
     for (int b = 0; b < (int)FGPU_MAX_STORAGE_BUFFERS; b++) sb_data[b] = NULL;
     snprintf(msg, sizeof msg, "%s: machine code matches the CPU shader machine", name);
     CHECK(!bad, msg);
-    printf("  %-22s vertex %4u instructions %3u registers, pixel %4u instructions %3u registers\n", name,
-           vsh.count / 4, vsh.regs, fsh.count / 4, fsh.regs);
+    // The checker must catch a broken schedule: the same code without any barrier waits, and with
+    // every stall at 1, has hazards whenever it has a variable- or fixed-latency dependency.
+    if (!bad && fsh.count > 8) {
+        static uint32_t broken[CAP * 8u];
+        nv_sass_t b = fsh;
+        b.code = broken;
+        memcpy(broken, fsh.code, fsh.count * 4u);
+        for (uint32_t i = 0; i < b.count / 4u; i++) {
+            uint32_t* w = &broken[4u * i];
+            w[3] &= ~((0x3Fu << (116 - 96)) | (0xFu << (105 - 96)));      // no waits
+            w[3] |= 1u << (105 - 96);                                      // stall 1
+        }
+        uint32_t at = 0;
+        snprintf(msg, sizeof msg, "%s: the schedule checker catches a schedule without waits", name);
+        CHECK(sched_check(&b, true, &at) != NULL, msg);
+    }
+    // Estimated cycles per warp with nothing else running (variable latencies from model_latency).
+    int32_t cyc[2] = { 0, 0 };
+    for (int st = 0; st < 2; st++) {
+        uint32_t at = 0;
+        if (!sched_check(st ? &fsh : &vsh, st != 0, &at)) cyc[st] = g_est_cycles;
+    }
+    printf("  %-22s vertex %4u instr %3u regs ~%5d cycles, pixel %4u instr %3u regs ~%5d cycles\n",
+           name, vsh.count / 4, vsh.regs, (int)cyc[0], fsh.count / 4, fsh.regs, (int)cyc[1]);
+}
+
+// The first instruction whose low `bits` opcode bits are `op` (a NOP-like zero instruction if none).
+static const uint32_t* find_op(const nv_sass_t* sh, uint32_t op, uint32_t bits) {
+    static const uint32_t none[4] = { 0 };
+    for (uint32_t i = 0; i < sh->count / 4u; i++)
+        if (nv_sass_field(&sh->code[4u * i], 0, bits) == op) return &sh->code[4u * i];
+    return none;
 }
 
 static void test_encodings(void) {
@@ -433,16 +580,18 @@ static void test_encodings(void) {
     nv_sass_t sh = { .code = words, .capacity = 1024 };
     const char* why = "";
     CHECK(nv_sass_encode(ir, 4, 3, false, 0, &sh, &why), "a small vertex stage encodes");
-    const uint32_t* w = sh.code;                            // ALD R0, a[0x98]
+    // The scheduler may reorder: each instruction is found by its opcode.
+    const uint32_t* w = find_op(&sh, 0x321, 12);            // ALD R0, a[0x98]
     CHECK(F(0, 12) == 0x321 && F(16, 24) == 0 && F(40, 50) == 0x98 && F(12, 16) == 7, "ALD");
-    CHECK(F(110, 113) == 0 && F(113, 116) == 1 && F(116, 122) == 0, "first instruction waits for nothing");
-    w = sh.code + 4;                                        // MOV R1, c[0][0x34]
+    // Its result is on barrier 0; it reads no register, so it sets no operand barrier.
+    CHECK(F(110, 113) == 0 && F(113, 116) == 7 && F(116, 122) == 0, "first instruction waits for nothing");
+    w = find_op(&sh, 0x002 | (5u << 9), 12);                // MOV R1, c[0][0x34]
     CHECK(F(0, 9) == 0x002 && F(9, 12) == 5 && F(16, 24) == 1 && F(38, 54) == 0x34, "MOV from the constant buffer");
-    w = sh.code + 8;                                        // FADD R2, -R0, |R1|
+    w = find_op(&sh, 0x021, 9);                             // FADD R2, -R0, |R1|
     CHECK(F(0, 9) == 0x021 && F(9, 12) == 1 && F(16, 24) == 2 && F(24, 32) == 0 && F(32, 40) == 1, "FADD registers");
     CHECK(F(72, 73) == 1 && F(73, 74) == 0 && F(62, 63) == 1 && F(63, 64) == 0, "FADD modifiers");
-    CHECK(F(116, 122) == 3, "later instructions wait for the barriers");
-    w = sh.code + 12;                                       // AST a[0x70], R2
+    CHECK(F(116, 122) == 1, "the FADD waits for the ALD's barrier only");
+    w = find_op(&sh, 0x322, 12);                            // AST a[0x70], R2
     CHECK(F(0, 12) == 0x322 && F(32, 40) == 2 && F(40, 50) == 0x70, "AST");
     w = sh.code + sh.count - 4;
     CHECK(F(0, 12) == 0x94D && F(87, 90) == 7, "EXIT ends the stage");
@@ -679,6 +828,7 @@ static void test_shader_dir(const char* dir) {
 }
 
 int main(void) {
+    if (getenv("NV_SASS_NO_REORDER")) nv_sass_reorder_enabled = false;
     for (int t = 0; t < 2; t++) {
         for (int i = 0; i < 64; i++) {
             rng = rng * 1664525u + 1013904223u;

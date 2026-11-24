@@ -20,9 +20,13 @@
  *   24..31  source 0, 32..39 source 1 (or 32..63 an immediate), 64..71 source 2
  *   105..125 scheduling: stall count, barriers to set and wait for
  *
- * Scheduling: every instruction sets a barrier when it writes and the
- * next one waits for it (NAK's "serial" mode). That is slower than a
- * real schedule and always correct.
+ * Scheduling (nv_sass_schedule): instructions stay in program order;
+ * a pass over the finished code sets each one's control bits from its
+ * real dependencies. Fixed-latency results (FFMA, FADD, MOV, FSETP, ...)
+ * are covered by stall counts, only as long as the next reader needs;
+ * variable-latency ones (TEX, IPA, ALD, LDC, MUFU, AST's operand read)
+ * by the six scoreboard barriers, waited for only by the instructions
+ * that use those registers. F2I and FRND get both, to be safe.
  *
  * Registers, per thread:
  *   0 .. ir_regs-1      the IR's own registers
@@ -48,6 +52,8 @@
 // scoreboard, the stall covers them (nv_sass.c emit()).
 #define NV_SASS_STALL_ALU 6u
 #define NV_SASS_STALL_PRED 13u
+// A barrier an instruction sets is waited for at least this many cycles later.
+#define NV_SASS_BARRIER_DELAY 2u
 #define NV_SASS_HW_RESERVED_REGS 2u
 
 #define NV_SASS_CB_UNIFORM_BYTES 1024u      // FGPU_SHADER_MAX_UNIFORMS vec4s
@@ -86,3 +92,15 @@ bool nv_sass_encode(const fgpu_ir_inst_t* code, uint32_t count, uint32_t ir_regs
 
 // One instruction's fields, for tests and listings.
 uint32_t nv_sass_field(const uint32_t inst[4], uint32_t lo, uint32_t hi);
+
+// What one encoded instruction reads and writes, for the scheduler and the tests' hazard checker.
+enum { NV_SASS_FIXED, NV_SASS_VARIABLE, NV_SASS_BOTH, NV_SASS_CONTROL };
+typedef struct {
+    uint8_t kind;               // NV_SASS_*: how its results become visible
+    uint8_t nreads, nwrites;
+    uint8_t reads[6], writes[4];
+    bool reads_pred, writes_pred;   // P0 (or the guard predicate)
+} nv_sass_deps_t;
+void nv_sass_deps(const uint32_t inst[4], bool fragment, nv_sass_deps_t* d);
+// Reordering on (default); the tests compare with it off.
+extern bool nv_sass_reorder_enabled;

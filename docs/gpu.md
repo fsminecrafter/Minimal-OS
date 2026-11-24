@@ -908,10 +908,27 @@ everything back first (`finish`).
 #### How a draw runs on the card
 
 - **Shaders.** `nv_sass.c` turns each IR operation into one to three
-  instructions (immediates and operands with modifiers the instruction
-  cannot take go through scratch registers), in "serial" scheduling:
-  every instruction waits for the one before it, which is slow for a GPU
-  and always right. Uniforms are constant buffer 0, loaded with every
+  instructions. An immediate goes into the instruction's 32-bit operand
+  slot; operands with modifiers the instruction cannot take go through
+  scratch registers. Texture results get a block of four registers only
+  from the lookup to its last use, so blocks are shared.
+  Two passes then work on the finished code:
+  - **Reordering** (`nv_sass_reorder`). The shader is one block (control flow is
+    flattened), so a list scheduler orders the instructions by their longest
+    latency path to the end. Every register and predicate dependency is kept,
+    and stores and KILL keep their order. Texture lookups and interpolation
+    start early, and independent chains fill each other's stalls.
+  - **Scheduling** (`nv_sass_schedule`). Fixed-latency results get only the
+    stall the next reader needs: 6 cycles for FP32, 13 for a predicate. Texture
+    lookups, interpolation, attribute and constant loads, MUFU and stores use
+    the six scoreboard barriers, waited for only by the instructions that use
+    those registers.
+
+  `nv_sass_tests` checks both passes. Every shader runs in the simulator
+  against the CPU, and a hazard checker walks the cycle each instruction
+  issues at, flagging any read or overwrite that comes too early. The
+  dependency decoder both passes rely on is checked against what each
+  instruction really touches in the simulator. Uniforms are constant buffer 0, loaded with every
   draw; texture handles sit behind them. The vertex stage writes every
   varying and the pixel stage's header lists every varying as read, so
   the two always agree. Not encoded yet: front-facing (`gl_FrontFacing`);

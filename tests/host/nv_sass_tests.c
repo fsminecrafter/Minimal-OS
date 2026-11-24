@@ -705,6 +705,26 @@ int main(void) {
             "void main() { vec4 x = texture(a, v_uv); vec4 y = texture(b, v_uv * 0.5);\n"
             "  if (x.a < cut) discard;\n"
             "  gl_FragColor = vec4(mix(x.rgb, y.bgr, clamp(v_k, 0.0, 1.0)), abs(x.a - y.a)); }");
+    // Varyings read after a texture lookup: the TEX coordinates must not land on the register that
+    // holds w for perspective (they did when the first scratch register was odd). Two shaders with
+    // different register counts, so both parities are covered.
+    for (int extra = 0; extra < 4; extra++) {
+        char fs[1024];
+        snprintf(fs, sizeof fs,
+                 "uniform sampler2D a; uniform vec4 k; varying vec2 v_uv; varying vec3 v_n; varying vec3 v_c;\n"
+                 "void main() { vec4 t = texture(a, v_uv);\n"
+                 "  vec3 q = vec3(k.x, k.y, k.z)%s;\n"
+                 "  gl_FragColor = vec4(t.rgb * normalize(v_n) + v_c * q, t.a); }",
+                 extra == 0 ? "" : extra == 1 ? " * k.w" : extra == 2 ? " * fract(k.w * 3.0) + k.xyz" :
+                 " + sin(k.yzx) * cos(k.zxy)");
+        char name[64];
+        snprintf(name, sizeof name, "varyings after a lookup %d", extra);
+        compare(name,
+                "uniform mat4 m; attribute vec3 position; attribute vec2 uv; attribute vec3 normal;\n"
+                "varying vec2 v_uv; varying vec3 v_n; varying vec3 v_c;\n"
+                "void main() { v_uv = uv; v_n = normal; v_c = position * 0.5; gl_Position = m * vec4(position, 1.0); }",
+                fs);
+    }
     compare("math and branches",
             "uniform vec4 k; attribute vec3 position; varying vec3 v;\n"
             "void main() { v = sin(position * k.x) + cos(position.zxy); gl_Position = vec4(position, 1.0 + k.y * 0.1); }",

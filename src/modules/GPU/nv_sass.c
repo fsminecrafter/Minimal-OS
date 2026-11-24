@@ -281,7 +281,8 @@ bool nv_sass_encode(const fgpu_ir_inst_t* code, uint32_t count, uint32_t ir_regs
     // Turing wants multi-register operands aligned to their size: the TEX
     // coordinate pair on an even register, its four results on a multiple
     // of 4 ("Misaligned Register" warp errors otherwise).
-    e.coord = (e.scratch + SCRATCH_REGS + 1u) & ~1u;
+    // After the operand scratch registers and the w register (perspective, scratch + SCRATCH_REGS).
+    e.coord = (e.scratch + SCRATCH_REGS + 2u) & ~1u;
     e.tex_base = (e.coord + 2u + 3u) & ~3u;
     e.out_base = e.tex_base + 4u * tex_count;
     out->regs = e.out_base + (fragment ? 4u : 0u) + NV_SASS_HW_RESERVED_REGS;

@@ -28,3 +28,5 @@ void fgpu_gpu_stats(syscall_gpu_stats_t* out);
 // 'gpu verify': compare the card's draws of the next `frames` frames with the CPU's, and the report.
 void fgpu_verify_start(uint32_t frames);
 void fgpu_verify_report(void (*print)(const char* text));
+// 'gpu perf': where each frame's time went since the command last ran.
+void fgpu_perf_report(void (*print)(const char* text));

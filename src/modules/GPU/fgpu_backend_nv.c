@@ -123,6 +123,8 @@ static struct {
 
 static bool batch_flush(void);
 static bool flush_wait(void);
+static uint32_t g_compile_failures;         // shaders kept on the CPU ('gpu perf')
+static const char* g_last_failure;
 
 enum { R_TARGET, R_PROGRAM, R_BUFFERS, R_TEXTURE, R_STORAGE, R_DEPTH, R_TILED, R_JOB };
 static const char* const k_refused[8] = {
@@ -185,6 +187,8 @@ static bool compile_stage(const fgpu_program_t* p, bool fragment, nv_stage_t* ou
         }
     }
     if (!ok) {
+        g_compile_failures++;
+        g_last_failure = why;
         serial_write_str("nv: shader stays on the CPU: ");
         serial_write_str(why);
         serial_write_str("\n");
@@ -313,6 +317,7 @@ static uint32_t g_tic_written, g_tic_hits;
 // Fence of the newest asynchronous batch (0 = none, or it went the synchronous way).
 static uint32_t g_fence;
 static uint32_t g_async_batches, g_waits;
+static uint64_t g_wait_ns, g_depth_cpu_ns;
 
 // Surfaces the 3D engine drew or cleared since the last barrier (or wait): a draw that samples one needs a
 // barrier first. More than fit: every sampling draw gets one until the next.
@@ -338,8 +343,11 @@ static bool gpu_wait(void) {
     g_written_count = 0;                    // done: whatever was drawn has landed
     g_written_all = false;
     if (!g_fence) return true;
-    if (!nv_rm_3d_done(g_fence)) g_waits++;
-    if (!nv_rm_3d_wait(g_fence)) {
+    uint64_t t0 = 0;
+    if (!nv_rm_3d_done(g_fence)) { g_waits++; t0 = clock_monotonic_ns(); }
+    bool done = nv_rm_3d_wait(g_fence);
+    if (t0) g_wait_ns += clock_monotonic_ns() - t0;
+    if (!done) {
         g.hw3d = false;
         serial_write_str("nv: a 3D batch did not finish; rendering goes back to the CPU\n");
         return false;
@@ -735,11 +743,13 @@ static bool nv_clear_3d(const fgpu_hw_target_t* t, uint32_t flags, uint32_t colo
     if (want_color) written_add(t->color.cpu);
     // The CPU's depth buffer follows the clears, for draws that fall back.
     if (want_depth) {
+        uint64_t t0 = clock_monotonic_ns();
         int zi = zeta_index(z);
         if (zi >= 0 && whole_area) g.zeta[zi].gpu_newer = false;     // both hold the cleared value
         if (rect) fgpu_raster_clear_rect(&t->cpu, FGPU_CLEAR_DEPTH, 0, depth, (int32_t)x0, (int32_t)y0,
                                          (int32_t)(x1 - x0), (int32_t)(y1 - y0));
         else fgpu_raster_clear(&t->cpu, FGPU_CLEAR_DEPTH, 0, depth);
+        g_depth_cpu_ns += clock_monotonic_ns() - t0;
     }
     g.clears++;
     return true;
@@ -972,6 +982,17 @@ static void nv_finish(void) {
 }
 
 static void nv_wait_idle(void) { flush_wait(); }
+
+static void nv_perf(fgpu_backend_perf_t* o) {
+    memset(o, 0, sizeof(*o));
+    o->wait_ns = g_wait_ns; o->waits = g_waits;
+    o->copy_ns = g.copy_ns; o->depth_cpu_ns = g_depth_cpu_ns;
+    o->batches = g_batches; o->draws = g.draws; o->clears = g.clears; o->barriers = g_barriers;
+    o->resolves = g.resolves; o->uploads = g.uploads; o->depth_loads = g.depth_loads; o->depth_stores = g.depth_stores;
+    for (int r = 0; r < 8; r++) { o->refused[r] = g.refused[r]; o->refused_names[r] = k_refused[r]; }
+    o->compile_failures = g_compile_failures;
+    o->last_failure = g_last_failure;
+}
 
 // One surface for the CPU: the frame it presents or reads back, pixels it writes. The other block-linear
 // copies stay valid: before, every present and buffer upload resolved all of them (the shadow map, the
@@ -1695,6 +1716,7 @@ fgpu_backend_t fgpu_backend_nvidia = {
     .h264_decode = nv_h264_decode,
     .h264_mismatch = nv_h264_mismatch,
     .engine_stats = nv_rm_engine_stats,
+    .perf = nv_perf,
 };
 
 /* ------------------------------------------------------- bring-up report */

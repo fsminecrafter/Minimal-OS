@@ -91,6 +91,19 @@ static void hw_sync_for_cpu(void);
 // Time the CPU spent drawing FarcadeGL work (the Task Manager shows it next to the card's engines).
 static uint64_t g_cpu_render_ns;
 
+// 'gpu perf': totals since boot; the command prints what changed since it last ran, per frame.
+#define PERF_OPS 20u
+typedef struct {
+    uint64_t op_ns[PERF_OPS], op_count[PERF_OPS];   // whole syscalls, by SYS_GPU_* op
+    uint64_t drain_ns[PERF_OPS];                    // of that: waiting for the program's queue and the card first
+    uint64_t finish_ns, finishes;                   // full finish(): every target copy brought back
+    uint64_t cpu_render_ns, mip_ns, upload_bytes;
+    uint64_t engine_ns[4];
+    fgpu_backend_perf_t hw;
+    uint64_t at_ns;
+} fgpu_perf_t;
+static fgpu_perf_t g_perf;
+
 // Renders the recorded CPU draws; returns the triangles drawn since the last flush.
 static uint32_t pass_flush(void) {
     if (!g_pass) return 0;
@@ -167,7 +180,13 @@ void fgpu_video_h264_mismatch(void) {
 
 // Waits for queued GPU work before the CPU reads or writes GPU memory.
 static void hw_sync(void) {
-    if (g_hw && g_hw_pending) { g_hw->finish(); g_hw_counts.syncs++; }
+    if (g_hw && g_hw_pending) {
+        uint64_t t0 = clock_monotonic_ns();
+        g_hw->finish();
+        g_hw_counts.syncs++;
+        g_perf.finish_ns += clock_monotonic_ns() - t0;
+        g_perf.finishes++;
+    }
     g_hw_pending = false;
 }
 
@@ -1030,6 +1049,97 @@ static const char* tenths(int v, char* buf) {
     return buf;
 }
 
+static void perf_snapshot(fgpu_perf_t* p) {
+    *p = g_perf;
+    p->cpu_render_ns = g_cpu_render_ns;
+    p->at_ns = clock_monotonic_ns();
+    uint64_t jobs[4];
+    if (g_hw && g_hw->engine_stats) g_hw->engine_stats(p->engine_ns, jobs);
+    if (g_hw && g_hw->perf) g_hw->perf(&p->hw);
+}
+
+// "12.3" from nanoseconds per frame, in milliseconds.
+static const char* perf_ms(uint64_t ns, uint64_t frames, char* buf) {
+    uint64_t us = frames ? ns / frames / 1000u : 0;
+    snprintf(buf, 24, "%u.%u", (unsigned)(us / 1000u), (unsigned)(us % 1000u / 100u));
+    return buf;
+}
+
+void fgpu_perf_report(void (*print)(const char* text)) {
+    static fgpu_perf_t last;
+    static bool have_last;
+    fgpu_perf_t now;
+    perf_snapshot(&now);
+    if (!have_last) {
+        last = now;
+        have_last = true;
+        print("gpu perf: counting from now. Use the app for a few seconds, then run 'gpu perf' again.\n");
+        return;
+    }
+    fgpu_perf_t d;
+    memset(&d, 0, sizeof(d));
+    for (uint32_t i = 0; i < PERF_OPS; i++) {
+        d.op_ns[i] = now.op_ns[i] - last.op_ns[i];
+        d.op_count[i] = now.op_count[i] - last.op_count[i];
+        d.drain_ns[i] = now.drain_ns[i] - last.drain_ns[i];
+    }
+    uint64_t frames = d.op_count[SYS_GPU_PRESENT] + d.op_count[SYS_GPU_READBACK];
+    uint64_t span = now.at_ns - last.at_ns;
+    char line[200], a[24], b[24], c2[24], e[24];
+    snprintf(line, sizeof(line), "gpu perf: %u frames (presents + readbacks) in %s s; per frame, in ms:\n",
+             (unsigned)frames, perf_ms(span, 1000u, a));
+    print(line);
+    if (!frames) { print("  no frames: draw something first.\n"); last = now; return; }
+    static const char* const names[PERF_OPS] = {
+        [SYS_GPU_CREATE_SURFACE] = "create surface", [SYS_GPU_DESTROY_SURFACE] = "destroy surface",
+        [SYS_GPU_CREATE_BUFFER] = "create buffer", [SYS_GPU_UPLOAD_BUFFER] = "upload buffer",
+        [SYS_GPU_DESTROY_BUFFER] = "destroy buffer", [SYS_GPU_SUBMIT] = "submit",
+        [SYS_GPU_READBACK] = "readback", [SYS_GPU_PRESENT] = "present", [SYS_GPU_CREATE_PROGRAM] = "create program",
+        [SYS_GPU_DESTROY_PROGRAM] = "destroy program", [SYS_GPU_WRITE_SURFACE] = "write surface",
+    };
+    snprintf(line, sizeof(line), "  frame time %s (wall clock / frames)\n", perf_ms(span, frames, a));
+    print(line);
+    print("  call             calls/frame  total   of it waiting first\n");
+    for (uint32_t i = 0; i < PERF_OPS; i++) {
+        if (!d.op_count[i]) continue;
+        snprintf(line, sizeof(line), "  %-16s %5u.%u   %7s  %7s\n", names[i] ? names[i] : "other",
+                 (unsigned)(d.op_count[i] / frames), (unsigned)(d.op_count[i] * 10u / frames % 10u),
+                 perf_ms(d.op_ns[i], frames, a), perf_ms(d.drain_ns[i], frames, b));
+        print(line);
+    }
+    snprintf(line, sizeof(line), "  card 3D busy %s, copy engine %s; CPU drawing %s, full finishes %u.%u/frame = %s\n",
+             perf_ms(now.engine_ns[0] - last.engine_ns[0], frames, a), perf_ms(now.engine_ns[1] - last.engine_ns[1], frames, b),
+             perf_ms(now.cpu_render_ns - last.cpu_render_ns, frames, c2),
+             (unsigned)((now.finishes - last.finishes) / frames), (unsigned)((now.finishes - last.finishes) * 10u / frames % 10u),
+             perf_ms(now.finish_ns - last.finish_ns, frames, e));
+    print(line);
+    snprintf(line, sizeof(line), "  CPU waiting for the card %s (%u waits), sync copies %s, CPU depth clears %s, mipmaps %s\n",
+             perf_ms(now.hw.wait_ns - last.hw.wait_ns, frames, a), (unsigned)((now.hw.waits - last.hw.waits) / frames),
+             perf_ms(now.hw.copy_ns - last.hw.copy_ns, frames, b),
+             perf_ms(now.hw.depth_cpu_ns - last.hw.depth_cpu_ns, frames, c2), perf_ms(now.mip_ns - last.mip_ns, frames, e));
+    print(line);
+    snprintf(line, sizeof(line), "  per frame: %u draws, %u clears, %u batches, %u barriers, %u resolves, %u loads, depth %u in / %u out, %u KB uploaded\n",
+             (unsigned)((now.hw.draws - last.hw.draws) / frames), (unsigned)((now.hw.clears - last.hw.clears) / frames),
+             (unsigned)((now.hw.batches - last.hw.batches) / frames), (unsigned)((now.hw.barriers - last.hw.barriers) / frames),
+             (unsigned)((now.hw.resolves - last.hw.resolves) / frames), (unsigned)((now.hw.uploads - last.hw.uploads) / frames),
+             (unsigned)((now.hw.depth_loads - last.hw.depth_loads) / frames),
+             (unsigned)((now.hw.depth_stores - last.hw.depth_stores) / frames),
+             (unsigned)((now.upload_bytes - last.upload_bytes) / frames / 1024u));
+    print(line);
+    for (int r = 0; r < 8; r++) {
+        uint32_t n = now.hw.refused[r] - last.hw.refused[r];
+        if (!n || !now.hw.refused_names[r]) continue;
+        snprintf(line, sizeof(line), "  drawn on the CPU: %s, %u/frame\n", now.hw.refused_names[r], (unsigned)(n / frames));
+        print(line);
+    }
+    if (now.hw.compile_failures) {
+        snprintf(line, sizeof(line), "  shaders kept on the CPU: %u (last: %s)\n", (unsigned)now.hw.compile_failures,
+                 now.hw.last_failure ? now.hw.last_failure : "?");
+        print(line);
+    }
+    last = now;
+}
+
 void fgpu_verify_report(void (*print)(const char* text)) {
     char line[200];
     if (!g_verify.draws && !g_verify.frames_left) {
@@ -1230,7 +1340,9 @@ static uint64_t execute(exec_state_t* st, const uint32_t* cmd, uint32_t words) {
                 // Draws recorded so far (maybe into this surface) must land first.
                 st->triangles += pass_flush();
                 hw_sync();
+                uint64_t mt0 = clock_monotonic_ns();
                 fgpu_mip_generate((uint32_t*)s->mem, s->width, s->height, s->pitch);
+                g_perf.mip_ns += clock_monotonic_ns() - mt0;
                 break;
             }
             case FGPU_OP_BIND_STORAGE_BUFFER: {
@@ -1878,6 +1990,8 @@ static uint64_t fgpu_syscall_checked(syscall_gpu_request_t* r) {
         goto out;
     }
     // Everything else sees the results of the program's queued submits.
+    uint64_t perf_t0 = clock_monotonic_ns();
+    uint32_t perf_op = r->op < PERF_OPS ? r->op : 0;
     ctx_drain(c);
     mutex_lock(&c->lock);
     uint64_t stamp = 0;
@@ -1893,6 +2007,8 @@ static uint64_t fgpu_syscall_checked(syscall_gpu_request_t* r) {
         // end); this keeps that true if a later change defers work.
         if (r->op != SYS_GPU_SUBMIT) { fgpu_flush_pending(); hw_idle(); }
     }
+    g_perf.drain_ns[perf_op] += clock_monotonic_ns() - perf_t0;
+    if (r->op == SYS_GPU_UPLOAD_BUFFER) g_perf.upload_bytes += r->bytes;
     switch (r->op) {
         case SYS_GPU_CREATE_SURFACE:
             if (c->counts[OBJ_SURFACE] >= k_quota[OBJ_SURFACE]) { result = SYS_ERR_NOMEM; break; }
@@ -1987,6 +2103,8 @@ static uint64_t fgpu_syscall_checked(syscall_gpu_request_t* r) {
         default:
             break;
     }
+    g_perf.op_ns[perf_op] += clock_monotonic_ns() - perf_t0;
+    g_perf.op_count[perf_op]++;
     if (render) mutex_unlock(&g_render);
     mutex_unlock(&c->lock);
 out:

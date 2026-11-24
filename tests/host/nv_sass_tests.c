@@ -392,6 +392,11 @@ static void compare(const char* name, const char* vs, const char* fs) {
                 s.attr_in[(NV_SASS_ATTR_GENERIC + 16 * i + 4 * c) / 4] = in[i][c];
             }
         for (int c = 0; c < 4; c++) s.attr_in[(NV_SASS_ATTR_POSITION + 4 * c) / 4] = special[0][c];
+        // Like the card: perspective attributes come out of the interpolator divided by w, and
+        // position.w is 1 / w (gl_FragCoord.w); the shader multiplies by w itself.
+        for (int i = 0; i < (int)FGPU_MAX_ATTRIBS; i++)
+            for (int c = 0; c < 4; c++)
+                s.attr_in[(NV_SASS_ATTR_GENERIC + 16 * i + 4 * c) / 4] = in[i][c] * special[0][3];
         fgpu_shader_io_t fio = { &prog, in, color, uniforms, special, textures, sbufs };
         bool kept = fgpu_shader_run_fragment(&fio);
         if (!sim_run(&s, &fsh, true)) { bad = 1; break; }

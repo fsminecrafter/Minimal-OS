@@ -299,6 +299,28 @@ bool nv_sass_encode(const fgpu_ir_inst_t* code, uint32_t count, uint32_t ir_regs
         }
     }
 
+    // Perspective: on Turing the interpolator hands out attribute / w (interpolated straight across the
+    // screen) and position.w as 1 / w; the shader multiplies by w itself (Mesa's GV100 lowering and NAK
+    // do the same: IPA, then FMUL by RCP(IPA a[pos.w])). Without it every varying came out divided by its
+    // distance: darker colours, depth too small (ambient occlusion outlines), shadows looked up wrong.
+    // w lives in the register after the operand scratch registers (below the TEX coordinates).
+    const uint32_t reg_w = e.scratch + SCRATCH_REGS;
+    if (fragment) {
+        bool any_input = false;
+        for (uint32_t i = 0; i < count && !any_input; i++) any_input = code[i].op == FGPU_IR_INPUT;
+        if (any_input) {
+            uint32_t w[4] = { 0 };
+            set(w, 0, 12, OP_IPA);
+            set(w, 16, 24, reg_w);
+            set(w, 32, 40, REG_ZERO);
+            set(w, 64, 72, (NV_SASS_ATTR_POSITION + 12u) >> 2);
+            set(w, 81, 84, PRED_TRUE);
+            emit(&e, w, PRED_TRUE, true, true);
+            opnd_t inv = reg_opnd(reg_w);
+            mufu(&e, reg_w, &inv, MUFU_RCP);
+        }
+    }
+
     uint32_t tex_index = 0;
     for (uint32_t i = 0; i < count; i++) {
         const fgpu_ir_inst_t* in = &code[i];
@@ -319,6 +341,14 @@ bool nv_sass_encode(const fgpu_ir_inst_t* code, uint32_t count, uint32_t ir_regs
                     set(w, 78, 80, 0);                  // every pass; perspective comes from the header
                     set(w, 81, 84, PRED_TRUE);
                     sph_field(sph, 192u + in->aux * 2u, 194u + in->aux * 2u, 2u);   // perspective
+                    emit(&e, w, PRED_TRUE, true, true);
+                    // times w (see reg_w above)
+                    opnd_t a = reg_opnd(in->reg), b = reg_opnd(reg_w), rz = reg_opnd(REG_ZERO);
+                    __builtin_memset(w, 0, sizeof w);
+                    alu(w, OP_FMUL, in->reg, &a, &b, &rz);
+                    set(w, 84, 87, 4);                  // no scaling, like the other FMULs
+                    emit(&e, w, PRED_TRUE, true, true);
+                    break;
                 } else {
                     set(w, 0, 12, OP_ALD);
                     set(w, 16, 24, in->reg);

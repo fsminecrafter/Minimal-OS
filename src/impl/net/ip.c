@@ -11,6 +11,12 @@ static uint32_t g_netmask = 0;
 static uint32_t g_gateway = 0;
 static uint32_t g_dns_ip = 0;
 static uint16_t g_ip_id = 1;
+/* Point-to-point link (PPPoE) that carries IPv4 instead of Ethernet. */
+static bool (*g_link_send)(const void* packet, uint16_t len);
+
+void ip_set_link(bool (*send)(const void* packet, uint16_t len)) {
+    g_link_send = send;
+}
 
 void ip_init(void) {
     g_local_ip = 0;
@@ -56,10 +62,15 @@ void ip_to_string(uint32_t ip, char* out) {
 bool ip_send(uint32_t dst_ip, uint8_t protocol, const void* payload, uint16_t len) {
     bool broadcast = (dst_ip == 0xFFFFFFFFu);
     bool on_link = broadcast || ((dst_ip & g_netmask) == (g_local_ip & g_netmask));
-    uint32_t next_hop = on_link ? dst_ip : g_gateway;
+    /* No gateway (some ISPs answer ARP for everything instead): ask for
+     * the destination itself. The gateway may be outside our subnet (a /32
+     * from an ISP); it is still reached directly by ARP. */
+    uint32_t next_hop = on_link || !g_gateway ? dst_ip : g_gateway;
 
     uint8_t dst_mac[6];
-    if (broadcast) {
+    if (g_link_send) {
+        /* no link-layer addresses on a point-to-point link */
+    } else if (broadcast) {
         memset(dst_mac, 0xFF, 6);
     } else if (!arp_resolve(next_hop, dst_mac, 1000)) {
         serial_write_str("IP: ARP resolve failed\n");
@@ -85,6 +96,7 @@ bool ip_send(uint32_t dst_ip, uint8_t protocol, const void* payload, uint16_t le
 
     memcpy(packet + sizeof(ipv4_header_t), payload, len);
 
+    if (g_link_send) return g_link_send(packet, total_len);
     eth_send(dst_mac, ETHERTYPE_IPV4, packet, total_len);
     return true;
 }

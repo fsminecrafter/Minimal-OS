@@ -10,6 +10,8 @@ uint32_t ip_get_netmask(void);
 void ip_set_dns(uint32_t dns_ip);
 uint32_t ip_get_dns(void);
 bool ip_is_configured(void);
+// Sends IPv4 through `send` instead of Ethernet + ARP (PPPoE); NULL: Ethernet.
+void ip_set_link(bool (*send)(const void* packet, uint16_t len));
 
 bool ip_send(uint32_t dst_ip, uint8_t protocol, const void* payload, uint16_t len);
 void ip_handle_packet(const uint8_t* frame_payload, uint16_t len);

@@ -604,6 +604,16 @@ void cmd_usage(int argc, const char** argv) {
         info_number(usage);
         info_text("% usg");
         if (smp_is_master_core_id(i)) info_text(" (Master)");
+        // What used the core in the last second, busiest first.
+        cpu_top_entry_t top[CPU_TOP_SHOWN];
+        uint32_t k = smp_get_cpu_top(i, top);
+        for (uint32_t j = 0; j < k; j++) {
+            info_text(j ? ", " : "  ");
+            info_text(top[j].name);
+            info_text(" ");
+            info_number(top[j].ticks);
+            info_text("%");
+        }
         info_text("\n");
     }
 }

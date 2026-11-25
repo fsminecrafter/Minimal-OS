@@ -1208,6 +1208,7 @@ typedef struct {
 #define SYS_TASK_LIST 1u
 #define SYS_TASK_END  2u
 #define SYS_TASK_GPU  3u    // rsi = syscall_gpu_stats_t*: the graphics card, for a Performance page
+#define SYS_TASK_CPU  4u    // rsi = syscall_cpu_stats_t*: the processor and what each core ran
 
 #define SYS_TASK_FLAG_WINDOW_MANAGER 1u
 #define SYS_TASK_FLAG_CRASHED        2u
@@ -1248,6 +1249,42 @@ typedef struct {
     uint64_t cpu_render_ns;         // FarcadeGL work the CPU did instead (draws and clears it ran)
 } syscall_gpu_stats_t;
 
+// SYS_TASK_CPU: the processor (CPUID) and, per online core, its usage over the last second and the
+// programs that used it most then (a program's threads count for it; the idle loops do not count).
+// Set `size` to sizeof(syscall_cpu_stats_t) before the call.
+#define SYS_CPU_TOP          4u
+#define SYS_CPU_MAX_CORES    64u
+#define SYS_CPU_FEAT_SSE42   (1u << 0)
+#define SYS_CPU_FEAT_AVX     (1u << 1)
+#define SYS_CPU_FEAT_AVX2    (1u << 2)
+#define SYS_CPU_FEAT_AVX512  (1u << 3)
+#define SYS_CPU_FEAT_AES     (1u << 4)
+#define SYS_CPU_FEAT_FMA     (1u << 5)
+#define SYS_CPU_FEAT_VM      (1u << 6)     // running under a hypervisor (hypervisor[] names it)
+typedef struct {
+    uint64_t pid;
+    uint32_t percent;               // of the core's last second
+    uint32_t reserved;
+    char name[32];
+} syscall_cpu_top_t;
+typedef struct {
+    uint32_t usage;                 // percent busy, last second
+    uint32_t top_count;
+    syscall_cpu_top_t top[SYS_CPU_TOP];
+} syscall_core_stats_t;
+typedef struct {
+    uint32_t size;
+    uint32_t cores;                 // online logical cores (entries in core[])
+    char brand[52];                 // "AMD Ryzen 7 3700X 8-Core Processor"
+    char vendor[16];                // "AuthenticAMD", "GenuineIntel"
+    char hypervisor[16];            // "KVMKVMKVM", "Microsoft Hv", "" = none
+    uint32_t family, model, stepping;
+    uint32_t base_mhz;              // 0 = unknown
+    uint32_t l1d_kb, l1i_kb, l2_kb, l3_kb;
+    uint32_t features;              // SYS_CPU_FEAT_*
+    uint64_t uptime_ms;
+    syscall_core_stats_t core[SYS_CPU_MAX_CORES];
+} syscall_cpu_stats_t;
 
 // VM: rdi = operation. Memory of the program's own, in whole 4 KiB pages,
 // above everything else it has (addresses from 2 TiB up). Pages read as

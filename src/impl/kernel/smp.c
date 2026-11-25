@@ -82,6 +82,21 @@ void smp_get_cpu_usage(uint32_t cpu_id, uint32_t* average, uint32_t* usage) {
     if (usage) *usage = recent;
 }
 
+uint32_t smp_get_cpu_top(uint32_t cpu_id, cpu_top_entry_t out[CPU_TOP_SHOWN]) {
+    if (cpu_id >= MAX_CPUS) return 0;
+    cpu_local_t* c = &g_cpus[cpu_id];
+    for (int tries = 0; tries < 8; tries++) {
+        uint32_t s0 = __atomic_load_n(&c->top_seq, __ATOMIC_ACQUIRE);
+        if (s0 & 1) continue;
+        uint32_t n = c->top_last_count;
+        if (n > CPU_TOP_SHOWN) n = CPU_TOP_SHOWN;
+        for (uint32_t i = 0; i < n; i++) out[i] = c->top_last[i];
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        if (__atomic_load_n(&c->top_seq, __ATOMIC_RELAXED) == s0) return n;
+    }
+    return 0;
+}
+
 void smp_init_bsp(void) {
     g_bsp_lapic_ready = false;
     for (uint32_t i = 0; i < MAX_CPUS; i++) {

@@ -47,6 +47,7 @@
 #include "net/ethernet.h"
 #include "net/arp.h"
 #include "net/ip.h"
+#include "net/pppoe.h"
 #include "net/udp.h"
 #include "net/tcp.h"
 #include "x86_64/net_syscall.h"
@@ -97,6 +98,9 @@ void usb_keyboard_update_task(void) {
     }
 }
 
+static uint16_t boot_vlan;      /* vlan= on the kernel command line */
+static char boot_pppoe[140];     /* pppoe=<user>:<password> */
+
 void kernel_main(uint64_t mb2_info_addr) {
     serial_init();
     smp_init_bsp();
@@ -135,6 +139,15 @@ void kernel_main(uint64_t mb2_info_addr) {
         char netlog[40];
         if (multiboot2_get_cmdline_value(mb_info, "netlog=", netlog, sizeof(netlog)))
             netlog_configure(netlog);
+        // vlan=<id> and pppoe=<user>:<password>: for lines straight to an
+        // ISP, e.g. from a live USB before anything is saved on disk
+        char vlan[8];
+        if (multiboot2_get_cmdline_value(mb_info, "vlan=", vlan, sizeof(vlan))) {
+            uint32_t v = 0;
+            for (const char* c = vlan; *c >= '0' && *c <= '9'; c++) v = v * 10 + (uint32_t)(*c - '0');
+            if (v > 0 && v < 4095) boot_vlan = (uint16_t)v;
+        }
+        multiboot2_get_cmdline_value(mb_info, "pppoe=", boot_pppoe, sizeof(boot_pppoe));
     }
     uint64_t total_ram_bytes = get_total_memory(mb_info);
     print_clear();
@@ -270,6 +283,14 @@ void kernel_main(uint64_t mb2_info_addr) {
     sti();
     createProcess("busy", busy);
     createProcess("kernelaudio", audioupdate);
+    if (boot_vlan) eth_set_vlan(boot_vlan);
+    if (boot_pppoe[0] && network_manager_has_driver()) {
+        char* colon = strchr(boot_pppoe, ':');
+        if (colon) {
+            *colon = 0;
+            pppoe_start(boot_pppoe, colon + 1);
+        }
+    }
     netlog_start();
     terminal_program_entry();
     // The boot core's idle loop (it used to spin here, which kept core 0 at 100%).

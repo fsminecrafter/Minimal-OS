@@ -1,6 +1,7 @@
 #include "net/ethernet.h"
 #include "net/arp.h"
 #include "net/ip.h"
+#include "net/pppoe.h"
 #include "x86_64/network_manager.h"
 #include "string.h"
 #include "serial.h"
@@ -17,17 +18,33 @@ void eth_init(void) {
     serial_write_str("\n");
 }
 
+/* 802.1Q VLAN that every frame is tagged with (some ISPs require one), 0: none */
+static uint16_t g_vlan;
+
+void eth_set_vlan(uint16_t vlan_id) { g_vlan = vlan_id & 0x0FFF; }
+uint16_t eth_get_vlan(void) { return g_vlan; }
+
 void eth_send(const uint8_t dst_mac[6], uint16_t ethertype, const void* payload, uint16_t len) {
-    static uint8_t frame[ETH_FRAME_MAX];
+    static uint8_t frame[ETH_FRAME_MAX + 4];
     if (len > ETH_MTU) len = ETH_MTU;
 
     eth_header_t* hdr = (eth_header_t*)frame;
     memcpy(hdr->dst_mac, dst_mac, 6);
     memcpy(hdr->src_mac, g_local_mac, 6);
-    hdr->ethertype = net_htons(ethertype);
+    uint16_t header = sizeof(eth_header_t);
+    if (g_vlan) {
+        hdr->ethertype = net_htons(0x8100);
+        frame[14] = (uint8_t)(g_vlan >> 8);
+        frame[15] = (uint8_t)g_vlan;
+        frame[16] = (uint8_t)(ethertype >> 8);
+        frame[17] = (uint8_t)ethertype;
+        header += 4;
+    } else {
+        hdr->ethertype = net_htons(ethertype);
+    }
 
-    memcpy(frame + sizeof(eth_header_t), payload, len);
-    network_manager_send(frame, (uint16_t)(sizeof(eth_header_t) + len));
+    memcpy(frame + header, payload, len);
+    network_manager_send(frame, (uint16_t)(header + len));
 }
 
 /*
@@ -69,8 +86,21 @@ void eth_handle_frame(const uint8_t* frame, uint16_t len) {
     uint16_t ethertype = net_ntohs(hdr->ethertype);
     const uint8_t* payload = frame + sizeof(eth_header_t);
     uint16_t payload_len = len - sizeof(eth_header_t);
+    if (ethertype == 0x8100) {
+        /* VLAN-tagged: only our VLAN */
+        if (payload_len < 4 || ((payload[0] << 8 | payload[1]) & 0x0FFF) != g_vlan) return;
+        ethertype = (uint16_t)(payload[2] << 8 | payload[3]);
+        payload += 4;
+        payload_len -= 4;
+    } else if (g_vlan) {
+        return;   /* untagged traffic is not ours while a VLAN is set */
+    }
 
     switch (ethertype) {
+        case 0x8863:
+        case 0x8864:
+            pppoe_handle_frame(hdr->src_mac, ethertype, payload, payload_len);
+            break;
         case ETHERTYPE_ARP:
             if (payload_len >= sizeof(arp_packet_t)) {
                 arp_handle_packet((const arp_packet_t*)payload);

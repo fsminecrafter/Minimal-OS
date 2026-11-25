@@ -109,7 +109,10 @@ static void help_diagnostics(void) {
 static void help_networking(void) {
     help_section("Networking");
     help_item("ifconfig", "Show network interface status.");
-    help_item("dhcp", "Request an IP address from the router.");
+    help_item("dhcp", "Get an address by DHCP (router or ISP); renews it by itself.");
+    help_item("ifconfig static <ip> <mask> <gw> [dns]", "Use a fixed address.");
+    help_item("pppoe <user> <password>", "Connect with your ISP login (DSL/fibre); 'pppoe stop'.");
+    help_item("vlan <id>|off", "Tag frames with the VLAN your ISP requires.");
     help_item("wget <url> [-d <path>]", "Fetch an HTTP or HTTPS URL; print or save to file.");
 }
 

@@ -12,10 +12,22 @@
 #include "net/tcp.h"
 #include "net/tls13.h"
 #include "net/dhcp.h"
+#include "net/pppoe.h"
+#include "x86_64/sysconf.h"
 #include "net/dns.h"
 #include "x86_64/minimafs.h"
 #include "fspaths.h"
 #include "time.h"
+
+static int parse_small_int(const char* text) {
+    if (!text || !*text) return -1;
+    int v = 0;
+    for (; *text; text++) {
+        if (*text < '0' || *text > '9' || v > 100000) return -1;
+        v = v * 10 + (*text - '0');
+    }
+    return v;
+}
 
 void cmd_ifconfig(int argc, const char** argv) {
     if (!network_manager_has_driver()) {
@@ -51,6 +63,16 @@ void cmd_ifconfig(int argc, const char** argv) {
     graphics_write_textr(buf);
     snprintf(buf, sizeof(buf), "      Gateway:%s  DNS:%s\n", gw_str, dns_str);
     graphics_write_textr(buf);
+    uint32_t lease, left, server;
+    if (dhcp_lease_info(&lease, &left, &server)) {
+        char server_str[16];
+        ip_to_string(server, server_str);
+        if (lease == 0xFFFFFFFFu) snprintf(buf, sizeof(buf), "      DHCP lease from %s (infinite)\n", server_str);
+        else snprintf(buf, sizeof(buf), "      DHCP lease from %s, %us left of %us\n", server_str, left, lease);
+        graphics_write_textr(buf);
+    } else {
+        graphics_write_textr("      Static address\n");
+    }
 }
 
 void cmd_dhcp(int argc, const char** argv) {
@@ -59,8 +81,23 @@ void cmd_dhcp(int argc, const char** argv) {
         if (!background) graphics_write_textr("No network interface present\n");
         return;
     }
-    if (!background) graphics_write_textr("Requesting IP via DHCP...\n");
-    if ((background ? dhcp_acquire_quiet : dhcp_acquire)(10000)) {
+    if (background) {
+        /* boot (dhcp.service): the saved connection type decides */
+        char value[72];
+        if (sysconf_get("NetVLAN", value, sizeof(value))) { int v = parse_small_int(value); if (v > 0 && v < 4095) eth_set_vlan((uint16_t)v); }
+        char user[72], password[72];
+        if (sysconf_get("NetMode", value, sizeof(value)) && strcmp(value, "pppoe") == 0 &&
+            sysconf_get("PPPoEUser", user, sizeof(user)) &&
+            sysconf_get("PPPoEPassword", password, sizeof(password))) {
+            pppoe_start(user, password);
+            return;
+        }
+        /* keeps trying (a modem or the ISP can take a while) and renews */
+        dhcp_start_background();
+        return;
+    }
+    graphics_write_textr("Requesting IP via DHCP (up to 30 s)...\n");
+    if (dhcp_acquire(30000)) {
         if (background) return;
         char ip_str[16];
         ip_to_string(ip_get_local(), ip_str);
@@ -69,7 +106,11 @@ void cmd_dhcp(int argc, const char** argv) {
         graphics_write_textr("\n");
     } else {
         if (!background) {
-            graphics_write_textr("DHCP failed (no router response?)\n");
+            graphics_write_textr("DHCP failed: no DHCP server answered.\n"
+                                 "  Connected straight to a modem? Some modems only serve the\n"
+                                 "  first device they saw: power the modem off and on. If your\n"
+                                 "  ISP gave you a fixed address, use\n"
+                                 "  'ifconfig static <ip> <netmask> <gateway> [dns]'.\n");
             char info[400];
             network_manager_describe(info, sizeof(info));
             graphics_write_textr("  ");
@@ -85,8 +126,8 @@ void cmd_dhcp(int argc, const char** argv) {
 }
 
 static void cmd_ifconfig_static(int argc, const char** argv) {
-    if (argc != 4) {
-        graphics_write_textr("Usage: ifconfig static <ip> <netmask> <gateway>\n");
+    if (argc != 4 && argc != 5) {
+        graphics_write_textr("Usage: ifconfig static <ip> <netmask> <gateway> [dns]\n");
         return;
     }
 
@@ -98,7 +139,10 @@ static void cmd_ifconfig_static(int argc, const char** argv) {
         return;
     }
 
+    dhcp_stop();
     ip_configure(ip, netmask, gateway);
+    if (argc == 5) ip_set_dns(ip_parse(argv[4]));
+    else if (!ip_get_dns()) ip_set_dns(gateway);   /* most gateways also resolve names */
     char ip_text[16];
     ip_to_string(ip, ip_text);
     graphics_write_textr("Bound static address: ");
@@ -112,6 +156,82 @@ void cmd_ifconfig_dispatch(int argc, const char** argv) {
         return;
     }
     cmd_ifconfig(argc, argv);
+}
+
+/* pppoe <user> <password> | pppoe stop | pppoe status */
+void cmd_pppoe(int argc, const char** argv) {
+    if (!network_manager_has_driver()) {
+        graphics_write_textr("No network interface present\n");
+        return;
+    }
+    if (argc == 2 && strcmp(argv[1], "stop") == 0) {
+        pppoe_stop();
+        sysconf_set("NetMode", "dhcp");
+        graphics_write_textr("PPPoE stopped; DHCP will be used from the next start ('dhcp' now).\n");
+        return;
+    }
+    if (argc == 1 || (argc == 2 && strcmp(argv[1], "status") == 0)) {
+        char line[200];
+        snprintf(line, sizeof(line), "PPPoE: %s\n", pppoe_status());
+        graphics_write_textr(line);
+        if (pppoe_last_error()[0]) {
+            snprintf(line, sizeof(line), "  last problem: %s\n", pppoe_last_error());
+            graphics_write_textr(line);
+        }
+        if (argc == 1)
+            graphics_write_textr("Usage: pppoe <user> <password>   connect with your ISP login (saved)\n"
+                                 "       pppoe stop | pppoe status\n");
+        return;
+    }
+    if (argc != 3) {
+        graphics_write_textr("Usage: pppoe <user> <password>\n");
+        return;
+    }
+    dhcp_stop();
+    if (!pppoe_start(argv[1], argv[2])) {
+        graphics_write_textr("pppoe: user name or password too long\n");
+        return;
+    }
+    bool saved = sysconf_set("NetMode", "pppoe") && sysconf_set("PPPoEUser", argv[1]) &&
+                 sysconf_set("PPPoEPassword", argv[2]);
+    graphics_write_textr("Connecting with PPPoE (up to 30 s)...\n");
+    if (pppoe_wait_up(30000)) {
+        char ip_str[16];
+        ip_to_string(ip_get_local(), ip_str);
+        graphics_write_textr("Connected, address ");
+        graphics_write_textr(ip_str);
+        graphics_write_textr("\n");
+    } else {
+        char line[200];
+        snprintf(line, sizeof(line), "Not connected yet (%s). It keeps trying in the background.\n",
+                 pppoe_last_error()[0] ? pppoe_last_error() : pppoe_status());
+        graphics_write_textr(line);
+    }
+    graphics_write_textr(saved ? "Saved: PPPoE starts by itself at boot ('pppoe stop' undoes it).\n"
+                               : "(not saved: no disk)\n");
+}
+
+/* vlan <id> | vlan off: tag frames for ISPs that need a VLAN */
+void cmd_vlan(int argc, const char** argv) {
+    if (argc != 2) {
+        char line[96];
+        uint16_t v = eth_get_vlan();
+        if (v) snprintf(line, sizeof(line), "VLAN %u\nUsage: vlan <1-4094> | vlan off\n", v);
+        else snprintf(line, sizeof(line), "No VLAN\nUsage: vlan <1-4094> | vlan off\n");
+        graphics_write_textr(line);
+        return;
+    }
+    int id = strcmp(argv[1], "off") == 0 ? 0 : parse_small_int(argv[1]);
+    if (id < 0 || id > 4094 || (id == 0 && strcmp(argv[1], "off") != 0)) {
+        graphics_write_textr("vlan: give a number from 1 to 4094, or 'off'\n");
+        return;
+    }
+    eth_set_vlan((uint16_t)id);
+    char text[8];
+    snprintf(text, sizeof(text), "%d", id);
+    bool saved = sysconf_set("NetVLAN", text);
+    graphics_write_textr(id ? "VLAN tagging on" : "VLAN tagging off");
+    graphics_write_textr(saved ? " (saved). Now run 'dhcp' or 'pppoe'.\n" : " (not saved: no disk).\n");
 }
 
 static bool parse_url(const char* url, char* host, size_t host_size,
@@ -381,6 +501,8 @@ void cmd_wget(int argc, const char** argv) {
 void register_net_commands(void) {
     command_register("ifconfig", cmd_ifconfig_dispatch);
     command_register("dhcp", cmd_dhcp);
+    command_register("pppoe", cmd_pppoe);
+    command_register("vlan", cmd_vlan);
     command_register("wget", cmd_wget);
 }
 

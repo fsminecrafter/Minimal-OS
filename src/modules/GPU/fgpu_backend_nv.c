@@ -824,8 +824,8 @@ static bool nv_draw(const fgpu_hw_draw_t* d, uint32_t* triangles) {
 
 static bool nv_draw_3d(const fgpu_hw_draw_t* d, uint32_t* triangles) {
     const fgpu_pipeline_t* pipe = d->pipe;
-    // TODO(nv): texture units >= FGPU_MAX_TEXTURE_UNITS run on the CPU backend (fgpu.c does
-    // not offer such draws either). Mipmapped textures are sampled at level 0 only: the
+    // Texture units >= FGPU_MAX_TEXTURE_UNITS (none: it is all 16) would run on the CPU backend
+    // (fgpu.c does not offer such draws either). Mipmapped textures are sampled at level 0 only: the
     // header describes a pitch-linear surface, which the hardware cannot mip. Drawing
     // them here keeps the frame on the card; going to the CPU for them meant copying the
     // render target back and forth for every such draw.

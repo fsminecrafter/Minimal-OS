@@ -115,6 +115,10 @@ void scheduler_priority_boost(void);
 
 // True for an AP's idle context (see schedule()); it is not a real process.
 bool scheduler_is_idle_process(const process_t* proc);
+// The boot core's idle loop: main() ends in it (never returns). It halts until the next interrupt and
+// gives the core to whatever is ready; it counts as idle in the core's usage.
+void scheduler_boot_idle_loop(void) __attribute__((__noreturn__));
+bool scheduler_is_boot_idle(const process_t* proc);
 
 // Moves a WAITING process to READY and onto its CPU's run queue. Atomic
 // against the timeout wake-up and other wakers: false when it was not

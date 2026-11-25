@@ -23,6 +23,8 @@
 #include "string.h"
 
 #include "x86_64/smp.h"
+#include "x86_64/clock.h"
+#include <stddef.h>
 #include "x86_64/boot_options.h"
 #include "x86_64/allocator.h"
 #include "x86_64/pmm.h"
@@ -872,6 +874,111 @@ static uint64_t sys_task_list(syscall_task_info_t* out, uint32_t max_entries) {
     if (n && !syscall_user_copy_out(out, tmp, sizeof(*tmp) * n)) r = SYS_ERR_INVAL;
     free_mem(tmp);
     return r;
+}
+
+static void task_cpuid(uint32_t leaf, uint32_t sub, uint32_t* a, uint32_t* b, uint32_t* c, uint32_t* d) {
+    asm volatile("cpuid" : "=a"(*a), "=b"(*b), "=c"(*c), "=d"(*d) : "a"(leaf), "c"(sub));
+}
+
+// SYS_TASK_CPU: CPUID once (it does not change), the per-core figures every call.
+static uint64_t sys_task_cpu(syscall_cpu_stats_t* out) {
+    if (!out || !user_range_ok(out, sizeof(*out), true) || out->size != sizeof(*out)) return SYS_ERR_INVAL;
+    static syscall_cpu_stats_t info;        // the CPUID part
+    static bool have_info;
+    if (!have_info) {
+        memset(&info, 0, sizeof info);
+        uint32_t a, b, c, d;
+        task_cpuid(0, 0, &a, &b, &c, &d);
+        uint32_t max_leaf = a;
+        memcpy(info.vendor + 0, &b, 4); memcpy(info.vendor + 4, &d, 4); memcpy(info.vendor + 8, &c, 4);
+        task_cpuid(1, 0, &a, &b, &c, &d);
+        uint32_t fam = (a >> 8) & 0xF, mod = (a >> 4) & 0xF;
+        if (fam == 0xF) fam += (a >> 20) & 0xFF;
+        if (fam == 0x6 || fam >= 0xF) mod |= ((a >> 16) & 0xF) << 4;
+        info.family = fam; info.model = mod; info.stepping = a & 0xF;
+        if (c & (1u << 20)) info.features |= SYS_CPU_FEAT_SSE42;
+        if (c & (1u << 28)) info.features |= SYS_CPU_FEAT_AVX;
+        if (c & (1u << 25)) info.features |= SYS_CPU_FEAT_AES;
+        if (c & (1u << 12)) info.features |= SYS_CPU_FEAT_FMA;
+        if (c & (1u << 31)) {
+            info.features |= SYS_CPU_FEAT_VM;
+            task_cpuid(0x40000000, 0, &a, &b, &c, &d);
+            memcpy(info.hypervisor + 0, &b, 4); memcpy(info.hypervisor + 4, &c, 4); memcpy(info.hypervisor + 8, &d, 4);
+        }
+        if (max_leaf >= 7) {
+            task_cpuid(7, 0, &a, &b, &c, &d);
+            if (b & (1u << 5)) info.features |= SYS_CPU_FEAT_AVX2;
+            if (b & (1u << 16)) info.features |= SYS_CPU_FEAT_AVX512;
+        }
+        if (max_leaf >= 0x16) {
+            task_cpuid(0x16, 0, &a, &b, &c, &d);
+            info.base_mhz = a & 0xFFFF;
+        }
+        if (!info.base_mhz) info.base_mhz = (uint32_t)(clock_tsc_hz() / 1000000ull);
+        task_cpuid(0x80000000, 0, &a, &b, &c, &d);
+        uint32_t max_ext = a;
+        if (max_ext >= 0x80000004) {
+            uint32_t* w = (uint32_t*)info.brand;
+            for (uint32_t l = 0; l < 3; l++) task_cpuid(0x80000002 + l, 0, &w[l * 4], &w[l * 4 + 1], &w[l * 4 + 2], &w[l * 4 + 3]);
+            info.brand[48] = 0;
+            // CPUID pads with spaces in front on some parts.
+            char* s = info.brand;
+            while (*s == ' ') s++;
+            if (s != info.brand) memmove(info.brand, s, strlen(s) + 1);
+        }
+        // Caches: Intel's deterministic parameters (leaf 4), else AMD's 0x80000005 / 0x80000006.
+        if (!strcmp(info.vendor, "GenuineIntel") && max_leaf >= 4) {
+            for (uint32_t i = 0; i < 16; i++) {
+                task_cpuid(4, i, &a, &b, &c, &d);
+                uint32_t type = a & 0x1F, level = (a >> 5) & 7;
+                if (!type) break;
+                uint64_t bytes = (uint64_t)(((b >> 22) & 0x3FF) + 1) * (((b >> 12) & 0x3FF) + 1) * ((b & 0xFFF) + 1) * (c + 1);
+                uint32_t kb = (uint32_t)(bytes / 1024);
+                if (level == 1 && type == 1) info.l1d_kb = kb;
+                else if (level == 1 && type == 2) info.l1i_kb = kb;
+                else if (level == 2) info.l2_kb = kb;
+                else if (level == 3) info.l3_kb = kb;
+            }
+        } else {
+            if (max_ext >= 0x80000005) {
+                task_cpuid(0x80000005, 0, &a, &b, &c, &d);
+                info.l1d_kb = c >> 24;
+                info.l1i_kb = d >> 24;
+            }
+            if (max_ext >= 0x80000006) {
+                task_cpuid(0x80000006, 0, &a, &b, &c, &d);
+                info.l2_kb = c >> 16;
+                info.l3_kb = (d >> 18) * 512;
+            }
+        }
+        have_info = true;
+    }
+    // The CPUID part, then the cores, straight into the caller's buffer.
+    size_t head = offsetof(syscall_cpu_stats_t, core);
+    memcpy(out, &info, head);
+    out->size = sizeof(*out);
+    out->uptime_ms = time_get_uptime_ms();
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < MAX_CPUS && n < SYS_CPU_MAX_CORES; i++) {
+        if (!g_cpus[i].online) continue;
+        syscall_core_stats_t cs;
+        memset(&cs, 0, sizeof cs);
+        uint32_t avg = 0, use = 0;
+        smp_get_cpu_usage(i, &avg, &use);
+        cs.usage = use;
+        cpu_top_entry_t top[CPU_TOP_SHOWN];
+        uint32_t k = smp_get_cpu_top(i, top);
+        for (uint32_t j = 0; j < k && j < SYS_CPU_TOP; j++) {
+            cs.top[j].pid = top[j].pid;
+            cs.top[j].percent = top[j].ticks;
+            memcpy(cs.top[j].name, top[j].name, sizeof cs.top[j].name);
+            cs.top[j].name[sizeof cs.top[j].name - 1] = 0;
+        }
+        cs.top_count = k < SYS_CPU_TOP ? k : SYS_CPU_TOP;
+        out->core[n++] = cs;
+    }
+    out->cores = n;
+    return SYS_SUCCESS;
 }
 
 static uint64_t sys_task_end(uint64_t pid) {
@@ -1895,6 +2002,8 @@ static void syscall_dispatch_inner(syscall_regs_t* regs) {
                     regs->rax = SYS_SUCCESS;
                 }
             }
+            else if (regs->rdi == SYS_TASK_CPU)
+                regs->rax = sys_task_cpu((syscall_cpu_stats_t*)regs->rsi);
             else
                 regs->rax = SYS_ERR_INVAL;
             break;

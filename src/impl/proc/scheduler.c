@@ -721,6 +721,77 @@ bool scheduler_is_idle_process(const process_t* proc) {
     return proc && proc >= &g_ap_idle[0] && proc < &g_ap_idle[MAX_CPUS];
 }
 
+// The boot core has no idle context of its own: once main() is done, the process it carries on as
+// ("busy", renamed "idle") becomes its idle loop (scheduler_boot_idle_loop). It counts as idle in the
+// core's usage and gets no CPU time, like the APs' idle contexts.
+static process_t* g_boot_idle;
+
+bool scheduler_is_boot_idle(const process_t* proc) { return proc && proc == g_boot_idle; }
+
+void scheduler_boot_idle_loop(void) {
+    for (;;) {
+        // Sleep until the next interrupt (the 1 kHz tick at the latest), then hand the core to anything
+        // that became ready. Spinning here kept core 0 at 100%.
+        asm volatile("sti; hlt" ::: "memory");
+        schedule();
+        // main() gets here before the scheduler has taken over this code: the first schedule() on the boot
+        // core makes it carry on as a process (the "busy" placeholder main() created for that). That one
+        // is the idle loop from then on.
+        if (!g_boot_idle && current_process) {
+            uint64_t flags;
+            asm volatile("pushfq; pop %0; cli" : "=r"(flags) :: "memory");
+            process_t* self = current_process;
+            g_boot_idle = self;
+            strncpy(self->name, "idle", sizeof(self->name) - 1);
+            self->sched_level = SCHED_LEVEL_BACKGROUND;
+            if (flags & 0x200) asm volatile("sti" ::: "memory");
+        }
+    }
+}
+
+// Per-core "what ran here": the program of each busy tick, a window per second (smp.h).
+static void cpu_top_account(cpu_local_t* cpu, process_t* p) {
+    process_t* owner = proc_mem_owner(p);
+    if (!owner) owner = p;
+    uint32_t n = cpu->top_window_count;
+    for (uint32_t i = 0; i < n; i++) {
+        if (cpu->top_window[i].pid == owner->pid) { cpu->top_window[i].ticks++; return; }
+    }
+    uint32_t slot = n;
+    if (n >= CPU_TOP_SLOTS) {
+        // Full: the entry with the fewest ticks makes room (rarely: few programs share a core in a second).
+        slot = 0;
+        for (uint32_t i = 1; i < n; i++)
+            if (cpu->top_window[i].ticks < cpu->top_window[slot].ticks) slot = i;
+    } else {
+        cpu->top_window_count = n + 1;
+    }
+    cpu->top_window[slot].pid = owner->pid;
+    cpu->top_window[slot].ticks = 1;
+    strncpy(cpu->top_window[slot].name, owner->name, sizeof(cpu->top_window[slot].name) - 1);
+    cpu->top_window[slot].name[sizeof(cpu->top_window[slot].name) - 1] = 0;
+}
+
+static void cpu_top_publish(cpu_local_t* cpu, uint32_t window_ticks) {
+    cpu_top_entry_t* w = cpu->top_window;
+    uint32_t n = cpu->top_window_count;
+    for (uint32_t i = 1; i < n; i++) {             // by ticks, most first
+        cpu_top_entry_t e = w[i];
+        uint32_t j = i;
+        while (j > 0 && w[j - 1].ticks < e.ticks) { w[j] = w[j - 1]; j--; }
+        w[j] = e;
+    }
+    __atomic_add_fetch(&cpu->top_seq, 1, __ATOMIC_RELEASE);
+    uint32_t m = n < CPU_TOP_SHOWN ? n : CPU_TOP_SHOWN;
+    for (uint32_t i = 0; i < m; i++) {
+        cpu->top_last[i] = w[i];
+        cpu->top_last[i].ticks = window_ticks ? (w[i].ticks * 100 + window_ticks / 2) / window_ticks : 0;
+    }
+    cpu->top_last_count = m;
+    __atomic_add_fetch(&cpu->top_seq, 1, __ATOMIC_RELEASE);
+    cpu->top_window_count = 0;
+}
+
 // Puts a READY process that is still running here (about to be switched
 // away from) on the queue of a CPU its affinity allows. The other CPU skips
 // it until this one is done with its stack (on_cpu).
@@ -1119,10 +1190,11 @@ void scheduler_tick() {
     if (cpu_id < MAX_CPUS) {
         cpu_local_t* cpu = &g_cpus[cpu_id];
         bool busy = current_process && current_process->state == PROCESS_RUNNING &&
-                    !scheduler_is_idle_process(current_process);
+                    !scheduler_is_idle_process(current_process) && !scheduler_is_boot_idle(current_process);
         __atomic_add_fetch(&cpu->usage_total_ticks, 1, __ATOMIC_RELAXED);
         if (busy) {
             __atomic_add_fetch(&cpu->usage_busy_ticks, 1, __ATOMIC_RELAXED);
+            cpu_top_account(cpu, current_process);
         }
         cpu->usage_window_ticks++;
         if (busy) cpu->usage_window_busy_ticks++;
@@ -1131,6 +1203,7 @@ void scheduler_tick() {
                                cpu->usage_window_ticks;
             __atomic_store_n(&cpu->usage_last_percent, percent,
                              __ATOMIC_RELAXED);
+            cpu_top_publish(cpu, cpu->usage_window_ticks);
             cpu->usage_window_ticks = 0;
             cpu->usage_window_busy_ticks = 0;
         }
@@ -1165,7 +1238,7 @@ void scheduler_tick() {
     }
 
     current_process->sched_ticks_used++;
-    current_process->cpu_time_ms++;
+    if (!scheduler_is_boot_idle(current_process)) current_process->cpu_time_ms++;
 
     uint64_t my_tick = __sync_add_and_fetch(&g_global_tick_count, 1);
 

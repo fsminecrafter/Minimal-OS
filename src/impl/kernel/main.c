@@ -272,5 +272,6 @@ void kernel_main(uint64_t mb2_info_addr) {
     createProcess("kernelaudio", audioupdate);
     netlog_start();
     terminal_program_entry();
-    while(1);
+    // The boot core's idle loop (it used to spin here, which kept core 0 at 100%).
+    scheduler_boot_idle_loop();
 }

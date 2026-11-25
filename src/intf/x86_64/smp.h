@@ -6,6 +6,16 @@
 
 #define MAX_CPUS 16
 
+// What a core ran, for a task manager: the programs (a thread counts for its program) that got the
+// core's ticks in the current one-second window, and the busiest of the last finished one.
+#define CPU_TOP_SLOTS 8
+#define CPU_TOP_SHOWN 4
+typedef struct {
+    uint64_t pid;
+    uint32_t ticks;             // top_last: percent of the window instead
+    char     name[32];
+} cpu_top_entry_t;
+
 typedef struct {
     uint32_t   cpu_id;
     uint32_t   lapic_id;
@@ -17,7 +27,15 @@ typedef struct {
     uint32_t   usage_window_ticks;
     uint32_t   usage_window_busy_ticks;
     uint32_t   usage_last_percent;
+    cpu_top_entry_t top_window[CPU_TOP_SLOTS];
+    uint32_t   top_window_count;
+    cpu_top_entry_t top_last[CPU_TOP_SHOWN];
+    uint32_t   top_last_count;
+    volatile uint32_t top_seq;  // odd while top_last is being written (readers retry)
 } cpu_local_t;
+
+// Copies a core's busiest programs of the last second (percent in .ticks); returns how many.
+uint32_t smp_get_cpu_top(uint32_t cpu_id, cpu_top_entry_t out[CPU_TOP_SHOWN]);
 
 extern cpu_local_t g_cpus[MAX_CPUS];
 extern volatile uint32_t g_cpu_count;

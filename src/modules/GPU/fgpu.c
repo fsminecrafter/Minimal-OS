@@ -1405,9 +1405,9 @@ static uint64_t execute(exec_state_t* st, const uint32_t* cmd, uint32_t words) {
                         return SYS_ERR_INVAL;
                 }
                 // A shader the backend could not compile runs on the CPU. So do draws that use
-                // state it does not know (ABI 4): texture units >= 4. (Mipmapped textures are
-                // the backend's choice: the NVIDIA one samples their level 0.)
-                // TODO(nv): drop this check as the backend learns each feature.
+                // state it does not know (ABI 4): texture units >= FGPU_MAX_TEXTURE_UNITS (none
+                // since it knows all 16). (Mipmapped textures are the backend's choice: the
+                // NVIDIA one samples their level 0.)
                 bool cpu_only = false;
                 for (uint32_t u = FGPU_MAX_TEXTURE_UNITS; u < FGPU_TEXTURE_UNITS && !cpu_only; u++)
                     if (st->pipe.textures[u].pixels) cpu_only = true;

@@ -266,10 +266,11 @@ enum {
 // Texture units programs may bind (ABI 4). Older programs and the hardware
 // backends only know FGPU_MAX_TEXTURE_UNITS.
 #define FGPU_TEXTURE_UNITS 16u
-// The units the NVIDIA backend can sample (its constant buffer and pools are
-// laid out for them): draws that use a higher unit run on the CPU backend.
-// TODO(nv): raise to FGPU_TEXTURE_UNITS once the backend lays out 16 units.
-#define FGPU_MAX_TEXTURE_UNITS 4u
+// The units the NVIDIA backend can sample: all 16 (a handle per unit in its
+// constant buffer at NV_SASS_CB_TEX_OFFSET, a header and sampler pool entry per
+// bound texture). It was 4: a lit shader with shadow, AO, light atlas and GI
+// maps plus a material texture needed 5, and every such draw ran on the CPU.
+#define FGPU_MAX_TEXTURE_UNITS FGPU_TEXTURE_UNITS
 #define FGPU_MAX_STORAGE_BUFFERS 4u
 
 // Matrices are column-major (OpenGL style): m[col * 4 + row].
